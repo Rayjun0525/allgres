@@ -73,44 +73,49 @@ injection (`FROM v_sales --x\n, argo_private.sessions`), quoted identifiers,
 comma joins, `extract(year FROM col)`, dollar quotes, a schema name that is
 really just a string literal. The grammar has already settled all of it.
 
-Analysis is still not the security boundary. Layered, strongest first:
+Validated statements do not run inline. PostgreSQL refuses `SET ROLE` inside a
+security-definer function (`cannot set parameter "role" within
+security-definer function`, SQLSTATE 42501), and `fn_validate_sql` is
+`SECURITY DEFINER` — it has to be, since it reads `argo_private.permissions`
+and `pg_proc` regardless of who is asking. So it only validates and returns
+the normalized statement text; it queues that text in `argo_private.sql_calls`
+and the runtime worker's SPI thread claims it and runs it as a **top-level**
+statement, issued directly by the worker with no enclosing `SECURITY DEFINER`
+frame — the same claim/complete shape already used for outbound LLM and tool
+calls. `SET ROLE sandbox` is legal there.
 
-1. `search_path = pg_temp`, so an unqualified relation name cannot resolve to
+Layered, strongest first:
+
+1. the statement only ever executes as `sandbox`, never as `fn_validate_sql`'s
+   owner;
+2. `search_path = pg_temp`, so an unqualified relation name cannot resolve to
    anything at all;
-2. the agent-visible views return no rows unless the current agent holds the
+3. the agent-visible views return no rows unless the current agent holds the
    matching permission (`argo_private.agent_may_read`), so authorisation does
    not depend on the analysis being complete;
-3. `transaction_read_only` and a 5s `statement_timeout`;
-4. only non-volatile functions, checked against `pg_proc`. Volatility is the
+4. `transaction_read_only` and a 5s `statement_timeout` — both real now that
+   execution is a top-level statement instead of nested inside one;
+5. only non-volatile functions, checked against `pg_proc`. Volatility is the
    property that separates a read from a side effect: `pg_read_file`,
    `pg_ls_dir`, `lo_import`, `dblink`, `nextval` and `pg_sleep` are volatile,
    while the aggregates, string, date and json functions an analyst needs are
    not. Unknown names are rejected rather than assumed safe;
-5. the parse tree must be exactly one non-writing `SELECT` (this also catches
+6. the parse tree must be exactly one non-writing `SELECT` (this also catches
    `SELECT ... INTO` and data-modifying CTEs, which are `SelectStmt` nodes);
-6. every relation named must be schema-qualified, outside the reserved schemas,
+7. every relation named must be schema-qualified, outside the reserved schemas,
    and present in the allowlist ∩ that agent's permissions.
 
 ## Known limitations
 
-**The `sandbox` role is not reachable from the current call path.** PostgreSQL
-refuses `SET ROLE` inside a security-definer function (`cannot set parameter
-"role" within security-definer function`, SQLSTATE 42501), and the restriction
-applies to the whole call stack below one. `fn_execute_sql` is reached only
-through `fn_submit_result`, which is `SECURITY DEFINER`, so agent SQL executes
-as the function owner rather than as `sandbox`. The volatility check in step 4
-is the compensating control.
+Outstanding gaps — the unverified Docker/PG17 build, the untested upgrade path
+and OAuth flow, secret key rotation, and more — are tracked in
+[KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
 
-The proper fix is to execute agent SQL as a top-level statement from the runtime
-worker, the same way outbound HTTP already works. That is a pump-shaped change
-and has not been made yet.
-
-This and every other outstanding gap — the unverified Docker/PG17 build, the
-untested upgrade path and OAuth flow, secret key rotation, and more — are
-tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
-
-`argo_public.fn_selftest()` exercises all of this, including the shapes that
-defeated the old text scanner. It runs as part of `tests/smoke.sql`.
+`argo_public.fn_selftest()` exercises the validate/queue/claim/complete state
+machine and every shape that defeated the old text scanner, and runs as part
+of `tests/smoke.sql`. It cannot exercise the role drop itself, though, being
+`SECURITY DEFINER` too; `tests/smoke.sql` separately asserts that against a
+live session (`SET LOCAL ROLE sandbox; SELECT current_user`).
 
 ## Security model
 

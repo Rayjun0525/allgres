@@ -67,6 +67,57 @@ BEGIN
   END IF;
 END $$;
 
+-- The sandbox role is actually assumed for agent SQL, not just documented as
+-- the intent.  fn_execute_sql used to validate *and* run the query as its own
+-- SECURITY DEFINER owner, because PostgreSQL refuses SET ROLE inside one; that
+-- is why this has to happen here, top level, exactly as the runtime worker
+-- does it (src/lib.rs's run_sandboxed_sql), not inside fn_selftest (also
+-- SECURITY DEFINER, so it could not prove this either).
+DO $$
+DECLARE
+  v_agent uuid;
+  v_sql   text;
+  v_result jsonb;
+BEGIN
+  SELECT agent_id INTO v_agent FROM argo_private.agents WHERE name = 'analyst' LIMIT 1;
+  v_sql := argo_private.fn_validate_sql(v_agent, 'SELECT region FROM argo_public.v_sales');
+
+  SET LOCAL ROLE sandbox;
+  SET LOCAL search_path = pg_temp;
+  SET LOCAL transaction_read_only = on;
+  SET LOCAL statement_timeout = '5s';
+  PERFORM set_config('argo.agent_id', v_agent::text, true);
+
+  IF current_user <> 'sandbox' THEN
+    RAISE EXCEPTION 'sandbox role was not assumed: current_user = %', current_user;
+  END IF;
+
+  v_result := argo_public.fn_run_sandboxed_sql(v_sql);
+  IF NOT COALESCE((v_result->>'ok')::boolean, false) THEN
+    RAISE EXCEPTION 'sandboxed execution failed: %', v_result->>'error';
+  END IF;
+  IF COALESCE(jsonb_array_length(v_result->'rows'), 0) = 0 THEN
+    RAISE EXCEPTION 'sandboxed execution returned no rows';
+  END IF;
+
+  RESET ROLE;
+END $$;
+
+-- transaction_read_only still blocks a write even when this execution
+-- primitive is reached directly, bypassing fn_validate_sql -- defence in
+-- depth, since fn_run_sandboxed_sql trusts its input completely.
+DO $$
+DECLARE v_result jsonb;
+BEGIN
+  SET LOCAL ROLE sandbox;
+  SET LOCAL transaction_read_only = on;
+  v_result := argo_public.fn_run_sandboxed_sql('INSERT INTO argo_private.sessions DEFAULT VALUES');
+  IF COALESCE((v_result->>'ok')::boolean, false) THEN
+    RAISE EXCEPTION 'sandbox role executed a write';
+  END IF;
+  RESET ROLE;
+END $$;
+
 -- A provider endpoint may not be pointed at a link-local or loopback address
 -- unless the operator opts that provider in explicitly.
 DO $$

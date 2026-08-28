@@ -14,7 +14,7 @@
 --   3. generic helpers
 --   4. outbound URL / host guards      (shared by the LLM and tool paths)
 --   5. provider secret storage
---   6. SQL sandbox                     (fn_execute_sql and its parser)
+--   6. SQL sandbox                     (fn_validate_sql, fn_run_sandboxed_sql, and the parser)
 --   7. agent state machine             (fn_next_step / fn_submit_result)
 --   8. pump                            (dispatch / claim / complete / watchdog)
 --   9. operator API
@@ -44,15 +44,16 @@ BEGIN
 END
 $$;
 
--- The sandbox never resolves an unqualified relation name: fn_execute_sql
+-- The sandbox never resolves an unqualified relation name: the runtime worker
 -- narrows search_path to pg_temp before running model-generated SQL, and this
 -- default keeps that true for any other session that assumes the role.
 ALTER ROLE sandbox  SET search_path = pg_temp;
 ALTER ROLE worker   SET search_path = argo_public, pg_temp;
 ALTER ROLE operator SET search_path = argo_private, argo_public, pg_temp;
 
--- The runtime worker drops to `worker` per transaction and fn_execute_sql then
--- drops further to `sandbox`; that second hop needs role membership.
+-- The runtime worker drops to `worker` per transaction, then drops further to
+-- `sandbox` to run agent SQL (fn_run_sandboxed_sql); that second hop needs
+-- role membership.
 GRANT sandbox TO worker;
 
 -- ---------------------------------------------------------------------------
@@ -62,6 +63,14 @@ GRANT sandbox TO worker;
 
 DROP FUNCTION IF EXISTS argo_public.fn_set_provider(uuid, text, boolean, text, text, text, text);
 DROP FUNCTION IF EXISTS allgres.create_session(uuid, text);
+
+-- fn_execute_sql validated *and* ran agent SQL as its own (SECURITY DEFINER)
+-- owner, which is what made SET ROLE sandbox illegal in the first place (see
+-- "6. SQL sandbox" below).  It is replaced by fn_validate_sql (validation
+-- only, returns text) plus fn_run_sandboxed_sql (execution, run by the
+-- runtime worker as the sandbox role) -- a name and a return-type change, so
+-- CREATE OR REPLACE cannot land it.
+DROP FUNCTION IF EXISTS argo_private.fn_execute_sql(uuid, text);
 
 -- The SQL sandbox no longer inspects statement text with regexes; it reads the
 -- tree produced by PostgreSQL's own parser (allgres.analyze_sql).  These are
@@ -227,6 +236,30 @@ CREATE INDEX IF NOT EXISTS outbound_task_idx
   ON argo_private.outbound_calls (task_id, status);
 CREATE INDEX IF NOT EXISTS outbound_inflight_idx
   ON argo_private.outbound_calls (updated_at)
+  WHERE status = 'in_flight';
+
+-- Agent SQL is validated here (fn_validate_sql) but executed by the runtime
+-- worker as a top-level statement under the `sandbox` role -- PostgreSQL
+-- forbids `SET ROLE` inside a SECURITY DEFINER function, so it cannot run
+-- inline in the same call that validates it.  This table is the handoff,
+-- shaped exactly like outbound_calls: queued -> in_flight -> harvested/lost.
+CREATE TABLE IF NOT EXISTS argo_private.sql_calls (
+  call_id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id     uuid NOT NULL REFERENCES argo_private.tasks(task_id),
+  agent_id    uuid NOT NULL REFERENCES argo_private.agents(agent_id),
+  sql         text NOT NULL,
+  status      text NOT NULL CHECK (status IN ('queued', 'in_flight', 'harvested', 'lost')),
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS sql_calls_ready_idx
+  ON argo_private.sql_calls (created_at)
+  WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS sql_calls_task_idx
+  ON argo_private.sql_calls (task_id, status);
+CREATE INDEX IF NOT EXISTS sql_calls_inflight_idx
+  ON argo_private.sql_calls (updated_at)
   WHERE status = 'in_flight';
 
 CREATE TABLE IF NOT EXISTS argo_private.demo_sales (
@@ -471,7 +504,7 @@ END;
 $fn$;
 
 -- Authorisation for agent-visible views lives in the views, so it holds even if
--- the statement analysis in fn_execute_sql misses a reference.  An agent that
+-- the statement analysis in fn_validate_sql misses a reference.  An agent that
 -- reaches a view it has no permission for sees no rows rather than a leak.
 CREATE OR REPLACE FUNCTION argo_private.agent_may_read(p_ref text)
 RETURNS boolean
@@ -823,30 +856,41 @@ $fn$;
 -- A note on the `sandbox` role, because the obvious design does not work:
 -- PostgreSQL refuses `SET ROLE` inside a security-definer function ("cannot set
 -- parameter \"role\" within security-definer function", SQLSTATE 42501), and the
--- restriction covers the whole call stack below one.  Every caller of this
--- function is SECURITY DEFINER, so the statement cannot be dropped to an
--- unprivileged role here; it executes as the function owner.  Earlier versions
--- of this file tried anyway and turned the failure into "sandbox role
--- unavailable", which meant execute_sql never worked at all.  Moving execution
--- out to a top-level statement in the runtime worker would restore the role
--- drop; see README, "Known limitations".
+-- restriction covers the whole call stack below one.  This function is
+-- SECURITY DEFINER (it needs to read argo_private.permissions and pg_proc
+-- regardless of who is asking), so it cannot itself drop to an unprivileged
+-- role.  Earlier versions of this file tried anyway and turned the failure
+-- into "sandbox role unavailable", which meant execute_sql never worked at
+-- all.
+--
+-- The fix is the split below: this function only validates and returns the
+-- normalized statement text; it executes nothing.  The runtime worker queues
+-- that text in argo_private.sql_calls (fn_claim_sql / fn_complete_sql, the
+-- same claim/complete shape the outbound HTTP pump uses for LLM and tool
+-- calls), then runs it as a *top-level* SPI statement -- issued directly by
+-- the worker, not nested inside any SECURITY DEFINER function -- where
+-- `SET LOCAL ROLE sandbox` is legal.  See argo_public.fn_run_sandboxed_sql
+-- below and src/lib.rs's `run_sandboxed_sql`.
 --
 -- Layering, strongest first:
---   a. search_path = pg_temp, so an unqualified relation name cannot resolve to
---      anything at all;
---   b. the views themselves return no rows unless the current agent holds the
---      matching permission (argo_private.agent_may_read), so authorisation does
---      not depend on the analysis being complete;
---   c. transaction_read_only + statement_timeout;
---   d. only non-volatile functions, checked against pg_proc — volatility is
+--   a. the statement only ever executes as `sandbox`, never as this
+--      function's owner;
+--   b. search_path = pg_temp, so an unqualified relation name cannot resolve
+--      to anything at all;
+--   c. the views themselves return no rows unless the current agent holds the
+--      matching permission (argo_private.agent_may_read), so authorisation
+--      does not depend on the analysis below being complete;
+--   d. transaction_read_only + statement_timeout, both real now that
+--      execution is a top-level statement instead of nested inside one;
+--   e. only non-volatile functions, checked against pg_proc — volatility is
 --      what separates a read from a side effect;
---   e. the parse tree must be exactly one non-writing SELECT;
---   f. every relation it names must be schema-qualified, outside the reserved
+--   f. the parse tree must be exactly one non-writing SELECT;
+--   g. every relation it names must be schema-qualified, outside the reserved
 --      schemas, and in allowlist n per-agent permission.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION argo_private.fn_execute_sql(p_agent_id uuid, p_sql text)
-RETURNS jsonb
+CREATE OR REPLACE FUNCTION argo_private.fn_validate_sql(p_agent_id uuid, p_sql text)
+RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = argo_private, argo_public, pg_temp
@@ -866,11 +910,8 @@ DECLARE
   v_schema   text;
   v_ref      text;
   v_ok       boolean;
-  v_rows     jsonb;
   v_plan     json;
   v_cost     numeric;
-  v_n        int;
-  v_truncated boolean := false;
 BEGIN
   PERFORM set_config('statement_timeout', '5000', true);
 
@@ -879,10 +920,10 @@ BEGIN
   -- to go even though the parser itself tolerates it.
   v_sql := regexp_replace(v_sql, ';+\s*$', '');
   IF v_sql = '' THEN
-    RAISE EXCEPTION 'fn_execute_sql: empty sql' USING ERRCODE = 'P0001';
+    RAISE EXCEPTION 'fn_validate_sql: empty sql' USING ERRCODE = 'P0001';
   END IF;
   IF length(v_sql) > 8000 THEN
-    RAISE EXCEPTION 'fn_execute_sql: statement too long' USING ERRCODE = 'P0001';
+    RAISE EXCEPTION 'fn_validate_sql: statement too long' USING ERRCODE = 'P0001';
   END IF;
 
   -- Parse only: no planning, no rewriting, no execution.  A syntax error
@@ -890,29 +931,29 @@ BEGIN
   BEGIN
     v_tree := allgres.analyze_sql(v_sql);
   EXCEPTION WHEN others THEN
-    RAISE EXCEPTION 'fn_execute_sql: not parseable as SQL: %', SQLERRM
+    RAISE EXCEPTION 'fn_validate_sql: not parseable as SQL: %', SQLERRM
       USING ERRCODE = 'P0001';
   END;
 
   IF NOT COALESCE((v_tree->>'ok')::boolean, false) THEN
-    RAISE EXCEPTION 'fn_execute_sql: statement could not be analysed'
+    RAISE EXCEPTION 'fn_validate_sql: statement could not be analysed'
       USING ERRCODE = 'P0001';
   END IF;
 
   IF (v_tree->>'statements')::int <> 1 THEN
-    RAISE EXCEPTION 'fn_execute_sql: expected one statement, found %',
+    RAISE EXCEPTION 'fn_validate_sql: expected one statement, found %',
       v_tree->>'statements' USING ERRCODE = 'P0001';
   END IF;
 
   IF v_tree->>'kind' <> 'select' THEN
-    RAISE EXCEPTION 'fn_execute_sql: only SELECT / WITH ... SELECT is allowed'
+    RAISE EXCEPTION 'fn_validate_sql: only SELECT / WITH ... SELECT is allowed'
       USING ERRCODE = 'P0001';
   END IF;
 
   -- Covers SELECT ... INTO and data-modifying CTEs, both of which parse as a
   -- SelectStmt and both of which write.
   IF COALESCE((v_tree->>'writes')::boolean, false) THEN
-    RAISE EXCEPTION 'fn_execute_sql: statement writes; only reads are allowed'
+    RAISE EXCEPTION 'fn_validate_sql: statement writes; only reads are allowed'
       USING ERRCODE = 'P0001';
   END IF;
 
@@ -927,12 +968,12 @@ BEGIN
       -- The parser cannot tell a CTE reference from a table reference; the CTE
       -- list it returns is what disambiguates them.
       CONTINUE WHEN (v_rel->>'name') = ANY (v_ctes);
-      RAISE EXCEPTION 'fn_execute_sql: unqualified name "%" rejected', v_rel->>'name'
+      RAISE EXCEPTION 'fn_validate_sql: unqualified name "%" rejected', v_rel->>'name'
         USING ERRCODE = 'P0001';
     END IF;
 
     IF lower(v_schema) = ANY (c_reserved) OR lower(v_schema) LIKE 'pg\_%' THEN
-      RAISE EXCEPTION 'fn_execute_sql: schema "%" is not readable by agents', v_schema
+      RAISE EXCEPTION 'fn_validate_sql: schema "%" is not readable by agents', v_schema
         USING ERRCODE = 'P0001';
     END IF;
 
@@ -948,19 +989,17 @@ BEGIN
     )
     INTO v_ok;
     IF NOT v_ok THEN
-      RAISE EXCEPTION 'fn_execute_sql: "%" not in allowlist', v_ref
+      RAISE EXCEPTION 'fn_validate_sql: "%" not in allowlist', v_ref
         USING ERRCODE = 'P0001';
     END IF;
   END LOOP;
 
-  -- Only non-volatile functions.  PostgreSQL forbids SET ROLE inside a
-  -- security-definer function ("cannot set parameter \"role\" within
-  -- security-definer function", 42501), and every caller of this function is
-  -- SECURITY DEFINER, so the statement cannot be dropped to the `sandbox` role
-  -- the way the comments here used to claim.  Volatility is the property that
-  -- actually separates a read from a side effect: pg_read_file, pg_ls_dir,
-  -- lo_import, dblink, nextval and pg_sleep are all volatile, while the
-  -- aggregates, string, date and json functions an analyst needs are not.
+  -- Only non-volatile functions.  Even though execution now happens as the
+  -- unprivileged `sandbox` role (see fn_run_sandboxed_sql), volatility stays
+  -- the check here rather than plain SELECT-list DDL/DML detection, because it
+  -- is what actually separates a read from a side effect: pg_read_file,
+  -- pg_ls_dir, lo_import, dblink, nextval and pg_sleep are all volatile, while
+  -- the aggregates, string, date and json functions an analyst needs are not.
   -- Default-deny: an unknown name is rejected rather than assumed safe.
   FOR v_fn IN SELECT jsonb_array_elements(COALESCE(v_tree->'functions', '[]'::jsonb)) LOOP
     SELECT count(*) FILTER (WHERE p.provolatile <> 'v'),
@@ -972,51 +1011,61 @@ BEGIN
       AND (v_fn->>'schema' IS NULL OR n.nspname = (v_fn->>'schema'));
 
     IF v_all_fns = 0 THEN
-      RAISE EXCEPTION 'fn_execute_sql: unknown function "%"', v_fn->>'name'
+      RAISE EXCEPTION 'fn_validate_sql: unknown function "%"', v_fn->>'name'
         USING ERRCODE = 'P0001';
     END IF;
     IF v_safe_fns <> v_all_fns THEN
-      RAISE EXCEPTION 'fn_execute_sql: function "%" is volatile and not allowed', v_fn->>'name'
+      RAISE EXCEPTION 'fn_validate_sql: function "%" is volatile and not allowed', v_fn->>'name'
         USING ERRCODE = 'P0001';
     END IF;
   END LOOP;
 
-  PERFORM set_config('argo.agent_id', p_agent_id::text, true);
-
-  -- With pg_temp only, an unqualified relation name resolves to nothing.
-  PERFORM set_config('search_path', 'pg_temp', true);
-  PERFORM set_config('transaction_read_only', 'on', true);
-
-  -- statement_timeout is armed when a top-level statement begins, so setting it
-  -- here does nothing to the statement already running -- this function is
-  -- always reached from inside one.  It is set anyway for the case where the
-  -- caller is a statement of its own, but the planner cost ceiling below is
-  -- what actually bounds the work when nested.
-  PERFORM set_config('statement_timeout', '5s', true);
-
+  -- Cost estimation only: no rows are fetched here, so this can safely run as
+  -- this function's owner rather than needing the `sandbox` role.
   BEGIN
     EXECUTE 'EXPLAIN (FORMAT JSON) ' || v_sql INTO v_plan;
   EXCEPTION WHEN others THEN
-    RAISE EXCEPTION 'fn_execute_sql: engine rejected query: %', SQLERRM
+    RAISE EXCEPTION 'fn_validate_sql: engine rejected query: %', SQLERRM
       USING ERRCODE = 'P0001';
   END;
 
   v_cost := (v_plan->0->'Plan'->>'Total Cost')::numeric;
   IF v_cost > 20000000 THEN
-    RAISE EXCEPTION 'fn_execute_sql: estimated cost % is too high', round(v_cost)
+    RAISE EXCEPTION 'fn_validate_sql: estimated cost % is too high', round(v_cost)
       USING ERRCODE = 'P0001';
   END IF;
 
-  -- Safe to wrap in a subquery: the parser has already confirmed v_sql is one
-  -- complete SELECT, so it cannot terminate the enclosing expression.
+  -- Normalized, parser-confirmed text: exactly one complete non-writing
+  -- SELECT, safe for the caller to queue and later wrap in a subquery.
+  RETURN v_sql;
+END;
+$fn$;
+
+-- Executes one already-validated statement as the `sandbox` role and shapes
+-- its result.  Deliberately not SECURITY DEFINER: it must run as whatever
+-- role the caller currently is, which is only ever `sandbox` because nothing
+-- but the runtime worker's top-level `SET LOCAL ROLE sandbox` (see
+-- src/lib.rs's `run_sandboxed_sql`) is granted EXECUTE on it -- see the grants
+-- section.  p_sql is trusted here precisely because it can only have reached
+-- this function by way of fn_validate_sql's return value.
+CREATE OR REPLACE FUNCTION argo_public.fn_run_sandboxed_sql(p_sql text)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_rows      jsonb;
+  v_n         int;
+  v_truncated boolean := false;
+BEGIN
+  -- Safe to wrap in a subquery: fn_validate_sql already confirmed p_sql is
+  -- one complete SELECT, so it cannot terminate the enclosing expression.
   BEGIN
     EXECUTE 'SELECT coalesce(jsonb_agg(q.row), ''[]''::jsonb) FROM (SELECT to_jsonb(s) AS row FROM ('
-      || v_sql
+      || p_sql
       || ') s LIMIT 201) q'
       INTO v_rows;
   EXCEPTION WHEN others THEN
-    RAISE EXCEPTION 'fn_execute_sql: engine rejected query: %', SQLERRM
-      USING ERRCODE = 'P0001';
+    RETURN jsonb_build_object('ok', false, 'error', SQLERRM);
   END;
 
   v_n := coalesce(jsonb_array_length(v_rows), 0);
@@ -1211,7 +1260,6 @@ DECLARE
   v_type text;
   v_parsed jsonb;
   v_action text;
-  v_sql_result jsonb;
   v_tool text;
   v_args jsonb;
   v_target uuid;
@@ -1223,6 +1271,7 @@ DECLARE
   v_reason text;
   v_call uuid;
   v_answer text;
+  v_valid_sql text;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -1338,23 +1387,34 @@ BEGIN
     RETURN jsonb_build_object('action', 'done');
   END IF;
 
+  -- Validation happens here, synchronously, as this function's owner (it only
+  -- reads argo_private.permissions and pg_proc; see fn_validate_sql).
+  -- Execution does not: it is queued for the runtime worker, which runs it as
+  -- a top-level statement under the `sandbox` role and reports back through
+  -- fn_complete_sql, the same claim/complete shape used for outbound HTTP
+  -- calls.  See "6. SQL sandbox" above for why this cannot happen inline.
   IF v_action = 'execute_sql' THEN
     BEGIN
-      v_sql_result := argo_private.fn_execute_sql(t.agent_id, v_parsed->>'sql');
-      PERFORM argo_private.append_log(
-        p_task_id, t.step_count + 1, 'tool',
-        jsonb_build_object('sql', v_parsed->>'sql', 'result', v_sql_result)
-      );
+      v_valid_sql := argo_private.fn_validate_sql(t.agent_id, v_parsed->>'sql');
     EXCEPTION WHEN others THEN
       PERFORM argo_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('sql', v_parsed->>'sql', 'message', SQLERRM)
       );
+      UPDATE argo_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
     END;
+
+    INSERT INTO argo_private.sql_calls (task_id, agent_id, sql, status)
+    VALUES (p_task_id, t.agent_id, v_valid_sql, 'queued')
+    RETURNING call_id INTO v_call;
+
     UPDATE argo_private.tasks
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
-    RETURN jsonb_build_object('action', 'continue');
+    RETURN jsonb_build_object('action', 'execute_sql', 'sql', v_valid_sql, 'call_id', v_call);
   END IF;
 
   IF v_action = 'call_tool' THEN
@@ -1497,7 +1557,9 @@ END;
 $fn$;
 
 -- ---------------------------------------------------------------------------
--- 8. Pump.  Builds requests; HTTP happens after these functions commit.
+-- 8. Pump.  Builds requests; HTTP and sandboxed SQL both happen after these
+--    functions commit -- the former on the runtime worker's HTTP pool
+--    threads, the latter back on its SPI thread as the `sandbox` role.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION argo_private.build_llm_http(
@@ -1712,6 +1774,45 @@ BEGIN
 END;
 $fn$;
 
+-- Same claim shape as fn_claim_outbound, for argo_private.sql_calls instead.
+-- The runtime worker executes each claimed call itself, as the `sandbox`
+-- role, via a top-level SPI statement (see fn_run_sandboxed_sql above and
+-- src/lib.rs's `run_sandboxed_sql`) -- there is no HTTP round trip here.
+CREATE OR REPLACE FUNCTION argo_public.fn_claim_sql(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = argo_private, argo_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT call_id, task_id, agent_id, sql
+    FROM argo_private.sql_calls
+    WHERE status = 'queued'
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE argo_private.sql_calls
+    SET status = 'in_flight', updated_at = now()
+    WHERE call_id = r.call_id;
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'call_id', r.call_id,
+      'task_id', r.task_id,
+      'agent_id', r.agent_id,
+      'sql', r.sql
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'calls', v_out);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION argo_private.llm_text_from_http(p_body text)
 RETURNS text
 LANGUAGE plpgsql
@@ -1817,6 +1918,86 @@ BEGIN
 END;
 $fn$;
 
+-- Same completion shape as fn_complete_outbound, for a sandboxed SQL
+-- execution.  p_ok/p_rows/p_row_count/p_truncated/p_error are exactly what
+-- fn_run_sandboxed_sql returned (or a worker-side failure, e.g. the sandbox
+-- role itself being unavailable); this function only records the outcome and
+-- continues the task, reusing fn_submit_result's tool_result/error handling
+-- (including its retry-count logic) rather than duplicating it.
+CREATE OR REPLACE FUNCTION argo_public.fn_complete_sql(
+  p_call_id uuid,
+  p_ok boolean,
+  p_rows jsonb,
+  p_row_count int,
+  p_truncated boolean,
+  p_error text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = argo_private, argo_public, pg_temp
+AS $fn$
+DECLARE
+  c argo_private.sql_calls%ROWTYPE;
+  v_payload jsonb;
+  v_result jsonb;
+  v_running boolean;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+
+  SELECT * INTO c
+  FROM argo_private.sql_calls
+  WHERE call_id = p_call_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_complete_sql: not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  UPDATE argo_private.sql_calls
+  SET status = 'harvested', updated_at = now()
+  WHERE call_id = p_call_id;
+
+  IF COALESCE(p_ok, false) THEN
+    v_payload := jsonb_build_object(
+      'type', 'tool_result',
+      'content', jsonb_build_object(
+        'sql', c.sql,
+        'result', jsonb_build_object(
+          'ok', true,
+          'row_count', COALESCE(p_row_count, 0),
+          'truncated', COALESCE(p_truncated, false),
+          'rows', COALESCE(p_rows, '[]'::jsonb)
+        )
+      )
+    );
+  ELSE
+    v_payload := jsonb_build_object(
+      'type', 'error',
+      'message', 'sql: ' || left(c.sql, 200) || ' -- ' || COALESCE(p_error, 'execution failed')
+    );
+  END IF;
+
+  -- The task may have been failed by the watchdog or by max_steps while this
+  -- call was in flight.  Harvesting must still commit, so never let
+  -- fn_submit_result abort the transaction that records the response.
+  SELECT EXISTS (
+    SELECT 1 FROM argo_private.tasks WHERE task_id = c.task_id AND status = 'running'
+  ) INTO v_running;
+
+  IF v_running THEN
+    BEGIN
+      v_result := argo_public.fn_submit_result(c.task_id, v_payload);
+    EXCEPTION WHEN others THEN
+      v_result := jsonb_build_object('action', 'error', 'message', SQLERRM);
+    END;
+  ELSE
+    v_result := jsonb_build_object('action', 'skipped', 'reason', 'task_not_running');
+  END IF;
+
+  RETURN jsonb_build_object('submit', v_result, 'call_id', p_call_id);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION argo_public.fn_watchdog(p_timeout_seconds int DEFAULT 90)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1850,6 +2031,34 @@ BEGIN
     END IF;
     n := n + 1;
   END LOOP;
+
+  -- Same reclaim, for a sandboxed SQL execution the worker never came back
+  -- from (a worker crash between fn_claim_sql and fn_complete_sql).  Ordinary
+  -- execution is bounded by fn_run_sandboxed_sql's own statement_timeout, so
+  -- this only ever fires on that kind of crash, not on a slow query.
+  FOR r IN
+    SELECT call_id, task_id
+    FROM argo_private.sql_calls
+    WHERE status = 'in_flight'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE argo_private.sql_calls
+    SET status = 'lost', updated_at = now()
+    WHERE call_id = r.call_id;
+    IF EXISTS (SELECT 1 FROM argo_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
+      BEGIN
+        PERFORM argo_public.fn_submit_result(
+          r.task_id,
+          jsonb_build_object('type', 'error', 'message', 'sql execution timeout')
+        );
+      EXCEPTION WHEN others THEN
+        NULL;
+      END;
+    END IF;
+    n := n + 1;
+  END LOOP;
+
   RETURN jsonb_build_object('lost', n);
 END;
 $fn$;
@@ -1864,12 +2073,15 @@ DECLARE
   d jsonb;
   c jsonb;
   w jsonb;
+  s jsonb;
 BEGIN
-  -- Does not perform HTTP.  Caller claims queued rows AFTER this commits.
+  -- Does not perform HTTP or run sandboxed SQL.  Caller claims queued rows
+  -- AFTER this commits.
   w := argo_public.fn_watchdog();
   d := argo_public.fn_dispatch_tasks(p_fallback_key);
   c := argo_public.fn_claim_outbound(4);
-  RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c);
+  s := argo_public.fn_claim_sql(4);
+  RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s);
 END;
 $fn$;
 
@@ -2381,6 +2593,9 @@ DECLARE
   n_logs int;
   ok boolean;
   detail text;
+  v_call uuid;
+  claim jsonb;
+  comp jsonb;
 BEGIN
   SELECT agent_id INTO v_agent FROM argo_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM argo_private.policies WHERE agent_id = v_agent;
@@ -2453,8 +2668,9 @@ BEGIN
     -- SELECT ... INTO and data-modifying CTEs both parse as a SelectStmt
     'SELECT * INTO argo_private.stolen FROM argo_public.v_sales',
     'WITH w AS (DELETE FROM argo_private.sessions RETURNING 1) SELECT * FROM w',
-    -- volatile functions: the statement runs as the function owner, so these
-    -- are what the volatility check exists to stop
+    -- volatile functions: without the sandbox role fix these would run as
+    -- this function's own owner, so the volatility check exists to stop them
+    -- even though execution is now sandboxed too (belt and suspenders)
     'SELECT * FROM pg_ls_dir(''.'')',
     'SELECT pg_read_file(''/etc/passwd'') FROM argo_public.v_sales',
     'SELECT pg_sleep(30) FROM argo_public.v_sales',
@@ -2463,7 +2679,7 @@ BEGIN
     'SELECT no_such_function_xyz(1) FROM argo_public.v_sales'
   ] LOOP
     BEGIN
-      r := argo_private.fn_execute_sql(v_agent, detail);
+      PERFORM argo_private.fn_validate_sql(v_agent, detail);
       ok := false;
     EXCEPTION WHEN others THEN
       ok := true;
@@ -2474,7 +2690,9 @@ BEGIN
     ));
   END LOOP;
 
-  -- 6. allowed shapes still work (the parser must not be uselessly strict)
+  -- 6. allowed shapes still validate (the parser must not be uselessly
+  --    strict); fn_validate_sql only normalizes and returns text now, it does
+  --    not execute -- that is covered separately below (item 13)
   FOREACH detail IN ARRAY ARRAY[
     'SELECT region, amount FROM argo_public.v_sales',
     'SELECT region, sum(amount) AS total FROM argo_public.v_sales GROUP BY region ORDER BY total DESC',
@@ -2489,8 +2707,7 @@ BEGIN
     'SELECT region FROM argo_public.v_sales WHERE sku = ''ARB-1'' /* join argo_private.x */'
   ] LOOP
     BEGIN
-      r := argo_private.fn_execute_sql(v_agent, detail);
-      ok := COALESCE((r->>'ok')::boolean, false);
+      ok := argo_private.fn_validate_sql(v_agent, detail) IS NOT NULL;
     EXCEPTION WHEN others THEN
       ok := false;
     END;
@@ -2553,7 +2770,7 @@ BEGIN
   v := v || jsonb_build_array(jsonb_build_object('name', 'llm_config_cannot_set_base_url', 'ok', ok));
 
   -- 11. the views enforce permission on their own, so authorisation does not
-  --     depend on fn_execute_sql having spotted every reference
+  --     depend on fn_validate_sql having spotted every reference
   PERFORM set_config('argo.agent_id', gen_random_uuid()::text, true);
   SELECT count(*) INTO n_logs FROM argo_public.v_sales;
   ok := (n_logs = 0);
@@ -2576,6 +2793,67 @@ BEGIN
     AND NOT ((allgres.analyze_sql('SELECT ''argo_private.sessions'' FROM argo_public.v_sales')->'relations')
              @> '[{"schema":"argo_private"}]'::jsonb);
   v := v || jsonb_build_array(jsonb_build_object('name', 'native_parser_analysis', 'ok', ok));
+
+  -- 13. execute_sql queues a call instead of running inline; the runtime
+  --     worker claims it, runs it as the sandbox role (fn_run_sandboxed_sql,
+  --     exercised directly against a live `sandbox` session in
+  --     tests/smoke.sql -- this function is SECURITY DEFINER and so cannot
+  --     itself do the SET ROLE), and posts the result back through
+  --     fn_claim_sql/fn_complete_sql, the same claim/complete shape the
+  --     outbound HTTP pump uses.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest execute_sql_queue')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid);
+  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"execute_sql"}',
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM argo_public.v_sales')
+  ));
+  v_call := (sub->>'call_id')::uuid;
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'execute_sql' AND v_call IS NOT NULL AND detail = 'running';
+  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  ok := ok AND detail = 'queued';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'execute_sql_queues_a_call', 'ok', ok));
+
+  claim := argo_public.fn_claim_sql(10);
+  ok := (claim->>'count')::int >= 1
+    AND EXISTS (
+      SELECT 1 FROM jsonb_array_elements(claim->'calls') c
+      WHERE (c->>'call_id')::uuid = v_call AND c->>'sql' = 'SELECT region FROM argo_public.v_sales'
+    );
+  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  ok := ok AND detail = 'in_flight';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'claim_sql_marks_in_flight', 'ok', ok));
+
+  comp := argo_public.fn_complete_sql(v_call, true, '[{"region":"west"}]'::jsonb, 1, false, NULL);
+  SELECT count(*) INTO n_logs
+  FROM argo_private.execution_logs
+  WHERE task_id = v_tid AND role = 'tool' AND content->>'sql' = 'SELECT region FROM argo_public.v_sales';
+  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  ok := (comp->'submit'->>'action') = 'continue' AND n_logs = 1 AND detail = 'harvested';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_sql_appends_tool_log', 'ok', ok));
+
+  -- a worker-side execution failure (sandbox unavailable, statement timeout,
+  -- ...) is logged as an error and retried, not treated as validation having
+  -- missed something
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest execute_sql_failure')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid);
+  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"execute_sql"}',
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM argo_public.v_sales')
+  ));
+  v_call := (sub->>'call_id')::uuid;
+  PERFORM argo_public.fn_claim_sql(10);
+  comp := argo_public.fn_complete_sql(v_call, false, NULL, NULL, false, 'statement timeout');
+  SELECT count(*) INTO n_logs
+  FROM argo_private.execution_logs
+  WHERE task_id = v_tid AND role = 'error';
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := n_logs >= 1 AND detail = 'running';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_sql_failure_logs_error', 'ok', ok));
 
   PERFORM argo_private.selftest_cleanup();
 
@@ -2622,8 +2900,17 @@ REVOKE ALL ON FUNCTION argo_public.fn_pump(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_dispatch_tasks(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_claim_outbound(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_complete_outbound(uuid, int, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION argo_public.fn_claim_sql(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION argo_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_watchdog(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_selftest() FROM PUBLIC;
+
+-- fn_run_sandboxed_sql is SECURITY INVOKER and does not itself validate what
+-- it is given: it must only ever be reachable as the `sandbox` role, which
+-- the runtime worker assumes with a top-level SET ROLE right before calling
+-- it (see src/lib.rs's `run_sandboxed_sql`).  A default grant to PUBLIC would
+-- defeat that, since sandbox already has USAGE on this schema.
+REVOKE ALL ON FUNCTION argo_public.fn_run_sandboxed_sql(text) FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION argo_public.fn_next_step(uuid) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_submit_result(uuid, jsonb) TO worker;
@@ -2631,10 +2918,13 @@ GRANT EXECUTE ON FUNCTION argo_public.fn_pump(text) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_dispatch_tasks(text) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_claim_outbound(int) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_complete_outbound(uuid, int, text) TO worker;
+GRANT EXECUTE ON FUNCTION argo_public.fn_claim_sql(int) TO worker;
+GRANT EXECUTE ON FUNCTION argo_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_watchdog(int) TO worker;
+GRANT EXECUTE ON FUNCTION argo_public.fn_run_sandboxed_sql(text) TO sandbox;
 
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA argo_public TO operator;
-REVOKE EXECUTE ON FUNCTION argo_private.fn_execute_sql(uuid, text) FROM worker;
+REVOKE EXECUTE ON FUNCTION argo_private.fn_validate_sql(uuid, text) FROM worker;
 REVOKE EXECUTE ON FUNCTION argo_private.provider_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION argo_private.provider_secret(uuid) FROM worker;
 REVOKE EXECUTE ON FUNCTION argo_private.decrypt_secret(text) FROM PUBLIC;
@@ -2718,6 +3008,7 @@ BEGIN
         'active_agents', (SELECT count(*) FROM argo_private.agents WHERE is_active),
         'running_tasks', (SELECT count(*) FROM argo_private.tasks WHERE status IN ('queued','running','waiting_human')),
         'queued_outbound', (SELECT count(*) FROM argo_private.outbound_calls WHERE status = 'queued'),
+        'queued_sql', (SELECT count(*) FROM argo_private.sql_calls WHERE status = 'queued'),
         'failed_tasks', (SELECT count(*) FROM argo_private.tasks WHERE status = 'failed'),
         'sessions', (SELECT count(*) FROM argo_private.sessions),
         'secret_storage', argo_private.secret_storage_mode(),

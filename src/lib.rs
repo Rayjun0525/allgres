@@ -5,7 +5,12 @@
 //!   `allgres runtime`  SPI thread + a pool of HTTP threads.  The SPI thread
 //!                      only ever runs short transactions (pump, RPC); every
 //!                      blocking network call happens on a pool thread, so a
-//!                      slow LLM can never stall the dashboard.
+//!                      slow LLM can never stall the dashboard.  Sandboxed
+//!                      agent SQL also runs here, on the SPI thread, since it
+//!                      needs SPI: PostgreSQL's SET ROLE restriction means it
+//!                      can only be a top-level statement issued directly by
+//!                      this worker, never nested inside a SECURITY DEFINER
+//!                      function -- see `run_sandboxed_sql`.
 //!
 //!   `allgres web`      HTTP listener.  No SPI at all: it forwards to the
 //!                      runtime worker over a unix socket.  One thread per
@@ -13,7 +18,12 @@
 //!                      accept loop either.
 //!
 //! All SQL is executed with bound parameters.  Nothing in this file builds a
-//! statement by concatenating a value into a string.
+//! statement by concatenating a value into a string.  `run_sandboxed_sql`
+//! passes agent-generated SQL to Postgres as a bind parameter too; the one
+//! place it gets wrapped into a larger statement by concatenation is
+//! sql/control_plane.sql's `fn_run_sandboxed_sql`, and only after
+//! `fn_validate_sql` has confirmed it parses as exactly one non-writing
+//! SELECT, which is what makes that safe.
 
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags};
 use pgrx::prelude::*;
@@ -49,6 +59,14 @@ const MAX_RESPONSE_BYTES: usize = 200_000;
 const PUMP_BUSY: Duration = Duration::from_millis(150);
 const PUMP_IDLE_MIN: Duration = Duration::from_millis(500);
 const PUMP_IDLE_MAX: Duration = Duration::from_secs(4);
+
+/// Sandboxed SQL executes on the SPI thread itself (it needs SPI, so it can't
+/// go on an HTTP pool thread the way outbound calls do), one call at a time,
+/// bounded by `SQL_STATEMENT_TIMEOUT` each.  Claiming only one per tick, not a
+/// batch, keeps a burst of agent queries from shutting the RPC/dashboard path
+/// out for several statement-timeouts in a row.
+const SQL_CLAIM_LIMIT: i32 = 1;
+const SQL_STATEMENT_TIMEOUT: &str = "5s";
 
 const MAX_WEB_THREADS: usize = 64;
 const MAX_REQUEST_BYTES: usize = 1 << 20;
@@ -501,6 +519,122 @@ fn dashboard_rpc(request: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Sandboxed SQL.  sql/control_plane.sql's fn_validate_sql (SECURITY DEFINER)
+// checks an agent statement and hands back its normalized text; PostgreSQL
+// forbids SET ROLE inside a SECURITY DEFINER function, so it cannot also run
+// it.  These functions are the other half: they claim a validated statement
+// and run it as a top-level SPI call, issued directly by this worker with no
+// enclosing SECURITY DEFINER frame, which is exactly where SET ROLE sandbox
+// is legal.
+// ---------------------------------------------------------------------------
+
+fn claim_sql_jobs(limit: i32) -> Value {
+    BackgroundWorker::transaction(|| {
+        drop_privileges();
+        Spi::get_one_with_args::<JsonB>("SELECT argo_public.fn_claim_sql($1)", &[limit.into()])
+            .ok()
+            .flatten()
+            .map(|j| j.0)
+            .unwrap_or_else(|| json!({ "count": 0, "calls": [] }))
+    })
+}
+
+/// Runs one already-validated agent statement as the `sandbox` role.  `sql`
+/// must be `fn_validate_sql`'s return value, never raw agent input: this
+/// function trusts it completely and so does the database function it calls.
+fn run_sandboxed_sql(agent_id: &str, sql: &str) -> Result<Value, String> {
+    BackgroundWorker::transaction(|| {
+        drop_privileges();
+        let dropped = Spi::run("SET LOCAL ROLE sandbox").is_ok()
+            && Spi::run("SET LOCAL search_path = pg_temp").is_ok()
+            && Spi::run("SET LOCAL transaction_read_only = on").is_ok()
+            && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT}'")).is_ok()
+            && Spi::run_with_args(
+                "SELECT set_config('argo.agent_id', $1, true)",
+                &[agent_id.into()],
+            )
+            .is_ok();
+        if !dropped {
+            return Err("sandbox role unavailable".to_string());
+        }
+        match Spi::get_one_with_args::<JsonB>(
+            "SELECT argo_public.fn_run_sandboxed_sql($1)",
+            &[sql.into()],
+        ) {
+            Ok(Some(JsonB(v))) => Ok(v),
+            Ok(None) => Err("sandboxed execution returned nothing".to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+}
+
+fn submit_sql_result(call_id: &str, outcome: Result<Value, String>) {
+    let (ok, rows, row_count, truncated, error) = match outcome {
+        Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => (
+            true,
+            v.get("rows").cloned(),
+            v.get("row_count").and_then(Value::as_i64).map(|n| n as i32),
+            v.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+            None,
+        ),
+        Ok(v) => (
+            false,
+            None,
+            None,
+            false,
+            Some(
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sql execution failed")
+                    .to_string(),
+            ),
+        ),
+        Err(e) => (false, None, None, false, Some(e)),
+    };
+    BackgroundWorker::transaction(|| {
+        drop_privileges();
+        let _ = Spi::get_one_with_args::<JsonB>(
+            "SELECT argo_public.fn_complete_sql($1::uuid, $2, $3, $4, $5, $6)",
+            &[
+                call_id.into(),
+                ok.into(),
+                rows.map(JsonB).into(),
+                row_count.into(),
+                truncated.into(),
+                error.into(),
+            ],
+        );
+    });
+}
+
+/// Claims up to `SQL_CLAIM_LIMIT` queued sandboxed-SQL calls and runs each to
+/// completion.  Returns how many it processed, so the pump loop's idle
+/// backoff treats this like any other unit of work.
+fn pump_sql() -> usize {
+    let claimed = claim_sql_jobs(SQL_CLAIM_LIMIT);
+    let mut n = 0usize;
+    let Some(calls) = claimed.get("calls").and_then(Value::as_array) else {
+        return 0;
+    };
+    for call in calls {
+        let (Some(call_id), Some(agent_id), Some(sql)) = (
+            call.get("call_id").and_then(Value::as_str),
+            call.get("agent_id").and_then(Value::as_str),
+            call.get("sql").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !valid_uuid(call_id) || !valid_uuid(agent_id) {
+            continue;
+        }
+        let outcome = run_sandboxed_sql(agent_id, sql);
+        submit_sql_result(call_id, outcome);
+        n += 1;
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
 // Outbound HTTP, on pool threads.  Nothing here may touch Postgres.
 // ---------------------------------------------------------------------------
 
@@ -719,7 +853,12 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
             }
         }
 
-        if queued > 0 {
+        // 4. Sandboxed SQL.  This has to run right here on the SPI thread (see
+        // the module doc comment), so it is claimed and executed one call at a
+        // time rather than handed to the HTTP pool.
+        let sql_ran = if ready { pump_sql() } else { 0 };
+
+        if queued > 0 || sql_ran > 0 {
             idle_delay = PUMP_IDLE_MIN;
             next_pump = Instant::now() + PUMP_BUSY;
         } else {

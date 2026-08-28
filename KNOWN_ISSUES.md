@@ -9,37 +9,39 @@ Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
 a gap between what the code does and what it should do.
 
-## 1. Agent SQL does not run as the `sandbox` role
+## 1. ~~Agent SQL does not run as the `sandbox` role~~ — fixed
 
-**Severity: high — this is the intended primary boundary for model-generated SQL.**
+`fn_execute_sql` validated *and* executed in one `SECURITY DEFINER` call, which
+is exactly what made `SET ROLE sandbox` illegal (PostgreSQL refuses `SET ROLE`
+inside a security-definer function, and the restriction covers the whole call
+stack below one). It is now split: `fn_validate_sql` only validates and
+returns the normalized statement text; the runtime worker queues that text in
+`argo_private.sql_calls` and its SPI thread claims and runs it
+(`fn_run_sandboxed_sql`) as a **top-level** statement — issued directly by the
+worker, no enclosing `SECURITY DEFINER` frame — under `SET LOCAL ROLE
+sandbox`, the same claim/complete shape (`fn_claim_sql` / `fn_complete_sql`)
+already used for outbound LLM and tool calls. See README, "The SQL sandbox".
 
-PostgreSQL refuses `SET ROLE` inside a security-definer function (`cannot set
-parameter "role" within security-definer function`, SQLSTATE 42501), and the
-restriction covers the whole call stack below one. `fn_execute_sql` is reached
-only through `fn_submit_result`, which is `SECURITY DEFINER`, so agent SQL
-executes as the function owner.
+`tests/smoke.sql` asserts the role is actually assumed (`SET LOCAL ROLE
+sandbox; SELECT current_user`) against a live session, since `fn_selftest`
+cannot: it is `SECURITY DEFINER` itself, so it cannot `SET ROLE` either.
+`fn_selftest` instead covers the validate → queue → claim → complete state
+machine, including a worker-side execution failure being logged and retried
+rather than treated as a validation gap.
 
-Compensating controls in place: `search_path = pg_temp`, per-agent enforcement
-inside the views (`argo_private.agent_may_read`), `transaction_read_only`, a
-planner cost ceiling, non-volatile functions only, and parse-tree validation of
-every relation. See README, "The SQL sandbox".
+One consequence: `execute_sql` now costs two step-count ticks (queue, then
+result) instead of one, matching how `call_tool` already worked — relevant
+only to `policies.max_steps` budgeting.
 
-**Fix:** execute agent SQL as a top-level statement from the runtime worker, the
-same shape the outbound HTTP pump already uses — SQL validates and hands back
-the statement, the worker runs it under `SET LOCAL ROLE sandbox` outside any
-security-definer frame, then submits the rows back. This also restores a real
-`statement_timeout` (see 2). It is a pump-shaped change and has not been made.
+## 2. `statement_timeout` is now real, but only bounds sandboxed execution
 
-## 2. `statement_timeout` is ineffective when nested
-
-`statement_timeout` is armed when a top-level statement begins, so setting it
-inside a function does not re-arm the statement already running. `SELECT
-pg_sleep(30)` ran the full 30 seconds under a nominal 5s limit until volatile
-functions were banned.
-
-The planner cost ceiling in `fn_execute_sql` bounds the work instead, but a
-query that is cheap to plan and slow to run is still unbounded. Fixed properly
-by 1.
+Fixed by 1 for the part that matters: `fn_run_sandboxed_sql` runs as a
+top-level statement, so `SET LOCAL statement_timeout` set by the runtime
+worker right before calling it actually arms. `fn_validate_sql`'s own
+`statement_timeout` (bounding parsing and the `EXPLAIN` cost check) is still
+set from inside a `SECURITY DEFINER` function and so is still nominal in the
+same nested-statement sense as before; the planner cost ceiling is what
+actually bounds that half.
 
 ## 3. Docker image path is unverified
 
@@ -76,7 +78,9 @@ No test covers these; they are wired up but unexercised:
 - the `delegate` action end to end (child task creation is covered by unit-level
   assertions only);
 - the `await_human` action and `fn_decide_approval`;
-- `fn_watchdog` reclaiming a genuinely stuck in-flight call.
+- `fn_watchdog` reclaiming a genuinely stuck in-flight call, for either
+  `outbound_calls` or the new `sql_calls` (a runtime worker crash between
+  `fn_claim_sql` and `fn_complete_sql`).
 
 ## 7. Secret key rotation
 
