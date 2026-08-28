@@ -98,18 +98,16 @@ refuses `SET ROLE` inside a security-definer function (`cannot set parameter
 "role" within security-definer function`, SQLSTATE 42501), and the restriction
 applies to the whole call stack below one. `fn_execute_sql` is reached only
 through `fn_submit_result`, which is `SECURITY DEFINER`, so agent SQL executes
-as the function owner rather than as `sandbox`.
-
-Earlier revisions of this file attempted the role drop anyway and converted the
-failure into `sandbox role unavailable or cannot be assumed`, which meant the
-`execute_sql` action never worked at all — it failed closed, but it failed. The
-volatility check in step 4 is the compensating control.
+as the function owner rather than as `sandbox`. The volatility check in step 4
+is the compensating control.
 
 The proper fix is to execute agent SQL as a top-level statement from the runtime
-worker, the same way outbound HTTP already works: SQL validates and hands back
-the statement, the worker runs it under `SET LOCAL ROLE sandbox` outside any
-security-definer frame, then submits the rows back. That is a pump-shaped change
+worker, the same way outbound HTTP already works. That is a pump-shaped change
 and has not been made yet.
+
+This and every other outstanding gap — the unverified Docker/PG17 build, the
+untested upgrade path and OAuth flow, secret key rotation, and more — are
+tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
 
 `argo_public.fn_selftest()` exercises all of this, including the shapes that
 defeated the old text scanner. It runs as part of `tests/smoke.sql`.
