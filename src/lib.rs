@@ -214,6 +214,56 @@ fn node_body(s: &str) -> &str {
     s
 }
 
+/// The substring covering one parenthesised list, starting just after its `(`.
+fn paren_body(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return &s[..i];
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    s
+}
+
+/// String nodes inside a List serialise as `"name"`, not as `{STRING ...}`,
+/// so a funcname list looks like `("pg_catalog" "generate_series")`.
+fn quoted_strings(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut s = String::new();
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                s.push(bytes[i + 1] as char);
+                i += 2;
+            } else {
+                s.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        i += 1;
+        out.push(s);
+    }
+    out
+}
+
 /// Value of `:name` within a node body, ignoring nested nodes' own fields for
 /// names that are unique to the node type we are reading.
 fn field(body: &str, name: &str) -> Option<String> {
@@ -272,6 +322,21 @@ fn analyze_dump(dump: &str) -> Value {
         idx = start;
     }
 
+    // Every function the statement calls.  PostgreSQL forbids SET ROLE inside a
+    // security-definer function, so the statement cannot be dropped to an
+    // unprivileged role; the caller vets these against pg_proc instead.
+    // funcname is a List of String nodes: ("pg_catalog" "generate_series").
+    let mut functions = Vec::new();
+    let mut idx = 0;
+    while let Some(p) = dump[idx..].find(":funcname (") {
+        let start = idx + p + ":funcname (".len();
+        let mut parts = quoted_strings(paren_body(&dump[start..]));
+        if let Some(name) = parts.pop() {
+            functions.push(json!({ "schema": parts.pop(), "name": name }));
+        }
+        idx = start;
+    }
+
     // `SELECT ... INTO t` and data-modifying CTEs are SelectStmts that write.
     let has_into = dump.contains(":intoClause {");
     let has_dml = ["{INSERTSTMT", "{UPDATESTMT", "{DELETESTMT", "{MERGESTMT"]
@@ -290,6 +355,7 @@ fn analyze_dump(dump: &str) -> Value {
         "kind": kind,
         "writes": has_into || has_dml,
         "relations": relations,
+        "functions": functions,
         "ctes": ctes,
     })
 }
@@ -554,7 +620,9 @@ fn handle_rpc_stream(mut stream: UnixStream, ready: bool) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
     let mut body = Vec::new();
-    if stream.by_ref().take(MAX_REQUEST_BYTES as u64).read_to_end(&mut body).is_err() {
+    // UnixStream is both Read and Write, so by_ref needs disambiguating.
+    let mut limited = std::io::Read::by_ref(&mut stream).take(MAX_REQUEST_BYTES as u64);
+    if limited.read_to_end(&mut body).is_err() {
         let _ = stream.write_all(json!({"ok": false, "error": "rpc_read_failed"}).to_string().as_bytes());
         return;
     }
@@ -1399,6 +1467,39 @@ mod tests {
         assert_eq!(read_token("odd\\ name rest").0, Some("odd name".into()));
         assert_eq!(read_token("\\2fast rest").0, Some("2fast".into()));
         assert_eq!(read_token("last}").0, Some("last".into()));
+    }
+
+    #[test]
+    fn collects_function_names_from_a_funcname_list() {
+        // Verified against real PG18 nodeToString output: String nodes inside a
+        // List serialise as "name", not as {STRING :sval name}.
+        let dump = "({RAWSTMT :stmt {SELECTSTMT :intoClause <> :targetList ({RESTARGET :val \
+                    {FUNCCALL :funcname (\"pg_sleep\") :args ({A_CONST :val 30})}})}})";
+        let d = analyze_dump(dump);
+        assert_eq!(d["functions"][0]["name"], "pg_sleep");
+        assert!(d["functions"][0]["schema"].is_null());
+    }
+
+    #[test]
+    fn keeps_the_schema_of_a_qualified_function() {
+        let dump = "({RAWSTMT :stmt {SELECTSTMT :intoClause <> \
+                    :fromClause ({FUNCCALL :funcname (\"pg_catalog\" \"generate_series\") :args <>})}})";
+        let d = analyze_dump(dump);
+        assert_eq!(d["functions"][0]["schema"], "pg_catalog");
+        assert_eq!(d["functions"][0]["name"], "generate_series");
+    }
+
+    #[test]
+    fn paren_body_stops_at_its_own_closing_paren() {
+        assert_eq!(paren_body("\"a\" \"b\") :args (x)"), "\"a\" \"b\"");
+        assert_eq!(paren_body("(nested) tail) rest"), "(nested) tail");
+    }
+
+    #[test]
+    fn quoted_strings_unescapes() {
+        assert_eq!(quoted_strings("\"a\" \"b\""), vec!["a", "b"]);
+        assert_eq!(quoted_strings("\"od\\\"d\""), vec!["od\"d"]);
+        assert!(quoted_strings("no quotes here").is_empty());
     }
 
     #[test]

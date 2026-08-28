@@ -75,19 +75,41 @@ really just a string literal. The grammar has already settled all of it.
 
 Analysis is still not the security boundary. Layered, strongest first:
 
-1. the statement runs as the `sandbox` role with `search_path = pg_temp`, so an
-   unqualified relation name cannot resolve to anything at all;
+1. `search_path = pg_temp`, so an unqualified relation name cannot resolve to
+   anything at all;
 2. the agent-visible views return no rows unless the current agent holds the
    matching permission (`argo_private.agent_may_read`), so authorisation does
    not depend on the analysis being complete;
 3. `transaction_read_only` and a 5s `statement_timeout`;
-4. the parse tree must be exactly one non-writing `SELECT` (this also catches
+4. only non-volatile functions, checked against `pg_proc`. Volatility is the
+   property that separates a read from a side effect: `pg_read_file`,
+   `pg_ls_dir`, `lo_import`, `dblink`, `nextval` and `pg_sleep` are volatile,
+   while the aggregates, string, date and json functions an analyst needs are
+   not. Unknown names are rejected rather than assumed safe;
+5. the parse tree must be exactly one non-writing `SELECT` (this also catches
    `SELECT ... INTO` and data-modifying CTEs, which are `SelectStmt` nodes);
-5. every relation named must be schema-qualified, outside the reserved schemas,
+6. every relation named must be schema-qualified, outside the reserved schemas,
    and present in the allowlist ∩ that agent's permissions.
 
-Steps 4 and 5 exist so the model gets a precise error. Steps 1–3 are what
-contain a statement that gets past them.
+## Known limitations
+
+**The `sandbox` role is not reachable from the current call path.** PostgreSQL
+refuses `SET ROLE` inside a security-definer function (`cannot set parameter
+"role" within security-definer function`, SQLSTATE 42501), and the restriction
+applies to the whole call stack below one. `fn_execute_sql` is reached only
+through `fn_submit_result`, which is `SECURITY DEFINER`, so agent SQL executes
+as the function owner rather than as `sandbox`.
+
+Earlier revisions of this file attempted the role drop anyway and converted the
+failure into `sandbox role unavailable or cannot be assumed`, which meant the
+`execute_sql` action never worked at all — it failed closed, but it failed. The
+volatility check in step 4 is the compensating control.
+
+The proper fix is to execute agent SQL as a top-level statement from the runtime
+worker, the same way outbound HTTP already works: SQL validates and hands back
+the statement, the worker runs it under `SET LOCAL ROLE sandbox` outside any
+security-definer frame, then submits the rows back. That is a pump-shaped change
+and has not been made yet.
 
 `argo_public.fn_selftest()` exercises all of this, including the shapes that
 defeated the old text scanner. It runs as part of `tests/smoke.sql`.

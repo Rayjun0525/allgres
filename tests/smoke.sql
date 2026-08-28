@@ -37,6 +37,36 @@ BEGIN
   END IF;
 END $$;
 
+-- What settings.get reports about secret storage must match what is on disk.
+-- Reporting "encrypted" while storing plaintext is worse than reporting
+-- plaintext, so this asserts the stored bytes, not the claim.
+DO $$
+DECLARE
+  v_mode text := argo_private.secret_storage_mode();
+  v_raw  text;
+BEGIN
+  SELECT s.api_key INTO v_raw
+  FROM argo_private.llm_secrets s
+  JOIN argo_private.llm_providers p USING (provider_id)
+  WHERE p.name = 'openai';
+
+  IF v_mode = 'encrypted' THEN
+    IF left(v_raw, 7) <> 'enc:v1:' THEN
+      RAISE EXCEPTION 'secret_storage_mode reports encrypted but the stored key is plaintext';
+    END IF;
+    IF v_raw LIKE '%sk-smoke-test-key%' THEN
+      RAISE EXCEPTION 'ciphertext still contains the plaintext key';
+    END IF;
+    IF argo_private.provider_secret(
+         (SELECT provider_id FROM argo_private.llm_providers WHERE name = 'openai')
+       ) <> 'sk-smoke-test-key' THEN
+      RAISE EXCEPTION 'encrypted secret did not round-trip';
+    END IF;
+  ELSIF v_mode NOT IN ('plaintext_no_key', 'plaintext_no_pgcrypto') THEN
+    RAISE EXCEPTION 'unexpected secret storage mode: %', v_mode;
+  END IF;
+END $$;
+
 -- A provider endpoint may not be pointed at a link-local or loopback address
 -- unless the operator opts that provider in explicitly.
 DO $$

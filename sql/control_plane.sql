@@ -689,23 +689,21 @@ AS $fn$
   SELECT nullif(current_setting('allgres.secret_key', true), '')
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.secret_storage_mode()
+-- pgcrypto can be installed into any schema, and the callers here run with a
+-- restricted search_path, so its schema is resolved rather than assumed.  An
+-- earlier version called `pgp_sym_encrypt` unqualified, failed to resolve it,
+-- and silently fell back to storing the secret in plaintext while still
+-- reporting "encrypted".
+CREATE OR REPLACE FUNCTION argo_private.pgcrypto_schema()
 RETURNS text
-LANGUAGE plpgsql
+LANGUAGE sql
 STABLE
 AS $fn$
-DECLARE
-  v_ok boolean;
-BEGIN
-  IF argo_private.secret_key() IS NULL THEN
-    RETURN 'plaintext_no_key';
-  END IF;
-  SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'pgp_sym_encrypt') INTO v_ok;
-  IF NOT v_ok THEN
-    RETURN 'plaintext_no_pgcrypto';
-  END IF;
-  RETURN 'encrypted';
-END;
+  SELECT n.nspname
+  FROM pg_catalog.pg_proc p
+  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+  WHERE p.proname = 'pgp_sym_encrypt'
+  LIMIT 1
 $fn$;
 
 CREATE OR REPLACE FUNCTION argo_private.encrypt_secret(p_plain text)
@@ -714,22 +712,29 @@ LANGUAGE plpgsql
 AS $fn$
 DECLARE
   v_key text := argo_private.secret_key();
+  v_ns  text := argo_private.pgcrypto_schema();
   v_out text;
 BEGIN
   IF p_plain IS NULL OR p_plain = '' THEN
     RETURN NULL;
   END IF;
+
+  -- No key configured is a deliberate choice, and the dashboard reports it.
   IF v_key IS NULL THEN
     RETURN p_plain;
   END IF;
-  -- Dynamic so the extension still installs when pgcrypto is absent.
-  BEGIN
-    EXECUTE 'SELECT ''enc:v1:'' || armor(pgp_sym_encrypt($1, $2))'
-      INTO v_out USING p_plain, v_key;
-    RETURN v_out;
-  EXCEPTION WHEN others THEN
-    RETURN p_plain;
-  END;
+
+  -- A key configured but no pgcrypto is a misconfiguration.  Fail loudly:
+  -- storing a secret in plaintext when the operator asked for encryption is
+  -- worse than refusing to store it.
+  IF v_ns IS NULL THEN
+    RAISE EXCEPTION 'allgres.secret_key is set but pgcrypto is not installed'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  EXECUTE format('SELECT %I.armor(%I.pgp_sym_encrypt($1, $2))', v_ns, v_ns)
+    INTO v_out USING p_plain, v_key;
+  RETURN 'enc:v1:' || v_out;
 END;
 $fn$;
 
@@ -739,6 +744,7 @@ LANGUAGE plpgsql
 AS $fn$
 DECLARE
   v_key text := argo_private.secret_key();
+  v_ns  text := argo_private.pgcrypto_schema();
   v_out text;
 BEGIN
   IF p_stored IS NULL THEN
@@ -747,16 +753,49 @@ BEGIN
   IF left(p_stored, 7) <> 'enc:v1:' THEN
     RETURN p_stored;
   END IF;
-  IF v_key IS NULL THEN
+  IF v_key IS NULL OR v_ns IS NULL THEN
     RETURN NULL;
   END IF;
   BEGIN
-    EXECUTE 'SELECT pgp_sym_decrypt(dearmor($1), $2)'
+    EXECUTE format('SELECT %I.pgp_sym_decrypt(%I.dearmor($1), $2)', v_ns, v_ns)
       INTO v_out USING substr(p_stored, 8), v_key;
     RETURN v_out;
   EXCEPTION WHEN others THEN
+    -- Wrong key, or ciphertext from a previous key.
     RETURN NULL;
   END;
+END;
+$fn$;
+
+-- Reports what the next write would actually do, by doing it.  Checking only
+-- that pgp_sym_encrypt exists somewhere is how the previous version came to
+-- report "encrypted" while storing plaintext.
+CREATE OR REPLACE FUNCTION argo_private.secret_storage_mode()
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $fn$
+DECLARE
+  v_probe text;
+BEGIN
+  IF argo_private.secret_key() IS NULL THEN
+    RETURN 'plaintext_no_key';
+  END IF;
+  IF argo_private.pgcrypto_schema() IS NULL THEN
+    RETURN 'plaintext_no_pgcrypto';
+  END IF;
+  BEGIN
+    v_probe := argo_private.encrypt_secret('allgres-probe');
+  EXCEPTION WHEN others THEN
+    RETURN 'plaintext_encrypt_failed';
+  END;
+  IF v_probe IS NULL OR left(v_probe, 7) <> 'enc:v1:' THEN
+    RETURN 'plaintext_encrypt_failed';
+  END IF;
+  IF argo_private.decrypt_secret(v_probe) IS DISTINCT FROM 'allgres-probe' THEN
+    RETURN 'encrypted_but_not_readable';
+  END IF;
+  RETURN 'encrypted';
 END;
 $fn$;
 
@@ -781,19 +820,29 @@ $fn$;
 -- comment injection, quoted identifiers, comma joins and `extract(x FROM y)`
 -- were all ways for it to be wrong in one direction or the other.
 --
+-- A note on the `sandbox` role, because the obvious design does not work:
+-- PostgreSQL refuses `SET ROLE` inside a security-definer function ("cannot set
+-- parameter \"role\" within security-definer function", SQLSTATE 42501), and the
+-- restriction covers the whole call stack below one.  Every caller of this
+-- function is SECURITY DEFINER, so the statement cannot be dropped to an
+-- unprivileged role here; it executes as the function owner.  Earlier versions
+-- of this file tried anyway and turned the failure into "sandbox role
+-- unavailable", which meant execute_sql never worked at all.  Moving execution
+-- out to a top-level statement in the runtime worker would restore the role
+-- drop; see README, "Known limitations".
+--
 -- Layering, strongest first:
---   a. the statement runs as `sandbox` with search_path = pg_temp, so an
---      unqualified relation name cannot resolve to anything at all;
+--   a. search_path = pg_temp, so an unqualified relation name cannot resolve to
+--      anything at all;
 --   b. the views themselves return no rows unless the current agent holds the
 --      matching permission (argo_private.agent_may_read), so authorisation does
 --      not depend on the analysis being complete;
 --   c. transaction_read_only + statement_timeout;
---   d. the parse tree must be exactly one non-writing SELECT;
---   e. every relation it names must be schema-qualified, outside the reserved
+--   d. only non-volatile functions, checked against pg_proc — volatility is
+--      what separates a read from a side effect;
+--   e. the parse tree must be exactly one non-writing SELECT;
+--   f. every relation it names must be schema-qualified, outside the reserved
 --      schemas, and in allowlist n per-agent permission.
---
--- (d) and (e) exist so the model gets a precise error.  (a), (b) and (c) are
--- what contain a statement that gets past them.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION argo_private.fn_execute_sql(p_agent_id uuid, p_sql text)
@@ -811,10 +860,15 @@ DECLARE
   v_tree     jsonb;
   v_ctes     text[];
   v_rel      jsonb;
+  v_fn       jsonb;
+  v_safe_fns int;
+  v_all_fns  int;
   v_schema   text;
   v_ref      text;
   v_ok       boolean;
   v_rows     jsonb;
+  v_plan     json;
+  v_cost     numeric;
   v_n        int;
   v_truncated boolean := false;
 BEGIN
@@ -899,21 +953,59 @@ BEGIN
     END IF;
   END LOOP;
 
-  PERFORM set_config('argo.agent_id', p_agent_id::text, true);
+  -- Only non-volatile functions.  PostgreSQL forbids SET ROLE inside a
+  -- security-definer function ("cannot set parameter \"role\" within
+  -- security-definer function", 42501), and every caller of this function is
+  -- SECURITY DEFINER, so the statement cannot be dropped to the `sandbox` role
+  -- the way the comments here used to claim.  Volatility is the property that
+  -- actually separates a read from a side effect: pg_read_file, pg_ls_dir,
+  -- lo_import, dblink, nextval and pg_sleep are all volatile, while the
+  -- aggregates, string, date and json functions an analyst needs are not.
+  -- Default-deny: an unknown name is rejected rather than assumed safe.
+  FOR v_fn IN SELECT jsonb_array_elements(COALESCE(v_tree->'functions', '[]'::jsonb)) LOOP
+    SELECT count(*) FILTER (WHERE p.provolatile <> 'v'),
+           count(*)
+    INTO v_safe_fns, v_all_fns
+    FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = (v_fn->>'name')
+      AND (v_fn->>'schema' IS NULL OR n.nspname = (v_fn->>'schema'));
 
-  -- Fail closed: never execute model-generated SQL with the SECURITY DEFINER owner.
-  BEGIN
-    EXECUTE 'SET LOCAL ROLE sandbox';
-  EXCEPTION
-    WHEN undefined_object OR invalid_authorization_specification OR insufficient_privilege THEN
-      RAISE EXCEPTION 'fn_execute_sql: sandbox role unavailable or cannot be assumed'
+    IF v_all_fns = 0 THEN
+      RAISE EXCEPTION 'fn_execute_sql: unknown function "%"', v_fn->>'name'
         USING ERRCODE = 'P0001';
-  END;
+    END IF;
+    IF v_safe_fns <> v_all_fns THEN
+      RAISE EXCEPTION 'fn_execute_sql: function "%" is volatile and not allowed', v_fn->>'name'
+        USING ERRCODE = 'P0001';
+    END IF;
+  END LOOP;
+
+  PERFORM set_config('argo.agent_id', p_agent_id::text, true);
 
   -- With pg_temp only, an unqualified relation name resolves to nothing.
   PERFORM set_config('search_path', 'pg_temp', true);
   PERFORM set_config('transaction_read_only', 'on', true);
+
+  -- statement_timeout is armed when a top-level statement begins, so setting it
+  -- here does nothing to the statement already running -- this function is
+  -- always reached from inside one.  It is set anyway for the case where the
+  -- caller is a statement of its own, but the planner cost ceiling below is
+  -- what actually bounds the work when nested.
   PERFORM set_config('statement_timeout', '5s', true);
+
+  BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON) ' || v_sql INTO v_plan;
+  EXCEPTION WHEN others THEN
+    RAISE EXCEPTION 'fn_execute_sql: engine rejected query: %', SQLERRM
+      USING ERRCODE = 'P0001';
+  END;
+
+  v_cost := (v_plan->0->'Plan'->>'Total Cost')::numeric;
+  IF v_cost > 20000000 THEN
+    RAISE EXCEPTION 'fn_execute_sql: estimated cost % is too high', round(v_cost)
+      USING ERRCODE = 'P0001';
+  END IF;
 
   -- Safe to wrap in a subquery: the parser has already confirmed v_sql is one
   -- complete SELECT, so it cannot terminate the enclosing expression.
@@ -2361,8 +2453,14 @@ BEGIN
     -- SELECT ... INTO and data-modifying CTEs both parse as a SelectStmt
     'SELECT * INTO argo_private.stolen FROM argo_public.v_sales',
     'WITH w AS (DELETE FROM argo_private.sessions RETURNING 1) SELECT * FROM w',
-    -- privilege-gated function: rejected by the sandbox role, not by a name list
-    'SELECT * FROM pg_ls_dir(''.'')'
+    -- volatile functions: the statement runs as the function owner, so these
+    -- are what the volatility check exists to stop
+    'SELECT * FROM pg_ls_dir(''.'')',
+    'SELECT pg_read_file(''/etc/passwd'') FROM argo_public.v_sales',
+    'SELECT pg_sleep(30) FROM argo_public.v_sales',
+    'SELECT lo_import(''/etc/passwd'')',
+    'SELECT random() FROM argo_public.v_sales',
+    'SELECT no_such_function_xyz(1) FROM argo_public.v_sales'
   ] LOOP
     BEGIN
       r := argo_private.fn_execute_sql(v_agent, detail);
