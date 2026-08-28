@@ -1,0 +1,31 @@
+services:
+  allgres:
+    build: .
+    environment:
+      # Override in a .env file; the default exists so `docker compose up`
+      # works, not because it is a reasonable password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-allgres}
+      POSTGRES_DB: postgres
+      ALLGRES_DATABASE: postgres
+      # 0.0.0.0 inside the container only; the published ports below are bound
+      # to the host loopback.
+      ALLGRES_HTTP_ADDR: 0.0.0.0:8088
+      ALLGRES_DASHBOARD_TOKEN: ${ALLGRES_DASHBOARD_TOKEN:-}
+      # Acknowledges that the container binds a wildcard address with no token
+      # by default.  Remove this and set a token before publishing the port
+      # anywhere but loopback.
+      ALLGRES_ALLOW_INSECURE_HTTP: "1"
+      # /mock/chat/completions is a test fixture; off unless asked for.
+      ALLGRES_ENABLE_MOCK: ${ALLGRES_ENABLE_MOCK:-1}
+      # Encrypts provider API keys at rest (needs pgcrypto, which the image has).
+      ALLGRES_SECRET_KEY: ${ALLGRES_SECRET_KEY:-}
+    ports:
+      # Loopback only.  Change to "8088:8088" only behind a reverse proxy that
+      # terminates TLS and authenticates.
+      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:8088:8088"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

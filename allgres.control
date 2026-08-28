@@ -1,0 +1,5 @@
+comment = 'Allgres — Postgres Is All You Need. PostgreSQL-native agent control plane.'
+default_version = '0.2.0'
+module_pathname = '$libdir/allgres'
+relocatable = false
+superuser = true

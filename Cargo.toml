@@ -1,0 +1,25 @@
+[package]
+name = "allgres"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Allgres — Postgres Is All You Need. PostgreSQL-native agent control plane."
+
+[lib]
+# "lib" in addition to "cdylib" so `cargo pgrx test` can link the unit tests.
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg17"]
+pg17 = ["pgrx/pg17"]
+pg18 = ["pgrx/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx = { version = "=0.19.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3.4", default-features = false, features = ["rustls", "json"] }
+
+[dev-dependencies]
+pgrx-tests = "=0.19.2"
