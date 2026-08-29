@@ -45,6 +45,19 @@ as_pg() { sudo -u postgres "$@"; }
 # audit trail in this database, and are harmless.
 SUFFIX="$(date +%s)_$$"
 
+# SCRATCH is overridable (SCRATCH=... in the environment) and gets rm -rf'd
+# twice below; refuse anything that isn't a plausible scratch path rather
+# than trusting an override blindly -- an empty or mistyped value here
+# (SCRATCH=/ being the sharpest case) would otherwise turn a cleanup step
+# into an unbounded delete.
+case "$SCRATCH" in
+  /var/lib/postgresql/*) ;;
+  *)
+    echo "FAIL: SCRATCH ('$SCRATCH') must be under /var/lib/postgresql/ -- refusing to rm -rf it" >&2
+    exit 1
+    ;;
+esac
+
 echo "=== backup_drill: cleaning any previous run's scratch clusters ==="
 as_pg "$PG_BIN/pg_ctl" -D "$SCRATCH/pitr_restore" stop -m fast 2>/dev/null || true
 as_pg "$PG_BIN/pg_ctl" -D "$SCRATCH/logical_restore" stop -m fast 2>/dev/null || true
@@ -113,6 +126,20 @@ chown postgres:postgres "$SCRATCH/pitr_restore/postgresql.auto.conf"
 
 as_pg "$PG_BIN/pg_ctl" -D "$SCRATCH/pitr_restore" -l "$SCRATCH/logs/pitr_restore.log" start
 for _ in $(seq 1 30); do as_pg pg_isready -h "$SCRATCH/sock" -p "$RESTORE_PORT" -q && break; sleep 1; done
+# pg_isready only proves the server accepts connections, which is already
+# true during hot-standby replay -- before recovery_target_action=promote
+# has actually finished promoting to a writable primary. Confirmed live:
+# querying right after pg_isready hit both a stale read ("before=0 after=0",
+# recovery hadn't replayed up to the target LSN yet) and, once that race
+# was papered over by a retry, "cannot execute UPDATE in a read-only
+# transaction" from fn_selftest -- still not promoted. Waiting on
+# pg_is_in_recovery() = false is what the PITR restore actually needs;
+# pg_isready alone is not far enough.
+for _ in $(seq 1 60); do
+  v=$(as_pg psql -h "$SCRATCH/sock" -p "$RESTORE_PORT" -d postgres -t -A -c "SELECT pg_is_in_recovery();" 2>/dev/null || echo "")
+  [ "$v" = "f" ] && break
+  sleep 1
+done
 
 BEFORE=$(as_pg psql -h "$SCRATCH/sock" -p "$RESTORE_PORT" -d postgres -t -A -c \
   "SELECT count(*) FROM allgres_private.agents WHERE name = 'backup_drill_before_$SUFFIX';")
@@ -156,7 +183,22 @@ chown postgres:postgres "$SCRATCH/logical_restore/postgresql.conf"
 as_pg env ALLGRES_HTTP_ADDR=127.0.0.1:0 "$PG_BIN/pg_ctl" -D "$SCRATCH/logical_restore" -l "$SCRATCH/logs/logical_restore.log" start
 for _ in $(seq 1 30); do as_pg pg_isready -h "$SCRATCH/sock" -p "$FRESH_PORT" -q && break; sleep 1; done
 
-as_pg psql -h "$SCRATCH/sock" -p "$FRESH_PORT" -d postgres -f "$SCRATCH/dumps/globals.sql" > "$SCRATCH/logs/globals_apply.log" 2>&1
+# Not -v ON_ERROR_STOP=1: pg_dumpall --globals-only unconditionally emits
+# `CREATE ROLE postgres ...` (and similar) for roles initdb already
+# created on this fresh cluster, which errors, expectedly, every run --
+# turning that into a hard stop would break the one case that is
+# supposed to happen. What must NOT happen silently is anything else
+# failing alongside it, which running with no error checking at all
+# (the gap an external review caught) cannot tell apart from the expected
+# case -- so every ERROR line in the log is inspected below, and only
+# ones that don't match the expected shape fail the drill.
+as_pg psql -h "$SCRATCH/sock" -p "$FRESH_PORT" -d postgres -f "$SCRATCH/dumps/globals.sql" > "$SCRATCH/logs/globals_apply.log" 2>&1 || true
+UNEXPECTED=$(grep "ERROR:" "$SCRATCH/logs/globals_apply.log" | grep -v "already exists" || true)
+if [ -n "$UNEXPECTED" ]; then
+  echo "FAIL: unexpected error(s) applying globals.sql:" >&2
+  echo "$UNEXPECTED" >&2
+  exit 1
+fi
 
 # Two-pass restore, not one: pg_restore's --disable-triggers only takes
 # effect during a --data-only restore (`pg_restore --help` says so exactly;
@@ -169,6 +211,17 @@ as_pg pg_restore -h "$SCRATCH/sock" -p "$FRESH_PORT" -d postgres --no-owner --ro
 as_pg pg_restore -h "$SCRATCH/sock" -p "$FRESH_PORT" -d postgres --no-owner --role=postgres \
   --data-only --disable-triggers "$SCRATCH/dumps/postgres.dump" > "$SCRATCH/logs/restore_data.log" 2>&1
 
+# SET LOCAL ROLE straight from this postgres superuser session would
+# succeed regardless of whether the dump/restore actually preserved the
+# GRANT <agent_role> TO worker membership fn_provision_agent_role makes --
+# a superuser can assume any role, membership grant or not, so that alone
+# only proves the role exists, not that the real path works. Hopping
+# through `worker` first, the same as the real runtime worker does
+# (drop_privileges() -> worker, then run_sandboxed_sql's own
+# SET LOCAL ROLE <agent_role>), means the *second* SET ROLE only succeeds
+# if worker's membership in the agent role actually survived -- once
+# current_user is a non-superuser role, PostgreSQL checks that role's own
+# grants for the next SET ROLE, not the original session's.
 ROLE_OK=$(as_pg psql -h "$SCRATCH/sock" -p "$FRESH_PORT" -d postgres -t -A -v ON_ERROR_STOP=1 -c "
 DO \$\$
 DECLARE
@@ -176,8 +229,10 @@ DECLARE
 BEGIN
   SELECT agent_id, pg_role INTO v_agent, v_role FROM allgres_private.agents WHERE name = 'backup_drill_logical_$SUFFIX';
   v_sql := allgres_private.fn_validate_sql(v_agent, 'SELECT task_id FROM allgres_public.v_my_tasks');
+  SET LOCAL ROLE worker;
+  IF current_user <> 'worker' THEN RAISE EXCEPTION 'worker role not assumed: %', current_user; END IF;
   EXECUTE format('SET LOCAL ROLE %I', v_role);
-  IF current_user <> v_role THEN RAISE EXCEPTION 'role not assumed: %', current_user; END IF;
+  IF current_user <> v_role THEN RAISE EXCEPTION 'agent role not assumed from worker (membership lost in restore?): %', current_user; END IF;
   v_result := allgres_public.fn_run_sandboxed_sql(v_sql);
   IF NOT COALESCE((v_result->>'ok')::boolean, false) OR COALESCE(jsonb_array_length(v_result->'rows'), 0) = 0 THEN
     RAISE EXCEPTION 'agent could not see its own task after restore: %', v_result;

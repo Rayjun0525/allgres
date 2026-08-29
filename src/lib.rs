@@ -473,31 +473,50 @@ fn extension_is_installed() -> bool {
     })
 }
 
-/// Best-effort privilege drop, run at the top of every runtime transaction.
-/// The worker connects as the bootstrap superuser so a not-yet-created role can
-/// never crash-loop it at startup; this puts ordinary work back on `worker`.
-/// A silently discarded error here used to mean this: the drop failed and
-/// every following statement in that transaction ran as the bootstrap
-/// superuser instead of `worker`, with nothing anywhere -- no log, no
-/// warning -- to say so. It is still best-effort (there is no separate
-/// backend to abort into instead), but it is no longer silent.
-fn drop_privileges() {
+/// Privilege drop, run at the top of every runtime transaction. The worker
+/// connects as the bootstrap superuser so a not-yet-created role can never
+/// crash-loop it at startup; this puts ordinary work back on `worker`.
+/// Returns whether the drop actually landed. Every call site below checks
+/// this and skips its own SPI calls when it is false, rather than
+/// proceeding with `current_user` still the bootstrap superuser: this used
+/// to only log a warning and continue regardless (silent before that, and
+/// silently fail-open even after -- an external review caught the second
+/// half). Most of what these call sites invoke is SECURITY DEFINER control-
+/// plane functions, so which role called them does not change what runs
+/// inside (SECURITY DEFINER always executes as the function's *owner*,
+/// which "12. Grants"' ownership-transfer block makes allgres_owner, not
+/// whoever is connected) -- but `run_sandboxed_sql` is the one path where
+/// current_user is the actual, primary trust boundary (agent-generated SQL
+/// runs as a top-level statement specifically so it *can* SET ROLE, see
+/// "The SQL sandbox" in README), and treating every call site the same way
+/// is what keeps that boundary from silently depending on which code path
+/// happens to reach it, now or after some future change.
+fn drop_privileges() -> bool {
     if std::env::var("ALLGRES_DROP_PRIVILEGES").as_deref() == Ok("0") {
-        return;
+        return true;
     }
     match Spi::get_one::<bool>("SELECT allgres.assume_worker_role()") {
-        Ok(Some(true)) => {}
+        Ok(Some(true)) => true,
         Ok(Some(false)) => {
-            pgrx::warning!("Allgres: assume_worker_role() reports the worker role is not ready")
+            pgrx::warning!("Allgres: assume_worker_role() reports the worker role is not ready");
+            false
         }
-        Ok(None) => pgrx::warning!("Allgres: assume_worker_role() returned no result"),
-        Err(e) => pgrx::warning!("Allgres: assume_worker_role() failed: {}", e),
+        Ok(None) => {
+            pgrx::warning!("Allgres: assume_worker_role() returned no result");
+            false
+        }
+        Err(e) => {
+            pgrx::warning!("Allgres: assume_worker_role() failed: {}", e);
+            false
+        }
     }
 }
 
 fn dispatch_and_claim(limit: usize) -> Value {
     BackgroundWorker::transaction(|| {
-        drop_privileges();
+        if !drop_privileges() {
+            return json!({ "count": 0, "calls": [] });
+        }
         if let Err(e) = Spi::get_one_with_args::<JsonB>(
             "SELECT allgres_public.fn_watchdog($1)",
             &[(HTTP_TIMEOUT.as_secs() as i32 * 2).into()],
@@ -522,7 +541,17 @@ fn submit_http_result(call_id: &str, status: i32, body: &str) {
     // Postgres text cannot hold NUL; this is sanitisation, not escaping.
     let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
     BackgroundWorker::transaction(|| {
-        drop_privileges();
+        if !drop_privileges() {
+            // Not fn_complete_outbound's fault, and not a lost result: the
+            // call stays 'in_flight' and fn_watchdog reclaims it as 'lost'
+            // on the same timeout it already uses for a worker that died
+            // mid-call -- the same recovery path, not a new failure mode.
+            pgrx::warning!(
+                "Allgres: skipping fn_complete_outbound for call {} -- privilege drop failed",
+                call_id
+            );
+            return;
+        }
         if let Err(e) = Spi::get_one_with_args::<JsonB>(
             "SELECT allgres_public.fn_complete_outbound($1::uuid, $2, $3)",
             &[call_id.into(), status.into(), body.as_str().into()],
@@ -534,7 +563,9 @@ fn submit_http_result(call_id: &str, status: i32, body: &str) {
 
 fn dashboard_rpc(request: &str) -> String {
     BackgroundWorker::transaction(|| {
-        drop_privileges();
+        if !drop_privileges() {
+            return json!({"ok": false, "error": "privilege_drop_failed"}).to_string();
+        }
         Spi::get_one_with_args::<JsonB>(
             "SELECT allgres.dashboard_rpc($1::jsonb)",
             &[request.into()],
@@ -558,7 +589,9 @@ fn dashboard_rpc(request: &str) -> String {
 
 fn claim_sql_jobs(limit: i32) -> Value {
     BackgroundWorker::transaction(|| {
-        drop_privileges();
+        if !drop_privileges() {
+            return json!({ "count": 0, "calls": [] });
+        }
         Spi::get_one_with_args::<JsonB>("SELECT allgres_public.fn_claim_sql($1)", &[limit.into()])
             .ok()
             .flatten()
@@ -586,13 +619,13 @@ fn valid_pg_role(s: &str) -> bool {
 fn run_sandboxed_sql(agent_id: &str, sql: &str, pg_role: Option<&str>) -> Result<Value, String> {
     let role = pg_role.filter(|r| valid_pg_role(r)).unwrap_or("sandbox");
     BackgroundWorker::transaction(|| {
-        drop_privileges();
-        let dropped = Spi::run(&format!("SET LOCAL ROLE {role}")).is_ok()
+        let dropped = drop_privileges()
+            && Spi::run(&format!("SET LOCAL ROLE {role}")).is_ok()
             && Spi::run("SET LOCAL search_path = pg_temp").is_ok()
             && Spi::run("SET LOCAL transaction_read_only = on").is_ok()
             && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT}'")).is_ok()
             && Spi::run_with_args(
-                "SELECT set_config('argo.agent_id', $1, true)",
+                "SELECT set_config('allgres.agent_id', $1, true)",
                 &[agent_id.into()],
             )
             .is_ok();
@@ -634,7 +667,17 @@ fn submit_sql_result(call_id: &str, outcome: Result<Value, String>) {
         Err(e) => (false, None, None, false, Some(e)),
     };
     BackgroundWorker::transaction(|| {
-        drop_privileges();
+        if !drop_privileges() {
+            // Same reasoning as submit_http_result: the row stays
+            // 'in_flight' and fn_watchdog's existing reclaim-as-'lost'
+            // path picks it up, rather than this recording a result under
+            // the bootstrap superuser.
+            pgrx::warning!(
+                "Allgres: skipping fn_complete_sql for call {} -- privilege drop failed",
+                call_id
+            );
+            return;
+        }
         if let Err(e) = Spi::get_one_with_args::<JsonB>(
             "SELECT allgres_public.fn_complete_sql($1::uuid, $2, $3, $4, $5, $6)",
             &[

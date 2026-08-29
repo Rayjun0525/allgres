@@ -284,16 +284,34 @@ WAL, a physical backup, a PITR archive, a replica, or a plain `SELECT` on
 
 ### Privileges
 
-Four fixed roles: `allgres_owner` (deploy only), `operator`, `worker`, `sandbox`.
+Five fixed roles: `allgres_owner` (owns every schema, table, view, and
+`SECURITY DEFINER` function this extension creates — a real object owner,
+`NOLOGIN NOINHERIT`, nobody connects as it directly), `allgres_role_admin`
+(owns exactly one function, `fn_provision_agent_role`, the only thing that
+runs a dynamic `CREATE ROLE` — kept separate and scoped to just that
+function, `CREATEROLE` on top of `allgres_owner` would hand every other
+`SECURITY DEFINER` function the same power for no reason any of the rest
+need it), `operator`, `worker`, `sandbox`.
 
 The runtime worker connects as the bootstrap superuser — a role that does not
 exist yet must never crash-loop a background worker at startup — and then calls
 `allgres.assume_worker_role()` at the top of every transaction, so ordinary work
-runs as `worker`. Set `ALLGRES_DROP_PRIVILEGES=0` to disable that.
+runs as `worker`. Set `ALLGRES_DROP_PRIVILEGES=0` to disable that; every call
+site checks whether the drop actually succeeded and skips its own work if not,
+rather than proceeding as the bootstrap superuser.
 
-The control-plane functions are `SECURITY DEFINER`, so this is defence in depth
-rather than the primary boundary; the primary boundary for model-generated SQL
-is the `sandbox` role — or, for an agent with its own role (below), that role.
+The control-plane functions are `SECURITY DEFINER` and owned by `allgres_owner`,
+so a caller's own role does not change what runs inside them — this is defence
+in depth rather than the primary boundary for most of the control plane; the
+primary boundary for model-generated SQL is the `sandbox` role — or, for an
+agent with its own role (below), that role. PostgreSQL grants `EXECUTE` on a
+new function to `PUBLIC` by default, unlike tables; every function in the
+`allgres`/`allgres_private`/`allgres_public` schemas has that revoked
+explicitly (a blanket revoke plus `ALTER DEFAULT PRIVILEGES` for anything
+added later), with access granted back only to the specific role that needs
+it — confirmed necessary live: this had been missed for roughly forty
+functions, `allgres_private.secret_key()` (the key that encrypts every
+provider secret) among them.
 
 #### Per-agent roles
 
@@ -311,7 +329,7 @@ additive migration, not a breaking one.
 
 `allgres_private.current_agent_id()` prefers this role identity
 (`current_user`, parsed back against the naming scheme, no table lookup)
-over the `argo.agent_id` GUC the worker also sets, falling back to the GUC
+over the `allgres.agent_id` GUC the worker also sets, falling back to the GUC
 only for an unprovisioned agent. It is deliberately `SECURITY INVOKER` and
 called directly by `v_sales`/`v_my_tasks`'s own `WHERE` clauses, never from
 inside another `SECURITY DEFINER` function: `SECURITY DEFINER` changes

@@ -86,7 +86,7 @@ BEGIN
   SET LOCAL search_path = pg_temp;
   SET LOCAL transaction_read_only = on;
   SET LOCAL statement_timeout = '5s';
-  PERFORM set_config('argo.agent_id', v_agent::text, true);
+  PERFORM set_config('allgres.agent_id', v_agent::text, true);
 
   IF current_user <> 'sandbox' THEN
     RAISE EXCEPTION 'sandbox role was not assumed: current_user = %', current_user;
@@ -164,7 +164,7 @@ BEGIN
   IF current_user <> v_role_a THEN
     RAISE EXCEPTION 'agent role was not assumed: current_user = %, expected %', current_user, v_role_a;
   END IF;
-  -- No argo.agent_id GUC set here on purpose: this proves role identity
+  -- No allgres.agent_id GUC set here on purpose: this proves role identity
   -- alone, not a GUC the worker would normally also set, resolves the right
   -- agent -- v_my_tasks's own definition calls
   -- allgres_private.agent_may_read(), which needs current_agent_id(); neither

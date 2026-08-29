@@ -52,30 +52,88 @@
 -- run before the CREATE ROLE/CREATE SCHEMA IF NOT EXISTS block right below
 -- it -- otherwise that block, finding no allgres_owner yet, creates an
 -- empty one before this rename ever gets a chance to run, and the rename's
--- own "allgres_owner must not already exist" guard then blocks it,
--- orphaning the old role instead of renaming it. A fresh install has
--- neither old name, so every guard here is a no-op.
+-- own "must not already exist" guard then blocks it, orphaning the old
+-- role/schema instead of renaming it. A fresh install has neither old
+-- name, so every guard here is a no-op.
+--
+-- Two safety properties an external review (correctly) pointed out the
+-- first version of this block lacked, both fixed here:
+--   - fail loud, not silent, on an ambiguous state (old and new both
+--     present) -- proceeding either would either error confusingly deep
+--     into the rest of this file or silently leave data stranded under
+--     the old name;
+--   - "a schema literally named argo_private/argo_public exists" is not by
+--     itself proof it is *this* extension's schema -- "Argo" is not an
+--     exotic enough name to rule out an unrelated coincidence on the same
+--     cluster. Each schema is checked for one object only Allgres would
+--     have put there (argo_private.agents, argo_public.fn_selftest)
+--     before it is touched. argo_owner has no object of its own to check
+--     this way (ownership was never actually transferred to it in any
+--     0.2.0-era install either -- see the ownership-transfer block later
+--     in this file, itself new); its only real link to Allgres is having
+--     been created alongside the two schemas, so it is only renamed once
+--     at least one of them was independently confirmed genuine.
 DO $$
+DECLARE
+  v_had_argo_private boolean := false;
+  v_had_argo_public boolean := false;
 BEGIN
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'argo_owner')
-     AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_owner') THEN
-    ALTER ROLE argo_owner RENAME TO allgres_owner;
-  END IF;
-  IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'argo_private')
-     AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'allgres_private') THEN
+  IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'argo_private') THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'argo_private' AND tablename = 'agents') THEN
+      RAISE EXCEPTION 'schema "argo_private" exists but has no "agents" table -- this does not look like an Allgres install; refusing to rename it automatically. Resolve the name collision manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'allgres_private') THEN
+      RAISE EXCEPTION 'both "argo_private" and "allgres_private" already exist -- ambiguous, refusing to guess which is current. Resolve manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+    END IF;
     ALTER SCHEMA argo_private RENAME TO allgres_private;
+    v_had_argo_private := true;
   END IF;
-  IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'argo_public')
-     AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'allgres_public') THEN
+
+  IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'argo_public') THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'argo_public' AND p.proname = 'fn_selftest'
+    ) THEN
+      RAISE EXCEPTION 'schema "argo_public" exists but has no "fn_selftest" function -- this does not look like an Allgres install; refusing to rename it automatically. Resolve the name collision manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'allgres_public') THEN
+      RAISE EXCEPTION 'both "argo_public" and "allgres_public" already exist -- ambiguous, refusing to guess which is current. Resolve manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+    END IF;
     ALTER SCHEMA argo_public RENAME TO allgres_public;
+    v_had_argo_public := true;
+  END IF;
+
+  IF (v_had_argo_private OR v_had_argo_public) AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'argo_owner') THEN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_owner') THEN
+      RAISE EXCEPTION 'both "argo_owner" and "allgres_owner" already exist -- ambiguous, refusing to guess which is current. Resolve manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+    END IF;
+    ALTER ROLE argo_owner RENAME TO allgres_owner;
   END IF;
 END
 $$;
 
+-- allgres_owner is a pure object-owner role -- NOLOGIN (nobody connects as
+-- it directly; the installer connects as a superuser or an equivalent
+-- deploy identity, and everything this file creates ends up owned by
+-- allgres_owner via the ownership-transfer block in "12. Grants") and
+-- NOINHERIT (it grants nothing to anyone by virtue of membership; every
+-- grant below is explicit). allgres_role_admin is deliberately a *separate*
+-- role, not folded into allgres_owner, and owns exactly one function
+-- (fn_provision_agent_role, the only thing in this file that runs a
+-- dynamic CREATE ROLE): giving allgres_owner CREATEROLE so that one
+-- function could dynamically provision agent roles would hand every other
+-- SECURITY DEFINER function in this file that same power too, since they
+-- would all share the same owner -- a bug or an unreviewed future change
+-- in any one of them would have it. Scoping CREATEROLE to the one role
+-- that owns exactly the one function that needs it keeps that blast radius
+-- to that one function.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_owner') THEN
-    CREATE ROLE allgres_owner LOGIN;
+    CREATE ROLE allgres_owner NOLOGIN NOINHERIT;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_role_admin') THEN
+    CREATE ROLE allgres_role_admin NOLOGIN NOINHERIT CREATEROLE;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator') THEN
     CREATE ROLE operator LOGIN;
@@ -88,6 +146,18 @@ BEGIN
   END IF;
 END
 $$;
+
+-- ALTER ROLE ... RENAME (above) changes only the name, never the role's
+-- other attributes -- a renamed argo_owner (LOGIN, from every 0.2.0-era
+-- install) stays LOGIN after becoming allgres_owner, and the CREATE ROLE
+-- IF NOT EXISTS block just above never touches it either, since by then it
+-- already exists under the new name. Normalizing both roles' attributes
+-- unconditionally, every replay, is what actually makes them NOLOGIN
+-- (nobody connects as either directly, see the comment above) regardless
+-- of whether this run created them fresh or found them renamed; confirmed
+-- live that a real 0.2.0-upgraded allgres_owner stayed LOGIN without this.
+ALTER ROLE allgres_owner NOLOGIN NOINHERIT;
+ALTER ROLE allgres_role_admin NOLOGIN NOINHERIT CREATEROLE;
 
 -- The sandbox never resolves an unqualified relation name: the runtime worker
 -- narrows search_path to pg_temp before running model-generated SQL, and this
@@ -567,7 +637,7 @@ CREATE TABLE IF NOT EXISTS allgres_private.demo_sales (
 );
 
 -- Prefers the caller's actual PostgreSQL role identity over the
--- argo.agent_id GUC: an agent provisioned with its own role (see
+-- allgres.agent_id GUC: an agent provisioned with its own role (see
 -- fn_provision_agent_role) is running sandboxed SQL as that role, and
 -- current_user is PostgreSQL's own session state, not a value this or any
 -- other function has to trust a GUC for.
@@ -617,7 +687,7 @@ AS $fn$
       -- ::uuid cast below with an "invalid input syntax" error.
       WHERE hex ~ '^[0-9a-f]{32}$'
     ),
-    nullif(current_setting('argo.agent_id', true), '')::uuid
+    nullif(current_setting('allgres.agent_id', true), '')::uuid
   )
 $fn$;
 
@@ -3892,13 +3962,13 @@ BEGIN
 
   -- 11. the views enforce permission on their own, so authorisation does not
   --     depend on fn_validate_sql having spotted every reference
-  PERFORM set_config('argo.agent_id', gen_random_uuid()::text, true);
+  PERFORM set_config('allgres.agent_id', gen_random_uuid()::text, true);
   SELECT count(*) INTO n_logs FROM allgres_public.v_sales;
   ok := (n_logs = 0);
-  PERFORM set_config('argo.agent_id', v_agent::text, true);
+  PERFORM set_config('allgres.agent_id', v_agent::text, true);
   SELECT count(*) INTO n_logs FROM allgres_public.v_sales;
   ok := ok AND (n_logs > 0);
-  PERFORM set_config('argo.agent_id', '', true);
+  PERFORM set_config('allgres.agent_id', '', true);
   SELECT count(*) INTO n_logs FROM allgres_public.v_sales;
   ok := ok AND (n_logs = 0);
   v := v || jsonb_build_array(jsonb_build_object('name', 'views_enforce_permission', 'ok', ok));
@@ -4450,8 +4520,152 @@ $fn$;
 -- 12. Grants.
 -- ---------------------------------------------------------------------------
 
+-- Every schema, table, view, sequence, and SECURITY DEFINER function this
+-- file creates is owned by allgres_owner (fn_provision_agent_role alone
+-- excepted -- see "1. Roles" for why it is owned by allgres_role_admin
+-- instead), not by whichever superuser happened to run CREATE EXTENSION.
+-- Ownership was never actually reassigned before this -- confirmed live,
+-- an external review caught it: every schema and every SECURITY DEFINER
+-- function in a fresh install was owned by the installing superuser, which
+-- means the "four fixed roles" README describes were three real
+-- boundaries and one that did nothing (allgres_owner existed but owned
+-- nothing, so SECURITY DEFINER meant "runs as whoever installed this," not
+-- "runs as a role scoped to exactly what this file grants it"). Iterates
+-- rather than naming every object by hand, so it stays correct as objects
+-- are added; idempotent (ALTER ... OWNER TO is a no-op when already
+-- correct), so replaying this on every install/upgrade is free. Must run
+-- after every object above has been created, and before the grants below
+-- (a GRANT does not depend on ownership, but keeping the two together
+-- keeps this section legible as "how access to these schemas actually
+-- works," start to finish).
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT n.nspname, c.relname, c.relkind
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
+      AND c.relkind IN ('r', 'v', 'S')
+      AND c.relowner <> 'allgres_owner'::regrole
+  LOOP
+    EXECUTE format(
+      'ALTER %s %I.%I OWNER TO allgres_owner',
+      CASE r.relkind WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' WHEN 'S' THEN 'SEQUENCE' END,
+      r.nspname, r.relname
+    );
+  END LOOP;
+
+  FOR r IN
+    SELECT p.oid::regprocedure AS sig, p.proname
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
+      AND p.proowner <> 'allgres_owner'::regrole
+      AND p.proname <> 'fn_provision_agent_role'
+  LOOP
+    EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
+  END LOOP;
+
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'allgres_private' AND p.proname = 'fn_provision_agent_role'
+      AND p.proowner <> 'allgres_role_admin'::regrole
+  ) THEN
+    ALTER FUNCTION allgres_private.fn_provision_agent_role(uuid) OWNER TO allgres_role_admin;
+  END IF;
+
+  IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres_private') <> 'allgres_owner'::regrole THEN
+    ALTER SCHEMA allgres_private OWNER TO allgres_owner;
+  END IF;
+  IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres_public') <> 'allgres_owner'::regrole THEN
+    ALTER SCHEMA allgres_public OWNER TO allgres_owner;
+  END IF;
+  -- The allgres schema (pgrx's native facade: analyze_sql, native_version,
+  -- native_status, dashboard_rpc) is included here too, not left owned by
+  -- the installing superuser: fn_selftest and other allgres_owner-owned
+  -- PL/pgSQL functions call allgres.analyze_sql, and a SECURITY DEFINER
+  -- function only gets what its *owner* was actually granted -- confirmed
+  -- live, this was missed on the first pass and fn_selftest failed with
+  -- "permission denied for schema allgres" the moment allgres_owner
+  -- stopped being a superuser stand-in and became a real, limited role.
+  IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres') <> 'allgres_owner'::regrole THEN
+    ALTER SCHEMA allgres OWNER TO allgres_owner;
+  END IF;
+END
+$$;
+
+-- fn_provision_agent_role's owner (allgres_role_admin) runs
+-- GRANT sandbox TO <newrole> and GRANT <newrole> TO worker for every agent
+-- it provisions. CREATEROLE alone covers creating and dropping the new
+-- role; granting membership in sandbox/worker specifically -- roles
+-- allgres_role_admin did not create -- needs ADMIN OPTION on each,
+-- confirmed live (plain membership, tried first, still failed with
+-- "permission denied to grant role \"sandbox\": only roles with the ADMIN
+-- option ... may grant this role" -- CREATEROLE's PG16+ relaxation covers
+-- managing a role's own attributes and dropping it, not granting
+-- membership in an unrelated pre-existing role). ADMIN OPTION also lets
+-- allgres_role_admin revoke sandbox/worker membership from anyone, not
+-- only the roles it provisions -- a wider grant than ideal, but there is
+-- no narrower standard primitive for "may grant this one role to others"
+-- short of it.
+GRANT sandbox TO allgres_role_admin WITH ADMIN OPTION;
+GRANT worker TO allgres_role_admin WITH ADMIN OPTION;
+
+-- fn_create_agent (owned by allgres_owner) calls fn_provision_agent_role
+-- directly -- across the ownership split above, that is now a call to a
+-- function owned by a *different* role, which needs its own EXECUTE grant
+-- the same as any other cross-owner call would; two objects owned by the
+-- same role never needed one, which is why this was missed on the first
+-- pass (confirmed live: fn_create_agent failed with "permission denied for
+-- function fn_provision_agent_role" the moment the two owners diverged).
+GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_agent_role(uuid) TO allgres_owner;
+
+-- fn_provision_agent_role's own body reads and updates allgres_private.agents
+-- directly -- also implicit before the ownership split (same reasoning as
+-- the EXECUTE grant above), also confirmed live: "permission denied for
+-- schema allgres_private" on the very next call after the EXECUTE grant
+-- alone. USAGE on the schema plus exactly the two privileges the function
+-- body actually uses, not a blanket grant on every table in the schema.
+GRANT USAGE ON SCHEMA allgres_private TO allgres_role_admin;
+GRANT SELECT, UPDATE ON allgres_private.agents TO allgres_role_admin;
+
 REVOKE ALL ON SCHEMA allgres_private FROM PUBLIC;
 REVOKE ALL ON SCHEMA allgres_public FROM PUBLIC;
+
+-- PostgreSQL grants EXECUTE on a newly created function to PUBLIC by
+-- default -- unlike tables, which default to no access at all. Only about
+-- a dozen of this file's ~55 functions ever got an explicit REVOKE for it
+-- (the ones the pump loop calls, added when that path was hardened).
+-- Confirmed live, an external review's narrower report of one such gap
+-- (fn_oauth_token_request, which hands back a decrypted OAuth client
+-- secret) led to checking every function in these three schemas the same
+-- way -- and found allgres_private.secret_key() on the same list: the
+-- literal pgcrypto key that encrypts every provider API key in the
+-- system, callable with zero Allgres role membership at all, by any role
+-- that can merely connect to the database. `operator` having broad
+-- EXECUTE by design (the dashboard's whole point) was never the real
+-- problem; PUBLIC having it by nobody ever revoking the default was.
+--
+-- REVOKE EXECUTE ON ALL FUNCTIONS is a snapshot against what exists right
+-- now, not a standing policy, so it has to run after every CREATE
+-- FUNCTION above it, here, to actually cover all of them -- ALTER DEFAULT
+-- PRIVILEGES below is the standing half, closing the same gap for
+-- whatever gets added later in this file without anyone remembering to
+-- name it. Neither breaks a legitimate caller: every SECURITY DEFINER
+-- function in this file runs as its *owner* regardless of who calls it
+-- (ownership always implies EXECUTE on what you own, with no grant
+-- needed), and every cross-owner call this file actually makes already
+-- has its own explicit GRANT (see fn_provision_agent_role above, the one
+-- real instance) -- confirmed live: fn_selftest, tests/smoke.sql, and
+-- tests/e2e_mock.sql (the last of which exercises the real background
+-- worker end to end, not just SECURITY DEFINER calls that would mask a
+-- gap the way testing as postgres/superuser always would) all still pass
+-- after this revoke.
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres_private FROM PUBLIC;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres_public FROM PUBLIC;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA allgres_private REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA allgres_public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA allgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 
 GRANT USAGE ON SCHEMA allgres_public TO worker, operator, sandbox;
 GRANT USAGE ON SCHEMA allgres_private TO operator;
@@ -4501,7 +4715,51 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, i
 GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
 
+-- current_agent_id() is deliberately SECURITY INVOKER, not DEFINER (see its
+-- own comment above, "1. Roles" is the wrong section to relitigate why),
+-- and v_sales/v_my_tasks call it directly from their own WHERE clause --
+-- which means it runs as whoever is actually querying the view, not as
+-- some owner, and needs its own EXECUTE grant precisely because it is not
+-- SECURITY DEFINER. Every per-agent role inherits this via `sandbox`
+-- membership, the same way it inherits everything else sandbox has, so
+-- one grant here covers all of them. Confirmed live: tests/smoke.sql's
+-- role-isolation check (a real `SET LOCAL ROLE sandbox` querying
+-- v_my_tasks, not fn_selftest calling through a SECURITY DEFINER wrapper)
+-- failed with "permission denied for function current_agent_id" the
+-- moment PUBLIC stopped covering this by default -- this was one of
+-- several such gaps found only by testing under the actual role, not
+-- superuser or another SECURITY DEFINER function.
+GRANT EXECUTE ON FUNCTION allgres_private.current_agent_id() TO sandbox;
+
+-- SECURITY DEFINER changes what agent_may_read's own body runs as once
+-- it's allowed to start -- it does not waive the EXECUTE check needed to
+-- call it in the first place, and v_sales/v_my_tasks call it directly
+-- from their own WHERE clause the same as current_agent_id() just above.
+-- Confirmed live, the same way: the next function PUBLIC's default had
+-- been quietly covering for the sandbox role.
+GRANT EXECUTE ON FUNCTION allgres_private.agent_may_read(text, uuid) TO sandbox;
+
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres_public TO operator;
+
+-- The dashboard never returns a secret, only whether one is set (see
+-- README, "Secrets at rest") -- provider_secret() is revoked from operator
+-- two lines below for exactly that reason. fn_oauth_token_request breaks
+-- the same rule: it hands the decrypted OAuth client_secret straight back
+-- in its return value, to whoever calls it. Nothing calls any of the
+-- three OAuth functions today -- the token exchange HTTP call itself was
+-- never implemented (see KNOWN_ISSUES.md, "Untested control-plane
+-- paths") -- so the blanket grant above would otherwise be the only thing
+-- standing between operator and a decrypted secret for a feature that
+-- does not work yet. Carved out until OAuth is actually finished with a
+-- real design for this (the outbound-queue pattern that already fixed the
+-- same class of leak for LLM provider keys -- see KNOWN_ISSUES.md, item
+-- 13 -- injecting the secret only into the runtime worker's own response
+-- at claim time, never back into a table or a caller's result, is the
+-- template), not before.
+REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_start(uuid, text) FROM operator;
+REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_token_request(text, text, text) FROM operator;
+REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_store_tokens(text, text, text, int) FROM operator;
+
 REVOKE EXECUTE ON FUNCTION allgres_private.fn_validate_sql(uuid, text) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM worker;
@@ -4577,6 +4835,16 @@ FROM allgres_private.projects;
 REVOKE ALL ON SCHEMA allgres FROM PUBLIC;
 GRANT USAGE ON SCHEMA allgres TO operator, worker;
 GRANT SELECT ON allgres.agents, allgres.tasks, allgres.projects TO operator;
+
+-- Same PUBLIC-EXECUTE-by-default gap the blanket revoke earlier in this
+-- file closes for allgres_private/allgres_public -- these four are
+-- defined here, in "13.", after that revoke already ran (a snapshot
+-- against what existed at the time, not a standing rule), so they need
+-- their own, same as dashboard_rpc and analyze_sql already had. Confirmed
+-- live: these four were still PUBLIC-executable after the earlier revoke,
+-- for exactly that reason.
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres FROM PUBLIC;
+
 GRANT EXECUTE ON FUNCTION allgres.create_agent(text) TO operator;
 GRANT EXECUTE ON FUNCTION allgres.create_session(uuid, text) TO operator;
 GRANT EXECUTE ON FUNCTION allgres.pump() TO worker, operator;

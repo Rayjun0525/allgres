@@ -956,3 +956,197 @@ when the new name already exists (it would either fail on a real conflict
 or silently clobber something), so that specific case needs a human to
 look at what is actually there before proceeding, rather than the upgrade
 script guessing.
+
+## 20. A second-round external review of items 18 and 19: real CI failure, silent PUBLIC access on ~50 functions (one of them the encryption key itself), fail-open privilege drop, and a decorative owner role
+
+An external review of the branch found six real, verified problems in the
+work items 18 and 19 describe — most of them worse in practice than the
+review itself estimated once checked against the actual database. Every
+item below was independently confirmed (not just accepted on the review's
+say-so) before being fixed, and several were found only *because* of that
+verification, not named by the review at all.
+
+- **CI was actually failing, for a mundane reason.** Item 18's CI matrix
+  had never run on GitHub's own infrastructure. It failed on all three
+  PostgreSQL versions at the same step: `cargo pgrx install` writing to
+  `/usr/lib/postgresql/*/lib/`, owned by root on the GitHub-hosted runner,
+  whose default user is not root — `Permission denied (os error 13)`, from
+  the actual job log. This session's own local testing never caught it
+  because this sandbox runs as root throughout. Fixed by `chown`ing the
+  target directories to the runner user before the unprivileged `cargo
+  pgrx install` call, rather than wrapping the whole cargo invocation in
+  `sudo` (which would need to correctly preserve rustup's PATH/HOME).
+  Verified against the actual log; the fix has not yet run in CI as of
+  this writing (that requires an actual push).
+- **The rename migration (item 19) could silently rename an unrelated
+  object, and silently orphaned data on a real collision.** Both real:
+  confirmed live, "argo_private exists" alone was accepted as proof it was
+  Allgres's own schema, and old-name-plus-new-name-both-exist was silently
+  skipped rather than raising. Fixed with two independent changes: each
+  schema is now checked for one object only Allgres would have put there
+  (`argo_private.agents`, `argo_public.fn_selftest`) before being touched,
+  and every ambiguous state (old and new both present) now `RAISE
+  EXCEPTION`s with a message naming exactly what to resolve, instead of
+  proceeding. Both failure modes reproduced live before the fix (a
+  same-named-but-foreign schema correctly refused; both names present
+  correctly refused) and confirmed a real 0.2.0-to-0.3.0 upgrade still
+  works end to end after the fix.
+- **`allgres_owner` existed but owned nothing — confirmed independently,
+  and it was worse than the review's own framing.** Every schema and every
+  `SECURITY DEFINER` function in a fresh install was owned by whichever
+  superuser ran `CREATE EXTENSION`, `allgres_owner` was a role nothing
+  actually used. Fixed with an idempotent ownership-transfer pass (new,
+  end of "12. Grants") that iterates every table/view/sequence/function in
+  the three Allgres schemas and reassigns ownership to `allgres_owner`,
+  replayed on every install/upgrade. One function is deliberately
+  excepted: `fn_provision_agent_role`, the only thing in this file that
+  runs a dynamic `CREATE ROLE`, is owned by a new, separate,
+  narrowly-scoped `allgres_role_admin` role (`NOLOGIN NOINHERIT
+  CREATEROLE`) instead — giving `allgres_owner` itself `CREATEROLE` so
+  that one function could work would hand every other function sharing
+  that owner the same power, for no reason any of the rest of them need
+  it. Getting this to actually work live surfaced three more real,
+  narrower gaps the ownership split itself introduced (each found by
+  running `fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql` against the
+  result, not by inspection): the `allgres` schema itself was left out of
+  the transfer at first (`fn_selftest` broke: "permission denied for
+  schema allgres"); the cross-owner call from `fn_create_agent`
+  (`allgres_owner`) to `fn_provision_agent_role` (`allgres_role_admin`)
+  needed its own `EXECUTE` grant, which two same-owner functions never
+  needed before (`fn_create_agent` broke: "permission denied for function
+  fn_provision_agent_role"); and `allgres_role_admin` needed `ADMIN
+  OPTION` on `sandbox`/`worker`, not just membership, to grant those roles
+  to the agent roles it provisions (`CREATEROLE` alone was not enough,
+  confirmed live, contrary to this session's own first assumption about
+  PostgreSQL 16's relaxed `CREATEROLE` semantics). `ALTER ROLE ... RENAME`
+  also does not touch a role's other attributes, so a renamed `argo_owner`
+  (`LOGIN`, from any 0.2.0-era install) stayed `LOGIN` after becoming
+  `allgres_owner` — caught the same way, fixed with an unconditional
+  `ALTER ROLE allgres_owner NOLOGIN NOINHERIT;` replayed every install,
+  not only at creation time.
+- **PostgreSQL's PUBLIC-executes-by-default was open on ~50 functions,
+  independently confirmed to be far more severe than the review's own
+  report.** The review named one instance
+  (`fn_oauth_token_request` returning a decrypted OAuth client secret to
+  any caller). Checking every function in the three Allgres schemas the
+  same way found that only about a dozen, out of roughly fifty, had ever
+  had `PUBLIC`'s default `EXECUTE` explicitly revoked — the rest,
+  including `allgres_private.secret_key()` (the literal `pgcrypto` key
+  that encrypts every provider API key in the system) and the entire
+  operator-facing API (`fn_create_agent`, `fn_grant_permission`,
+  `fn_decide_approval`, `fn_set_policy`, `fn_cancel_session`, and more),
+  were callable by *any* role that could merely connect to the database —
+  no Allgres role membership needed at all. Fixed with a blanket
+  `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA ... FROM PUBLIC` for all
+  three schemas (plus `ALTER DEFAULT PRIVILEGES` for whatever gets added
+  later), which — because it is a snapshot against what exists at the
+  point it runs, not a standing rule — needed a second copy near the end
+  of "13." specifically for the four native-facade functions
+  (`create_agent`, `create_session`, `pump`, `assume_worker_role`) defined
+  after the first one runs; confirmed live that these four were still
+  `PUBLIC`-executable after only the first revoke. Verifying this against
+  the real `sandbox` role (not `fn_selftest`, itself `SECURITY DEFINER`
+  and so exempt from exactly this class of gap the same way testing as
+  superuser is) surfaced two functions that legitimately needed an
+  explicit grant restored, both called directly from `v_sales`/
+  `v_my_tasks`'s own `WHERE` clause rather than from inside another
+  owned function: `current_agent_id()` (`SECURITY INVOKER` by design, so
+  it runs as whoever queries the view, not as an owner) and
+  `agent_may_read()` (`SECURITY DEFINER`, which was the wrong reason to
+  assume it needed no caller-side grant — `SECURITY DEFINER` changes what
+  a function's own body runs as once it is allowed to start, it does not
+  waive the `EXECUTE` check needed to call it at all). Both now have an
+  explicit `GRANT ... TO sandbox`, inherited by every per-agent role via
+  `sandbox` membership.  The OAuth instance the review named is separately
+  carved out of `operator`'s existing blanket grant on `allgres_public`
+  (see below) rather than left to the general schema-wide revoke alone,
+  since `operator` legitimately has broad access to that whole schema by
+  design and would otherwise still reach it.
+- **`fn_oauth_token_request` returns a decrypted secret to its caller,**
+  confirmed, and worse once ownership was fixed: `operator` reaches it
+  through the existing `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA
+  allgres_public TO operator` (a deliberate, broad, pre-existing grant —
+  not new), which breaks the same "the dashboard never returns a secret,
+  only whether one is set" invariant `provider_secret()` being revoked
+  from `operator` two lines below it already exists to enforce.  Nothing
+  calls any of the three OAuth functions today (the token exchange HTTP
+  call itself was never implemented — see item 6), so this is not
+  breaking a working feature: `fn_oauth_start`/`fn_oauth_token_request`/
+  `fn_oauth_store_tokens` are now explicitly revoked from `operator`
+  again, right after the blanket grant, until OAuth is finished with a
+  real design for this — the outbound-queue pattern that already fixed
+  the identical class of leak for LLM provider keys (item 13: resolve the
+  credential at claim time, inject it only into the runtime worker's own
+  response, never write it back anywhere a caller's result or a table
+  could expose it) is the template, not attempted here.
+- **`drop_privileges()` failing was logged but not actually fail-closed** —
+  confirmed real, though independent analysis found the practical
+  severity lower than the review's framing for five of its six call
+  sites: `dispatch_and_claim`, `submit_http_result`, `dashboard_rpc`,
+  `claim_sql_jobs`, and `submit_sql_result` all only ever call `SECURITY
+  DEFINER` control-plane functions, which run as their *owner* (now
+  `allgres_owner`, per the ownership fix above) regardless of the
+  caller's role — so whether the drop succeeded was already not changing
+  what ran inside them. `run_sandboxed_sql` is the one call site where it
+  actually was the primary boundary (agent-generated SQL runs as a
+  top-level statement specifically so it *can* `SET ROLE`, see "The SQL
+  sandbox"), and it already built its own `dropped` flag from the
+  subsequent `SET LOCAL ROLE <agent>` chain and failed closed on that —
+  just without `drop_privileges()`'s own result folded in. Fixed
+  everywhere anyway, both for the narrower real gap and so the boundary
+  does not silently start depending on which code path happens to reach
+  it after some future change: `drop_privileges()` now returns whether
+  the drop landed, and all six call sites skip their own work when it did
+  not, rather than logging a warning and proceeding as the bootstrap
+  superuser. Verified live: `fn_selftest`, `tests/smoke.sql`, and
+  `tests/e2e_mock.sql` (the last of which exercises the real background
+  worker end to end) all still pass, and the PostgreSQL log is clean —
+  the fail-closed paths exist but do not fire on the healthy path.
+- **`scripts/backup_drill.sh` (item 18) had three real gaps of its own,**
+  found on review rather than live failure: `rm -rf "$SCRATCH"` trusted an
+  overridable environment variable with no validation (now refuses
+  anything not under `/var/lib/postgresql/`); the globals-restore `psql`
+  call had no error checking at all, meaning a real failure alongside the
+  one expected, harmless one (`CREATE ROLE postgres` erroring because
+  initdb already created it) would have gone unnoticed (now captures the
+  log and fails the drill on any `ERROR:` line that isn't the expected
+  one); and the role-isolation check assumed a role straight from the
+  `postgres` superuser session, which can `SET ROLE` to anything
+  regardless of actual membership grants, so it was not actually proving
+  the real runtime path (`drop_privileges()` → `worker`, then
+  `run_sandboxed_sql`'s own `SET LOCAL ROLE <agent>`) survives a restore —
+  only that the agent role exists at all. Fixed by hopping through
+  `worker` first, the same as the real path, so the second `SET ROLE`
+  only succeeds if `worker`'s membership in the agent role actually
+  survived the dump/restore. All three fixes verified live, including
+  three consecutive clean re-runs to confirm nothing about the new checks
+  broke the drill's own re-runnability.
+
+  Applying those fixes surfaced a fourth, unrelated bug in the script,
+  live: the PITR restore's wait loop only polled `pg_isready`, which
+  reports success as soon as the server accepts connections — true during
+  hot-standby WAL replay, *before* `recovery_target_action = 'promote'`
+  has actually finished promoting to a writable primary. Two different
+  failures came from the same race, on different runs: a stale read
+  (`before=0 after=0`, recovery had not replayed up to the target LSN
+  yet) and, once that looked fixed by luck, `fn_selftest` failing outright
+  with "cannot execute UPDATE in a read-only transaction" — still not
+  promoted. Fixed by waiting on `pg_is_in_recovery() = false` specifically
+  instead of just connectivity. Confirmed with two further consecutive
+  clean runs after the fix.
+
+Also raised, deliberately not changed: **the plaintext-secret fallback
+when `ALLGRES_SECRET_KEY` is unset.** Checked against the actual code —
+this is an existing, explicit, already-documented design choice (the
+source comment literally reads "a deliberate choice"; `secret_storage_mode()`
+reports exactly which of several plaintext reasons applies; the dashboard
+shows a warning banner derived from it), not a silent gap of the kind
+every item above is. The review's suggestion — refuse to store a secret
+at all without a key, or require an explicit opt-in env var to allow
+plaintext — is a legitimate, reasonable hardening option, but it is a
+product/policy trade-off (it would make the tool refuse to run without a
+key for anyone currently relying on plaintext mode for a quick local
+setup, which matches this project's own stated "one person's small
+setup" scope) rather than a bug that contradicts what the code already
+claims to do, so it was surfaced as a decision rather than changed
+unilaterally.
