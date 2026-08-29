@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-pgrx version must track the `pgrx` dependency pin in Cargo.toml.
+  PGRX_VERSION: "0.19.2"
+
+jobs:
+  # The real target: fn_selftest, tests/smoke.sql, and tests/e2e_mock.sql,
+  # natively installed and run against every PostgreSQL major version this
+  # extension claims to support -- not just the one the Dockerfile happens to
+  # build (see the docker-smoke job below for that path specifically, and
+  # KNOWN_ISSUES.md, "Docker image path", for why the two are not redundant:
+  # this job proves the extension itself works on 16/17/18; docker-smoke
+  # proves the shipped container image does).
+  native-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev pkg-config curl ca-certificates
+
+      - name: Install PostgreSQL ${{ matrix.pg }} (PGDG)
+        run: |
+          sudo apt-get install -y --no-install-recommends postgresql-common
+          yes '' | sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }}
+          echo "PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config" >> "$GITHUB_ENV"
+          # GitHub-hosted runner images preinstall PostgreSQL 16 with a
+          # running 16/main cluster already created, but set
+          # create_main_cluster = false in postgresql-common's config --
+          # confirmed live: 16 has /etc/postgresql/16/main/postgresql.conf
+          # already, 17 and 18 do not, so the next step's `tee` into it
+          # fails with "No such file or directory". Create the cluster
+          # ourselves whenever the config doesn't already exist; a no-op
+          # for 16.
+          if [ ! -f "/etc/postgresql/${{ matrix.pg }}/main/postgresql.conf" ]; then
+            sudo pg_createcluster ${{ matrix.pg }} main
+          fi
+
+      - name: Cache cargo registry, cargo-pgrx binary, and target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-pgrx
+            target
+          key: pg${{ matrix.pg }}-cargo-pgrx${{ env.PGRX_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install cargo-pgrx (skip if the cache already has it)
+        run: |
+          if [ ! -x "$HOME/.cargo/bin/cargo-pgrx" ]; then
+            cargo install --locked cargo-pgrx --version "$PGRX_VERSION"
+          fi
+
+      - name: cargo pgrx init
+        run: cargo pgrx init --pg${{ matrix.pg }}="$PG_CONFIG"
+
+      - name: Rust unit tests (request parsing, auth/rate-limit, parse-tree reader)
+        run: cargo test --no-default-features --features "pg${{ matrix.pg }},pg_test" --lib
+
+      - name: cargo pgrx install
+        run: |
+          # The GitHub-hosted runner's default user is not root and the PGDG
+          # packages install pkglibdir/extension-dir owned by root; cargo pgrx
+          # install writes the compiled .so, control file, and SQL scripts
+          # there directly (no sudo of its own), so it fails with EACCES
+          # otherwise -- confirmed live the first time this workflow actually
+          # ran on GitHub's infrastructure (see KNOWN_ISSUES.md, item 3).
+          # chown once, up front, rather than wrapping the cargo invocation in
+          # sudo, which would need to preserve rustup's PATH/HOME correctly.
+          sudo chown "$(id -un)" "$("$PG_CONFIG" --pkglibdir)" "$("$PG_CONFIG" --sharedir)/extension"
+          cargo pgrx install --no-default-features --features pg${{ matrix.pg }} --pg-config "$PG_CONFIG"
+          # cargo-pgrx only writes the current crate version's script
+          # (allgres--<version>.sql); the frozen base snapshot(s) and
+          # generated upgrade script(s) are ours to place too, same as the
+          # Dockerfile does -- see sql/allgres--0.2.0.sql's own header.
+          cp -f sql/allgres--*.sql "$("$PG_CONFIG" --sharedir)/extension/"
+
+      - name: Configure and restart the cluster
+        run: |
+          PGCONF="/etc/postgresql/${{ matrix.pg }}/main/postgresql.conf"
+          PGENV="/etc/postgresql/${{ matrix.pg }}/main/environment"
+          echo "shared_preload_libraries = 'allgres'" | sudo tee -a "$PGCONF"
+          echo "ALLGRES_ENABLE_MOCK = '1'" | sudo tee -a "$PGENV"
+          sudo pg_ctlcluster ${{ matrix.pg }} main restart
+          # The runner image's preinstalled default PostgreSQL service
+          # already holds port 5432 in some matrix legs, so a cluster this
+          # workflow just created (previous step's pg_createcluster) can
+          # land on a different port -- confirmed live: 18/main came up on
+          # 5433. Read back whatever port this exact cluster actually uses
+          # instead of assuming 5432, and pass it explicitly everywhere
+          # from here on (sudo does not reliably propagate env vars set via
+          # GITHUB_ENV into the child, so this is threaded through as a
+          # literal -p argument, not relied on as inherited environment).
+          PGPORT="$(pg_lsclusters -h | awk -v v="${{ matrix.pg }}" '$1==v && $2=="main"{print $3}')"
+          echo "PGPORT=$PGPORT" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do sudo -u postgres pg_isready -q -p "$PGPORT" && break; sleep 1; done
+
+      - name: CREATE EXTENSION and run fn_selftest / smoke / e2e
+        run: |
+          sudo -u postgres psql -p "$PGPORT" -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION allgres;"
+          sudo -u postgres psql -p "$PGPORT" -d postgres -v ON_ERROR_STOP=1 -f tests/smoke.sql
+          sudo -u postgres psql -p "$PGPORT" -d postgres -v ON_ERROR_STOP=1 -f tests/e2e_mock.sql
+
+      - name: PostgreSQL log on failure
+        if: failure()
+        run: sudo tail -n 300 /var/log/postgresql/postgresql-${{ matrix.pg }}-main.log || true
+
+  # The container path is a separate concern from native install: it exercises
+  # the Dockerfile (currently pinned to postgres:17-bookworm) and
+  # docker-compose.yml exactly as an operator following the README would,
+  # including the loopback-only port binding.
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose build + smoke
+        run: ./scripts/smoke.sh
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose logs --no-color allgres | tail -300 || true

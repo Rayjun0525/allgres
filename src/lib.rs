@@ -5,7 +5,12 @@
 //!   `allgres runtime`  SPI thread + a pool of HTTP threads.  The SPI thread
 //!                      only ever runs short transactions (pump, RPC); every
 //!                      blocking network call happens on a pool thread, so a
-//!                      slow LLM can never stall the dashboard.
+//!                      slow LLM can never stall the dashboard.  Sandboxed
+//!                      agent SQL also runs here, on the SPI thread, since it
+//!                      needs SPI: PostgreSQL's SET ROLE restriction means it
+//!                      can only be a top-level statement issued directly by
+//!                      this worker, never nested inside a SECURITY DEFINER
+//!                      function -- see `run_sandboxed_sql`.
 //!
 //!   `allgres web`      HTTP listener.  No SPI at all: it forwards to the
 //!                      runtime worker over a unix socket.  One thread per
@@ -13,22 +18,28 @@
 //!                      accept loop either.
 //!
 //! All SQL is executed with bound parameters.  Nothing in this file builds a
-//! statement by concatenating a value into a string.
+//! statement by concatenating a value into a string.  `run_sandboxed_sql`
+//! passes agent-generated SQL to Postgres as a bind parameter too; the one
+//! place it gets wrapped into a larger statement by concatenation is
+//! sql/control_plane.sql's `fn_run_sandboxed_sql`, and only after
+//! `fn_validate_sql` has confirmed it parses as exactly one non-writing
+//! SELECT, which is what makes that safe.
 
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags};
 use pgrx::prelude::*;
 use pgrx::JsonB;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 pgrx::pg_module_magic!();
@@ -50,11 +61,28 @@ const PUMP_BUSY: Duration = Duration::from_millis(150);
 const PUMP_IDLE_MIN: Duration = Duration::from_millis(500);
 const PUMP_IDLE_MAX: Duration = Duration::from_secs(4);
 
+/// Sandboxed SQL executes on the SPI thread itself (it needs SPI, so it can't
+/// go on an HTTP pool thread the way outbound calls do), one call at a time,
+/// bounded by `SQL_STATEMENT_TIMEOUT` each.  Claiming only one per tick, not a
+/// batch, keeps a burst of agent queries from shutting the RPC/dashboard path
+/// out for several statement-timeouts in a row.
+const SQL_CLAIM_LIMIT: i32 = 1;
+const SQL_STATEMENT_TIMEOUT: &str = "5s";
+
 const MAX_WEB_THREADS: usize = 64;
 const MAX_REQUEST_BYTES: usize = 1 << 20;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 const SSE_TOTAL: Duration = Duration::from_secs(30);
 const SSE_INTERVAL: Duration = Duration::from_secs(1);
+/// A ticket minted by `POST /api/v1/events/ticket` (bearer-token gated) is
+/// good for one connection attempt, within this window.  This keeps the
+/// long-lived dashboard token out of the one URL that has to carry auth in
+/// the query string at all -- `EventSource` cannot set request headers --
+/// and therefore out of proxy access logs, browser history, and the
+/// Referrer header.  Reconnection is client-driven (see `startEvents` in
+/// web/index.html), not the browser's native retry-with-the-same-URL, since
+/// a single-use ticket cannot be replayed for that.
+const SSE_TICKET_TTL: Duration = Duration::from_secs(30);
 
 extension_sql_file!("../sql/control_plane.sql", finalize);
 
@@ -445,26 +473,61 @@ fn extension_is_installed() -> bool {
     })
 }
 
-/// Best-effort privilege drop, run at the top of every runtime transaction.
-/// The worker connects as the bootstrap superuser so a not-yet-created role can
-/// never crash-loop it at startup; this puts ordinary work back on `worker`.
-fn drop_privileges() {
+/// Privilege drop, run at the top of every runtime transaction. The worker
+/// connects as the bootstrap superuser so a not-yet-created role can never
+/// crash-loop it at startup; this puts ordinary work back on `worker`.
+/// Returns whether the drop actually landed. Every call site below checks
+/// this and skips its own SPI calls when it is false, rather than
+/// proceeding with `current_user` still the bootstrap superuser: this used
+/// to only log a warning and continue regardless (silent before that, and
+/// silently fail-open even after -- an external review caught the second
+/// half). Most of what these call sites invoke is SECURITY DEFINER control-
+/// plane functions, so which role called them does not change what runs
+/// inside (SECURITY DEFINER always executes as the function's *owner*,
+/// which "12. Grants"' ownership-transfer block makes allgres_owner, not
+/// whoever is connected) -- but `run_sandboxed_sql` is the one path where
+/// current_user is the actual, primary trust boundary (agent-generated SQL
+/// runs as a top-level statement specifically so it *can* SET ROLE, see
+/// "The SQL sandbox" in README), and treating every call site the same way
+/// is what keeps that boundary from silently depending on which code path
+/// happens to reach it, now or after some future change.
+fn drop_privileges() -> bool {
     if std::env::var("ALLGRES_DROP_PRIVILEGES").as_deref() == Ok("0") {
-        return;
+        return true;
     }
-    let _ = Spi::get_one::<bool>("SELECT allgres.assume_worker_role()");
+    match Spi::get_one::<bool>("SELECT allgres.assume_worker_role()") {
+        Ok(Some(true)) => true,
+        Ok(Some(false)) => {
+            pgrx::warning!("Allgres: assume_worker_role() reports the worker role is not ready");
+            false
+        }
+        Ok(None) => {
+            pgrx::warning!("Allgres: assume_worker_role() returned no result");
+            false
+        }
+        Err(e) => {
+            pgrx::warning!("Allgres: assume_worker_role() failed: {}", e);
+            false
+        }
+    }
 }
 
 fn dispatch_and_claim(limit: usize) -> Value {
     BackgroundWorker::transaction(|| {
-        drop_privileges();
-        let _ = Spi::get_one_with_args::<JsonB>(
-            "SELECT argo_public.fn_watchdog($1)",
+        if !drop_privileges() {
+            return json!({ "count": 0, "calls": [] });
+        }
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_watchdog($1)",
             &[(HTTP_TIMEOUT.as_secs() as i32 * 2).into()],
-        );
-        let _ = Spi::get_one::<JsonB>("SELECT argo_public.fn_dispatch_tasks(NULL)");
+        ) {
+            pgrx::warning!("Allgres: fn_watchdog failed: {}", e);
+        }
+        if let Err(e) = Spi::get_one::<JsonB>("SELECT allgres_public.fn_dispatch_tasks()") {
+            pgrx::warning!("Allgres: fn_dispatch_tasks failed: {}", e);
+        }
         Spi::get_one_with_args::<JsonB>(
-            "SELECT argo_public.fn_claim_outbound($1)",
+            "SELECT allgres_public.fn_claim_outbound($1)",
             &[(limit as i32).into()],
         )
         .ok()
@@ -478,17 +541,31 @@ fn submit_http_result(call_id: &str, status: i32, body: &str) {
     // Postgres text cannot hold NUL; this is sanitisation, not escaping.
     let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
     BackgroundWorker::transaction(|| {
-        drop_privileges();
-        let _ = Spi::get_one_with_args::<JsonB>(
-            "SELECT argo_public.fn_complete_outbound($1::uuid, $2, $3)",
+        if !drop_privileges() {
+            // Not fn_complete_outbound's fault, and not a lost result: the
+            // call stays 'in_flight' and fn_watchdog reclaims it as 'lost'
+            // on the same timeout it already uses for a worker that died
+            // mid-call -- the same recovery path, not a new failure mode.
+            pgrx::warning!(
+                "Allgres: skipping fn_complete_outbound for call {} -- privilege drop failed",
+                call_id
+            );
+            return;
+        }
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_complete_outbound($1::uuid, $2, $3)",
             &[call_id.into(), status.into(), body.as_str().into()],
-        );
+        ) {
+            pgrx::warning!("Allgres: fn_complete_outbound failed for call {}: {}", call_id, e);
+        }
     });
 }
 
 fn dashboard_rpc(request: &str) -> String {
     BackgroundWorker::transaction(|| {
-        drop_privileges();
+        if !drop_privileges() {
+            return json!({"ok": false, "error": "privilege_drop_failed"}).to_string();
+        }
         Spi::get_one_with_args::<JsonB>(
             "SELECT allgres.dashboard_rpc($1::jsonb)",
             &[request.into()],
@@ -498,6 +575,151 @@ fn dashboard_rpc(request: &str) -> String {
         .map(|j| j.0.to_string())
         .unwrap_or_else(|| json!({"ok": false, "error": "empty_rpc_result"}).to_string())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Sandboxed SQL.  sql/control_plane.sql's fn_validate_sql (SECURITY DEFINER)
+// checks an agent statement and hands back its normalized text; PostgreSQL
+// forbids SET ROLE inside a SECURITY DEFINER function, so it cannot also run
+// it.  These functions are the other half: they claim a validated statement
+// and run it as a top-level SPI call, issued directly by this worker with no
+// enclosing SECURITY DEFINER frame, which is exactly where SET ROLE sandbox
+// is legal.
+// ---------------------------------------------------------------------------
+
+fn claim_sql_jobs(limit: i32) -> Value {
+    BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            return json!({ "count": 0, "calls": [] });
+        }
+        Spi::get_one_with_args::<JsonB>("SELECT allgres_public.fn_claim_sql($1)", &[limit.into()])
+            .ok()
+            .flatten()
+            .map(|j| j.0)
+            .unwrap_or_else(|| json!({ "count": 0, "calls": [] }))
+    })
+}
+
+/// A role fn_provision_agent_role could actually have produced: a fixed
+/// prefix plus a uuid with its dashes stripped, hex digits only. SET LOCAL
+/// ROLE has no parameterized form, so this is what stands between a
+/// database value and a string built with `format!` -- belt and suspenders
+/// alongside the fact that the column this comes from is only ever written
+/// by that one function, never by anything agent- or operator-controlled.
+fn valid_pg_role(s: &str) -> bool {
+    s.strip_prefix("allgres_agent_")
+        .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Runs one already-validated agent statement as the agent's own sandboxed
+/// role if it has one (see fn_provision_agent_role), or the shared
+/// `sandbox` role for an agent that predates per-agent roles. `sql` must be
+/// `fn_validate_sql`'s return value, never raw agent input: this function
+/// trusts it completely and so does the database function it calls.
+fn run_sandboxed_sql(agent_id: &str, sql: &str, pg_role: Option<&str>) -> Result<Value, String> {
+    let role = pg_role.filter(|r| valid_pg_role(r)).unwrap_or("sandbox");
+    BackgroundWorker::transaction(|| {
+        let dropped = drop_privileges()
+            && Spi::run(&format!("SET LOCAL ROLE {role}")).is_ok()
+            && Spi::run("SET LOCAL search_path = pg_temp").is_ok()
+            && Spi::run("SET LOCAL transaction_read_only = on").is_ok()
+            && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT}'")).is_ok()
+            && Spi::run_with_args(
+                "SELECT set_config('allgres.agent_id', $1, true)",
+                &[agent_id.into()],
+            )
+            .is_ok();
+        if !dropped {
+            return Err("sandbox role unavailable".to_string());
+        }
+        match Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_run_sandboxed_sql($1)",
+            &[sql.into()],
+        ) {
+            Ok(Some(JsonB(v))) => Ok(v),
+            Ok(None) => Err("sandboxed execution returned nothing".to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+}
+
+fn submit_sql_result(call_id: &str, outcome: Result<Value, String>) {
+    let (ok, rows, row_count, truncated, error) = match outcome {
+        Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => (
+            true,
+            v.get("rows").cloned(),
+            v.get("row_count").and_then(Value::as_i64).map(|n| n as i32),
+            v.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+            None,
+        ),
+        Ok(v) => (
+            false,
+            None,
+            None,
+            false,
+            Some(
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sql execution failed")
+                    .to_string(),
+            ),
+        ),
+        Err(e) => (false, None, None, false, Some(e)),
+    };
+    BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            // Same reasoning as submit_http_result: the row stays
+            // 'in_flight' and fn_watchdog's existing reclaim-as-'lost'
+            // path picks it up, rather than this recording a result under
+            // the bootstrap superuser.
+            pgrx::warning!(
+                "Allgres: skipping fn_complete_sql for call {} -- privilege drop failed",
+                call_id
+            );
+            return;
+        }
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_complete_sql($1::uuid, $2, $3, $4, $5, $6)",
+            &[
+                call_id.into(),
+                ok.into(),
+                rows.map(JsonB).into(),
+                row_count.into(),
+                truncated.into(),
+                error.into(),
+            ],
+        ) {
+            pgrx::warning!("Allgres: fn_complete_sql failed for call {}: {}", call_id, e);
+        }
+    });
+}
+
+/// Claims up to `SQL_CLAIM_LIMIT` queued sandboxed-SQL calls and runs each to
+/// completion.  Returns how many it processed, so the pump loop's idle
+/// backoff treats this like any other unit of work.
+fn pump_sql() -> usize {
+    let claimed = claim_sql_jobs(SQL_CLAIM_LIMIT);
+    let mut n = 0usize;
+    let Some(calls) = claimed.get("calls").and_then(Value::as_array) else {
+        return 0;
+    };
+    for call in calls {
+        let (Some(call_id), Some(agent_id), Some(sql)) = (
+            call.get("call_id").and_then(Value::as_str),
+            call.get("agent_id").and_then(Value::as_str),
+            call.get("sql").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if !valid_uuid(call_id) || !valid_uuid(agent_id) {
+            continue;
+        }
+        let pg_role = call.get("pg_role").and_then(Value::as_str);
+        let outcome = run_sandboxed_sql(agent_id, sql, pg_role);
+        submit_sql_result(call_id, outcome);
+        n += 1;
+    }
+    n
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +737,79 @@ struct OutboundResult {
     body: String,
 }
 
+/// Mirrors `allgres_private.is_blocked_host`'s IPv4-literal ranges exactly, so
+/// the two blocklists cannot drift: loopback, RFC1918, CGNAT (100.64/10),
+/// link-local (including the cloud-metadata address 169.254.169.254),
+/// TEST-NET/protocol-assignment (192.0.0/24, 192.0.2/24), benchmarking
+/// (198.18/15), and multicast/reserved/broadcast (224-255).
+fn is_blocked_ipv4(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 0
+        || o[0] == 10
+        || o[0] == 127
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || o[0] >= 224
+}
+
+/// Same idea for IPv6: loopback/unspecified, IPv4-mapped (reduces to the v4
+/// check), fc00::/7 unique-local, and fe80::/10 link-local.
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ipv4(&v4);
+            }
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            let first = v6.segments()[0];
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Wraps ureq's `DefaultResolver` to re-check every address DNS actually
+/// hands back, immediately before ureq connects to it. The SQL layer already
+/// checks the URL's host *string* at queue time (`check_outbound_url`), but
+/// that is a check on a name, not on where the name points: a hostname that
+/// resolves to a public address when the agent's request is validated can
+/// resolve to 127.0.0.1 or an RFC1918 address by the time this worker thread
+/// actually connects (DNS rebinding), and no amount of re-checking the
+/// string closes that gap. Filtering here instead of after resolving
+/// separately closes it completely rather than narrowing it to a race
+/// window: ureq connects only to what this resolver returns, so a blocked
+/// address is never dialed at all, not even once.
+#[derive(Debug)]
+struct GuardedResolver {
+    allow_private: bool,
+}
+
+impl ureq::unversioned::resolver::Resolver for GuardedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let addrs = ureq::unversioned::resolver::DefaultResolver::default()
+            .resolve(uri, config, timeout)?;
+        if !self.allow_private {
+            for addr in &addrs {
+                if is_blocked_ip(&addr.ip()) {
+                    return Err(ureq::Error::HostNotFound);
+                }
+            }
+        }
+        Ok(addrs)
+    }
+}
+
 fn perform_http(call: &Value) -> (i32, String) {
     let Some(url) = call.get("url").and_then(Value::as_str) else {
         return (0, "missing outbound URL".into());
@@ -529,6 +824,10 @@ fn perform_http(call: &Value) -> (i32, String) {
     let kind = call.get("kind").and_then(Value::as_str).unwrap_or("llm");
     let headers = call.get("headers").and_then(Value::as_object);
     let body = call.get("body").cloned().unwrap_or_else(|| json!({}));
+    // Only an LLM provider can ever carry this, and only when the operator
+    // opted it in (allow_private_network); http_get always queues false. See
+    // GuardedResolver.
+    let allow_private = call.get("allow_private").and_then(Value::as_bool).unwrap_or(false);
 
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(HTTP_TIMEOUT))
@@ -537,7 +836,11 @@ fn perform_http(call: &Value) -> (i32, String) {
         // is the standard way to turn an allowlisted URL into an SSRF.
         .max_redirects(0)
         .build();
-    let agent = ureq::Agent::new_with_config(config);
+    let agent = ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        GuardedResolver { allow_private },
+    );
 
     let outcome = if kind == "tool" {
         let mut req = agent.get(url);
@@ -719,7 +1022,12 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
             }
         }
 
-        if queued > 0 {
+        // 4. Sandboxed SQL.  This has to run right here on the SPI thread (see
+        // the module doc comment), so it is claimed and executed one call at a
+        // time rather than handed to the HTTP pool.
+        let sql_ran = if ready { pump_sql() } else { 0 };
+
+        if queued > 0 || sql_ran > 0 {
             idle_delay = PUMP_IDLE_MIN;
             next_pump = Instant::now() + PUMP_BUSY;
         } else {
@@ -843,6 +1151,94 @@ struct WebConfig {
 
 static WEB_THREADS: AtomicUsize = AtomicUsize::new(0);
 
+static SSE_TICKETS: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Mints a fresh single-use SSE ticket, sweeping expired ones first so this
+/// map cannot grow without bound from tickets nobody ever redeemed.
+fn mint_sse_ticket() -> String {
+    let ticket = nonce();
+    let now = Instant::now();
+    let mut tickets = SSE_TICKETS.lock().unwrap();
+    tickets.retain(|_, issued| now.duration_since(*issued) < SSE_TICKET_TTL);
+    tickets.insert(ticket.clone(), now);
+    ticket
+}
+
+/// Consumes a ticket if it exists and has not expired -- removing it either
+/// way, so the same ticket can never authorize a second connection.
+fn consume_sse_ticket(t: &str) -> bool {
+    let now = Instant::now();
+    let mut tickets = SSE_TICKETS.lock().unwrap();
+    tickets.retain(|_, issued| now.duration_since(*issued) < SSE_TICKET_TTL);
+    tickets.remove(t).is_some()
+}
+
+/// Per-IP request accounting for `rate_limited`.  Two independent windows:
+/// `general` (every request) and `auth_fail` (only 401 responses, a much
+/// tighter cap) so one slow analyst tab can never itself trip the lockout
+/// meant for a token-guessing script.  IPs are swept lazily, on the same
+/// call that would insert a new one, rather than on a timer -- there is no
+/// background thread appropriate to own that here.
+struct RateWindows {
+    general: HashMap<IpAddr, Vec<Instant>>,
+    auth_fail: HashMap<IpAddr, Vec<Instant>>,
+}
+static RATE_LIMIT: LazyLock<Mutex<RateWindows>> = LazyLock::new(|| {
+    Mutex::new(RateWindows { general: HashMap::new(), auth_fail: HashMap::new() })
+});
+const RATE_GENERAL_LIMIT: usize = 120;
+const RATE_GENERAL_WINDOW: Duration = Duration::from_secs(60);
+const RATE_AUTH_FAIL_LIMIT: usize = 20;
+const RATE_AUTH_FAIL_WINDOW: Duration = Duration::from_secs(300);
+
+/// Records one hit against `ip` in `window` (via `pick`) and reports whether
+/// it is still under `limit` -- sliding window, not a fixed bucket: entries
+/// older than the window are dropped before counting, on every call, so a
+/// burst right at a window boundary cannot double an attacker's effective
+/// budget the way a fixed-bucket reset would.
+fn rate_check(
+    map: &mut HashMap<IpAddr, Vec<Instant>>,
+    ip: IpAddr,
+    window: Duration,
+    limit: usize,
+) -> bool {
+    let now = Instant::now();
+    let hits = map.entry(ip).or_default();
+    hits.retain(|t| now.duration_since(*t) < window);
+    if hits.len() >= limit {
+        return false;
+    }
+    hits.push(now);
+    // An IP with no recent hits after the retain above is dead weight; drop
+    // it here rather than in a separate sweep pass so the map never holds
+    // more live entries than there are IPs that have hit it inside the
+    // window right now.
+    map.retain(|_, v| !v.is_empty());
+    true
+}
+
+/// `false` means "reject with 429" -- called once per request, before auth,
+/// for the general cap; `record_auth_failure` is called separately, only
+/// after a 401, for the tighter one.
+fn rate_limited(ip: IpAddr) -> bool {
+    let mut w = RATE_LIMIT.lock().unwrap();
+    !rate_check(&mut w.general, ip, RATE_GENERAL_WINDOW, RATE_GENERAL_LIMIT)
+}
+
+fn auth_failures_exceeded(ip: IpAddr) -> bool {
+    let mut w = RATE_LIMIT.lock().unwrap();
+    let hits = w.auth_fail.entry(ip).or_default();
+    let now = Instant::now();
+    hits.retain(|t| now.duration_since(*t) < RATE_AUTH_FAIL_WINDOW);
+    hits.len() >= RATE_AUTH_FAIL_LIMIT
+}
+
+fn record_auth_failure(ip: IpAddr) {
+    let mut w = RATE_LIMIT.lock().unwrap();
+    w.auth_fail.entry(ip).or_default().push(Instant::now());
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -905,11 +1301,14 @@ fn authorized(r: &HttpRequest, cfg: &WebConfig) -> bool {
             }
         }
     }
-    // EventSource cannot set request headers, so the stream endpoint accepts the
-    // token as a query parameter.  Nothing else does.
+    // EventSource cannot set request headers, so the stream endpoint accepts a
+    // short-lived, single-use ticket (see `mint_sse_ticket`/`consume_sse_ticket`)
+    // as a query parameter instead of the durable token itself. Minting one
+    // still requires the real bearer token, via POST /api/v1/events/ticket,
+    // which is not exempted from the check above.
     if r.route() == "/api/v1/events" {
-        if let Some(t) = query_param(r.query(), "token") {
-            return constant_time_eq(t.as_bytes(), cfg.token.as_bytes());
+        if let Some(t) = query_param(r.query(), "ticket") {
+            return consume_sse_ticket(&t);
         }
     }
     false
@@ -1032,6 +1431,22 @@ fn api_route(cfg: &WebConfig, r: &HttpRequest) -> Option<Value> {
             b["agent_id"] = json!(p.trim_start_matches("/api/v1/agents/"));
             Some(rpc(cfg, &b))
         }
+        // Generic passthrough: the request body IS the dashboard_rpc request
+        // (it just needs an "action" key). allgres.dashboard_rpc is already
+        // the actual trust boundary -- it decides what's a valid action, and
+        // runs SECURITY DEFINER regardless of how the call reached it -- so a
+        // named Rust route per action added nothing but boilerplate that
+        // needed a recompile for every new SQL-side capability. The routes
+        // above predate this and stay for compatibility; every action added
+        // since (projects.*, approvals.*, sessions.*, permissions.*,
+        // allowlist.*, policy.history, ...) reaches here instead.
+        ("POST", "/api/v1/rpc") => {
+            let b = body_json(r);
+            if b.get("action").and_then(Value::as_str).is_none() {
+                return Some(json!({"ok": false, "error": "action_required"}));
+            }
+            Some(rpc(cfg, &b))
+        }
         _ => None,
     }
 }
@@ -1049,11 +1464,12 @@ fn stream_events(s: &mut TcpStream, cfg: &WebConfig) {
          {sec}\r\n",
         sec = security_headers(),
     );
+    // No `retry:` field: a single-use ticket cannot authorize the browser's
+    // native retry-with-the-same-URL, so reconnection is client-driven
+    // instead (`startEvents` in web/index.html mints a fresh ticket and opens
+    // a new EventSource on every `error` event).
     let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
     if s.write_all(head.as_bytes()).is_err() {
-        return;
-    }
-    if s.write_all(b"retry: 2000\n\n").is_err() {
         return;
     }
 
@@ -1070,6 +1486,15 @@ fn stream_events(s: &mut TcpStream, cfg: &WebConfig) {
 }
 
 fn handle_web_connection(mut s: TcpStream, cfg: &WebConfig) {
+    let peer_ip = s.peer_addr().map(|a| a.ip()).ok();
+    if let Some(ip) = peer_ip {
+        if rate_limited(ip) {
+            respond(&mut s, "429 Too Many Requests", "application/json",
+                    "{\"ok\":false,\"error\":\"rate_limited\"}", "Retry-After: 60\r\n");
+            return;
+        }
+    }
+
     let Some(r) = read_http_request(&mut s) else { return };
     let path = r.route();
 
@@ -1130,9 +1555,35 @@ fn handle_web_connection(mut s: TcpStream, cfg: &WebConfig) {
         return;
     }
 
+    // Checked ahead of the real auth comparison, not after it, so a locked-out
+    // IP cannot keep spending a thread and a constant-time compare on every
+    // attempt -- only the failures that got this far ever counted against it.
+    if let Some(ip) = peer_ip {
+        if auth_failures_exceeded(ip) {
+            respond(&mut s, "429 Too Many Requests", "application/json",
+                    "{\"ok\":false,\"error\":\"rate_limited\"}", "Retry-After: 300\r\n");
+            return;
+        }
+    }
+
     if !authorized(&r, cfg) {
+        if let Some(ip) = peer_ip {
+            record_auth_failure(ip);
+        }
         respond(&mut s, "401 Unauthorized", "application/json",
                 "{\"ok\":false,\"error\":\"unauthorized\"}", "WWW-Authenticate: Bearer\r\n");
+        return;
+    }
+
+    if path == "/api/v1/events/ticket" {
+        if r.method != "POST" {
+            respond(&mut s, "405 Method Not Allowed", "application/json",
+                    "{\"ok\":false,\"error\":\"method_not_allowed\"}", "Allow: POST\r\n");
+            return;
+        }
+        let ticket = mint_sse_ticket();
+        let body = json!({"ok": true, "ticket": ticket, "expires_in": SSE_TICKET_TTL.as_secs()}).to_string();
+        respond_json(&mut s, "200 OK", &body);
         return;
     }
 
@@ -1346,14 +1797,73 @@ mod tests {
     }
 
     #[test]
-    fn query_token_is_accepted_only_for_the_event_stream() {
+    fn query_ticket_is_accepted_only_for_the_event_stream_and_only_once() {
         let cfg = WebConfig {
             token: "s3cr3t".into(),
             socket: PathBuf::from("/dev/null"),
             mock_enabled: false,
         };
-        assert!(authorized(&req("GET /api/v1/events?token=s3cr3t HTTP/1.1\r\n\r\n"), &cfg));
-        assert!(!authorized(&req("GET /api/v1/tasks?token=s3cr3t HTTP/1.1\r\n\r\n"), &cfg));
+        // The durable token itself, presented as a query param, must never
+        // authorize -- only a minted ticket does, and only for /api/v1/events.
+        assert!(!authorized(&req("GET /api/v1/events?token=s3cr3t HTTP/1.1\r\n\r\n"), &cfg));
+
+        let ticket = mint_sse_ticket();
+        assert!(authorized(
+            &req(&format!("GET /api/v1/events?ticket={ticket} HTTP/1.1\r\n\r\n")),
+            &cfg
+        ));
+        // Single-use: the same ticket does not authorize a second time.
+        assert!(!authorized(
+            &req(&format!("GET /api/v1/events?ticket={ticket} HTTP/1.1\r\n\r\n")),
+            &cfg
+        ));
+        // Not accepted on any other route, even freshly minted.
+        let ticket2 = mint_sse_ticket();
+        assert!(!authorized(
+            &req(&format!("GET /api/v1/tasks?ticket={ticket2} HTTP/1.1\r\n\r\n")),
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn sse_ticket_expires() {
+        let ticket = mint_sse_ticket();
+        {
+            let mut tickets = SSE_TICKETS.lock().unwrap();
+            let stale = Instant::now() - SSE_TICKET_TTL - Duration::from_secs(1);
+            tickets.insert(ticket.clone(), stale);
+        }
+        assert!(!consume_sse_ticket(&ticket));
+    }
+
+    #[test]
+    fn rate_limit_trips_after_the_general_cap_and_recovers_outside_the_window() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        for _ in 0..RATE_GENERAL_LIMIT {
+            assert!(!rate_limited(ip));
+        }
+        assert!(rate_limited(ip));
+
+        // A hit recorded outside the window does not count against the cap.
+        {
+            let mut w = RATE_LIMIT.lock().unwrap();
+            let old = Instant::now() - RATE_GENERAL_WINDOW - Duration::from_secs(1);
+            w.general.insert(ip, vec![old; RATE_GENERAL_LIMIT]);
+        }
+        assert!(!rate_limited(ip));
+    }
+
+    #[test]
+    fn auth_failure_lockout_is_independent_of_the_general_rate_limit() {
+        let ip: IpAddr = "203.0.113.8".parse().unwrap();
+        assert!(!auth_failures_exceeded(ip));
+        for _ in 0..RATE_AUTH_FAIL_LIMIT {
+            record_auth_failure(ip);
+        }
+        assert!(auth_failures_exceeded(ip));
+        // A different IP is unaffected.
+        let other: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(!auth_failures_exceeded(other));
     }
 
     #[test]
@@ -1392,7 +1902,7 @@ mod tests {
     //
     // These exercise `analyze_dump` against the shape `nodeToString` produces.
     // The end-to-end path (real parser -> real dump) is covered by
-    // argo_public.fn_selftest, which runs inside the database.
+    // allgres_public.fn_selftest, which runs inside the database.
 
     fn rangevar(schema: &str, rel: &str) -> String {
         format!("{{RANGEVAR :schemaname {schema} :relname {rel} :inh true :relpersistence p :alias <> :location 14}}")
@@ -1404,21 +1914,21 @@ mod tests {
 
     #[test]
     fn reads_a_schema_qualified_relation() {
-        let d = analyze_dump(&select_dump(&rangevar("argo_public", "v_sales")));
+        let d = analyze_dump(&select_dump(&rangevar("allgres_public", "v_sales")));
         assert_eq!(d["kind"], "select");
         assert_eq!(d["statements"], 1);
         assert_eq!(d["writes"], false);
-        assert_eq!(d["relations"][0]["schema"], "argo_public");
+        assert_eq!(d["relations"][0]["schema"], "allgres_public");
         assert_eq!(d["relations"][0]["name"], "v_sales");
     }
 
     #[test]
     fn reads_every_relation_in_a_comma_join() {
-        let inner = format!("{} {}", rangevar("argo_public", "v_sales"), rangevar("argo_private", "sessions"));
+        let inner = format!("{} {}", rangevar("allgres_public", "v_sales"), rangevar("allgres_private", "sessions"));
         let d = analyze_dump(&select_dump(&inner));
         let rels = d["relations"].as_array().unwrap();
         assert_eq!(rels.len(), 2);
-        assert_eq!(rels[1]["schema"], "argo_private");
+        assert_eq!(rels[1]["schema"], "allgres_private");
     }
 
     #[test]

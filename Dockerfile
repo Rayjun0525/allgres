@@ -13,9 +13,12 @@ RUN cargo pgrx init --pg17=/usr/lib/postgresql/17/bin/pg_config
 WORKDIR /src/allgres
 COPY . .
 RUN cargo pgrx install --release --features pg17
-# cargo-pgrx installs only the current version's script; extension upgrade
-# scripts are ours to place.
-RUN cp -f sql/allgres--*--*.sql /usr/share/postgresql/17/extension/ 2>/dev/null || true
+# cargo-pgrx installs only the current version's script (allgres--<crate
+# version>.sql); frozen base snapshots of earlier versions (allgres--0.2.0.sql)
+# and generated upgrade scripts (allgres--0.2.0--0.3.0.sql) are ours to place,
+# so a real prior version stays installable and `ALTER EXTENSION ... UPDATE`
+# stays a real, reachable operation in this image, not just natively.
+RUN cp -f sql/allgres--*.sql /usr/share/postgresql/17/extension/ 2>/dev/null || true
 
 FROM postgres:17-bookworm
 COPY --from=builder /usr/lib/postgresql/17/lib/allgres.so /usr/lib/postgresql/17/lib/allgres.so
