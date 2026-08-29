@@ -9,6 +9,38 @@ embedded browser control panel into one PostgreSQL extension.
 Version 0.2.0. This is an MVP: read [Security model](#security-model) before
 putting it anywhere that matters.
 
+## Status
+
+Implemented and verified (natively on PostgreSQL 16.15; see [Known
+limitations](#known-limitations) for what the PG17/Docker path still needs):
+
+- **Agent control plane** — policy, permissions, delegation, retries,
+  per-agent concurrency (`max_concurrent_tasks`) and wall-clock
+  (`max_turn_seconds`) caps, and a versioned policy history.
+- **SQL sandbox** — parse-tree-based analysis, execution under the
+  unprivileged `sandbox` role, and a per-view allowlist.
+- **Outbound calls** — LLM provider calls and the `http_get` tool, both
+  behind the SSRF guard described below.
+- **Human-in-the-loop** — `await_human`, operator approve/reject with a
+  reply that feeds back into the agent's own log, and timed expiry via the
+  watchdog.
+- **Projects & sessions** — sessions can be grouped into projects, an
+  operator can cancel a running session, and a full per-session thread
+  view is available.
+- **Dashboard** — a single static HTML file (no build step) covering
+  Overview, Agents, Projects, Run, Sessions, Approvals, Tasks, Logs, and
+  Settings, all reachable through one generic `/api/v1/rpc` route.
+
+Not yet built:
+
+- Helm charts, Kubernetes manifests, and CNPG dynamic loading — only a
+  native install and `docker-compose` exist today.
+- Per-operator identity/accounts — the dashboard has one shared token, not
+  user accounts, so "who approved this" is unanswerable by design.
+- OAuth token exchange, secret key rotation, dashboard rate limiting.
+
+See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
+
 ## Runtime requirements
 
 - PostgreSQL 17+

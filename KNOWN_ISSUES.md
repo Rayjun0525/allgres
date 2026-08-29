@@ -149,10 +149,9 @@ Deliberately out of scope for this pass, worth revisiting:
   this" is unanswerable by design, not by oversight. Adding real identity
   would be a bigger change than this one.
 
-## 11. Fine-grained operator controls, still no UI
+## 11. Fine-grained operator controls
 
-Filling the gaps a comparison against Hermes-agent and Buzz (block/buzz)
-turned up:
+The gaps this pass filled:
 
 - **`fn_cancel_session`** — nothing could stop a running agent before this;
   cancels every open task in a session, rejects any pending approval so it
