@@ -42,6 +42,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }}
           echo "PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config" >> "$GITHUB_ENV"
+          # GitHub-hosted runner images preinstall PostgreSQL 16 with a
+          # running 16/main cluster already created, but set
+          # create_main_cluster = false in postgresql-common's config --
+          # confirmed live: 16 has /etc/postgresql/16/main/postgresql.conf
+          # already, 17 and 18 do not, so the next step's `tee` into it
+          # fails with "No such file or directory". Create the cluster
+          # ourselves whenever the config doesn't already exist; a no-op
+          # for 16.
+          if [ ! -f "/etc/postgresql/${{ matrix.pg }}/main/postgresql.conf" ]; then
+            sudo pg_createcluster ${{ matrix.pg }} main
+          fi
 
       - name: Cache cargo registry, cargo-pgrx binary, and target dir
         uses: actions/cache@v4

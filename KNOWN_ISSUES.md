@@ -1150,3 +1150,36 @@ setup, which matches this project's own stated "one person's small
 setup" scope) rather than a bug that contradicts what the code already
 claims to do, so it was surfaced as a decision rather than changed
 unilaterally.
+
+## 21. CI, round two: PG17/PG18 never got a cluster to install into
+
+Item 20's `cargo pgrx install` permission fix worked exactly as intended —
+confirmed from the actual next CI run: all three matrix legs now build,
+`cargo test` passes, and `cargo pgrx install` completes cleanly with no
+`EACCES` on 16, 17, *and* 18. `native-matrix (16)` went fully green. 17 and
+18 failed one step later, in "Configure and restart the cluster":
+`tee: /etc/postgresql/18/main/postgresql.conf: No such file or directory`.
+
+Root cause, confirmed by diffing the two jobs' actual logs line by line:
+GitHub's `ubuntu-latest` runner image preinstalls PostgreSQL 16 with a
+running `16/main` cluster already created at image-build time, but ships
+`postgresql-common` configured with `create_main_cluster = false` — so
+installing any *other* major version's PGDG package (`postgresql-17`,
+`postgresql-18`) only unpacks the binaries; nothing calls
+`pg_createcluster` for them, and `/etc/postgresql/{17,18}/main/` never
+comes into existence. The workflow's "Install PostgreSQL N (PGDG)" step
+looked identical for all three versions and reported success for all
+three — the actual apt install truly did succeed in every case — so this
+was invisible without reading the full install-step output side by side
+for a passing version and a failing one, not just the failing job's error
+line.
+
+Fixed with a one-line guard right after the package install, in the same
+step: if `/etc/postgresql/${{ matrix.pg }}/main/postgresql.conf` doesn't
+already exist, run `sudo pg_createcluster ${{ matrix.pg }} main` before
+moving on. A no-op for 16 (the file already exists), and creates the
+missing cluster for 17/18 — verified by reasoning about the actual
+observed state (16 has the file, 17/18 don't) rather than assumption; this
+fix has not yet been confirmed green on GitHub's infrastructure as of this
+writing, the same "added" vs. "verified" distinction item 3 already draws
+for the rest of this CI matrix.
