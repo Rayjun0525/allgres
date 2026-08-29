@@ -1178,8 +1178,29 @@ Fixed with a one-line guard right after the package install, in the same
 step: if `/etc/postgresql/${{ matrix.pg }}/main/postgresql.conf` doesn't
 already exist, run `sudo pg_createcluster ${{ matrix.pg }} main` before
 moving on. A no-op for 16 (the file already exists), and creates the
-missing cluster for 17/18 — verified by reasoning about the actual
-observed state (16 has the file, 17/18 don't) rather than assumption; this
-fix has not yet been confirmed green on GitHub's infrastructure as of this
-writing, the same "added" vs. "verified" distinction item 3 already draws
-for the rest of this CI matrix.
+missing cluster for 17/18.
+
+That fix alone was not enough, confirmed from the very next CI run on
+this same commit: `native-matrix (18)` got past cluster creation and the
+config `tee` cleanly, but then failed at `CREATE EXTENSION` with
+`connection to server on socket "/var/run/postgresql/.s.PGSQL.5432"
+failed: No such file or directory`. The PostgreSQL log for the same run
+showed the real cause: `listening on Unix socket
+"/var/run/postgresql/.s.PGSQL.5433"` — the runner image's preinstalled
+default PostgreSQL service already holds port 5432 (that default service
+is what 16/main actually is, on this image), so `pg_createcluster 18
+main` auto-assigned the next free port, 5433, and every downstream `psql`/
+`pg_isready` call in the workflow assumed the default 5432 with no `-p`.
+Fixed by reading back the real port with `pg_lsclusters` right after the
+restart and threading it through explicitly (`-p "$PGPORT"`) to the
+`pg_isready` wait loop and every `psql` invocation in the next step,
+passed through `$GITHUB_ENV` between steps and interpolated into each
+command line rather than relied on as environment `sudo -u postgres`
+would inherit (it does not, reliably). A no-op for 16, where the port
+happens to already be 5432.
+
+Both fixes verified by reasoning about the actual observed state (job
+logs, PostgreSQL's own log lines) rather than assumption at each step, but
+neither has yet been confirmed green end-to-end on GitHub's infrastructure
+as of this writing — the same "added" vs. "verified" distinction item 3
+already draws for the rest of this CI matrix.

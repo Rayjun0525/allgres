@@ -101,13 +101,24 @@ jobs:
           echo "shared_preload_libraries = 'allgres'" | sudo tee -a "$PGCONF"
           echo "ALLGRES_ENABLE_MOCK = '1'" | sudo tee -a "$PGENV"
           sudo pg_ctlcluster ${{ matrix.pg }} main restart
-          for _ in $(seq 1 30); do sudo -u postgres pg_isready -q && break; sleep 1; done
+          # The runner image's preinstalled default PostgreSQL service
+          # already holds port 5432 in some matrix legs, so a cluster this
+          # workflow just created (previous step's pg_createcluster) can
+          # land on a different port -- confirmed live: 18/main came up on
+          # 5433. Read back whatever port this exact cluster actually uses
+          # instead of assuming 5432, and pass it explicitly everywhere
+          # from here on (sudo does not reliably propagate env vars set via
+          # GITHUB_ENV into the child, so this is threaded through as a
+          # literal -p argument, not relied on as inherited environment).
+          PGPORT="$(pg_lsclusters -h | awk -v v="${{ matrix.pg }}" '$1==v && $2=="main"{print $3}')"
+          echo "PGPORT=$PGPORT" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do sudo -u postgres pg_isready -q -p "$PGPORT" && break; sleep 1; done
 
       - name: CREATE EXTENSION and run fn_selftest / smoke / e2e
         run: |
-          sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION allgres;"
-          sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 -f tests/smoke.sql
-          sudo -u postgres psql -d postgres -v ON_ERROR_STOP=1 -f tests/e2e_mock.sql
+          sudo -u postgres psql -p "$PGPORT" -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION allgres;"
+          sudo -u postgres psql -p "$PGPORT" -d postgres -v ON_ERROR_STOP=1 -f tests/smoke.sql
+          sudo -u postgres psql -p "$PGPORT" -d postgres -v ON_ERROR_STOP=1 -f tests/e2e_mock.sql
 
       - name: PostgreSQL log on failure
         if: failure()
