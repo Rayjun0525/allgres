@@ -80,6 +80,7 @@ DROP FUNCTION IF EXISTS argo_private.fn_execute_sql(uuid, text);
 -- explicit drop first.
 DROP FUNCTION IF EXISTS argo_public.fn_create_session(uuid, text);
 DROP FUNCTION IF EXISTS argo_public.fn_decide_approval(uuid, boolean);
+DROP FUNCTION IF EXISTS argo_public.fn_set_policy(uuid, text, int, int, jsonb);
 
 -- The SQL sandbox no longer inspects statement text with regexes; it reads the
 -- tree produced by PostgreSQL's own parser (allgres.analyze_sql).  These are
@@ -113,6 +114,41 @@ CREATE TABLE IF NOT EXISTS argo_private.policies (
   llm_config      jsonb NOT NULL DEFAULT '{}'::jsonb,
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
+
+-- generation + max_concurrent_tasks/max_turn_seconds: a real version count
+-- (fn_set_policy snapshots the pre-change row into policy_history and bumps
+-- this, but only when something actually changed -- a no-op update, e.g.
+-- agents.update only flipping is_active, must not create a phantom version),
+-- and two caps max_steps/max_retries didn't cover: max_steps bounds a
+-- runaway *loop* (how many turns), not how many tasks this agent runs at
+-- once (max_concurrent_tasks, enforced in fn_dispatch_tasks) or how long one
+-- task may run start to finish regardless of step count (max_turn_seconds, a
+-- wall-clock ceiling from the task's created_at, enforced in fn_watchdog;
+-- NULL means uncapped).
+ALTER TABLE argo_private.policies
+  ADD COLUMN IF NOT EXISTS generation int NOT NULL DEFAULT 1,
+  ADD COLUMN IF NOT EXISTS max_concurrent_tasks int NOT NULL DEFAULT 4 CHECK (max_concurrent_tasks > 0),
+  ADD COLUMN IF NOT EXISTS max_turn_seconds int CHECK (max_turn_seconds IS NULL OR max_turn_seconds > 0);
+
+-- Append-only: one row per version that was ever live, populated by
+-- fn_set_policy just before it overwrites argo_private.policies.  There is no
+-- row for the current version -- that's what argo_private.policies itself is.
+CREATE TABLE IF NOT EXISTS argo_private.policy_history (
+  version_id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id             uuid NOT NULL REFERENCES argo_private.agents(agent_id) ON DELETE CASCADE,
+  generation           int NOT NULL,
+  system_prompt        text NOT NULL,
+  max_steps            int NOT NULL,
+  max_retries          int NOT NULL,
+  llm_config           jsonb NOT NULL,
+  max_concurrent_tasks int NOT NULL,
+  max_turn_seconds     int,
+  changed_at           timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (agent_id, generation)
+);
+
+CREATE INDEX IF NOT EXISTS policy_history_agent_idx
+  ON argo_private.policy_history (agent_id, generation DESC);
 
 CREATE TABLE IF NOT EXISTS argo_private.permissions (
   permission_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -173,6 +209,16 @@ CREATE TABLE IF NOT EXISTS argo_private.tasks (
   created_at      timestamptz NOT NULL DEFAULT now(),
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
+
+-- 'cancelled' is distinct from 'failed': an operator stopping a task is a
+-- different signal than the agent's own logic giving up.  Unnamed CHECK
+-- constraints get Postgres's default <table>_<column>_check name, so this is
+-- the idempotent way to widen one -- CREATE TABLE IF NOT EXISTS won't touch
+-- an existing table, and there is no ALTER TABLE ... ADD VALUE for a plain
+-- CHECK the way there is for an enum type.
+ALTER TABLE argo_private.tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
+ALTER TABLE argo_private.tasks ADD CONSTRAINT tasks_status_check CHECK (status IN
+  ('queued', 'running', 'completed', 'failed', 'waiting_human', 'cancelled'));
 
 CREATE INDEX IF NOT EXISTS tasks_ready_idx
   ON argo_private.tasks (created_at)
@@ -1752,7 +1798,7 @@ BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
   FOR t IN
-    SELECT task_id
+    SELECT task_id, agent_id
     FROM argo_private.tasks
     WHERE status IN ('queued', 'running')
       AND NOT EXISTS (
@@ -1763,6 +1809,19 @@ BEGIN
     ORDER BY created_at
     FOR UPDATE SKIP LOCKED
   LOOP
+    -- max_concurrent_tasks caps how many of this agent's tasks may be
+    -- actively in a turn (running or waiting_human) at once; a 'queued' task
+    -- that hasn't started yet doesn't occupy a slot, it just waits longer.
+    -- Excluding t.task_id itself matters for a 'running' task continuing its
+    -- next turn: that's not a new slot, it already holds the one it's in.
+    IF (
+      SELECT count(*) FROM argo_private.tasks x
+      WHERE x.agent_id = t.agent_id AND x.task_id <> t.task_id
+        AND x.status IN ('running', 'waiting_human')
+    ) >= (SELECT max_concurrent_tasks FROM argo_private.policies WHERE agent_id = t.agent_id) THEN
+      CONTINUE;
+    END IF;
+
     BEGIN
       spec := argo_public.fn_next_step(t.task_id);
     EXCEPTION WHEN others THEN
@@ -2154,6 +2213,30 @@ BEGIN
     n := n + 1;
   END LOOP;
 
+  -- max_turn_seconds: a wall-clock ceiling on a task's whole lifetime, not
+  -- tied to any particular in-flight call -- a task can blow this budget by
+  -- taking many fast steps just as easily as one slow one, so it is checked
+  -- against created_at rather than any single call's updated_at.  Terminal,
+  -- like max_steps: no retry, straight to failed.
+  FOR r IN
+    SELECT t.task_id, t.session_id, t.step_count
+    FROM argo_private.tasks t
+    JOIN argo_private.policies p USING (agent_id)
+    WHERE t.status IN ('queued', 'running', 'waiting_human')
+      AND p.max_turn_seconds IS NOT NULL
+      AND t.created_at < now() - make_interval(secs => p.max_turn_seconds)
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    PERFORM argo_private.append_log(
+      r.task_id, r.step_count + 1, 'error', jsonb_build_object('reason', 'turn_timeout')
+    );
+    UPDATE argo_private.tasks
+    SET status = 'failed', error = 'turn_timeout', step_count = step_count + 1, updated_at = now()
+    WHERE task_id = r.task_id;
+    PERFORM argo_private.maybe_complete_session(r.session_id);
+    n := n + 1;
+  END LOOP;
+
   RETURN jsonb_build_object('lost', n);
 END;
 $fn$;
@@ -2261,33 +2344,87 @@ BEGIN
 END;
 $fn$;
 
+-- Versions only on a real change: agents.update calls this on every save
+-- (e.g. just flipping is_active), and if that always snapshotted history and
+-- bumped generation, "version 47" would mean nothing -- most of the chain
+-- would be identical no-op copies of the row next to it.  IS DISTINCT FROM
+-- against the row as it stood at the top of this call is what tells the two
+-- apart.
 CREATE OR REPLACE FUNCTION argo_public.fn_set_policy(
   p_agent_id uuid,
   p_prompt text DEFAULT NULL,
   p_max_steps int DEFAULT NULL,
   p_max_retries int DEFAULT NULL,
-  p_llm_config jsonb DEFAULT NULL
+  p_llm_config jsonb DEFAULT NULL,
+  p_max_concurrent_tasks int DEFAULT NULL,
+  p_max_turn_seconds int DEFAULT NULL,
+  p_clear_max_turn_seconds boolean DEFAULT false
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = argo_private, pg_temp
 AS $fn$
+DECLARE
+  p_row argo_private.policies%ROWTYPE;
+  v_prompt text;
+  v_steps int;
+  v_retries int;
+  v_cfg jsonb;
+  v_concurrent int;
+  v_turn_secs int;
+  v_changed boolean;
 BEGIN
-  UPDATE argo_private.policies
-  SET
-    system_prompt = COALESCE(NULLIF(p_prompt, ''), system_prompt),
-    max_steps = COALESCE(p_max_steps, max_steps),
-    max_retries = COALESCE(p_max_retries, max_retries),
-    llm_config = CASE
-      WHEN p_llm_config IS NULL THEN llm_config
-      ELSE argo_private.sanitize_llm_config(llm_config || p_llm_config)
-    END,
-    updated_at = now()
-  WHERE agent_id = p_agent_id;
+  SELECT * INTO p_row FROM argo_private.policies WHERE agent_id = p_agent_id FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'policy not found' USING ERRCODE = 'P0001';
   END IF;
-  RETURN jsonb_build_object('ok', true);
+
+  v_prompt     := COALESCE(NULLIF(p_prompt, ''), p_row.system_prompt);
+  v_steps      := COALESCE(p_max_steps, p_row.max_steps);
+  v_retries    := COALESCE(p_max_retries, p_row.max_retries);
+  v_cfg        := CASE WHEN p_llm_config IS NULL THEN p_row.llm_config
+                       ELSE argo_private.sanitize_llm_config(p_row.llm_config || p_llm_config) END;
+  v_concurrent := COALESCE(p_max_concurrent_tasks, p_row.max_concurrent_tasks);
+  -- max_turn_seconds is the one field whose desired value can legitimately be
+  -- NULL ("no cap"), so unlike the others a NULL argument can't just mean
+  -- "leave it alone" -- p_clear_max_turn_seconds is the explicit way to ask
+  -- for that, distinct from simply not passing the parameter.
+  v_turn_secs  := CASE WHEN p_clear_max_turn_seconds THEN NULL
+                       ELSE COALESCE(p_max_turn_seconds, p_row.max_turn_seconds) END;
+
+  v_changed := v_prompt IS DISTINCT FROM p_row.system_prompt
+    OR v_steps IS DISTINCT FROM p_row.max_steps
+    OR v_retries IS DISTINCT FROM p_row.max_retries
+    OR v_cfg IS DISTINCT FROM p_row.llm_config
+    OR v_concurrent IS DISTINCT FROM p_row.max_concurrent_tasks
+    OR v_turn_secs IS DISTINCT FROM p_row.max_turn_seconds;
+
+  IF v_changed THEN
+    INSERT INTO argo_private.policy_history (
+      agent_id, generation, system_prompt, max_steps, max_retries, llm_config,
+      max_concurrent_tasks, max_turn_seconds
+    ) VALUES (
+      p_row.agent_id, p_row.generation, p_row.system_prompt, p_row.max_steps,
+      p_row.max_retries, p_row.llm_config, p_row.max_concurrent_tasks, p_row.max_turn_seconds
+    );
+  END IF;
+
+  UPDATE argo_private.policies
+  SET system_prompt = v_prompt,
+      max_steps = v_steps,
+      max_retries = v_retries,
+      llm_config = v_cfg,
+      max_concurrent_tasks = v_concurrent,
+      max_turn_seconds = v_turn_secs,
+      generation = generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
+      updated_at = now()
+  WHERE agent_id = p_agent_id;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'generation', p_row.generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
+    'changed', v_changed
+  );
 END;
 $fn$;
 
@@ -2621,6 +2758,54 @@ BEGIN
 END;
 $fn$;
 
+-- The one control that was missing entirely: nothing could stop a runaway
+-- agent.  Cancels every open task in the session (queued/running/
+-- waiting_human), rejects any pending approval so it doesn't linger, logs an
+-- operator message on each cancelled task so the thread shows why it stopped,
+-- and closes the session as 'cancelled' -- distinct from maybe_complete_session's
+-- 'completed'/'failed', which this deliberately bypasses: that function has
+-- no notion of an operator-initiated stop.
+CREATE OR REPLACE FUNCTION argo_public.fn_cancel_session(p_session_id uuid, p_reason text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = argo_private, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_reason text := COALESCE(NULLIF(btrim(p_reason), ''), 'Cancelled by operator.');
+  v_n int := 0;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM argo_private.sessions WHERE session_id = p_session_id) THEN
+    RAISE EXCEPTION 'session not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  FOR r IN
+    SELECT task_id, step_count
+    FROM argo_private.tasks
+    WHERE session_id = p_session_id AND status IN ('queued', 'running', 'waiting_human')
+    FOR UPDATE
+  LOOP
+    PERFORM argo_private.append_log(r.task_id, r.step_count + 1, 'operator', to_jsonb(v_reason));
+    UPDATE argo_private.tasks
+    SET status = 'cancelled', error = 'operator_cancelled', step_count = step_count + 1, updated_at = now()
+    WHERE task_id = r.task_id;
+    v_n := v_n + 1;
+  END LOOP;
+
+  UPDATE argo_private.human_approvals h
+  SET status = 'rejected', reply_text = 'session_cancelled', decided_at = now()
+  FROM argo_private.tasks t
+  WHERE h.task_id = t.task_id AND t.session_id = p_session_id AND h.status = 'pending';
+
+  UPDATE argo_private.sessions
+  SET status = 'cancelled', completed_at = now()
+  WHERE session_id = p_session_id AND status = 'open';
+
+  RETURN jsonb_build_object('ok', true, 'tasks_cancelled', v_n);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION argo_public.fn_allowlist_add(p_ref text)
 RETURNS jsonb
 LANGUAGE sql
@@ -2764,6 +2949,8 @@ DECLARE
   v_project uuid;
   v_approval uuid;
   v_expires timestamptz;
+  v_tid2 uuid;
+  v_gen int;
 BEGIN
   SELECT agent_id INTO v_agent FROM argo_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM argo_private.policies WHERE agent_id = v_agent;
@@ -3097,6 +3284,108 @@ BEGIN
   ok := ok AND n_logs = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_expires_stale_approval', 'ok', ok));
 
+  -- 17. fn_cancel_session stops every open task in the session, rejects any
+  --     pending approval so it doesn't linger, and closes the session --
+  --     the control that was simply missing before this pass.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest cancel_session')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid);
+  PERFORM argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"await_human"}',
+    'parsed', jsonb_build_object('action', 'await_human', 'reason', 'irrelevant, session gets cancelled')
+  ));
+  comp := argo_public.fn_cancel_session(v_sid, 'selftest stop');
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := (comp->>'tasks_cancelled')::int = 1 AND detail = 'cancelled';
+  SELECT status INTO detail FROM argo_private.sessions WHERE session_id = v_sid;
+  ok := ok AND detail = 'cancelled';
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM argo_private.human_approvals WHERE task_id = v_tid AND status = 'pending'
+  );
+  SELECT count(*) INTO n_logs
+  FROM argo_private.execution_logs
+  WHERE task_id = v_tid AND role = 'operator' AND content = to_jsonb('selftest stop'::text);
+  ok := ok AND n_logs = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'cancel_session_stops_open_task', 'ok', ok));
+
+  -- 18. fn_grant_permission / fn_revoke_permission -- the RPC surface
+  --     (permissions.grant/revoke) is a thin passthrough to these, so
+  --     exercising them here covers both.  Uses a scratch http_host ref
+  --     rather than a real view grant, so it can't disturb the seeded
+  --     permissions the sandbox_allow/reject cases above depend on.
+  PERFORM argo_public.fn_grant_permission(v_agent, 'http_host', 'selftest.invalid');
+  ok := EXISTS (
+    SELECT 1 FROM argo_private.permissions
+    WHERE agent_id = v_agent AND resource_type = 'http_host' AND resource_ref = 'selftest.invalid'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'grant_permission_creates_row', 'ok', ok));
+
+  PERFORM argo_public.fn_revoke_permission(v_agent, 'http_host', 'selftest.invalid');
+  ok := NOT EXISTS (
+    SELECT 1 FROM argo_private.permissions
+    WHERE agent_id = v_agent AND resource_type = 'http_host' AND resource_ref = 'selftest.invalid'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'revoke_permission_removes_row', 'ok', ok));
+
+  -- 19. fn_set_policy only versions on a real change.  A no-op call (every
+  --     param NULL/false) must not bump generation or write history --
+  --     agents.update calls this on every save, e.g. just flipping
+  --     is_active, and that must not manufacture a version.  A call that
+  --     actually changes something must do both, and the pre-change values
+  --     must land in policy_history under the *old* generation number.
+  SELECT generation INTO v_gen FROM argo_private.policies WHERE agent_id = v_agent;
+  PERFORM argo_public.fn_set_policy(v_agent);
+  ok := (SELECT generation FROM argo_private.policies WHERE agent_id = v_agent) = v_gen;
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM argo_private.policy_history WHERE agent_id = v_agent AND generation = v_gen
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'noop_policy_update_does_not_version', 'ok', ok));
+
+  comp := argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, 7);
+  ok := COALESCE((comp->>'changed')::boolean, false) AND (comp->>'generation')::int = v_gen + 1;
+  ok := ok AND (SELECT max_concurrent_tasks FROM argo_private.policies WHERE agent_id = v_agent) = 7;
+  ok := ok AND EXISTS (
+    SELECT 1 FROM argo_private.policy_history
+    WHERE agent_id = v_agent AND generation = v_gen AND max_concurrent_tasks = 4
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'real_policy_update_versions_the_old_row', 'ok', ok));
+  PERFORM argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, 4);
+
+  -- 20. max_concurrent_tasks holds a task back from fn_dispatch_tasks once
+  --     the agent's cap is already occupied by another running task, rather
+  --     than dispatching it anyway.
+  UPDATE argo_private.policies SET max_concurrent_tasks = 1 WHERE agent_id = v_agent;
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest concurrency_a')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  UPDATE argo_private.tasks SET status = 'running', updated_at = now() WHERE task_id = v_tid;
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest concurrency_b')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid2 FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_dispatch_tasks(NULL);
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid2;
+  ok := detail = 'queued';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'max_concurrent_tasks_holds_back_dispatch', 'ok', ok));
+  UPDATE argo_private.policies SET max_concurrent_tasks = 4 WHERE agent_id = v_agent;
+  UPDATE argo_private.tasks SET status = 'cancelled' WHERE task_id IN (v_tid, v_tid2);
+
+  -- 21. max_turn_seconds is a wall-clock ceiling on a task's whole lifetime;
+  --     fn_watchdog reclaims one that has been open longer than its agent's
+  --     cap, straight to failed, no retry -- the same terminal shape as
+  --     max_steps.
+  UPDATE argo_private.policies SET max_turn_seconds = 60 WHERE agent_id = v_agent;
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest turn_timeout')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  UPDATE argo_private.tasks SET created_at = now() - interval '2 minutes' WHERE task_id = v_tid;
+  PERFORM argo_public.fn_watchdog();
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := detail = 'failed';
+  SELECT count(*) INTO n_logs
+  FROM argo_private.execution_logs
+  WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'turn_timeout';
+  ok := ok AND n_logs = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_expires_stale_task', 'ok', ok));
+  PERFORM argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, NULL, NULL, true);
+
   PERFORM argo_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -3290,6 +3579,9 @@ BEGIN
             'max_steps', p.max_steps,
             'max_retries', p.max_retries,
             'llm_config', p.llm_config,
+            'generation', p.generation,
+            'max_concurrent_tasks', p.max_concurrent_tasks,
+            'max_turn_seconds', p.max_turn_seconds,
             'permissions', COALESCE((
               SELECT jsonb_agg(jsonb_build_object('type', x.resource_type, 'ref', x.resource_ref)
                      ORDER BY x.resource_type, x.resource_ref)
@@ -3314,9 +3606,74 @@ BEGIN
         NULLIF(p_request->>'system_prompt',''),
         CASE WHEN p_request ? 'max_steps'   THEN (p_request->>'max_steps')::int    ELSE NULL END,
         CASE WHEN p_request ? 'max_retries' THEN (p_request->>'max_retries')::int  ELSE NULL END,
-        CASE WHEN p_request ? 'llm_config'  THEN p_request->'llm_config'           ELSE NULL END
+        CASE WHEN p_request ? 'llm_config'  THEN p_request->'llm_config'           ELSE NULL END,
+        CASE WHEN p_request ? 'max_concurrent_tasks' THEN (p_request->>'max_concurrent_tasks')::int ELSE NULL END,
+        CASE WHEN p_request ? 'max_turn_seconds' THEN (p_request->>'max_turn_seconds')::int ELSE NULL END,
+        (p_request ? 'max_turn_seconds') AND (p_request->>'max_turn_seconds') IS NULL
       );
       RETURN jsonb_build_object('ok', true, 'agent_id', v_id);
+
+    WHEN 'policy.history' THEN
+      RETURN jsonb_build_object('ok', true, 'history', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.generation DESC)
+        FROM (
+          SELECT version_id, generation, system_prompt, max_steps, max_retries,
+                 llm_config, max_concurrent_tasks, max_turn_seconds, changed_at
+          FROM argo_private.policy_history
+          WHERE agent_id = (p_request->>'agent_id')::uuid
+        ) q
+      ), '[]'::jsonb));
+
+    WHEN 'permissions.list' THEN
+      RETURN jsonb_build_object('ok', true, 'permissions', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'permission_id', p.permission_id, 'type', p.resource_type,
+          'ref', p.resource_ref, 'granted_at', p.granted_at
+        ) ORDER BY p.resource_type, p.resource_ref)
+        FROM argo_private.permissions p
+        WHERE p.agent_id = (p_request->>'agent_id')::uuid
+      ), '[]'::jsonb));
+
+    WHEN 'permissions.grant' THEN
+      RETURN argo_public.fn_grant_permission(
+        (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
+      );
+
+    WHEN 'permissions.revoke' THEN
+      RETURN argo_public.fn_revoke_permission(
+        (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
+      );
+
+    -- Fills the four grant-target pickers a permissions editor needs in one
+    -- call: agent-visible views (queried live from pg_catalog, not hardcoded,
+    -- so a newly created view shows up with no code change), the one real
+    -- tool, other agents (delegate targets), and a note that http_host is
+    -- free text -- there is no fixed list of allowed hosts to offer.
+    WHEN 'permissions.options' THEN
+      RETURN jsonb_build_object(
+        'ok', true,
+        'views', COALESCE((
+          SELECT jsonb_agg(schemaname || '.' || viewname ORDER BY viewname)
+          FROM pg_catalog.pg_views WHERE schemaname = 'argo_public'
+        ), '[]'::jsonb),
+        'tools', '["http_get"]'::jsonb,
+        'agents', COALESCE((
+          SELECT jsonb_agg(name ORDER BY name) FROM argo_private.agents WHERE is_active
+        ), '[]'::jsonb),
+        'http_hosts', 'free text -- any hostname the outbound guard allows'
+      );
+
+    WHEN 'allowlist.list' THEN
+      RETURN jsonb_build_object('ok', true, 'allowlist', COALESCE((
+        SELECT jsonb_agg(resource_ref ORDER BY resource_ref)
+        FROM argo_private.sql_sandbox_allowlist
+      ), '[]'::jsonb));
+
+    WHEN 'allowlist.add' THEN
+      RETURN argo_public.fn_allowlist_add(p_request->>'ref');
+
+    WHEN 'allowlist.remove' THEN
+      RETURN argo_public.fn_allowlist_del(p_request->>'ref');
 
     WHEN 'projects.list' THEN
       RETURN jsonb_build_object('ok', true, 'projects', COALESCE((
@@ -3342,6 +3699,61 @@ BEGIN
         (p_request->>'agent_id')::uuid,
         p_request->>'goal',
         NULLIF(p_request->>'project_id', '')::uuid
+      );
+
+    WHEN 'sessions.cancel' THEN
+      RETURN argo_public.fn_cancel_session(
+        (p_request->>'session_id')::uuid,
+        p_request->>'reason'
+      );
+
+    WHEN 'sessions.list' THEN
+      RETURN jsonb_build_object('ok', true, 'sessions', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.started_at DESC)
+        FROM (
+          SELECT s.session_id, s.agent_id, a.name AS agent, s.project_id,
+                 s.goal, s.status, s.final_answer, s.started_at, s.completed_at
+          FROM argo_private.sessions s
+          JOIN argo_private.agents a USING (agent_id)
+          WHERE NOT (p_request ? 'project_id')
+             OR s.project_id IS NOT DISTINCT FROM NULLIF(p_request->>'project_id', '')::uuid
+          ORDER BY s.started_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 100), 1), 500)
+        ) q
+      ), '[]'::jsonb));
+
+    WHEN 'sessions.get' THEN
+      v_id := (p_request->>'session_id')::uuid;
+      IF NOT EXISTS (SELECT 1 FROM argo_private.sessions WHERE session_id = v_id) THEN
+        RETURN jsonb_build_object('ok', false, 'error', 'session_not_found');
+      END IF;
+      RETURN jsonb_build_object(
+        'ok', true,
+        'session', (
+          SELECT jsonb_build_object(
+            'session_id', s.session_id, 'agent_id', s.agent_id, 'agent', a.name,
+            'project_id', s.project_id, 'goal', s.goal, 'status', s.status,
+            'final_answer', s.final_answer, 'started_at', s.started_at, 'completed_at', s.completed_at
+          )
+          FROM argo_private.sessions s JOIN argo_private.agents a USING (agent_id)
+          WHERE s.session_id = v_id
+        ),
+        'tasks', COALESCE((
+          SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at)
+          FROM (
+            SELECT task_id, parent_task_id, status, step_count, output, error, created_at, updated_at
+            FROM argo_private.tasks WHERE session_id = v_id
+          ) q
+        ), '[]'::jsonb),
+        'logs', COALESCE((
+          SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at)
+          FROM (
+            SELECT l.log_id, l.task_id, l.step_number, l.role, l.content, l.created_at
+            FROM argo_private.execution_logs l
+            JOIN argo_private.tasks t USING (task_id)
+            WHERE t.session_id = v_id
+          ) q
+        ), '[]'::jsonb)
       );
 
     WHEN 'tasks.list' THEN

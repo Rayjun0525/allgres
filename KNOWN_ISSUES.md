@@ -2,11 +2,13 @@
 
 Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
-reached to verify against — see item 3): `fn_selftest` 49/49, `tests/smoke.sql`
+reached to verify against — see item 3): `fn_selftest` 56/56, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
 socket → runtime SPI thread → PL/pgSQL works end to end, including a live
-`dashboard_rpc` round trip for `projects.*` and `approvals.*`. Earlier builds
-were verified on PostgreSQL 18.6; nothing here is PG-version-specific.
+`dashboard_rpc` round trip for every action added so far (`projects.*`,
+`approvals.*`, `sessions.cancel`/`.list`/`.get`, `permissions.*`,
+`allowlist.*`, `policy.history`). Earlier builds were verified on
+PostgreSQL 18.6; nothing here is PG-version-specific.
 
 Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
@@ -82,13 +84,16 @@ No test covers these; they are wired up but unexercised:
   assertions only);
 - `fn_watchdog` reclaiming a genuinely stuck **in-flight** call, for either
   `outbound_calls` or `sql_calls` (a runtime worker crash between claim and
-  complete). This is distinct from the pending-**approval** expiry path, which
-  is now covered (`fn_selftest`'s `watchdog_expires_stale_approval`) — the
-  await_human timeout and the in-flight-call timeout are two different loops
-  inside `fn_watchdog`; only the second remains unexercised.
+  complete). `fn_watchdog` now has four reclaim loops total; the other two
+  (pending-approval expiry, `max_turn_seconds` — see item 11) got selftest
+  coverage in the same pass that added them, using the same technique this
+  pair would need (mark a row in the relevant state, backdate its timestamp,
+  call `fn_watchdog`, assert the reclaim) — nothing stops writing the same
+  tests here, it just hasn't been done yet.
 
 `await_human` / `fn_decide_approval` themselves are no longer on this list —
-see item 10.
+see item 10. Neither is task/session cancellation, permission and allowlist
+management, or per-agent concurrency/wall-clock limits — see item 11.
 
 ## 7. Secret key rotation
 
@@ -140,3 +145,44 @@ Deliberately out of scope for this pass, worth revisiting:
   system (the dashboard has one shared token, not accounts), so "who approved
   this" is unanswerable by design, not by oversight. Adding real identity
   would be a bigger change than this one.
+
+## 11. Fine-grained operator controls, still no UI
+
+Filling the gaps a comparison against Hermes-agent and Buzz (block/buzz)
+turned up:
+
+- **`fn_cancel_session`** — nothing could stop a running agent before this;
+  cancels every open task in a session, rejects any pending approval so it
+  doesn't linger, logs why on each cancelled task, and closes the session as
+  `'cancelled'` — a status distinct from `'failed'`, since an operator
+  stopping something is a different signal than the agent's own logic giving
+  up. Wired to `dashboard_rpc` as `sessions.cancel`.
+- **`permissions.grant`/`.revoke`/`.list`/`.options` and `allowlist.add`/
+  `.remove`/`.list`** — `fn_grant_permission`, `fn_revoke_permission`,
+  `fn_allowlist_add`, `fn_allowlist_del` existed but were reachable only by
+  raw SQL; there was no way to grant an agent a view/tool/delegate-target/
+  http_host, or add a view to the SQL sandbox allowlist, without a direct
+  database connection. `permissions.options` queries `pg_catalog.pg_views`
+  live for the view picker rather than hardcoding a list.
+- **`sessions.list`/`sessions.get`** — the backing query for a thread view:
+  one session's full `execution_logs` across all its tasks, in order. Did not
+  exist before; `logs.list` only ever returned a flat, unscoped, 150-row-capped
+  slice of every agent's logs mixed together.
+- **Policy version history** — `argo_private.policies` gained `generation`;
+  `argo_private.policy_history` is an append-only snapshot of every prior
+  version, written by `fn_set_policy` immediately before it overwrites the
+  live row. Versions only on an actual change (compared field by field with
+  `IS DISTINCT FROM`) — `agents.update` calls `fn_set_policy` on every save,
+  including a bare `is_active` toggle, and that must not manufacture a
+  version. Exposed as `policy.history`.
+- **`max_concurrent_tasks`/`max_turn_seconds`** — `max_steps`/`max_retries`
+  bound a runaway *loop* within one task; neither bounded how many tasks one
+  agent runs at once or how long any single task may take start to finish.
+  `max_concurrent_tasks` (default 4) is enforced in `fn_dispatch_tasks`, which
+  now skips a candidate task if its agent already has that many tasks
+  `running`/`waiting_human`. `max_turn_seconds` (default: uncapped) is
+  enforced in `fn_watchdog` against `created_at`, terminal like `max_steps` —
+  straight to `failed`, no retry.
+
+None of this has a dashboard UI yet — no cancel button, no permission editor,
+no thread view, no version history panel. That is next.
