@@ -29,16 +29,17 @@ use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTi
 use pgrx::prelude::*;
 use pgrx::JsonB;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 pgrx::pg_module_magic!();
@@ -73,6 +74,15 @@ const MAX_REQUEST_BYTES: usize = 1 << 20;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 const SSE_TOTAL: Duration = Duration::from_secs(30);
 const SSE_INTERVAL: Duration = Duration::from_secs(1);
+/// A ticket minted by `POST /api/v1/events/ticket` (bearer-token gated) is
+/// good for one connection attempt, within this window.  This keeps the
+/// long-lived dashboard token out of the one URL that has to carry auth in
+/// the query string at all -- `EventSource` cannot set request headers --
+/// and therefore out of proxy access logs, browser history, and the
+/// Referrer header.  Reconnection is client-driven (see `startEvents` in
+/// web/index.html), not the browser's native retry-with-the-same-URL, since
+/// a single-use ticket cannot be replayed for that.
+const SSE_TICKET_TTL: Duration = Duration::from_secs(30);
 
 extension_sql_file!("../sql/control_plane.sql", finalize);
 
@@ -1098,6 +1108,94 @@ struct WebConfig {
 
 static WEB_THREADS: AtomicUsize = AtomicUsize::new(0);
 
+static SSE_TICKETS: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Mints a fresh single-use SSE ticket, sweeping expired ones first so this
+/// map cannot grow without bound from tickets nobody ever redeemed.
+fn mint_sse_ticket() -> String {
+    let ticket = nonce();
+    let now = Instant::now();
+    let mut tickets = SSE_TICKETS.lock().unwrap();
+    tickets.retain(|_, issued| now.duration_since(*issued) < SSE_TICKET_TTL);
+    tickets.insert(ticket.clone(), now);
+    ticket
+}
+
+/// Consumes a ticket if it exists and has not expired -- removing it either
+/// way, so the same ticket can never authorize a second connection.
+fn consume_sse_ticket(t: &str) -> bool {
+    let now = Instant::now();
+    let mut tickets = SSE_TICKETS.lock().unwrap();
+    tickets.retain(|_, issued| now.duration_since(*issued) < SSE_TICKET_TTL);
+    tickets.remove(t).is_some()
+}
+
+/// Per-IP request accounting for `rate_limited`.  Two independent windows:
+/// `general` (every request) and `auth_fail` (only 401 responses, a much
+/// tighter cap) so one slow analyst tab can never itself trip the lockout
+/// meant for a token-guessing script.  IPs are swept lazily, on the same
+/// call that would insert a new one, rather than on a timer -- there is no
+/// background thread appropriate to own that here.
+struct RateWindows {
+    general: HashMap<IpAddr, Vec<Instant>>,
+    auth_fail: HashMap<IpAddr, Vec<Instant>>,
+}
+static RATE_LIMIT: LazyLock<Mutex<RateWindows>> = LazyLock::new(|| {
+    Mutex::new(RateWindows { general: HashMap::new(), auth_fail: HashMap::new() })
+});
+const RATE_GENERAL_LIMIT: usize = 120;
+const RATE_GENERAL_WINDOW: Duration = Duration::from_secs(60);
+const RATE_AUTH_FAIL_LIMIT: usize = 20;
+const RATE_AUTH_FAIL_WINDOW: Duration = Duration::from_secs(300);
+
+/// Records one hit against `ip` in `window` (via `pick`) and reports whether
+/// it is still under `limit` -- sliding window, not a fixed bucket: entries
+/// older than the window are dropped before counting, on every call, so a
+/// burst right at a window boundary cannot double an attacker's effective
+/// budget the way a fixed-bucket reset would.
+fn rate_check(
+    map: &mut HashMap<IpAddr, Vec<Instant>>,
+    ip: IpAddr,
+    window: Duration,
+    limit: usize,
+) -> bool {
+    let now = Instant::now();
+    let hits = map.entry(ip).or_default();
+    hits.retain(|t| now.duration_since(*t) < window);
+    if hits.len() >= limit {
+        return false;
+    }
+    hits.push(now);
+    // An IP with no recent hits after the retain above is dead weight; drop
+    // it here rather than in a separate sweep pass so the map never holds
+    // more live entries than there are IPs that have hit it inside the
+    // window right now.
+    map.retain(|_, v| !v.is_empty());
+    true
+}
+
+/// `false` means "reject with 429" -- called once per request, before auth,
+/// for the general cap; `record_auth_failure` is called separately, only
+/// after a 401, for the tighter one.
+fn rate_limited(ip: IpAddr) -> bool {
+    let mut w = RATE_LIMIT.lock().unwrap();
+    !rate_check(&mut w.general, ip, RATE_GENERAL_WINDOW, RATE_GENERAL_LIMIT)
+}
+
+fn auth_failures_exceeded(ip: IpAddr) -> bool {
+    let mut w = RATE_LIMIT.lock().unwrap();
+    let hits = w.auth_fail.entry(ip).or_default();
+    let now = Instant::now();
+    hits.retain(|t| now.duration_since(*t) < RATE_AUTH_FAIL_WINDOW);
+    hits.len() >= RATE_AUTH_FAIL_LIMIT
+}
+
+fn record_auth_failure(ip: IpAddr) {
+    let mut w = RATE_LIMIT.lock().unwrap();
+    w.auth_fail.entry(ip).or_default().push(Instant::now());
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1160,11 +1258,14 @@ fn authorized(r: &HttpRequest, cfg: &WebConfig) -> bool {
             }
         }
     }
-    // EventSource cannot set request headers, so the stream endpoint accepts the
-    // token as a query parameter.  Nothing else does.
+    // EventSource cannot set request headers, so the stream endpoint accepts a
+    // short-lived, single-use ticket (see `mint_sse_ticket`/`consume_sse_ticket`)
+    // as a query parameter instead of the durable token itself. Minting one
+    // still requires the real bearer token, via POST /api/v1/events/ticket,
+    // which is not exempted from the check above.
     if r.route() == "/api/v1/events" {
-        if let Some(t) = query_param(r.query(), "token") {
-            return constant_time_eq(t.as_bytes(), cfg.token.as_bytes());
+        if let Some(t) = query_param(r.query(), "ticket") {
+            return consume_sse_ticket(&t);
         }
     }
     false
@@ -1320,11 +1421,12 @@ fn stream_events(s: &mut TcpStream, cfg: &WebConfig) {
          {sec}\r\n",
         sec = security_headers(),
     );
+    // No `retry:` field: a single-use ticket cannot authorize the browser's
+    // native retry-with-the-same-URL, so reconnection is client-driven
+    // instead (`startEvents` in web/index.html mints a fresh ticket and opens
+    // a new EventSource on every `error` event).
     let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
     if s.write_all(head.as_bytes()).is_err() {
-        return;
-    }
-    if s.write_all(b"retry: 2000\n\n").is_err() {
         return;
     }
 
@@ -1341,6 +1443,15 @@ fn stream_events(s: &mut TcpStream, cfg: &WebConfig) {
 }
 
 fn handle_web_connection(mut s: TcpStream, cfg: &WebConfig) {
+    let peer_ip = s.peer_addr().map(|a| a.ip()).ok();
+    if let Some(ip) = peer_ip {
+        if rate_limited(ip) {
+            respond(&mut s, "429 Too Many Requests", "application/json",
+                    "{\"ok\":false,\"error\":\"rate_limited\"}", "Retry-After: 60\r\n");
+            return;
+        }
+    }
+
     let Some(r) = read_http_request(&mut s) else { return };
     let path = r.route();
 
@@ -1401,9 +1512,35 @@ fn handle_web_connection(mut s: TcpStream, cfg: &WebConfig) {
         return;
     }
 
+    // Checked ahead of the real auth comparison, not after it, so a locked-out
+    // IP cannot keep spending a thread and a constant-time compare on every
+    // attempt -- only the failures that got this far ever counted against it.
+    if let Some(ip) = peer_ip {
+        if auth_failures_exceeded(ip) {
+            respond(&mut s, "429 Too Many Requests", "application/json",
+                    "{\"ok\":false,\"error\":\"rate_limited\"}", "Retry-After: 300\r\n");
+            return;
+        }
+    }
+
     if !authorized(&r, cfg) {
+        if let Some(ip) = peer_ip {
+            record_auth_failure(ip);
+        }
         respond(&mut s, "401 Unauthorized", "application/json",
                 "{\"ok\":false,\"error\":\"unauthorized\"}", "WWW-Authenticate: Bearer\r\n");
+        return;
+    }
+
+    if path == "/api/v1/events/ticket" {
+        if r.method != "POST" {
+            respond(&mut s, "405 Method Not Allowed", "application/json",
+                    "{\"ok\":false,\"error\":\"method_not_allowed\"}", "Allow: POST\r\n");
+            return;
+        }
+        let ticket = mint_sse_ticket();
+        let body = json!({"ok": true, "ticket": ticket, "expires_in": SSE_TICKET_TTL.as_secs()}).to_string();
+        respond_json(&mut s, "200 OK", &body);
         return;
     }
 
@@ -1617,14 +1754,73 @@ mod tests {
     }
 
     #[test]
-    fn query_token_is_accepted_only_for_the_event_stream() {
+    fn query_ticket_is_accepted_only_for_the_event_stream_and_only_once() {
         let cfg = WebConfig {
             token: "s3cr3t".into(),
             socket: PathBuf::from("/dev/null"),
             mock_enabled: false,
         };
-        assert!(authorized(&req("GET /api/v1/events?token=s3cr3t HTTP/1.1\r\n\r\n"), &cfg));
-        assert!(!authorized(&req("GET /api/v1/tasks?token=s3cr3t HTTP/1.1\r\n\r\n"), &cfg));
+        // The durable token itself, presented as a query param, must never
+        // authorize -- only a minted ticket does, and only for /api/v1/events.
+        assert!(!authorized(&req("GET /api/v1/events?token=s3cr3t HTTP/1.1\r\n\r\n"), &cfg));
+
+        let ticket = mint_sse_ticket();
+        assert!(authorized(
+            &req(&format!("GET /api/v1/events?ticket={ticket} HTTP/1.1\r\n\r\n")),
+            &cfg
+        ));
+        // Single-use: the same ticket does not authorize a second time.
+        assert!(!authorized(
+            &req(&format!("GET /api/v1/events?ticket={ticket} HTTP/1.1\r\n\r\n")),
+            &cfg
+        ));
+        // Not accepted on any other route, even freshly minted.
+        let ticket2 = mint_sse_ticket();
+        assert!(!authorized(
+            &req(&format!("GET /api/v1/tasks?ticket={ticket2} HTTP/1.1\r\n\r\n")),
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn sse_ticket_expires() {
+        let ticket = mint_sse_ticket();
+        {
+            let mut tickets = SSE_TICKETS.lock().unwrap();
+            let stale = Instant::now() - SSE_TICKET_TTL - Duration::from_secs(1);
+            tickets.insert(ticket.clone(), stale);
+        }
+        assert!(!consume_sse_ticket(&ticket));
+    }
+
+    #[test]
+    fn rate_limit_trips_after_the_general_cap_and_recovers_outside_the_window() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        for _ in 0..RATE_GENERAL_LIMIT {
+            assert!(!rate_limited(ip));
+        }
+        assert!(rate_limited(ip));
+
+        // A hit recorded outside the window does not count against the cap.
+        {
+            let mut w = RATE_LIMIT.lock().unwrap();
+            let old = Instant::now() - RATE_GENERAL_WINDOW - Duration::from_secs(1);
+            w.general.insert(ip, vec![old; RATE_GENERAL_LIMIT]);
+        }
+        assert!(!rate_limited(ip));
+    }
+
+    #[test]
+    fn auth_failure_lockout_is_independent_of_the_general_rate_limit() {
+        let ip: IpAddr = "203.0.113.8".parse().unwrap();
+        assert!(!auth_failures_exceeded(ip));
+        for _ in 0..RATE_AUTH_FAIL_LIMIT {
+            record_auth_failure(ip);
+        }
+        assert!(auth_failures_exceeded(ip));
+        // A different IP is unaffected.
+        let other: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(!auth_failures_exceeded(other));
     }
 
     #[test]

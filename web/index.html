@@ -183,6 +183,31 @@ async function settings(){
   $('#runSelftest').onclick=async()=>{try{$('#selftestOut').textContent='running…';const r=await api('/api/v1/selftest',{method:'POST'});$('#selftestOut').textContent=`passed ${r.passed}, failed ${r.failed}`+(r.failed?': '+(r.cases||[]).filter(c=>!c.ok).map(c=>c.name).join(', '):'')}catch(e){$('#selftestOut').textContent=e.message}}
 }
 function providerModal(p){$('#modal').classList.remove('hidden');$('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>${esc(p.name)}</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div><div class="field"><label>Base URL</label><input class="input" id="pUrl" value="${esc(p.base_url)}"></div><div class="field"><label>API key (leave blank to keep existing)</label><input type="password" class="input" id="pKey" autocomplete="new-password"></div><div class="field"><label><input type="checkbox" id="pEnabled" ${p.is_enabled?'checked':''}> Enabled</label></div><div class="field"><label><input type="checkbox" id="pPrivate" ${p.allow_private_network?'checked':''}> Allow loopback / private-network endpoint</label><div class="muted" style="font-size:12px">Needed for a local Ollama or an in-cluster gateway. Leaving this off is what stops this endpoint from being pointed at an internal address.</div></div><button class="btn primary" id="saveP">Save</button></div>`;$('#closeM').onclick=closeModal;$('#saveP').onclick=async()=>{try{await api('/api/v1/settings/provider',{method:'POST',body:JSON.stringify({provider_id:p.provider_id,base_url:$('#pUrl').value,api_key:$('#pKey').value,is_enabled:$('#pEnabled').checked,allow_private_network:$('#pPrivate').checked})});closeModal();toast('Provider saved');settings()}catch(e){toast(e.message)}}}
-function startEvents(){const url='/api/v1/events'+(tok()?'?token='+encodeURIComponent(tok()):'');const es=new EventSource(url);es.addEventListener('snapshot',e=>{try{const d=JSON.parse(e.data);$('#health').textContent='workers online';const live=$('#live');if(live&&d.tasks){live.innerHTML=d.tasks.slice(0,8).map(t=>`<div class="row" style="padding:5px 0"><span>${esc(t.agent)}</span><span>${status(t.status)}</span><span class="mono muted">step ${esc(t.step_count)}</span></div>`).join('')||'No activity'} }catch{}});es.onerror=()=>{$('#health').textContent='reconnecting'}}
+// The event stream authenticates with a short-lived, single-use ticket
+// (POST /api/v1/events/ticket, gated by the real bearer token) instead of
+// carrying the durable dashboard token in the URL -- EventSource cannot set
+// headers, so something has to go in the query string, and this keeps it
+// out of proxy access logs, browser history, and the Referrer header. The
+// server closes the stream every ~30s on purpose (see stream_events in
+// src/lib.rs) and does not send a `retry:` field, so reconnection is driven
+// from here: mint a fresh ticket and open a new EventSource on every error,
+// rather than relying on the browser's native retry-with-the-same-URL,
+// which a single-use ticket cannot satisfy.
+let esRetryTimer=null;
+async function startEvents(){
+  if(esRetryTimer){clearTimeout(esRetryTimer);esRetryTimer=null}
+  let url='/api/v1/events';
+  try{
+    const t=await api('/api/v1/events/ticket',{method:'POST'});
+    if(t.ticket)url+='?ticket='+encodeURIComponent(t.ticket)
+  }catch(e){
+    $('#health').textContent='reconnecting';
+    esRetryTimer=setTimeout(startEvents,2000);
+    return;
+  }
+  const es=new EventSource(url);
+  es.addEventListener('snapshot',e=>{try{const d=JSON.parse(e.data);$('#health').textContent='workers online';const live=$('#live');if(live&&d.tasks){live.innerHTML=d.tasks.slice(0,8).map(t=>`<div class="row" style="padding:5px 0"><span>${esc(t.agent)}</span><span>${status(t.status)}</span><span class="mono muted">step ${esc(t.step_count)}</span></div>`).join('')||'No activity'} }catch{}});
+  es.onerror=()=>{$('#health').textContent='reconnecting';es.close();esRetryTimer=setTimeout(startEvents,1500)};
+}
 nav();loadPage();startEvents();
 </script></body></html>

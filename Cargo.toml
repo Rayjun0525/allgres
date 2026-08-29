@@ -1,6 +1,6 @@
 [package]
 name = "allgres"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Allgres — Postgres Is All You Need. PostgreSQL-native agent control plane."
@@ -11,6 +11,7 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = ["pg17"]
+pg16 = ["pgrx/pg16"]
 pg17 = ["pgrx/pg17"]
 pg18 = ["pgrx/pg18"]
 pg_test = []

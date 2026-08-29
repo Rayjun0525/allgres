@@ -6,7 +6,7 @@ Allgres is a PostgreSQL-native agent control plane. It packages the PL/pgSQL
 state machine, a Rust/pgrx native runtime worker, outbound HTTP/HTTPS, and an
 embedded browser control panel into one PostgreSQL extension.
 
-Version 0.2.0. This is an MVP: read [Security model](#security-model) before
+Version 0.3.0. This is an MVP: read [Security model](#security-model) before
 putting it anywhere that matters.
 
 ## Status
@@ -36,6 +36,18 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
 - **Dashboard** — a single static HTML file (no build step) covering
   Overview, Agents, Projects, Run, Sessions, Approvals, Proposals, Tasks,
   Logs, and Settings, all reachable through one generic `/api/v1/rpc` route.
+- **Dashboard auth hardening** — a per-IP rate limit on `/api/v1/*` (a
+  tighter, separate cap on failed-auth responses specifically), and the
+  event stream authenticates with a short-lived single-use ticket instead
+  of the durable token sitting in a URL. See [Security
+  model](#security-model).
+- **A real, tested extension upgrade path and backup/restore drill** — a
+  frozen prior-version base makes `ALTER EXTENSION ... UPDATE` an actual
+  operation instead of an aspirational one, and a runnable drill
+  (`scripts/backup_drill.sh`) proves both a physical (`pg_basebackup`/PITR)
+  and a logical (`pg_dump`) backup/restore round-trip real data, including
+  per-agent role identity. See [Upgrades](#upgrades) and [Backup and
+  restore](#backup-and-restore).
 
 Not yet built:
 
@@ -43,7 +55,7 @@ Not yet built:
   native install and `docker-compose` exist today.
 - Per-operator identity/accounts — the dashboard has one shared token, not
   user accounts, so "who approved this" is unanswerable by design.
-- OAuth token exchange, secret key rotation, dashboard rate limiting.
+- OAuth token exchange, secret key rotation.
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
@@ -196,6 +208,26 @@ cross-origin page cannot read.
 
 Dashboard HTML is served with a per-response CSP nonce, `frame-ancestors
 'none'`, and `nosniff`.
+
+### Event stream auth and rate limiting
+
+`EventSource` cannot set request headers, so `/api/v1/events` has always had
+to carry auth in the query string somehow. It no longer carries the durable
+dashboard token itself: `POST /api/v1/events/ticket` (gated by the real
+bearer token, exactly like every other route) mints a single-use ticket good
+for one connection within 30 seconds; `/api/v1/events?ticket=...` consumes
+it. This keeps the long-lived credential out of proxy access logs, browser
+history, and the Referrer header. Because a ticket cannot be replayed, the
+dashboard reconnects itself (mints a fresh ticket, opens a new
+`EventSource`) rather than relying on the browser's native retry against the
+same URL.
+
+`/api/v1/*` also enforces a per-IP sliding-window rate limit (120
+requests/60s), and a separate, much tighter one specifically on failed-auth
+responses (20/300s) — checked before the token comparison itself runs, so a
+locked-out IP cannot keep spending a thread and a constant-time compare on
+every attempt. Both return `429`. This does not slow an attacker rotating
+source IPs; it is one layer, not a substitute for a real token.
 
 ### Outbound requests (SSRF)
 
@@ -385,12 +417,67 @@ return type changed. `scripts/gen-upgrade.sh <from> <to>` turns it into a
 versioned upgrade script:
 
 ```bash
-./scripts/gen-upgrade.sh 0.1.0 0.2.0    # writes sql/allgres--0.1.0--0.2.0.sql
+./scripts/gen-upgrade.sh 0.2.0 0.3.0    # writes sql/allgres--0.2.0--0.3.0.sql
 ```
 
 ```sql
-ALTER EXTENSION allgres UPDATE TO '0.2.0';
+ALTER EXTENSION allgres UPDATE TO '0.3.0';
 ```
+
+Every released version after 0.2.0 keeps a frozen base install script
+(`sql/allgres--0.2.0.sql`, and one more at each version bump from here on) —
+a real snapshot of what that version's schema actually was, not just the
+generated upgrade diff. That is what makes `ALTER EXTENSION ... UPDATE` a
+real, testable operation: `CREATE EXTENSION allgres VERSION '0.2.0'` installs
+an actual prior version, and `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from
+there is the same operation an in-place production upgrade would run. See
+KNOWN_ISSUES.md, item 18, for how this was verified and what version 0.2.0
+meant before this file existed.
+
+## Backup and restore
+
+`scripts/backup_drill.sh` is a runnable, re-runnable drill against a real
+local PostgreSQL 16 install (bare-metal, not `docker-compose` — that path is
+`scripts/smoke.sh`) that proves both backup strategies below actually work
+with Allgres installed, not just that the commands exist. It is what first
+caught the two bugs described in KNOWN_ISSUES.md, item 18; run it again if
+either regresses.
+
+**Physical (`pg_basebackup` + WAL archiving + PITR).** Covers everything,
+including per-agent PostgreSQL roles (`agents.pg_role`) automatically, since
+it copies the actual data files. Standard PostgreSQL procedure — take a
+base backup, archive WAL, restore with a `recovery_target_time` — nothing
+Allgres-specific to it.
+
+**Logical (`pg_dump` + `pg_dumpall --globals-only`).** Needs two things this
+extension does that a generic `pg_dump` would otherwise miss silently:
+
+- **Roles are cluster-global.** `agents.pg_role` values (real `NOLOGIN`
+  PostgreSQL roles, see [Per-agent roles](#per-agent-roles)) are not part of
+  any database dump — restoring onto a fresh cluster needs
+  `pg_dumpall --globals-only` applied first, or every agent's row-level
+  isolation is gone even though the row data itself restored fine.
+- **Restore in two passes, not one.** `sql/control_plane.sql` registers
+  every table holding real operator/agent state via
+  `pg_extension_config_dump()` (agents, sessions, tasks, policies and their
+  history, permissions, projects, execution logs, human approvals, change
+  proposals, provider secrets, and the outbound/SQL call queues), so a plain
+  `pg_dump` now actually includes this extension's data — it silently did
+  not, before KNOWN_ISSUES.md item 18. Restoring it needs
+  `pg_restore --schema-only` first (creates the extension and its own seed
+  data), then `pg_restore --data-only --disable-triggers` (loads everything
+  else with triggers off — `agents_ensure_policy`, see [Per-agent
+  roles](#per-agent-roles), would otherwise create a default policy row for
+  each restored agent that collides with that agent's real one arriving
+  right behind it in the same dump). A single-pass `pg_restore dump.file`
+  will fail on that collision; `--disable-triggers` alone does not fix it
+  either, since `pg_restore --help` documents that the flag only takes
+  effect during a `--data-only` restore.
+- One accepted, permanent limitation of the exclusion-filter approach: an
+  operator's own edit to a *built-in* provider row (base_url, is_enabled,
+  allow_private_network, a stored secret) does not survive a
+  `pg_dump`-based restore — only a wholly new provider row would. Physical
+  backup has no such gap.
 
 ## Tests
 

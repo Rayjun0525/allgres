@@ -1,6 +1,6 @@
 # Known issues and future work
 
-Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
+Status as of 0.3.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
 reached to verify against — see item 3): `fn_selftest` 78/78, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
@@ -10,8 +10,11 @@ socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
 `approvals.*`, `sessions.cancel`/`.list`/`.get`, `permissions.*`,
 `allowlist.*`, `policy.history`, `policy.rollback`, `proposals.*`) and the
 `web/index.html` pages that call them (`Projects`, `Sessions`, `Approvals`,
-`Proposals`, plus the extended `Agents` and `Settings`). Earlier builds
-were verified on PostgreSQL 18.6; nothing here is PG-version-specific.
+`Proposals`, plus the extended `Agents` and `Settings`). A real
+`ALTER EXTENSION allgres UPDATE TO '0.3.0'` from a real prior version, and a
+physical (`pg_basebackup`/PITR) and logical (`pg_dump`) backup/restore drill,
+are also verified — see item 18. Earlier builds were verified on
+PostgreSQL 18.6; nothing here is PG-version-specific.
 
 Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
@@ -51,23 +54,32 @@ set from inside a `SECURITY DEFINER` function and so is still nominal in the
 same nested-statement sense as before; the planner cost ceiling is what
 actually bounds that half.
 
-## 3. Docker image path is unverified
+## 3. Docker image path is unverified in this environment (but now in CI)
 
 The build was verified natively against PostgreSQL 18. The `Dockerfile` targets
 `postgres:17-bookworm` and builds `--features pg17`, and `scripts/smoke.sh`
-requires Docker; neither has been run. The PG17 build in particular has not been
-compiled since the parse-tree work landed.
+requires Docker; neither has been run *in this environment* (no Docker daemon
+reachable here). `.github/workflows/ci.yml`'s `docker-smoke` job now runs
+`scripts/smoke.sh` on every push, and `native-matrix` builds and runs
+`fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql` against real PG16/17/18
+native installs the same way this file's other native verification has always
+been done — see item 18. Until that workflow has actually run once on GitHub's
+infrastructure, "added to CI" is not the same claim as "verified there."
 
 `nodeToString` field names and `RawParseMode` are stable across 17 and 18, so
 this is expected to work, but "expected" is not "tested".
 
-## 4. Extension upgrade has only been installed fresh
+## 4. ~~Extension upgrade has only been installed fresh~~ — fixed
 
-`sql/allgres--0.1.0--0.2.0.sql` is generated and installed, but
-`ALTER EXTENSION allgres UPDATE TO '0.2.0'` has never been run against a real
-0.1.0 install. The script is the idempotent control plane replayed, so the risk
-is in the `DROP FUNCTION` statements for changed signatures and in the
-create-only seeds, not in the bulk of it.
+`sql/allgres--0.1.0--0.2.0.sql` used to be generated and installed but never
+actually exercised: no real, distinct "0.1.0" install had ever existed in
+this repository to upgrade *from* (see item 18 for the full account and the
+fix — a frozen, real `sql/allgres--0.2.0.sql` base and a version bump to
+0.3.0). `ALTER EXTENSION allgres UPDATE TO '0.3.0'` is now a real, tested
+operation: installed at a real prior version, seeded with realistic data
+across every subsystem, upgraded, and confirmed byte-for-byte identical
+afterward, plus `fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql` all
+green post-upgrade.
 
 ## 5. `allgres web` does not appear in `pg_stat_activity`
 
@@ -105,11 +117,13 @@ Changing `allgres.secret_key` makes every existing `enc:v1:` value undecryptable
 There is no re-encryption path and no warning. An operator rotating the key today
 has to re-enter every provider secret.
 
-## 8. No rate limiting on the dashboard API
+## 8. ~~No rate limiting on the dashboard API~~ — fixed
 
-`/api/v1/*` has a connection cap (64 threads) but no per-client rate limit. With
-a token set and loopback binding this is minor; it matters if the dashboard is
-ever exposed through a proxy.
+`/api/v1/*` had a connection cap (64 threads) but no per-client rate limit.
+Fixed in item 18: a per-IP sliding-window cap on every request, plus a
+separate, tighter cap specifically on failed-auth (401) responses so a
+token-guessing script locks out faster than an ordinary slow client ever
+could trip the general cap.
 
 ## 9. Non-ASCII identifiers in the parse-tree reader
 
@@ -720,3 +734,149 @@ identity attached to a decision or a rollback, for the same reason item
 one agent can propose (a persistently misbehaving agent can fill the
 pending queue, though every entry still requires an explicit operator
 decision — nothing auto-applies).
+
+## 18. Phase 5: operational stability — dashboard auth/SSE hardening, a real extension upgrade path, a PG-version CI matrix, and a backup/PITR drill that found two real bugs
+
+Phase 5 of the second review round: "운영 안정성" (operational stability) —
+backup/PITR, extension upgrade/rollback, a PG-version CI matrix, and
+dashboard auth/SSE hardening. Four mostly-independent pieces; each is
+described where it landed rather than duplicated here.
+
+- **SSE auth no longer puts the durable token in a URL.** `/api/v1/events`
+  used to accept the dashboard token itself as a query parameter (documented
+  necessity: `EventSource` cannot set request headers). That put a long-lived
+  credential in a place proxy access logs, browser history, and the
+  Referrer header can all see. Fixed with a short-lived (30s), single-use
+  ticket: `POST /api/v1/events/ticket` (gated by the real bearer token, same
+  as every other route) mints one; `GET /api/v1/events?ticket=...` consumes
+  it. Because a ticket cannot be replayed, reconnection is now client-driven
+  (`startEvents` in `web/index.html` mints a fresh ticket and opens a new
+  `EventSource` on every `error` event) rather than relying on the browser's
+  native retry-with-the-same-URL, which the server's own `retry:` field used
+  to invite every ~30s (the server deliberately closes the stream on that
+  cycle; see `stream_events` in `src/lib.rs`). Verified live end-to-end
+  through a real headless browser (Playwright/Chromium): token set, page
+  loaded, health line reaches "workers online," survives one full ~30s
+  server-side stream-close-and-reconnect cycle, zero console errors. Unit
+  tests: a ticket authorizes exactly once and expires; the raw token in the
+  query string no longer authorizes anything.
+- **Per-IP rate limiting on the dashboard API.** Two independent sliding
+  windows (`src/lib.rs`, `rate_limited`/`auth_failures_exceeded`): a general
+  cap (120 requests/60s) on every request, and a much tighter one (20
+  failed-auth responses/300s) specifically on 401s, checked *before* the
+  real token comparison runs so a locked-out IP cannot keep spending a
+  thread and a constant-time compare on every attempt. Both return 429.
+  Verified live against the real HTTP listener: hammering `/healthz`
+  actually trips 429 at the real socket layer, not just in a unit test.
+  Known limitation, inherent to any per-IP scheme: an attacker rotating
+  source IPs is not slowed by this at all.
+- **A real, tested extension upgrade path.** `sql/allgres--0.1.0--0.2.0.sql`
+  (item 4, before this fix) was never actually testable: this repository
+  never had a genuine, distinct "0.1.0" — every commit since the first one
+  regenerated that file as a byte-for-byte copy of whatever
+  `sql/control_plane.sql` said *right now*, so `ALTER EXTENSION ... UPDATE`
+  had nothing real to upgrade *from*. Fixed by freezing an actual base:
+  `sql/allgres--0.2.0.sql` is a real snapshot of the schema as it stood at
+  the end of 0.2.0 development (commit `12e1df7`), the crate version bumped
+  to 0.3.0, and `sql/allgres--0.2.0--0.3.0.sql` regenerated for real against
+  that base. The `Dockerfile` and `.github/workflows/ci.yml` both now copy
+  every `sql/allgres--*.sql` file into the extension directory (base
+  snapshots included, not only `--from--to` upgrade scripts, which is all
+  the old glob matched). Verified live: installed fresh at a real 0.2.0,
+  seeded realistic data across every subsystem (agents, sessions, tasks,
+  policies with history, pending/decided proposals, projects, a provider
+  secret), ran `ALTER EXTENSION allgres UPDATE TO '0.3.0'`, confirmed every
+  piece of seeded state came back byte-for-byte identical (hashed
+  comparison) and reachable through the real `dashboard_rpc` entry point,
+  then `fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql` all green
+  post-upgrade. Going forward, each future version bump freezes one more
+  base snapshot the same way.
+- **A PG-version CI matrix** (`.github/workflows/ci.yml`, new). A
+  `native-matrix` job builds and runs `fn_selftest`/`tests/smoke.sql`/
+  `tests/e2e_mock.sql` against real, natively-installed PostgreSQL 16, 17,
+  and 18 (PGDG apt packages), plus the Rust unit test suite, on every push
+  and PR. A separate `docker-smoke` job runs the existing
+  `scripts/smoke.sh` (the Dockerfile/docker-compose path). Neither job has
+  actually run on GitHub's infrastructure yet as of this writing — see item
+  3 for what "added to CI" does and does not claim until it has.
+- **A backup/PITR drill that found two real bugs**, both now fixed and both
+  covered by `scripts/backup_drill.sh`, a runnable, re-runnable script (not
+  just documentation) that this session actually ran, repeatedly, against a
+  real local PostgreSQL 16 install:
+  - **`pg_dump` silently excluded 100% of Allgres's runtime data.**
+    PostgreSQL excludes data belonging to an extension's own tables from a
+    logical dump by default — schema only, regenerated fresh by
+    `CREATE EXTENSION` on restore — unless a table is explicitly registered
+    via `pg_extension_config_dump()`. Nothing in `sql/control_plane.sql`
+    ever called it. Confirmed live before fixing: a real agent, session,
+    and task, dumped with `pg_dump -Fc` and restored into a fresh cluster,
+    came back with *none* of it — every agent, session, task, policy, log,
+    and secret gone, with no error anywhere to say so; the restored
+    database looked like a normal, working, empty install. Fixed by
+    registering every table that holds real operator/agent state (agents,
+    policies, permissions, demo_sales, llm_providers, and
+    sql_sandbox_allowlist with a filter excluding exactly the rows section
+    10's own seed inserts, since those get recreated fresh by
+    `CREATE EXTENSION` either way; policy_history, projects, sessions,
+    tasks, execution_logs, human_approvals, change_proposals, llm_secrets,
+    outbound_calls, and sql_calls unconditionally). `sql_function_allowlist`
+    and `oauth_states` are deliberately left unregistered — see the comment
+    at "10b." in `sql/control_plane.sql` for why. One real, permanent cost
+    of the seed-row exclusion: an operator's own edit to a *built-in*
+    provider row (base_url, is_enabled, allow_private_network, a stored
+    secret) does not survive a `pg_dump`-based restore — only a wholly new
+    provider row would. Physical backup (`pg_basebackup`/PITR) has no such
+    gap.
+  - **Built-in LLM provider rows had random, per-install ids.** Excluding
+    the seeded `llm_providers` rows from the dump (above) only works if
+    every install's 'openai' row has the *same* `provider_id` — otherwise
+    any dumped row that references it by id (`llm_secrets`, `outbound_calls`)
+    points at an id that doesn't exist on the restore target, and the
+    restore fails on a foreign key violation. It used to be
+    `gen_random_uuid()`, different every install. Confirmed live: exactly
+    this failure, on the first attempt. Fixed by giving each of the five
+    built-in providers a fixed, hardcoded `provider_id` in the seed insert.
+    Forward-only, by construction of `ON CONFLICT (name) DO NOTHING`: an
+    install that already seeded these rows before this fix keeps its old
+    random id (the row already exists by name, so the fixed-id insert is
+    skipped); only a fresh install, or a restore onto one, gets the fixed
+    id from here on. No migration is provided for an already-seeded
+    install to adopt the fixed id retroactively — out of scope for this
+    pass.
+  - **The correct restore technique needed a real fix too, not just a flag.**
+    `pg_restore --disable-triggers` is the standard companion to
+    `pg_extension_config_dump` (it is meant to stop exactly the
+    `agents_ensure_policy` trigger, item 15, from firing while the dumped
+    `agents` rows load and creating a default `policies` row that then
+    collides with that same agent's real one arriving right behind it) —
+    but `pg_restore --help` says outright that the flag only takes effect
+    during a `--data-only` restore; combined with a full restore it is
+    silently a no-op, discovered live when it did not fix anything. The
+    correct technique, confirmed live, is two passes: `pg_restore
+    --schema-only` (creates the extension and its own seed data), then
+    `pg_restore --data-only --disable-triggers` (loads everything else,
+    triggers off). `scripts/backup_drill.sh` and README, "Upgrades," both
+    now say this explicitly rather than a bare `pg_restore dump.file`.
+  - Also verified, once both bugs above were fixed: point-in-time recovery
+    actually lands at the intended timestamp, not just "replay everything"
+    (an agent created before the recovery target is present after restore;
+    one created after it is not); a per-agent PostgreSQL role
+    (`agents.pg_role`, item 15) and the row-level isolation it gates both
+    survive a full logical dump/restore into a wholly fresh cluster, not
+    only a physical one; `fn_selftest` is clean on both restored instances.
+  - `scripts/backup_drill.sh` is safely re-runnable (confirmed three times
+    in a row): it cannot clean up a previous run's test data by deleting it
+    (`execution_logs` is append-only by design — enforced by trigger and by
+    `REVOKE`, not just convention — so a repeat run's cleanup attempt itself
+    failed loudly the first time this was tried, which is the append-only
+    invariant working as intended, not a script bug to route around), so
+    each run's test agents get a unique per-run suffix instead and the tiny
+    rows a run leaves behind are permanent, exactly like every other
+    agent's audit trail in this database.
+
+Still not done, deliberately out of scope for this pass: automated backup
+scheduling or retention (this is a drill an operator runs, not a cron job);
+a migration path for an already-seeded install to adopt the new fixed
+provider ids; secret key rotation (item 7, unrelated to this pass but still
+open); per-operator dashboard accounts (items 10/11, still open — the SSE
+ticket mechanism authenticates the *session*, not a *person*).
