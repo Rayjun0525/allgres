@@ -14,7 +14,9 @@ putting it anywhere that matters.
 Implemented and verified (natively on PostgreSQL 16.15; see [Known
 limitations](#known-limitations) for what the PG17/Docker path still needs):
 
-- **Agent control plane** — policy, permissions, delegation, retries,
+- **Agent control plane** — policy, permissions, delegation (bounded by a
+  per-agent depth cap, an ancestor-cycle check, and a per-session total-task
+  cap — see `max_delegation_depth`/`max_session_tasks` below), retries,
   per-agent concurrency (`max_concurrent_tasks`) and wall-clock
   (`max_turn_seconds`) caps, and a versioned policy history.
 - **SQL sandbox** — parse-tree-based analysis, execution under the
@@ -355,8 +357,9 @@ between what the agent can touch and what only an operator can:
   may contain `system_prompt` and/or `llm_config.{model,temperature,
   max_tokens}` — nothing else. Any other key anywhere in the payload
   (`max_steps`, `max_retries`, `max_concurrent_tasks`, `max_turn_seconds`,
-  `llm_config.provider`/`base_url`, permissions — anything at all) is
-  rejected outright, not silently dropped, and nothing is applied.
+  `max_delegation_depth`, `max_session_tasks`, `llm_config.provider`/
+  `base_url`, permissions — anything at all) is rejected outright, not
+  silently dropped, and nothing is applied.
 - **The agent can never expand its own trust boundary.** Its resource
   envelope stays operator-only via `agents.update`, unchanged by this
   action; `llm_config.provider`/`base_url` stay locked to the

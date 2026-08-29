@@ -229,6 +229,13 @@ DROP FUNCTION IF EXISTS allgres_private.fn_execute_sql(uuid, text);
 DROP FUNCTION IF EXISTS allgres_public.fn_create_session(uuid, text);
 DROP FUNCTION IF EXISTS allgres_public.fn_decide_approval(uuid, boolean);
 DROP FUNCTION IF EXISTS allgres_public.fn_set_policy(uuid, text, int, int, jsonb);
+-- fn_set_policy gains max_delegation_depth/max_session_tasks (see "1.
+-- Roles" -- no, "2. Schemas" -- the policies table comment near
+-- max_concurrent_tasks/max_turn_seconds) -- same signature-growth rule as
+-- above: the 0.2.0-era 8-arg version needs its own explicit drop, not just
+-- the 5-arg one three lines up, or an upgrade leaves both overloads
+-- installed side by side.
+DROP FUNCTION IF EXISTS allgres_public.fn_set_policy(uuid, text, int, int, jsonb, int, int, boolean);
 
 -- The SQL sandbox no longer inspects statement text with regexes; it reads the
 -- tree produced by PostgreSQL's own parser (allgres.analyze_sql).  These are
@@ -311,6 +318,23 @@ ALTER TABLE allgres_private.policies
   ADD COLUMN IF NOT EXISTS max_concurrent_tasks int NOT NULL DEFAULT 4 CHECK (max_concurrent_tasks > 0),
   ADD COLUMN IF NOT EXISTS max_turn_seconds int CHECK (max_turn_seconds IS NULL OR max_turn_seconds > 0);
 
+-- max_delegation_depth/max_session_tasks: delegate (see fn_submit_result) had no
+-- resource bound of its own at all before this -- an external review pointed
+-- out that with mutual delegate permissions granted (A may delegate to B, B
+-- to A), nothing stopped an unbounded A -> B -> A -> B -> ... chain, since
+-- each child task gets its own fresh max_steps/max_retries/max_turn_seconds
+-- budget under max_concurrent_tasks alone. Two independent bounds, not one:
+-- max_delegation_depth caps how many delegate hops deep one chain may go
+-- (checked against tasks.delegation_depth, below), which alone does not
+-- catch a long non-repeating chain (A -> B -> C -> D -> ...) that never
+-- revisits an agent -- max_session_tasks caps the total number of tasks one
+-- session may ever spawn, regardless of shape. Both operator-configurable,
+-- same envelope-field pattern as max_concurrent_tasks/max_turn_seconds: an
+-- agent's own propose_change can never touch either (see fn_submit_result).
+ALTER TABLE allgres_private.policies
+  ADD COLUMN IF NOT EXISTS max_delegation_depth int NOT NULL DEFAULT 5 CHECK (max_delegation_depth >= 0),
+  ADD COLUMN IF NOT EXISTS max_session_tasks int NOT NULL DEFAULT 100 CHECK (max_session_tasks > 0);
+
 -- Append-only: one row per version that was ever live, populated by
 -- fn_set_policy just before it overwrites allgres_private.policies.  There is no
 -- row for the current version -- that's what allgres_private.policies itself is.
@@ -327,6 +351,10 @@ CREATE TABLE IF NOT EXISTS allgres_private.policy_history (
   changed_at           timestamptz NOT NULL DEFAULT now(),
   UNIQUE (agent_id, generation)
 );
+
+ALTER TABLE allgres_private.policy_history
+  ADD COLUMN IF NOT EXISTS max_delegation_depth int NOT NULL DEFAULT 5,
+  ADD COLUMN IF NOT EXISTS max_session_tasks int NOT NULL DEFAULT 100;
 
 CREATE INDEX IF NOT EXISTS policy_history_agent_idx
   ON allgres_private.policy_history (agent_id, generation DESC);
@@ -460,6 +488,13 @@ CREATE TABLE IF NOT EXISTS allgres_private.tasks (
 -- first turn.
 ALTER TABLE allgres_private.tasks
   ADD COLUMN IF NOT EXISTS started_at timestamptz;
+
+-- 0 for a root task (no parent); a delegate child is always
+-- parent.delegation_depth + 1 -- see fn_submit_result's delegate branch, which
+-- enforces max_delegation_depth against this before ever inserting a
+-- child row.
+ALTER TABLE allgres_private.tasks
+  ADD COLUMN IF NOT EXISTS delegation_depth int NOT NULL DEFAULT 0;
 
 -- 'cancelled' is distinct from 'failed': an operator stopping a task is a
 -- different signal than the agent's own logic giving up.  Unnamed CHECK
@@ -1788,6 +1823,8 @@ DECLARE
   v_child uuid;
   v_err_n int;
   v_allowed boolean;
+  v_cycle boolean;
+  v_session_task_count int;
   v_url text;
   v_host text;
   v_reason text;
@@ -2048,11 +2085,76 @@ BEGIN
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
+
+    -- Three independent bounds on delegation, none of which existed before
+    -- an external review pointed out the gap: with mutual delegate
+    -- permissions (A may delegate to B, B to A -- a legitimate,
+    -- operator-granted setup, not a misconfiguration), nothing stopped an
+    -- unbounded A -> B -> A -> B -> ... chain, since each child task got
+    -- its own fresh max_steps/max_retries/max_turn_seconds budget under
+    -- max_concurrent_tasks alone -- none of which bound the chain as a
+    -- whole.
+    --
+    -- 1. max_delegation_depth: how many hops deep one chain may go.
+    IF t.delegation_depth + 1 > p.max_delegation_depth THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'delegate_depth_exceeded', 'agent_name', v_parsed->>'agent_name',
+                            'depth', t.delegation_depth, 'max_delegation_depth', p.max_delegation_depth)
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    -- 2. Ancestor-cycle check: depth alone does not catch a chain that
+    -- revisits an agent well within its depth budget (A -> B -> A with a
+    -- generous max_delegation_depth) -- walk this task's own ancestor
+    -- chain (parent_task_id, including this task itself as the base case)
+    -- and refuse if the target agent already appears in it.
+    WITH RECURSIVE ancestors AS (
+      SELECT task_id, agent_id, parent_task_id FROM allgres_private.tasks WHERE task_id = p_task_id
+      UNION ALL
+      SELECT tk.task_id, tk.agent_id, tk.parent_task_id
+      FROM allgres_private.tasks tk
+      JOIN ancestors an ON tk.task_id = an.parent_task_id
+    )
+    SELECT EXISTS (SELECT 1 FROM ancestors WHERE agent_id = v_target) INTO v_cycle;
+    IF v_cycle THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'delegate_cycle', 'agent_name', v_parsed->>'agent_name')
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    -- 3. max_session_tasks: a long, never-repeating chain (A -> B -> C ->
+    -- D -> ...) defeats both checks above without ever revisiting an
+    -- agent or exceeding a generous depth cap -- this bounds the total
+    -- task count of the session as a whole, regardless of shape.
+    SELECT count(*) INTO v_session_task_count
+    FROM allgres_private.tasks WHERE session_id = t.session_id;
+    IF v_session_task_count >= p.max_session_tasks THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'delegate_session_task_limit', 'agent_name', v_parsed->>'agent_name',
+                            'session_tasks', v_session_task_count, 'max_session_tasks', p.max_session_tasks)
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
     INSERT INTO allgres_private.tasks (
-      session_id, agent_id, parent_task_id, status, input
+      session_id, agent_id, parent_task_id, status, input, delegation_depth
     ) VALUES (
       t.session_id, v_target, p_task_id, 'queued',
-      COALESCE(v_parsed->'input', '{}'::jsonb)
+      COALESCE(v_parsed->'input', '{}'::jsonb), t.delegation_depth + 1
     ) RETURNING task_id INTO v_child;
     UPDATE allgres_private.tasks
     SET status = 'completed',
@@ -2177,21 +2279,26 @@ DECLARE
   v_rest jsonb := '[]'::jsonb;
   v_el jsonb;
 BEGIN
+  -- Fail closed on the requested provider, never silently substitute a
+  -- different one. This used to fall back to whichever enabled provider
+  -- sorted first by name when v_name didn't resolve -- not a convenience,
+  -- a real privacy/security bug: an agent (or operator) configured for one
+  -- provider specifically, who then disables it or mistypes its name,
+  -- could have every subsequent prompt silently routed to a completely
+  -- different provider with no error, no log entry distinguishing "sent
+  -- where configured" from "sent wherever was first alphabetically" --
+  -- confirmed by inspection, an external review caught it. There is no
+  -- fallback_provider_id or similar explicit opt-in for cross-provider
+  -- fallback in this file; if that is ever wanted, it needs to be a real,
+  -- named policy an operator turns on, not the default.
   SELECT * INTO v_prov
   FROM allgres_private.llm_providers
   WHERE name = v_name AND is_enabled
   LIMIT 1;
 
-  IF NOT FOUND THEN
-    SELECT * INTO v_prov
-    FROM allgres_private.llm_providers
-    WHERE is_enabled
-    ORDER BY name
-    LIMIT 1;
-  END IF;
-
   IF v_prov.provider_id IS NULL THEN
-    RAISE EXCEPTION 'no enabled llm provider' USING ERRCODE = 'P0001';
+    RAISE EXCEPTION 'llm provider "%" is not configured or not enabled -- refusing to silently substitute a different provider', v_name
+      USING ERRCODE = 'P0001';
   END IF;
 
   -- No secret is fetched or handled here on purpose. This function's result
@@ -3020,7 +3127,9 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_set_policy(
   p_llm_config jsonb DEFAULT NULL,
   p_max_concurrent_tasks int DEFAULT NULL,
   p_max_turn_seconds int DEFAULT NULL,
-  p_clear_max_turn_seconds boolean DEFAULT false
+  p_clear_max_turn_seconds boolean DEFAULT false,
+  p_max_delegation_depth int DEFAULT NULL,
+  p_max_session_tasks int DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -3034,6 +3143,8 @@ DECLARE
   v_cfg jsonb;
   v_concurrent int;
   v_turn_secs int;
+  v_deleg_depth int;
+  v_session_tasks int;
   v_changed boolean;
 BEGIN
   SELECT * INTO p_row FROM allgres_private.policies WHERE agent_id = p_agent_id FOR UPDATE;
@@ -3053,21 +3164,26 @@ BEGIN
   -- for that, distinct from simply not passing the parameter.
   v_turn_secs  := CASE WHEN p_clear_max_turn_seconds THEN NULL
                        ELSE COALESCE(p_max_turn_seconds, p_row.max_turn_seconds) END;
+  v_deleg_depth   := COALESCE(p_max_delegation_depth, p_row.max_delegation_depth);
+  v_session_tasks := COALESCE(p_max_session_tasks, p_row.max_session_tasks);
 
   v_changed := v_prompt IS DISTINCT FROM p_row.system_prompt
     OR v_steps IS DISTINCT FROM p_row.max_steps
     OR v_retries IS DISTINCT FROM p_row.max_retries
     OR v_cfg IS DISTINCT FROM p_row.llm_config
     OR v_concurrent IS DISTINCT FROM p_row.max_concurrent_tasks
-    OR v_turn_secs IS DISTINCT FROM p_row.max_turn_seconds;
+    OR v_turn_secs IS DISTINCT FROM p_row.max_turn_seconds
+    OR v_deleg_depth IS DISTINCT FROM p_row.max_delegation_depth
+    OR v_session_tasks IS DISTINCT FROM p_row.max_session_tasks;
 
   IF v_changed THEN
     INSERT INTO allgres_private.policy_history (
       agent_id, generation, system_prompt, max_steps, max_retries, llm_config,
-      max_concurrent_tasks, max_turn_seconds
+      max_concurrent_tasks, max_turn_seconds, max_delegation_depth, max_session_tasks
     ) VALUES (
       p_row.agent_id, p_row.generation, p_row.system_prompt, p_row.max_steps,
-      p_row.max_retries, p_row.llm_config, p_row.max_concurrent_tasks, p_row.max_turn_seconds
+      p_row.max_retries, p_row.llm_config, p_row.max_concurrent_tasks, p_row.max_turn_seconds,
+      p_row.max_delegation_depth, p_row.max_session_tasks
     );
   END IF;
 
@@ -3078,6 +3194,8 @@ BEGIN
       llm_config = v_cfg,
       max_concurrent_tasks = v_concurrent,
       max_turn_seconds = v_turn_secs,
+      max_delegation_depth = v_deleg_depth,
+      max_session_tasks = v_session_tasks,
       generation = generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
       updated_at = now()
   WHERE agent_id = p_agent_id;
@@ -3175,7 +3293,8 @@ BEGIN
 
   RETURN allgres_public.fn_set_policy(
     p_agent_id, h.system_prompt, h.max_steps, h.max_retries, h.llm_config,
-    h.max_concurrent_tasks, h.max_turn_seconds, h.max_turn_seconds IS NULL
+    h.max_concurrent_tasks, h.max_turn_seconds, h.max_turn_seconds IS NULL,
+    h.max_delegation_depth, h.max_session_tasks
   );
 END;
 $fn$;
@@ -3657,7 +3776,7 @@ BEGIN
 
     -- Only on first creation, so an upgrade never overwrites a tuned policy.
     UPDATE allgres_private.policies
-    SET system_prompt = $prompt$You are ARGO analyst. Reply with one JSON object only. No markdown, no prose.
+    SET system_prompt = $prompt$You are the Allgres analyst. Reply with one JSON object only. No markdown, no prose.
 
 Allowed:
 {"action":"final_answer","answer":"..."}
@@ -3801,6 +3920,8 @@ DECLARE
   v_role2 text;
   v_proposal uuid;
   v_prompt_before text;
+  v_deleg_a uuid;
+  v_deleg_b uuid;
 BEGIN
   SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM allgres_private.policies WHERE agent_id = v_agent;
@@ -4536,6 +4657,117 @@ BEGIN
   END;
   v := v || jsonb_build_array(jsonb_build_object('name', 'provision_agent_role_rejects_unknown_agent', 'ok', ok));
 
+  -- 24. delegate's three independent resource bounds -- an external review
+  --     pointed out delegate had none of its own before this: with mutual
+  --     delegate permissions granted (a legitimate, operator-granted
+  --     setup), nothing stopped an unbounded A -> B -> A -> B -> ... chain,
+  --     since each child task got a fresh max_steps/max_retries/
+  --     max_turn_seconds budget under max_concurrent_tasks alone -- none of
+  --     which bounded the chain as a whole. Two fixed, reused test agents
+  --     (same repeatable-fn_selftest reasoning as selftest_provision_agent
+  --     above), granted delegate permission to each other so the guards
+  --     under test are the only thing stopping a cycle, not a missing
+  --     permission. 24a/24c build their ancestor chain directly via
+  --     UPDATE/INSERT rather than by driving delegate hop by hop, since
+  --     only the enforcement at the final hop is under test.
+  SELECT agent_id INTO v_deleg_a FROM allgres_private.agents WHERE name = 'selftest_delegate_a';
+  IF NOT FOUND THEN
+    v_deleg_a := (allgres_public.fn_create_agent('selftest_delegate_a')->>'agent_id')::uuid;
+  END IF;
+  SELECT agent_id INTO v_deleg_b FROM allgres_private.agents WHERE name = 'selftest_delegate_b';
+  IF NOT FOUND THEN
+    v_deleg_b := (allgres_public.fn_create_agent('selftest_delegate_b')->>'agent_id')::uuid;
+  END IF;
+  PERFORM allgres_public.fn_grant_permission(v_deleg_a, 'agent', 'selftest_delegate_b');
+  PERFORM allgres_public.fn_grant_permission(v_deleg_b, 'agent', 'selftest_delegate_a');
+
+  -- 24a. a chain already at max_delegation_depth may not delegate one hop
+  --      further, even with a permitted target and room in every other budget.
+  UPDATE allgres_private.policies SET max_delegation_depth = 2 WHERE agent_id = v_deleg_a;
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest delegate_depth')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  UPDATE allgres_private.tasks SET delegation_depth = 2 WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"delegate"}',
+    'parsed', jsonb_build_object('action', 'delegate', 'agent_name', 'selftest_delegate_b')
+  ));
+  SELECT count(*) INTO n_logs FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'delegate_depth_exceeded';
+  ok := n_logs = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'delegate_depth_exceeded_rejected', 'ok', ok));
+  UPDATE allgres_private.policies SET max_delegation_depth = 5 WHERE agent_id = v_deleg_a;
+
+  -- 24b. delegating back to an agent already in this task's own ancestor
+  --      chain is rejected regardless of depth headroom -- a long chain
+  --      that keeps revisiting the same two agents would otherwise pass
+  --      24a's check forever.
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest delegate_cycle')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  INSERT INTO allgres_private.tasks (session_id, agent_id, parent_task_id, status, delegation_depth)
+  VALUES (v_sid, v_deleg_b, v_tid, 'running', 1)
+  RETURNING task_id INTO v_tid2;
+  PERFORM allgres_public.fn_next_step(v_tid2);
+  sub := allgres_public.fn_submit_result(v_tid2, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"delegate"}',
+    'parsed', jsonb_build_object('action', 'delegate', 'agent_name', 'selftest_delegate_a')
+  ));
+  SELECT count(*) INTO n_logs FROM allgres_private.execution_logs
+    WHERE task_id = v_tid2 AND role = 'error' AND content->>'reason' = 'delegate_cycle';
+  ok := n_logs = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'delegate_cycle_rejected', 'ok', ok));
+
+  -- 24c. independent of depth or cycle shape, max_session_tasks bounds a
+  --      session's total task count outright -- the guard a long,
+  --      never-repeating chain (A -> B -> C -> D -> ...) cannot evade.
+  UPDATE allgres_private.policies SET max_session_tasks = 1 WHERE agent_id = v_deleg_a;
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest delegate_session_cap')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"delegate"}',
+    'parsed', jsonb_build_object('action', 'delegate', 'agent_name', 'selftest_delegate_b')
+  ));
+  SELECT count(*) INTO n_logs FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'delegate_session_task_limit';
+  ok := n_logs = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'delegate_session_task_limit_rejected', 'ok', ok));
+  UPDATE allgres_private.policies SET max_session_tasks = 100 WHERE agent_id = v_deleg_a;
+
+  -- 24d. none of the above are so tight a legitimate delegate within every
+  --      budget cannot go through, and the child's delegation_depth is set
+  --      correctly (parent + 1) so a later hop's own depth check has the
+  --      right number to compare against.
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest delegate_ok')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"delegate"}',
+    'parsed', jsonb_build_object('action', 'delegate', 'agent_name', 'selftest_delegate_b')
+  ));
+  v_tid2 := NULLIF(sub->>'child_task_id', '')::uuid;
+  ok := v_tid2 IS NOT NULL;
+  ok := ok AND (SELECT agent_id FROM allgres_private.tasks WHERE task_id = v_tid2) = v_deleg_b;
+  ok := ok AND (SELECT delegation_depth FROM allgres_private.tasks WHERE task_id = v_tid2) = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'delegate_succeeds_within_budget', 'ok', ok));
+
+  -- 25. build_llm_http fails closed on an unconfigured/disabled provider
+  --     instead of silently substituting whichever other enabled provider
+  --     sorted first by name -- an external review caught the old
+  --     fallback: a real privacy/security bug, since it could quietly
+  --     reroute a prompt to a completely different provider than the one
+  --     actually configured, with no error and no log entry distinguishing
+  --     the two.
+  BEGIN
+    PERFORM allgres_private.build_llm_http(jsonb_build_object(
+      'llm_config', jsonb_build_object('provider', 'selftest_nonexistent_provider')
+    ));
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%selftest_nonexistent_provider%is not configured or not enabled%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'llm_provider_fails_closed_not_substituted', 'ok', ok));
+
   PERFORM allgres_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -4965,6 +5197,8 @@ BEGIN
             'generation', p.generation,
             'max_concurrent_tasks', p.max_concurrent_tasks,
             'max_turn_seconds', p.max_turn_seconds,
+            'max_delegation_depth', p.max_delegation_depth,
+            'max_session_tasks', p.max_session_tasks,
             'permissions', COALESCE((
               SELECT jsonb_agg(jsonb_build_object('type', x.resource_type, 'ref', x.resource_ref)
                      ORDER BY x.resource_type, x.resource_ref)
@@ -4992,7 +5226,9 @@ BEGIN
         CASE WHEN p_request ? 'llm_config'  THEN p_request->'llm_config'           ELSE NULL END,
         CASE WHEN p_request ? 'max_concurrent_tasks' THEN (p_request->>'max_concurrent_tasks')::int ELSE NULL END,
         CASE WHEN p_request ? 'max_turn_seconds' THEN (p_request->>'max_turn_seconds')::int ELSE NULL END,
-        (p_request ? 'max_turn_seconds') AND (p_request->>'max_turn_seconds') IS NULL
+        (p_request ? 'max_turn_seconds') AND (p_request->>'max_turn_seconds') IS NULL,
+        CASE WHEN p_request ? 'max_delegation_depth' THEN (p_request->>'max_delegation_depth')::int ELSE NULL END,
+        CASE WHEN p_request ? 'max_session_tasks' THEN (p_request->>'max_session_tasks')::int ELSE NULL END
       );
       RETURN jsonb_build_object('ok', true, 'agent_id', v_id);
 
@@ -5001,7 +5237,8 @@ BEGIN
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.generation DESC)
         FROM (
           SELECT version_id, generation, system_prompt, max_steps, max_retries,
-                 llm_config, max_concurrent_tasks, max_turn_seconds, changed_at
+                 llm_config, max_concurrent_tasks, max_turn_seconds,
+                 max_delegation_depth, max_session_tasks, changed_at
           FROM allgres_private.policy_history
           WHERE agent_id = (p_request->>'agent_id')::uuid
         ) q

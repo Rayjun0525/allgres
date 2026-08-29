@@ -1329,3 +1329,108 @@ verified once more, across all of it: `fn_selftest` 78/78,
 `tests/smoke.sql`/`tests/e2e_mock.sql` green on a fresh install and on a
 real 0.2.0 → 0.3.0 upgrade seeded with a real agent beforehand, and
 `scripts/backup_drill.sh` green end to end.
+
+## 23. Two more external reviews: a silent LLM provider fallback, unbounded delegation, and a real leftover "ARGO" name
+
+Two independent full-repository reviews of 0.3.0 (one broad architectural
+pass, one security-focused) named two P0s in agent behavior — not
+infrastructure this time, the actual state machine — plus a genuine
+leftover of the retired project name that item 19's rename swept missed
+because it lived in seed *data*, not an identifier. All three confirmed
+against the real code before fixing, then re-verified live: fresh install,
+a real 0.2.0 → 0.3.0 upgrade seeded beforehand, `fn_selftest` (83/83, five
+new cases), `tests/smoke.sql`/`tests/e2e_mock.sql`, and the dashboard_rpc
+round trip for the two new operator-configurable fields this added.
+
+- **`build_llm_http` silently rerouted a prompt to a different LLM
+  provider.** If an agent's (or operator's) configured `llm_config.provider`
+  didn't resolve to an enabled row — disabled, mistyped, never
+  configured — the function fell back to whichever *other* enabled
+  provider sorted first by name, with no error and no log entry
+  distinguishing "sent where configured" from "sent wherever was first
+  alphabetically." Confirmed by reading the function: this was not a
+  defensive fallback for "no provider at all" (that case already raised);
+  it specifically covered "the requested one doesn't exist or is
+  disabled" by substituting a different one. An operator who disables a
+  provider, or an agent whose `llm_config.provider` has a typo, could have
+  every subsequent prompt silently sent to a completely different LLM
+  vendor — a real privacy/security issue, not a convenience. Fixed by
+  removing the substitution entirely: an unresolvable provider now raises
+  `llm provider "%" is not configured or not enabled -- refusing to
+  silently substitute a different provider`, which `fn_dispatch_tasks`'s
+  existing exception handling already turned into a task-level error (the
+  same plumbing the old "no enabled llm provider" case already used) — no
+  new error path needed, just removing the one that quietly avoided it.
+  There is no configurable explicit fallback (a `fallback_provider_id` or
+  similar) added here; if cross-provider fallback is ever wanted, it needs
+  to be a real, named, operator-opted-in policy, not a default. Selftest:
+  `llm_provider_fails_closed_not_substituted` (calls `build_llm_http`
+  directly with an unconfigured provider name, asserts it raises rather
+  than returning a substituted provider's spec).
+
+- **`delegate` had no resource bound of its own at all.** A child task
+  created by `delegate` got its own fresh `max_steps`/`max_retries`/
+  `max_turn_seconds` budget, gated only by `max_concurrent_tasks` (how
+  many tasks may run *at once*, not how many a chain may ever create).
+  With mutual delegate permissions granted between two agents — a
+  legitimate, operator-granted setup for real collaboration, not a
+  misconfiguration — nothing stopped an unbounded `A -> B -> A -> B -> ...`
+  chain. Fixed with three independent checks in `fn_submit_result`'s
+  `delegate` branch, none of which alone would have been enough:
+  - `tasks.delegation_depth` (new column; 0 for a root task, always
+    `parent.delegation_depth + 1` for a delegate child) checked against a
+    new operator-configurable `policies.max_delegation_depth` (default 5,
+    same envelope-field pattern and `propose_change` exclusion as
+    `max_concurrent_tasks`/`max_turn_seconds` — see item above and
+    `fn_submit_result`'s `propose_change` handling for the allow-list this
+    was added to *not* be part of).
+  - An ancestor-cycle check: a chain that keeps revisiting the same two
+    agents can stay well within a generous depth cap forever, so a
+    recursive CTE walks the current task's own `parent_task_id` chain (the
+    task itself included as the base case) and refuses to delegate to any
+    agent already in it, regardless of depth headroom.
+  - A new `policies.max_session_tasks` (default 100) caps a session's
+    total task count outright — the guard a long, *never-repeating* chain
+    (`A -> B -> C -> D -> ...`) cannot evade, since it revisits no agent
+    and can stay under any reasonable depth cap.
+  All three are checked in the delegating task's own agent's policy, so
+  the strictest agent to actually attempt a delegate hop in a chain is the
+  one whose caps apply at that hop — a defense-in-depth choice, not a
+  precise global invariant, but the actual security property (nothing
+  unbounded) holds regardless of which agent's policy happened to be
+  consulted. `fn_set_policy` gained two parameters (`p_max_delegation_depth`,
+  `p_max_session_tasks`), threaded through `policy_history`,
+  `fn_rollback_policy`, and `dashboard_rpc`'s `agents.list`/`agents.update`/
+  `policy.history` exactly like `max_concurrent_tasks`/`max_turn_seconds`
+  already were; the web UI's agent editor and policy-history view gained
+  matching fields. Since `fn_set_policy`'s signature grew (8 args to 10),
+  the file's own established rule for this applies — `CREATE OR REPLACE
+  FUNCTION` does not replace a shorter-signature function, it creates a
+  second overload, which an upgrade would otherwise leave installed
+  alongside the new one — so the previous 8-arg signature gets its own
+  explicit `DROP FUNCTION IF EXISTS`, confirmed live on a real 0.2.0 →
+  0.3.0 upgrade: exactly one `fn_set_policy` overload (the new 10-arg one)
+  exists afterward. Selftest: `delegate_depth_exceeded_rejected`,
+  `delegate_cycle_rejected`, `delegate_session_task_limit_rejected` (each
+  built by placing a task directly at the boundary being tested — an
+  already-at-cap depth, an ancestor chain, a session already at its task
+  cap — rather than driving a real chain hop by hop, since only the
+  enforcement at the final hop is under test), and
+  `delegate_succeeds_within_budget` (a legitimate delegate inside every
+  budget still succeeds, and the child's `delegation_depth` is set
+  correctly for a later hop's own check). `delegate` previously had *no*
+  `fn_selftest` coverage at all — KNOWN_ISSUES item 6 named this
+  explicitly ("child task creation is covered by unit-level assertions
+  only").
+
+- **A real "ARGO" leftover, in seed data rather than an identifier.**
+  Item 19's rename swept every internal schema/role/GUC name, but the
+  default seed agent (`analyst`)'s own `system_prompt` — real,
+  user-visible product content, not an internal identifier — still read
+  literally "You are ARGO analyst." on a fresh install. Confirmed by
+  grep, fixed to "You are the Allgres analyst." This is create-only seed
+  data (see "10. Seed data"'s own header comment: replaying this file
+  must not clobber an operator's edited prompt), so an *existing* install
+  that already seeded the old prompt keeps it — this only changes what a
+  fresh install (or a restore onto one) gets from here on, the same
+  forward-only shape as the fixed provider ids in item 18.
