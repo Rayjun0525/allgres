@@ -127,11 +127,24 @@ Layered, strongest first:
    not depend on the analysis being complete;
 4. `transaction_read_only` and a 5s `statement_timeout` — both real now that
    execution is a top-level statement instead of nested inside one;
-5. only non-volatile functions, checked against `pg_proc`. Volatility is the
-   property that separates a read from a side effect: `pg_read_file`,
-   `pg_ls_dir`, `lo_import`, `dblink`, `nextval` and `pg_sleep` are volatile,
-   while the aggregates, string, date and json functions an analyst needs are
-   not. Unknown names are rejected rather than assumed safe;
+5. only non-volatile, non-security-definer functions built into `pg_catalog`,
+   checked against `pg_proc`. Volatility is the property that separates a
+   read from a side effect: `pg_read_file`, `pg_ls_dir`, `lo_import`,
+   `dblink`, `nextval` and `pg_sleep` are volatile, while the aggregates,
+   string, date and json functions an analyst needs are not — but volatility
+   alone is not a security boundary. `current_setting()` is `STABLE`, not
+   volatile, and `current_setting('allgres.secret_key', true)` handed back
+   the key that encrypts every provider secret in the system, confirmed by
+   actually running it through the sandbox. Three more gates close that:
+   `pg_catalog` only, which also rules out every user-defined
+   `SECURITY DEFINER` function (Allgres's own control-plane functions
+   included) and every extension function such as `pgcrypto`'s or
+   `dblink`'s; `NOT prosecdef`, as defense in depth; and an explicit denylist
+   of `pg_catalog` functions that disclose configuration, session, or
+   process state despite being non-volatile (`current_setting`,
+   `set_config`, `version`, `inet_server_addr`, `txid_current`, and
+   similar). Unknown names, and anything failing any of these gates, are
+   rejected rather than assumed safe;
 6. the parse tree must be exactly one non-writing `SELECT` (this also catches
    `SELECT ... INTO` and data-modifying CTEs, which are `SelectStmt` nodes);
 7. every relation named must be schema-qualified, outside the reserved schemas,
@@ -190,7 +203,17 @@ and the OAuth token exchange:
 - URLs containing `userinfo@host` are rejected outright rather than parsed;
 - the HTTP client follows **zero** redirects, so an allowlisted host cannot
   redirect into an internal one;
-- `http_get` additionally requires a per-agent `http_host` permission.
+- `http_get` additionally requires a per-agent `http_host` permission;
+- every one of these checks so far is against the URL's host **string**,
+  which says nothing about where DNS actually points it: a hostname that
+  resolves to a public address when the agent's request is validated can
+  resolve to `127.0.0.1` or an RFC1918 address by the time the worker
+  connects (DNS rebinding). The Rust worker closes that with a custom `ureq`
+  resolver (`GuardedResolver`) that re-checks every address DNS actually
+  returns — the same blocked ranges, reimplemented once in Rust to match the
+  SQL check exactly — immediately before connecting, on the same call that
+  will use it. There is no separate resolve-then-connect step for a rebind
+  to land in: ureq only ever dials an address this resolver returned.
 
 A per-agent `llm_config` can no longer set `base_url`. The endpoint comes only
 from the operator-managed provider row, which is validated on write and again at

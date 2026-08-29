@@ -2,7 +2,7 @@
 
 Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
-reached to verify against — see item 3): `fn_selftest` 56/56, `tests/smoke.sql`
+reached to verify against — see item 3): `fn_selftest` 65/65, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
 socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
 (`curl` against `/api/v1/rpc`, CSRF checks included), including a live
@@ -183,8 +183,13 @@ The gaps this pass filled:
   `max_concurrent_tasks` (default 4) is enforced in `fn_dispatch_tasks`, which
   now skips a candidate task if its agent already has that many tasks
   `running`/`waiting_human`. `max_turn_seconds` (default: uncapped) is
-  enforced in `fn_watchdog` against `created_at`, terminal like `max_steps` —
-  straight to `failed`, no retry.
+  enforced in `fn_watchdog`, terminal like `max_steps` — straight to
+  `failed`, no retry. It measures against `tasks.started_at` (set once, in
+  `fn_next_step`, the first time a task leaves `'queued'`), not
+  `created_at` — an earlier version used `created_at`, which meant a task
+  held back by `max_concurrent_tasks` could get killed by `max_turn_seconds`
+  before it ever ran a single turn, one limit starving a task the other
+  limit hadn't even started timing yet. See item 12.
 
 All of it now has a dashboard UI. `web/index.html` gained three pages
 (`Projects`, `Sessions`, `Approvals`) and extended two existing ones
@@ -238,3 +243,112 @@ identity attached to a cancel, grant, or approval decision, for the same
 reason item 10 gives (no accounts system yet); no confirmation dialog
 before `sessions.cancel` beyond the browser's own — an operator fat-fingering
 Cancel loses a running task with no undo.
+
+## 12. Six correctness/security regressions from items 10 and 11, found by external review
+
+An external review of the branch (before merge) found six real bugs in the
+work described in items 10 and 11 above — none caught by `fn_selftest` at
+the time, because the tests checked that a row got written, not that the
+row was ever read back by the code path that mattered. All six are fixed
+and each now has selftest coverage that checks the actual consuming path,
+not just the write; two were also reproduced and re-verified live against
+the real background worker (not just through `fn_selftest`'s direct calls)
+before and after the fix. `fn_selftest` was 56/56 throughout — all six bugs
+were sitting under passing tests.
+
+- **`execute_sql` raced the next LLM call.** `fn_dispatch_tasks` checked
+  `outbound_calls` for in-flight work before redispatching a task, but not
+  `sql_calls`. A task that had just emitted `execute_sql` stayed `'running'`
+  with no `outbound_calls` row at all — the SQL result queued into
+  `sql_calls` instead — so the next pump would call `fn_next_step` on it
+  again, rebuild the same dangling `execute_sql` request from
+  `execution_logs` (no tool result existed for it yet), and fire a second,
+  racing LLM call before the pending SQL result was ever seen. Fixed by
+  adding the same `NOT EXISTS` guard for `sql_calls` that already existed
+  for `outbound_calls`. Reproduced and re-verified live: queuing a real
+  `execute_sql` turn and watching the actual background worker's pump loop
+  now produces exactly one `sql_calls` row and exactly one follow-up
+  `outbound_calls` row, in order, with no duplicate or racing call.
+  Selftest: `dispatch_holds_back_pending_sql_task`.
+- **An operator's `await_human` reply never reached the model.**
+  `fn_decide_approval` correctly wrote the reply as an `'operator'`-role log
+  row (item 10), but `fn_next_step`'s message-assembly loop only recognized
+  `('system', 'user', 'assistant', 'tool')` — `'operator'` fell through
+  silently. The reply was visible on the dashboard; the agent's next
+  `call_llm` never carried it. Fixed by adding `'operator'` to that list,
+  mapped to a `'user'` turn the same way `'tool'` already is. Selftest
+  (`approval_reply_feeds_back_into_log`) only ever checked that the log row
+  existed; it now also asserts the reply string appears in
+  `fn_next_step`'s own `messages` output
+  (`operator_reply_reaches_llm_messages`).
+- **`fn_cancel_session` didn't stop what was already queued.** It set the
+  task to `'cancelled'` but left any `'queued'`/`'in_flight'`
+  `outbound_calls`/`sql_calls` row untouched, and `fn_claim_outbound` /
+  `fn_claim_sql` claimed by row status alone with no join back to the
+  task — so a cancelled session's SQL or HTTP request could still fire.
+  Fixed two ways: `fn_cancel_session` now marks those rows `'lost'` itself
+  (matching what `fn_complete_outbound`/`fn_complete_sql` already do when a
+  result comes back for a no-longer-running task), and both claim functions
+  now join to `tasks` and only claim a row whose task is still `'running'`,
+  as defense in depth against the same race for *any* terminal transition,
+  not only cancel. `fn_watchdog`'s `max_turn_seconds` reclaim got the same
+  cleanup for the same reason. Selftest: `cancel_session_voids_pending_calls`.
+- **The SQL sandbox's function check let `current_setting()` through.**
+  `fn_validate_sql` only checked `provolatile <> 'v'` — but `STABLE` means
+  "cannot change within one statement," not "safe to expose to an agent."
+  `current_setting()` is `STABLE`. `SELECT current_setting('allgres.secret_key',
+  true)` — the key that encrypts every provider secret in the system —
+  validated as ordinary safe SQL and, run under the `sandbox` role exactly
+  as the sandbox executes real agent SQL, returned the key. Reproduced and
+  confirmed live before fixing. Closed with three more gates on top of the
+  volatility check: `pg_catalog` only (rules out every user-defined
+  `SECURITY DEFINER` function — Allgres's own control-plane functions
+  included — and every extension function), `NOT prosecdef`, and an
+  explicit denylist of `pg_catalog` functions that disclose configuration,
+  session, or process state despite being non-volatile (`current_setting`,
+  `set_config`, `version`, `inet_server_addr`, `txid_current`, and similar
+  — see `fn_validate_sql`'s `c_denied_fns` for the full list). Re-verified
+  live after the fix, including that the block survives an uppercase call
+  and a schema-qualified one (`pg_catalog.current_setting(...)`). Selftest:
+  five new `sandbox_reject` cases, including the exact secret-key query and
+  a call to Allgres's own `argo_private.secret_key()`.
+- **SSRF: the outbound guard checked a hostname string, never the address it
+  resolves to.** `argo_private.is_blocked_host` (used at SQL build/queue
+  time) and the Rust HTTP client's own DNS resolution were two separate
+  steps with nothing tying them together: a hostname that resolves to a
+  public address when the agent's request is validated can resolve to
+  `127.0.0.1` or an RFC1918 address by the time the worker actually
+  connects (DNS rebinding), and no amount of re-checking the string closes
+  that. Fixed with a custom `ureq` resolver (`GuardedResolver` in
+  `src/lib.rs`) that re-checks every address DNS actually returns against
+  the same blocked ranges (reimplemented once in Rust,
+  `is_blocked_ip`/`is_blocked_ipv4`, to match the SQL check), immediately
+  before ureq connects to it — not a separate resolve-then-check step a
+  rebind could land in between, the resolver *is* the thing ureq dials.
+  Threading the per-call "is this provider allowed to hit private
+  addresses" decision through required a new `outbound_calls.allow_private`
+  column, set from `llm_providers.allow_private_network` when a call is
+  queued (`http_get` never sets it — the tool path always validates with
+  `p_allow_private = false`). Reproduced and confirmed live: a provider
+  pointed at a hostname resolving to `127.0.0.1`, on a port where a real
+  mock server was listening, failed with "host not found" rather than
+  reaching it, over three retries.
+- **`max_turn_seconds` could kill a task before its first turn.** It
+  measured against `created_at`, which includes time spent `'queued'`
+  waiting for a `max_concurrent_tasks` slot — so a busy agent's own
+  concurrency cap could starve a task long enough for the wall-clock limit
+  to fail it having never run once. Fixed by adding `tasks.started_at`, set
+  once by `fn_next_step` the first time a task leaves `'queued'`, and
+  measuring from there instead; a task still `'queued'` has `started_at
+  IS NULL` and the watchdog leaves it alone entirely, however old
+  `created_at` is. Selftest: `max_turn_seconds_spares_queued_task`
+  (new) alongside the existing `max_turn_seconds_expires_stale_task`,
+  which now backdates `started_at` rather than `created_at`.
+
+None of these were architectural — every fix is local to the function that
+had the gap. The pattern across all six is the same one item 6 already
+names for the two untested watchdog reclaim loops: something was wired up
+and superficially tested, but the test checked that a write happened, not
+that the thing reading it back behaved correctly. Worth treating as a
+standing question for anything still on this list: does the test for it
+check the write, or the read?

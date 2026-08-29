@@ -214,6 +214,16 @@ CREATE TABLE IF NOT EXISTS argo_private.tasks (
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
 
+-- Set once, in fn_next_step, the first time a task leaves 'queued' -- distinct
+-- from created_at because a task can sit 'queued' for a while waiting for a
+-- max_concurrent_tasks slot before it ever runs a turn. max_turn_seconds (see
+-- fn_watchdog) measures from here, not from created_at: the queue wait is not
+-- part of the agent's own turn budget, and counting it would let a busy
+-- agent's own concurrency cap starve tasks that are still waiting for their
+-- first turn.
+ALTER TABLE argo_private.tasks
+  ADD COLUMN IF NOT EXISTS started_at timestamptz;
+
 -- 'cancelled' is distinct from 'failed': an operator stopping a task is a
 -- different signal than the agent's own logic giving up.  Unnamed CHECK
 -- constraints get Postgres's default <table>_<column>_check name, so this is
@@ -327,6 +337,22 @@ CREATE TABLE IF NOT EXISTS argo_private.outbound_calls (
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now()
 );
+
+-- The URL's host string is checked against argo_private.is_blocked_host at
+-- queue time (see check_outbound_url), but the worker connects by hostname
+-- later, on its own HTTP thread, with its own DNS resolution -- a hostname
+-- that resolves to a public IP right now can resolve to 127.0.0.1 or an
+-- RFC1918 address by the time the request actually goes out (DNS
+-- rebinding), and the string check has nothing left to say about that. The
+-- worker re-checks every IP the host actually resolves to immediately
+-- before connecting; this column is the one piece of context it cannot
+-- derive from the URL alone -- whether *this* call's provider opted into
+-- loopback/private endpoints -- so it knows whether that recheck should
+-- reject a private address or accept it. http_get never sets it: the tool
+-- path passes p_allow_private = false into check_outbound_url unconditionally,
+-- so it stays at its default here too.
+ALTER TABLE argo_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS allow_private boolean NOT NULL DEFAULT false;
 
 CREATE INDEX IF NOT EXISTS outbound_ready_idx
   ON argo_private.outbound_calls (created_at)
@@ -1004,6 +1030,28 @@ DECLARE
     'argo_private', 'allgres', 'pg_catalog', 'pg_toast', 'information_schema'
   ];
 
+  -- Volatility alone is not a security boundary: STABLE means "cannot change
+  -- within one statement", not "safe to expose to an agent". current_setting
+  -- is STABLE, and current_setting('allgres.secret_key', true) hands the key
+  -- that encrypts every provider secret in the system straight back as a SQL
+  -- result -- confirmed by actually running it under the sandbox role. This
+  -- denylist blocks the pg_catalog functions that disclose configuration,
+  -- session, or process state despite being non-volatile; the namespace and
+  -- prosecdef checks below close the same gap for anything not built in.
+  c_denied_fns constant text[] := ARRAY[
+    'current_setting', 'set_config',
+    'current_database', 'current_catalog', 'current_schema', 'current_schemas',
+    'current_user', 'session_user',
+    'inet_client_addr', 'inet_client_port', 'inet_server_addr', 'inet_server_port',
+    'pg_backend_pid', 'pg_postmaster_start_time', 'pg_conf_load_time',
+    'pg_trigger_depth', 'pg_is_in_recovery',
+    'version',
+    'txid_current', 'txid_current_snapshot', 'txid_status',
+    'txid_snapshot_xmin', 'txid_snapshot_xmax', 'txid_snapshot_xip',
+    'pg_current_xact_id', 'pg_current_xact_id_if_assigned', 'pg_current_snapshot',
+    'pg_last_wal_receive_lsn', 'pg_last_wal_replay_lsn', 'pg_last_xact_replay_timestamp'
+  ];
+
   v_sql      text;
   v_tree     jsonb;
   v_ctes     text[];
@@ -1098,15 +1146,32 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- Only non-volatile functions.  Even though execution now happens as the
-  -- unprivileged `sandbox` role (see fn_run_sandboxed_sql), volatility stays
-  -- the check here rather than plain SELECT-list DDL/DML detection, because it
-  -- is what actually separates a read from a side effect: pg_read_file,
-  -- pg_ls_dir, lo_import, dblink, nextval and pg_sleep are all volatile, while
-  -- the aggregates, string, date and json functions an analyst needs are not.
-  -- Default-deny: an unknown name is rejected rather than assumed safe.
+  -- Only non-volatile, non-security-definer functions built into pg_catalog.
+  -- Even though execution now happens as the unprivileged `sandbox` role
+  -- (see fn_run_sandboxed_sql), volatility stays part of the check here
+  -- rather than plain SELECT-list DDL/DML detection, because it is what
+  -- actually separates a read from a side effect: pg_read_file, pg_ls_dir,
+  -- lo_import, dblink, nextval and pg_sleep are all volatile, while the
+  -- aggregates, string, date and json functions an analyst needs are not.
+  -- It is not sufficient on its own, though (see c_denied_fns above), so
+  -- three more gates apply: pg_catalog only -- an agent can never call a
+  -- user-defined function, which rules out every SECURITY DEFINER function
+  -- Allgres itself ships (they run as this validator's owner, not as
+  -- `sandbox`, and were never meant to be agent-callable) and every
+  -- extension function such as pgcrypto's or dblink's; NOT prosecdef, as
+  -- defense in depth in case a future pg_catalog entry is ever
+  -- security-definer; and the explicit denylist. Default-deny throughout: an
+  -- unknown name, or one that fails any gate, is rejected rather than
+  -- assumed safe.
   FOR v_fn IN SELECT jsonb_array_elements(COALESCE(v_tree->'functions', '[]'::jsonb)) LOOP
-    SELECT count(*) FILTER (WHERE p.provolatile <> 'v'),
+    IF lower(v_fn->>'name') = ANY (c_denied_fns) THEN
+      RAISE EXCEPTION 'fn_validate_sql: function "%" is not allowed', v_fn->>'name'
+        USING ERRCODE = 'P0001';
+    END IF;
+
+    SELECT count(*) FILTER (
+             WHERE p.provolatile <> 'v' AND NOT p.prosecdef AND n.nspname = 'pg_catalog'
+           ),
            count(*)
     INTO v_safe_fns, v_all_fns
     FROM pg_catalog.pg_proc p
@@ -1119,7 +1184,7 @@ BEGIN
         USING ERRCODE = 'P0001';
     END IF;
     IF v_safe_fns <> v_all_fns THEN
-      RAISE EXCEPTION 'fn_validate_sql: function "%" is volatile and not allowed', v_fn->>'name'
+      RAISE EXCEPTION 'fn_validate_sql: function "%" is volatile, security-definer, or not a pg_catalog builtin, and not allowed', v_fn->>'name'
         USING ERRCODE = 'P0001';
     END IF;
   END LOOP;
@@ -1235,7 +1300,7 @@ BEGIN
 
   IF t.status = 'queued' THEN
     UPDATE argo_private.tasks
-    SET status = 'running', updated_at = now()
+    SET status = 'running', started_at = now(), updated_at = now()
     WHERE task_id = p_task_id;
     t.status := 'running';
   END IF;
@@ -1303,10 +1368,14 @@ BEGIN
     WHERE task_id = p_task_id
     ORDER BY step_number, created_at
   LOOP
-    IF v_log.role IN ('system', 'user', 'assistant', 'tool') THEN
+    -- 'operator' carries a human's reply to an await_human approval (see
+    -- fn_decide_approval); it has to reach the model as a 'user' turn just
+    -- like a tool result does, or the human's answer is visible on the
+    -- dashboard but the agent it was meant for never sees it.
+    IF v_log.role IN ('system', 'user', 'assistant', 'tool', 'operator') THEN
       v_messages := v_messages || jsonb_build_array(
         jsonb_build_object(
-          'role', CASE WHEN v_log.role = 'tool' THEN 'user' ELSE v_log.role END,
+          'role', CASE WHEN v_log.role IN ('tool', 'operator') THEN 'user' ELSE v_log.role END,
           'content', argo_private.log_content_text(v_log.content)
         )
       );
@@ -1780,7 +1849,8 @@ BEGIN
     'kind', v_prov.kind,
     'url', v_url,
     'headers', v_headers,
-    'body', v_body
+    'body', v_body,
+    'allow_private', v_prov.allow_private_network
   );
 END;
 $fn$;
@@ -1809,6 +1879,17 @@ BEGIN
         SELECT 1 FROM argo_private.outbound_calls o
         WHERE o.task_id = tasks.task_id
           AND o.status IN ('queued', 'in_flight')
+      )
+      -- A task that just emitted execute_sql stays 'running' with no
+      -- outbound_calls row at all -- the SQL result hasn't come back yet, it
+      -- queued into sql_calls instead. Without this guard the next pump
+      -- would call fn_next_step on it again before that result exists,
+      -- rebuild the same dangling execute_sql request from execution_logs,
+      -- and fire a second LLM call racing the pending SQL result.
+      AND NOT EXISTS (
+        SELECT 1 FROM argo_private.sql_calls sc
+        WHERE sc.task_id = tasks.task_id
+          AND sc.status IN ('queued', 'in_flight')
       )
     ORDER BY created_at
     FOR UPDATE SKIP LOCKED
@@ -1844,9 +1925,10 @@ BEGIN
       CONTINUE;
     END;
     INSERT INTO argo_private.outbound_calls (
-      task_id, kind, url, request_headers, request_body, status
+      task_id, kind, url, request_headers, request_body, status, allow_private
     ) VALUES (
-      t.task_id, 'llm', http->>'url', http->'headers', http->'body', 'queued'
+      t.task_id, 'llm', http->>'url', http->'headers', http->'body', 'queued',
+      COALESCE((http->>'allow_private')::boolean, false)
     ) RETURNING call_id INTO v_id;
     v_out := v_out || jsonb_build_array(jsonb_build_object('call_id', v_id, 'task_id', t.task_id));
     v_n := v_n + 1;
@@ -1869,12 +1951,20 @@ DECLARE
   v_n int := 0;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
+  -- The task-status join is defense in depth against fn_cancel_session (or a
+  -- watchdog terminal transition) racing a row from 'queued' to claimable
+  -- between when it was inserted and when this runs: a call whose task is no
+  -- longer 'running' must never be claimed and actually sent, cancelled or
+  -- not -- fn_complete_outbound already discards its result in that case,
+  -- but by then the request has left the process.
   FOR r IN
-    SELECT call_id, task_id, kind, tool, url, request_headers, request_body
-    FROM argo_private.outbound_calls
-    WHERE status = 'queued'
-    ORDER BY created_at
-    FOR UPDATE SKIP LOCKED
+    SELECT o.call_id, o.task_id, o.kind, o.tool, o.url, o.request_headers, o.request_body,
+           o.allow_private
+    FROM argo_private.outbound_calls o
+    JOIN argo_private.tasks t ON t.task_id = o.task_id
+    WHERE o.status = 'queued' AND t.status = 'running'
+    ORDER BY o.created_at
+    FOR UPDATE OF o SKIP LOCKED
     LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
   LOOP
     UPDATE argo_private.outbound_calls
@@ -1887,7 +1977,8 @@ BEGIN
       'tool', r.tool,
       'url', r.url,
       'headers', r.request_headers,
-      'body', r.request_body
+      'body', r.request_body,
+      'allow_private', r.allow_private
     ));
     v_n := v_n + 1;
   END LOOP;
@@ -1911,12 +2002,17 @@ DECLARE
   v_n int := 0;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
+  -- Same task-status join as fn_claim_outbound, and for the same reason: a
+  -- cancelled or otherwise-terminal task's queued SQL must never actually
+  -- execute under the sandbox role, even if it was queued before the task
+  -- left 'running'.
   FOR r IN
-    SELECT call_id, task_id, agent_id, sql
-    FROM argo_private.sql_calls
-    WHERE status = 'queued'
-    ORDER BY created_at
-    FOR UPDATE SKIP LOCKED
+    SELECT sc.call_id, sc.task_id, sc.agent_id, sc.sql
+    FROM argo_private.sql_calls sc
+    JOIN argo_private.tasks t ON t.task_id = sc.task_id
+    WHERE sc.status = 'queued' AND t.status = 'running'
+    ORDER BY sc.created_at
+    FOR UPDATE OF sc SKIP LOCKED
     LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
   LOOP
     UPDATE argo_private.sql_calls
@@ -2217,18 +2313,24 @@ BEGIN
     n := n + 1;
   END LOOP;
 
-  -- max_turn_seconds: a wall-clock ceiling on a task's whole lifetime, not
-  -- tied to any particular in-flight call -- a task can blow this budget by
-  -- taking many fast steps just as easily as one slow one, so it is checked
-  -- against created_at rather than any single call's updated_at.  Terminal,
-  -- like max_steps: no retry, straight to failed.
+  -- max_turn_seconds: a wall-clock ceiling on a task's whole lifetime once it
+  -- has actually started, not tied to any particular in-flight call -- a
+  -- task can blow this budget by taking many fast steps just as easily as
+  -- one slow one, so it is checked against started_at rather than any single
+  -- call's updated_at. Measured from started_at, not created_at: a 'queued'
+  -- task waiting on a max_concurrent_tasks slot has never run a turn, so
+  -- started_at is still NULL for it and this loop leaves it alone entirely
+  -- -- otherwise a busy agent's own concurrency cap would starve a task long
+  -- enough to have this kill it before its first turn. Terminal, like
+  -- max_steps: no retry, straight to failed.
   FOR r IN
     SELECT t.task_id, t.session_id, t.step_count
     FROM argo_private.tasks t
     JOIN argo_private.policies p USING (agent_id)
-    WHERE t.status IN ('queued', 'running', 'waiting_human')
+    WHERE t.status IN ('running', 'waiting_human')
       AND p.max_turn_seconds IS NOT NULL
-      AND t.created_at < now() - make_interval(secs => p.max_turn_seconds)
+      AND t.started_at IS NOT NULL
+      AND t.started_at < now() - make_interval(secs => p.max_turn_seconds)
     FOR UPDATE SKIP LOCKED
   LOOP
     PERFORM argo_private.append_log(
@@ -2237,6 +2339,15 @@ BEGIN
     UPDATE argo_private.tasks
     SET status = 'failed', error = 'turn_timeout', step_count = step_count + 1, updated_at = now()
     WHERE task_id = r.task_id;
+    -- Same reasoning as fn_cancel_session: whatever this task had queued or
+    -- in flight when its wall clock ran out must not still fire after it is
+    -- failed.
+    UPDATE argo_private.outbound_calls
+    SET status = 'lost', error = 'turn_timeout', updated_at = now()
+    WHERE task_id = r.task_id AND status IN ('queued', 'in_flight');
+    UPDATE argo_private.sql_calls
+    SET status = 'lost', updated_at = now()
+    WHERE task_id = r.task_id AND status IN ('queued', 'in_flight');
     PERFORM argo_private.maybe_complete_session(r.session_id);
     n := n + 1;
   END LOOP;
@@ -2797,6 +2908,28 @@ BEGIN
     v_n := v_n + 1;
   END LOOP;
 
+  -- A 'queued' outbound/SQL call has not been claimed yet, so marking the
+  -- task cancelled above does not stop fn_claim_outbound/fn_claim_sql from
+  -- picking it up next pump (see the task-status guard added there) -- but
+  -- that guard only helps once the row is still 'queued' when it runs.
+  -- Cancel it here too, before that race window opens, so a cancelled
+  -- session cannot still fire an HTTP request or sandboxed query. An
+  -- 'in_flight' row is already claimed and cannot be un-sent; marking it
+  -- 'lost' here just means its eventual fn_complete_outbound/fn_complete_sql
+  -- call finds the task no longer 'running' and discards the result, the
+  -- same as any other post-cancel completion.
+  UPDATE argo_private.outbound_calls o
+  SET status = 'lost', error = 'session_cancelled', updated_at = now()
+  FROM argo_private.tasks t
+  WHERE o.task_id = t.task_id AND t.session_id = p_session_id
+    AND o.status IN ('queued', 'in_flight');
+
+  UPDATE argo_private.sql_calls sc
+  SET status = 'lost', updated_at = now()
+  FROM argo_private.tasks t
+  WHERE sc.task_id = t.task_id AND t.session_id = p_session_id
+    AND sc.status IN ('queued', 'in_flight');
+
   UPDATE argo_private.human_approvals h
   SET status = 'rejected', reply_text = 'session_cancelled', decided_at = now()
   FROM argo_private.tasks t
@@ -3035,7 +3168,16 @@ BEGIN
     'SELECT pg_sleep(30) FROM argo_public.v_sales',
     'SELECT lo_import(''/etc/passwd'')',
     'SELECT random() FROM argo_public.v_sales',
-    'SELECT no_such_function_xyz(1) FROM argo_public.v_sales'
+    'SELECT no_such_function_xyz(1) FROM argo_public.v_sales',
+    -- STABLE, not VOLATILE -- the volatility check alone let this through,
+    -- and it hands back the key that encrypts every provider secret.
+    'SELECT current_setting(''allgres.secret_key'', true) AS leak',
+    'SELECT current_setting(''allgres.secret_key'', true) AS leak FROM argo_public.v_sales',
+    'SELECT version()',
+    'SELECT inet_server_addr()',
+    -- a user-defined SECURITY DEFINER function, even one Allgres ships
+    -- itself, must never be callable from inside the sandbox
+    'SELECT argo_private.secret_key() AS leak'
   ] LOOP
     BEGIN
       PERFORM argo_private.fn_validate_sql(v_agent, detail);
@@ -3175,6 +3317,20 @@ BEGIN
   ok := ok AND detail = 'queued';
   v := v || jsonb_build_array(jsonb_build_object('name', 'execute_sql_queues_a_call', 'ok', ok));
 
+  -- 13b. The task is still 'running' with no outbound_calls row -- the model
+  --      just asked for execute_sql and the SQL result has not come back yet
+  --      -- so before the sql_calls guard existed, fn_dispatch_tasks would
+  --      call fn_next_step on it again right here, rebuild the same dangling
+  --      execute_sql request from execution_logs (no tool result exists for
+  --      it yet), and fire a second, racing LLM call before the pending SQL
+  --      result was ever seen. It must dispatch nothing while that sql_calls
+  --      row is still queued.
+  PERFORM argo_public.fn_dispatch_tasks(NULL);
+  ok := NOT EXISTS (
+    SELECT 1 FROM argo_private.outbound_calls WHERE task_id = v_tid
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'dispatch_holds_back_pending_sql_task', 'ok', ok));
+
   claim := argo_public.fn_claim_sql(10);
   ok := (claim->>'count')::int >= 1
     AND EXISTS (
@@ -3262,6 +3418,20 @@ BEGIN
   ok := COALESCE((comp->>'task_updated')::boolean, false) AND n_logs = 1 AND detail = 'queued';
   v := v || jsonb_build_array(jsonb_build_object('name', 'approval_reply_feeds_back_into_log', 'ok', ok));
 
+  -- 15b. The log row above is necessary but not sufficient: fn_next_step
+  --      builds the actual LLM request from execution_logs, and used to skip
+  --      role='operator' entirely (only system/user/assistant/tool made it
+  --      into the message list), so the dashboard showed the human's reply
+  --      but the agent's next call_llm never carried it. It has to arrive as
+  --      a 'user' turn, the same way a tool result does.
+  spec := argo_public.fn_next_step(v_tid);
+  ok := spec->>'action' = 'call_llm'
+    AND EXISTS (
+      SELECT 1 FROM jsonb_array_elements(spec->'messages') m
+      WHERE m->>'role' = 'user' AND m->>'content' = 'Use the fiscal-year quarter.'
+    );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'operator_reply_reaches_llm_messages', 'ok', ok));
+
   -- 16. fn_watchdog reclaims an approval nobody ever answers -- the same
   --     self-healing shape it already applies to stuck outbound/sql calls,
   --     just on a per-row deadline instead of p_timeout_seconds.
@@ -3312,6 +3482,43 @@ BEGIN
   WHERE task_id = v_tid AND role = 'operator' AND content = to_jsonb('selftest stop'::text);
   ok := ok AND n_logs = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'cancel_session_stops_open_task', 'ok', ok));
+
+  -- 17b. Marking the task 'cancelled' above is not enough on its own: a
+  --      'queued' outbound_calls or sql_calls row for it would otherwise
+  --      still be claimable and would still actually fire (HTTP request or
+  --      sandboxed query) after the operator cancelled the session --
+  --      fn_cancel_session must also mark those rows 'lost' itself, and
+  --      fn_claim_outbound/fn_claim_sql's own task-status join is the second
+  --      layer in case anything is queued in the race window before that.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest cancel_pending_calls')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid);
+  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"execute_sql"}',
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM argo_public.v_sales')
+  ));
+  v_call := (sub->>'call_id')::uuid;
+  -- A synthetic queued outbound row on the same task, standing in for one
+  -- fn_dispatch_tasks would have queued for a real LLM turn -- exercising the
+  -- cleanup does not require the provider machinery that inserts it normally.
+  INSERT INTO argo_private.outbound_calls (task_id, kind, url, status)
+  VALUES (v_tid, 'llm', 'https://api.x.ai/v1/chat/completions', 'queued')
+  RETURNING call_id INTO v_tid2;
+  comp := argo_public.fn_cancel_session(v_sid, 'selftest stop pending calls');
+  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  ok := (comp->>'tasks_cancelled')::int = 1 AND detail = 'lost';
+  SELECT status INTO detail FROM argo_private.outbound_calls WHERE call_id = v_tid2;
+  ok := ok AND detail = 'lost';
+  claim := argo_public.fn_claim_sql(10);
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(claim->'calls') c WHERE (c->>'call_id')::uuid = v_call
+  );
+  claim := argo_public.fn_claim_outbound(10);
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(claim->'calls') c WHERE (c->>'call_id')::uuid = v_tid2
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'cancel_session_voids_pending_calls', 'ok', ok));
 
   -- 18. fn_grant_permission / fn_revoke_permission -- the RPC surface
   --     (permissions.grant/revoke) is a thin passthrough to these, so
@@ -3372,14 +3579,17 @@ BEGIN
   UPDATE argo_private.policies SET max_concurrent_tasks = 4 WHERE agent_id = v_agent;
   UPDATE argo_private.tasks SET status = 'cancelled' WHERE task_id IN (v_tid, v_tid2);
 
-  -- 21. max_turn_seconds is a wall-clock ceiling on a task's whole lifetime;
-  --     fn_watchdog reclaims one that has been open longer than its agent's
-  --     cap, straight to failed, no retry -- the same terminal shape as
-  --     max_steps.
+  -- 21. max_turn_seconds is a wall-clock ceiling on a task's whole lifetime
+  --     once it has actually started; fn_watchdog reclaims one that has been
+  --     running longer than its agent's cap, straight to failed, no retry --
+  --     the same terminal shape as max_steps. fn_next_step (called here to
+  --     simulate a real turn) is what sets started_at, so this backdates
+  --     that instead of created_at.
   UPDATE argo_private.policies SET max_turn_seconds = 60 WHERE agent_id = v_agent;
   v_sid := (argo_public.fn_create_session(v_agent, 'selftest turn_timeout')->>'session_id')::uuid;
   SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  UPDATE argo_private.tasks SET created_at = now() - interval '2 minutes' WHERE task_id = v_tid;
+  PERFORM argo_public.fn_next_step(v_tid);
+  UPDATE argo_private.tasks SET started_at = now() - interval '2 minutes' WHERE task_id = v_tid;
   PERFORM argo_public.fn_watchdog();
   SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
   ok := detail = 'failed';
@@ -3388,6 +3598,20 @@ BEGIN
   WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'turn_timeout';
   ok := ok AND n_logs = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_expires_stale_task', 'ok', ok));
+
+  -- 22. A task still 'queued' -- e.g. held back by max_concurrent_tasks --
+  --     has never run a turn, so started_at is still NULL for it and
+  --     max_turn_seconds must leave it alone no matter how old created_at
+  --     is. Without this a busy agent's own concurrency cap could starve a
+  --     task long enough for max_turn_seconds to kill it before its first
+  --     turn -- exactly the bug this loop's started_at rewrite closes.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest turn_timeout_queued')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  UPDATE argo_private.tasks SET created_at = now() - interval '2 minutes' WHERE task_id = v_tid;
+  PERFORM argo_public.fn_watchdog();
+  SELECT status, started_at INTO detail, v_expires FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := detail = 'queued' AND v_expires IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_spares_queued_task', 'ok', ok));
   PERFORM argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, NULL, NULL, true);
 
   PERFORM argo_private.selftest_cleanup();

@@ -649,6 +649,79 @@ struct OutboundResult {
     body: String,
 }
 
+/// Mirrors `argo_private.is_blocked_host`'s IPv4-literal ranges exactly, so
+/// the two blocklists cannot drift: loopback, RFC1918, CGNAT (100.64/10),
+/// link-local (including the cloud-metadata address 169.254.169.254),
+/// TEST-NET/protocol-assignment (192.0.0/24, 192.0.2/24), benchmarking
+/// (198.18/15), and multicast/reserved/broadcast (224-255).
+fn is_blocked_ipv4(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 0
+        || o[0] == 10
+        || o[0] == 127
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || o[0] >= 224
+}
+
+/// Same idea for IPv6: loopback/unspecified, IPv4-mapped (reduces to the v4
+/// check), fc00::/7 unique-local, and fe80::/10 link-local.
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ipv4(&v4);
+            }
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            let first = v6.segments()[0];
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Wraps ureq's `DefaultResolver` to re-check every address DNS actually
+/// hands back, immediately before ureq connects to it. The SQL layer already
+/// checks the URL's host *string* at queue time (`check_outbound_url`), but
+/// that is a check on a name, not on where the name points: a hostname that
+/// resolves to a public address when the agent's request is validated can
+/// resolve to 127.0.0.1 or an RFC1918 address by the time this worker thread
+/// actually connects (DNS rebinding), and no amount of re-checking the
+/// string closes that gap. Filtering here instead of after resolving
+/// separately closes it completely rather than narrowing it to a race
+/// window: ureq connects only to what this resolver returns, so a blocked
+/// address is never dialed at all, not even once.
+#[derive(Debug)]
+struct GuardedResolver {
+    allow_private: bool,
+}
+
+impl ureq::unversioned::resolver::Resolver for GuardedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let addrs = ureq::unversioned::resolver::DefaultResolver::default()
+            .resolve(uri, config, timeout)?;
+        if !self.allow_private {
+            for addr in &addrs {
+                if is_blocked_ip(&addr.ip()) {
+                    return Err(ureq::Error::HostNotFound);
+                }
+            }
+        }
+        Ok(addrs)
+    }
+}
+
 fn perform_http(call: &Value) -> (i32, String) {
     let Some(url) = call.get("url").and_then(Value::as_str) else {
         return (0, "missing outbound URL".into());
@@ -663,6 +736,10 @@ fn perform_http(call: &Value) -> (i32, String) {
     let kind = call.get("kind").and_then(Value::as_str).unwrap_or("llm");
     let headers = call.get("headers").and_then(Value::as_object);
     let body = call.get("body").cloned().unwrap_or_else(|| json!({}));
+    // Only an LLM provider can ever carry this, and only when the operator
+    // opted it in (allow_private_network); http_get always queues false. See
+    // GuardedResolver.
+    let allow_private = call.get("allow_private").and_then(Value::as_bool).unwrap_or(false);
 
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(HTTP_TIMEOUT))
@@ -671,7 +748,11 @@ fn perform_http(call: &Value) -> (i32, String) {
         // is the standard way to turn an allowlisted URL into an SSRF.
         .max_redirects(0)
         .build();
-    let agent = ureq::Agent::new_with_config(config);
+    let agent = ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        GuardedResolver { allow_private },
+    );
 
     let outcome = if kind == "tool" {
         let mut req = agent.get(url);
