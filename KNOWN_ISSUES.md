@@ -2,7 +2,7 @@
 
 Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
-reached to verify against — see item 3): `fn_selftest` 65/65, `tests/smoke.sql`
+reached to verify against — see item 3): `fn_selftest` 66/66, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
 socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
 (`curl` against `/api/v1/rpc`, CSRF checks included), including a live
@@ -352,3 +352,60 @@ and superficially tested, but the test checked that a write happened, not
 that the thing reading it back behaved correctly. Worth treating as a
 standing question for anything still on this list: does the test for it
 check the write, or the read?
+
+## 13. Two more from a second review round: `started_at` resetting, and provider credentials in plaintext
+
+- **`started_at` reset on every human-approval resume.** Item 12's own fix
+  had a bug: `fn_next_step`'s `queued -> running` transition set
+  `started_at = now()` unconditionally, but a task revisits `'queued'`
+  every time it resumes from `waiting_human` (`fn_decide_approval` puts it
+  back there), not only on its first turn. That silently turned
+  `max_turn_seconds` into "time since most recently resumed" instead of
+  "time since this task first started running," for any task that ever
+  waits on a human — defeating the wall-clock ceiling `started_at` exists
+  for, one release after it was added. Fixed with
+  `COALESCE(started_at, now())`, so only the first transition sets it.
+  Selftest: `started_at_survives_human_resume`.
+- **A provider's decrypted API key sat in a table in plaintext.**
+  `build_llm_http` decrypted the key and baked it into the
+  `Authorization`/`x-api-key` header it returned; `fn_dispatch_tasks` wrote
+  that header straight into `argo_private.outbound_calls.request_headers`
+  — an ordinary table column, not a transient value. From the moment a
+  call was queued until it was harvested (and after, since nothing purges
+  it), the plaintext key sat in WAL, in any physical backup or PITR
+  archive, on any replica, and was readable by a plain `SELECT` on that
+  table by any role with access to it. Confirmed live before fixing:
+  registered a distinctive test key, ran a real session through it, found
+  the key sitting in `outbound_calls.request_headers`.
+
+  Fixed by moving credential resolution from build/queue time to claim
+  time. `outbound_calls` gained `provider_id` and `auth_kind` (which header
+  name, not the secret) instead of holding the assembled header;
+  `build_llm_http` no longer touches `provider_secret` at all;
+  `fn_claim_outbound` now decrypts the key and merges the real header only
+  into the JSON response it hands the runtime worker over the RPC socket
+  — never back into the table. The key exists only in that one response
+  and then in the worker's memory for the single HTTP request it is used
+  for. (`build_llm_http`, `fn_dispatch_tasks`, and `fn_claim_outbound` all
+  changed signature for this — `p_fallback_key` moved from the first two
+  to the third, since it is claim time that now needs it.)
+
+  Reproduced and reverified live the way the review asked: registered a
+  distinctive test key, ran a real session through it end to end (real
+  background worker, real mock HTTP endpoint, actual completion), then
+  searched every column of `outbound_calls` and `execution_logs` for the
+  key string — zero rows, while the session still completed normally,
+  confirming the header was still built and sent correctly and this
+  wasn't just breaking the feature to hide the bug.
+
+  One side effect worth naming: `outbound_calls.provider_id` is a real
+  foreign key to `llm_providers`, so a provider with call history can no
+  longer be deleted out from under it. There was no delete-provider path
+  before this change either (only `fn_set_provider`, never a remove), so
+  nothing user-facing regresses — but the constraint is there now and
+  would need a decision (cascade? block? soft-delete the provider row?) if
+  provider deletion is ever added.
+
+Both were found the same way item 12's six were: an external review reading
+the actual code path end to end, not the tests passing. `fn_selftest` was
+green through both.

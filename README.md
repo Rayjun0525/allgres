@@ -231,6 +231,18 @@ tokens are encrypted with `pgp_sym_encrypt`. Without a key they are stored in
 plaintext and the dashboard shows a banner saying so. The dashboard never
 returns a secret, only whether one is set.
 
+That covers `llm_secrets`, the one table meant to hold a credential. A
+decrypted key never reaches any other table: `argo_private.outbound_calls`
+(the queue an LLM call sits in between being built and actually sent) holds
+only `provider_id` and which header name a credential belongs in
+(`auth_kind`) — never the credential itself. `fn_claim_outbound` resolves and
+injects the real `Authorization`/`x-api-key` header at claim time, into the
+response it hands the runtime worker over the RPC socket; that value is
+never written back to a row. The key exists only in that one response and
+then in the worker's memory for the HTTP request it is used for — never in
+WAL, a physical backup, a PITR archive, a replica, or a plain `SELECT` on
+`outbound_calls`.
+
 ### Privileges
 
 Four roles: `argo_owner` (deploy only), `operator`, `worker`, `sandbox`.

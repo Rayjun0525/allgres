@@ -91,6 +91,21 @@ DROP FUNCTION IF EXISTS argo_private.sql_cte_names(text);
 DROP FUNCTION IF EXISTS argo_private.sql_normalize(text);
 DROP FUNCTION IF EXISTS argo_private.strip_sql_noise(text);
 
+-- The provider API key used to be decrypted and baked into the Authorization/
+-- x-api-key header inside build_llm_http, which fn_dispatch_tasks then wrote
+-- straight into outbound_calls.request_headers -- a real table row, so the
+-- plaintext key sat there for the row's whole life, in WAL, in any physical
+-- backup or PITR archive, on any replica, and readable by a plain SELECT.
+-- Credential resolution moves to fn_claim_outbound, at claim time, injected
+-- only into the response handed to the worker over the RPC socket -- never
+-- written back to a table. build_llm_http drops p_fallback_key (it no longer
+-- touches a key at all); fn_dispatch_tasks drops it for the same reason;
+-- fn_claim_outbound gains it, since resolving the fallback key is now its
+-- job. All three signatures changed, so all three need an explicit drop.
+DROP FUNCTION IF EXISTS argo_private.build_llm_http(jsonb, text);
+DROP FUNCTION IF EXISTS argo_public.fn_dispatch_tasks(text);
+DROP FUNCTION IF EXISTS argo_public.fn_claim_outbound(int);
+
 -- ---------------------------------------------------------------------------
 -- 2. Schemas, tables, indexes, triggers.
 -- ---------------------------------------------------------------------------
@@ -349,6 +364,15 @@ CREATE TABLE IF NOT EXISTS argo_private.outbound_calls (
 -- so it stays at its default here too.
 ALTER TABLE argo_private.outbound_calls
   ADD COLUMN IF NOT EXISTS allow_private boolean NOT NULL DEFAULT false;
+
+-- Which provider (if any) this call needs a credential for, and which header
+-- to put it in -- not the credential itself. request_headers never holds the
+-- decrypted key; fn_claim_outbound resolves it from provider_id at claim
+-- time and merges it only into the JSON handed to the worker. Both are NULL
+-- for a 'tool' call (http_get carries no credential at all).
+ALTER TABLE argo_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS provider_id uuid REFERENCES argo_private.llm_providers(provider_id),
+  ADD COLUMN IF NOT EXISTS auth_kind text CHECK (auth_kind IS NULL OR auth_kind IN ('authorization', 'x-api-key'));
 
 CREATE INDEX IF NOT EXISTS outbound_ready_idx
   ON argo_private.outbound_calls (created_at)
@@ -1743,8 +1767,7 @@ $fn$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION argo_private.build_llm_http(
-  p_spec jsonb,
-  p_fallback_key text
+  p_spec jsonb
 ) RETURNS jsonb
 LANGUAGE plpgsql
 STABLE
@@ -1755,7 +1778,6 @@ DECLARE
   v_cfg jsonb := COALESCE(p_spec->'llm_config', '{}'::jsonb);
   v_name text := COALESCE(v_cfg->>'provider', 'xai');
   v_prov argo_private.llm_providers%ROWTYPE;
-  v_key text;
   v_url text;
   v_reason text;
   v_headers jsonb;
@@ -1783,13 +1805,16 @@ BEGIN
     RAISE EXCEPTION 'no enabled llm provider' USING ERRCODE = 'P0001';
   END IF;
 
-  v_key := argo_private.provider_secret(v_prov.provider_id);
-  IF (v_key IS NULL OR v_key = '') AND v_prov.name IN ('xai', 'grok') THEN
-    v_key := NULLIF(p_fallback_key, '');
-  END IF;
-  IF v_key IS NULL THEN
-    v_key := COALESCE(NULLIF(p_fallback_key, ''), '');
-  END IF;
+  -- No secret is fetched or handled here on purpose. This function's result
+  -- is what fn_dispatch_tasks persists into outbound_calls -- a real table
+  -- row, subject to WAL, physical backup, PITR, and replication -- so a
+  -- credential built into it here would sit there in plaintext for the
+  -- row's whole lifetime. fn_claim_outbound resolves and injects the actual
+  -- Authorization/x-api-key header itself, at claim time, into the response
+  -- it hands the worker over the RPC socket; that value is never written
+  -- back to any table. See "provider_id"/"auth_kind" in the RETURN below --
+  -- that is the only credential-shaped thing this function ever produces:
+  -- which provider and which header name, not the secret itself.
 
   v_model := COALESCE(v_cfg->>'model', 'grok-4.5');
 
@@ -1818,7 +1843,6 @@ BEGIN
     v_url := v_url || '/v1/messages';
     v_headers := jsonb_build_object(
       'content-type', 'application/json',
-      'x-api-key', COALESCE(v_key, ''),
       'anthropic-version', '2023-06-01'
     );
     v_body := jsonb_build_object(
@@ -1830,8 +1854,7 @@ BEGIN
   ELSE
     v_url := v_url || '/chat/completions';
     v_headers := jsonb_build_object(
-      'content-type', 'application/json',
-      'authorization', 'Bearer ' || COALESCE(v_key, '')
+      'content-type', 'application/json'
     );
     v_body := jsonb_build_object(
       'model', v_model,
@@ -1853,12 +1876,14 @@ BEGIN
     'url', v_url,
     'headers', v_headers,
     'body', v_body,
-    'allow_private', v_prov.allow_private_network
+    'allow_private', v_prov.allow_private_network,
+    'provider_id', v_prov.provider_id,
+    'auth_kind', CASE WHEN v_prov.kind = 'anthropic' THEN 'x-api-key' ELSE 'authorization' END
   );
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_dispatch_tasks(p_fallback_key text DEFAULT NULL)
+CREATE OR REPLACE FUNCTION argo_public.fn_dispatch_tasks()
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1919,7 +1944,7 @@ BEGIN
       CONTINUE;
     END IF;
     BEGIN
-      http := argo_private.build_llm_http(spec, p_fallback_key);
+      http := argo_private.build_llm_http(spec);
     EXCEPTION WHEN others THEN
       PERFORM argo_public.fn_submit_result(
         t.task_id,
@@ -1927,11 +1952,16 @@ BEGIN
       );
       CONTINUE;
     END;
+    -- request_headers holds only what build_llm_http returned -- no
+    -- credential; provider_id/auth_kind are what fn_claim_outbound needs to
+    -- inject one later, at claim time, without ever writing it here.
     INSERT INTO argo_private.outbound_calls (
-      task_id, kind, url, request_headers, request_body, status, allow_private
+      task_id, kind, url, request_headers, request_body, status, allow_private,
+      provider_id, auth_kind
     ) VALUES (
       t.task_id, 'llm', http->>'url', http->'headers', http->'body', 'queued',
-      COALESCE((http->>'allow_private')::boolean, false)
+      COALESCE((http->>'allow_private')::boolean, false),
+      (http->>'provider_id')::uuid, http->>'auth_kind'
     ) RETURNING call_id INTO v_id;
     v_out := v_out || jsonb_build_array(jsonb_build_object('call_id', v_id, 'task_id', t.task_id));
     v_n := v_n + 1;
@@ -1942,7 +1972,7 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_claim_outbound(p_limit int DEFAULT 4)
+CREATE OR REPLACE FUNCTION argo_public.fn_claim_outbound(p_limit int DEFAULT 4, p_fallback_key text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1952,6 +1982,8 @@ DECLARE
   r record;
   v_out jsonb := '[]'::jsonb;
   v_n int := 0;
+  v_headers jsonb;
+  v_key text;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
   -- The task-status join is defense in depth against fn_cancel_session (or a
@@ -1962,9 +1994,10 @@ BEGIN
   -- but by then the request has left the process.
   FOR r IN
     SELECT o.call_id, o.task_id, o.kind, o.tool, o.url, o.request_headers, o.request_body,
-           o.allow_private
+           o.allow_private, o.provider_id, o.auth_kind, p.name AS provider_name
     FROM argo_private.outbound_calls o
     JOIN argo_private.tasks t ON t.task_id = o.task_id
+    LEFT JOIN argo_private.llm_providers p ON p.provider_id = o.provider_id
     WHERE o.status = 'queued' AND t.status = 'running'
     ORDER BY o.created_at
     FOR UPDATE OF o SKIP LOCKED
@@ -1973,13 +2006,33 @@ BEGIN
     UPDATE argo_private.outbound_calls
     SET status = 'in_flight', updated_at = now()
     WHERE call_id = r.call_id;
+
+    -- The credential is resolved and injected right here, into the response
+    -- this function hands the worker over the RPC socket -- never written
+    -- back to outbound_calls.request_headers, which is why that column was
+    -- never given one in the first place (see fn_dispatch_tasks /
+    -- build_llm_http). It exists only in this return value and then in the
+    -- worker's memory for the one HTTP request it is used for.
+    v_headers := r.request_headers;
+    IF r.auth_kind IS NOT NULL AND r.provider_id IS NOT NULL THEN
+      v_key := argo_private.provider_secret(r.provider_id);
+      IF (v_key IS NULL OR v_key = '') AND r.provider_name IN ('xai', 'grok') THEN
+        v_key := NULLIF(p_fallback_key, '');
+      END IF;
+      v_key := COALESCE(v_key, NULLIF(p_fallback_key, ''), '');
+      v_headers := v_headers || jsonb_build_object(
+        r.auth_kind,
+        CASE WHEN r.auth_kind = 'x-api-key' THEN v_key ELSE 'Bearer ' || v_key END
+      );
+    END IF;
+
     v_out := v_out || jsonb_build_array(jsonb_build_object(
       'call_id', r.call_id,
       'task_id', r.task_id,
       'kind', r.kind,
       'tool', r.tool,
       'url', r.url,
-      'headers', r.request_headers,
+      'headers', v_headers,
       'body', r.request_body,
       'allow_private', r.allow_private
     ));
@@ -2374,8 +2427,8 @@ BEGIN
   -- Does not perform HTTP or run sandboxed SQL.  Caller claims queued rows
   -- AFTER this commits.
   w := argo_public.fn_watchdog();
-  d := argo_public.fn_dispatch_tasks(p_fallback_key);
-  c := argo_public.fn_claim_outbound(4);
+  d := argo_public.fn_dispatch_tasks();
+  c := argo_public.fn_claim_outbound(4, p_fallback_key);
   s := argo_public.fn_claim_sql(4);
   RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s);
 END;
@@ -3329,7 +3382,7 @@ BEGIN
   --      it yet), and fire a second, racing LLM call before the pending SQL
   --      result was ever seen. It must dispatch nothing while that sql_calls
   --      row is still queued.
-  PERFORM argo_public.fn_dispatch_tasks(NULL);
+  PERFORM argo_public.fn_dispatch_tasks();
   ok := NOT EXISTS (
     SELECT 1 FROM argo_private.outbound_calls WHERE task_id = v_tid
   );
@@ -3588,7 +3641,7 @@ BEGIN
   UPDATE argo_private.tasks SET status = 'running', updated_at = now() WHERE task_id = v_tid;
   v_sid := (argo_public.fn_create_session(v_agent, 'selftest concurrency_b')->>'session_id')::uuid;
   SELECT task_id INTO v_tid2 FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_dispatch_tasks(NULL);
+  PERFORM argo_public.fn_dispatch_tasks();
   SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid2;
   ok := detail = 'queued';
   v := v || jsonb_build_array(jsonb_build_object('name', 'max_concurrent_tasks_holds_back_dispatch', 'ok', ok));
@@ -3672,8 +3725,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA argo_public GRANT SELECT ON TABLES TO sandbox
 REVOKE ALL ON FUNCTION argo_public.fn_next_step(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_submit_result(uuid, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_pump(text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_dispatch_tasks(text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_claim_outbound(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION argo_public.fn_dispatch_tasks() FROM PUBLIC;
+REVOKE ALL ON FUNCTION argo_public.fn_claim_outbound(int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_complete_outbound(uuid, int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_claim_sql(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION argo_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) FROM PUBLIC;
@@ -3690,8 +3743,8 @@ REVOKE ALL ON FUNCTION argo_public.fn_run_sandboxed_sql(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION argo_public.fn_next_step(uuid) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_submit_result(uuid, jsonb) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_pump(text) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_dispatch_tasks(text) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_claim_outbound(int) TO worker;
+GRANT EXECUTE ON FUNCTION argo_public.fn_dispatch_tasks() TO worker;
+GRANT EXECUTE ON FUNCTION argo_public.fn_claim_outbound(int, text) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_complete_outbound(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_claim_sql(int) TO worker;
 GRANT EXECUTE ON FUNCTION argo_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) TO worker;
@@ -3727,7 +3780,7 @@ AS $$ SELECT argo_public.fn_create_session(p_agent_id, p_goal) $$;
 CREATE OR REPLACE FUNCTION allgres.pump()
 RETURNS jsonb LANGUAGE sql SECURITY DEFINER
 SET search_path = argo_public, argo_private, pg_temp
-AS $$ SELECT argo_public.fn_dispatch_tasks(NULL) $$;
+AS $$ SELECT argo_public.fn_dispatch_tasks() $$;
 
 -- Best-effort privilege drop for the runtime background worker.  It connects as
 -- the bootstrap superuser (so a missing role can never crash-loop the worker at

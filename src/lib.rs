@@ -480,7 +480,7 @@ fn dispatch_and_claim(limit: usize) -> Value {
             "SELECT argo_public.fn_watchdog($1)",
             &[(HTTP_TIMEOUT.as_secs() as i32 * 2).into()],
         );
-        let _ = Spi::get_one::<JsonB>("SELECT argo_public.fn_dispatch_tasks(NULL)");
+        let _ = Spi::get_one::<JsonB>("SELECT argo_public.fn_dispatch_tasks()");
         Spi::get_one_with_args::<JsonB>(
             "SELECT argo_public.fn_claim_outbound($1)",
             &[(limit as i32).into()],
