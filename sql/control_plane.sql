@@ -178,6 +178,66 @@ CREATE TABLE IF NOT EXISTS argo_private.sql_sandbox_allowlist (
   resource_ref text PRIMARY KEY
 );
 
+-- Positive allowlist for functions callable from sandboxed SQL, on top of
+-- every other gate fn_validate_sql already applies (pg_catalog only,
+-- non-volatile, non-security-definer, not in c_denied_fns). A denylist can
+-- only ever name what is already known to be dangerous, and pg_catalog has
+-- hundreds of functions: pg_show_all_settings() is STABLE, not VOLATILE, not
+-- SECURITY DEFINER, lives in pg_catalog, and is on no reasonable denylist
+-- that only thinks to name current_setting/set_config/version/etc by
+-- name -- confirmed live, it validated as ordinary safe SQL and would have
+-- returned every GUC on the server, allgres.secret_key included, the same
+-- class of bug the denylist was added to close. An allowlist fails in the
+-- opposite, safe direction: a legitimate function an analyst needs might not
+-- be seeded here yet, which is a false rejection, not a leak.
+CREATE TABLE IF NOT EXISTS argo_private.sql_function_allowlist (
+  function_name text PRIMARY KEY
+);
+
+INSERT INTO argo_private.sql_function_allowlist (function_name) VALUES
+  -- aggregates
+  ('count'), ('sum'), ('avg'), ('min'), ('max'),
+  ('array_agg'), ('string_agg'), ('jsonb_agg'), ('jsonb_object_agg'),
+  ('json_agg'), ('json_object_agg'), ('bool_and'), ('bool_or'), ('every'),
+  ('stddev'), ('stddev_pop'), ('stddev_samp'),
+  ('variance'), ('var_pop'), ('var_samp'),
+  ('percentile_cont'), ('percentile_disc'), ('mode'),
+  -- string
+  ('length'), ('char_length'), ('character_length'), ('bit_length'), ('octet_length'),
+  ('upper'), ('lower'), ('initcap'),
+  ('substring'), ('substr'), ('trim'), ('btrim'), ('ltrim'), ('rtrim'),
+  ('concat'), ('concat_ws'), ('replace'), ('split_part'), ('strpos'), ('position'),
+  ('left'), ('right'), ('lpad'), ('rpad'), ('repeat'), ('reverse'), ('format'),
+  ('regexp_replace'), ('regexp_match'), ('regexp_matches'),
+  ('regexp_split_to_array'), ('regexp_split_to_table'), ('regexp_count'),
+  ('to_char'), ('quote_literal'), ('quote_ident'),
+  -- numeric / math
+  ('abs'), ('round'), ('ceil'), ('ceiling'), ('floor'), ('trunc'),
+  ('power'), ('sqrt'), ('cbrt'), ('exp'), ('ln'), ('log'), ('mod'),
+  ('sign'), ('div'), ('gcd'), ('lcm'), ('width_bucket'), ('greatest'), ('least'),
+  -- date/time
+  ('now'), ('extract'), ('date_part'), ('date_trunc'), ('age'), ('isfinite'),
+  ('to_date'), ('to_timestamp'), ('make_date'), ('make_time'),
+  ('make_timestamp'), ('make_timestamptz'), ('make_interval'),
+  ('justify_days'), ('justify_hours'), ('justify_interval'),
+  -- json/jsonb
+  ('jsonb_build_object'), ('jsonb_build_array'), ('jsonb_array_elements'),
+  ('jsonb_array_elements_text'), ('jsonb_array_length'),
+  ('jsonb_extract_path'), ('jsonb_extract_path_text'), ('jsonb_object_keys'),
+  ('jsonb_typeof'), ('jsonb_pretty'), ('jsonb_strip_nulls'),
+  ('jsonb_each'), ('jsonb_each_text'), ('jsonb_path_query'), ('jsonb_path_exists'),
+  ('json_build_object'), ('json_build_array'), ('json_array_elements'),
+  ('json_array_elements_text'), ('json_extract_path'), ('json_extract_path_text'),
+  ('json_object_keys'), ('json_typeof'),
+  ('row_to_json'), ('to_json'), ('to_jsonb'),
+  -- set-returning helpers commonly used with a value list
+  ('generate_series'), ('unnest'),
+  -- null / conditional -- these are grammar keywords in most positions, but
+  -- harmless to allow in case the parser ever surfaces one as a plain call
+  ('coalesce'), ('nullif'),
+  ('pg_typeof')
+ON CONFLICT DO NOTHING;
+
 -- Groups sessions the way a Slack workspace groups channels.  Deliberately
 -- does not scope agents: an agent is reused across projects (the same way one
 -- bot can sit in several channels), so only sessions -- the actual
@@ -1166,26 +1226,34 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- Only non-volatile, non-security-definer functions built into pg_catalog.
-  -- Even though execution now happens as the unprivileged `sandbox` role
-  -- (see fn_run_sandboxed_sql), volatility stays part of the check here
-  -- rather than plain SELECT-list DDL/DML detection, because it is what
-  -- actually separates a read from a side effect: pg_read_file, pg_ls_dir,
-  -- lo_import, dblink, nextval and pg_sleep are all volatile, while the
-  -- aggregates, string, date and json functions an analyst needs are not.
-  -- It is not sufficient on its own, though (see c_denied_fns above), so
-  -- three more gates apply: pg_catalog only -- an agent can never call a
-  -- user-defined function, which rules out every SECURITY DEFINER function
-  -- Allgres itself ships (they run as this validator's owner, not as
-  -- `sandbox`, and were never meant to be agent-callable) and every
-  -- extension function such as pgcrypto's or dblink's; NOT prosecdef, as
-  -- defense in depth in case a future pg_catalog entry is ever
-  -- security-definer; and the explicit denylist. Default-deny throughout: an
-  -- unknown name, or one that fails any gate, is rejected rather than
+  -- A function must be on the sql_function_allowlist AND pass every other
+  -- gate: pg_catalog only -- an agent can never call a user-defined
+  -- function, which rules out every SECURITY DEFINER function Allgres
+  -- itself ships (they run as this validator's owner, not as `sandbox`, and
+  -- were never meant to be agent-callable) and every extension function
+  -- such as pgcrypto's or dblink's; non-volatile, which is what actually
+  -- separates a read from a side effect (pg_read_file, pg_ls_dir,
+  -- lo_import, dblink, nextval and pg_sleep are all volatile); NOT
+  -- prosecdef, as defense in depth in case a future pg_catalog entry is
+  -- ever security-definer; and not on the explicit denylist, as one more
+  -- backstop in case the allowlist is ever seeded with a mistake. The
+  -- allowlist is the one that actually matters, though: a denylist can only
+  -- ever name what is already known to be dangerous, and pg_catalog has
+  -- hundreds of functions that are STABLE, non-security-definer, and
+  -- unnamed by any reasonable denylist -- pg_show_all_settings() among
+  -- them, which returns every GUC on the server. Default-deny throughout:
+  -- an unknown name, or one that fails any gate, is rejected rather than
   -- assumed safe.
   FOR v_fn IN SELECT jsonb_array_elements(COALESCE(v_tree->'functions', '[]'::jsonb)) LOOP
     IF lower(v_fn->>'name') = ANY (c_denied_fns) THEN
       RAISE EXCEPTION 'fn_validate_sql: function "%" is not allowed', v_fn->>'name'
+        USING ERRCODE = 'P0001';
+    END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM argo_private.sql_function_allowlist
+      WHERE function_name = lower(v_fn->>'name')
+    ) THEN
+      RAISE EXCEPTION 'fn_validate_sql: function "%" is not in the sandbox allowlist', v_fn->>'name'
         USING ERRCODE = 'P0001';
     END IF;
 
@@ -3234,7 +3302,17 @@ BEGIN
     'SELECT inet_server_addr()',
     -- a user-defined SECURITY DEFINER function, even one Allgres ships
     -- itself, must never be callable from inside the sandbox
-    'SELECT argo_private.secret_key() AS leak'
+    'SELECT argo_private.secret_key() AS leak',
+    -- STABLE, non-security-definer, pg_catalog -- passes every gate a
+    -- denylist-only check has, and isn't the kind of name a hand-written
+    -- denylist thinks to include. Confirmed live before the allowlist
+    -- existed: this validated as ordinary safe SQL and would have returned
+    -- every GUC on the server, allgres.secret_key included.
+    'SELECT setting FROM pg_catalog.pg_show_all_settings() WHERE name = ''allgres.secret_key''',
+    -- an ordinary pg_catalog, non-volatile, non-secdef function that is
+    -- simply not on the allowlist -- proves default-deny holds for
+    -- anything unseeded, not just the specific names already known to leak
+    'SELECT pg_get_userbyid(10) AS whoever'
   ] LOOP
     BEGIN
       PERFORM argo_private.fn_validate_sql(v_agent, detail);

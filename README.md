@@ -127,24 +127,25 @@ Layered, strongest first:
    not depend on the analysis being complete;
 4. `transaction_read_only` and a 5s `statement_timeout` — both real now that
    execution is a top-level statement instead of nested inside one;
-5. only non-volatile, non-security-definer functions built into `pg_catalog`,
-   checked against `pg_proc`. Volatility is the property that separates a
-   read from a side effect: `pg_read_file`, `pg_ls_dir`, `lo_import`,
-   `dblink`, `nextval` and `pg_sleep` are volatile, while the aggregates,
-   string, date and json functions an analyst needs are not — but volatility
-   alone is not a security boundary. `current_setting()` is `STABLE`, not
-   volatile, and `current_setting('allgres.secret_key', true)` handed back
-   the key that encrypts every provider secret in the system, confirmed by
-   actually running it through the sandbox. Three more gates close that:
-   `pg_catalog` only, which also rules out every user-defined
-   `SECURITY DEFINER` function (Allgres's own control-plane functions
-   included) and every extension function such as `pgcrypto`'s or
-   `dblink`'s; `NOT prosecdef`, as defense in depth; and an explicit denylist
-   of `pg_catalog` functions that disclose configuration, session, or
-   process state despite being non-volatile (`current_setting`,
-   `set_config`, `version`, `inet_server_addr`, `txid_current`, and
-   similar). Unknown names, and anything failing any of these gates, are
-   rejected rather than assumed safe;
+5. a function must be on `argo_private.sql_function_allowlist` — a seeded,
+   positive allowlist of the aggregate, string, math, date and json
+   functions an analyst actually needs — **and** pass every other gate:
+   non-volatile (the property that separates a read from a side effect;
+   `pg_read_file`, `pg_ls_dir`, `lo_import`, `dblink`, `nextval` and
+   `pg_sleep` are all volatile), `pg_catalog` only (rules out every
+   user-defined `SECURITY DEFINER` function, Allgres's own control-plane
+   functions included, and every extension function such as `pgcrypto`'s or
+   `dblink`'s), `NOT prosecdef` as defense in depth, and not on an explicit
+   denylist as one more backstop. The allowlist is the one that actually
+   matters: a denylist can only ever name what is already known to be
+   dangerous, and volatility alone is not a security boundary either —
+   `current_setting('allgres.secret_key', true)` and
+   `pg_show_all_settings()` are both `STABLE`, not volatile, and both
+   confirmed live (before each was closed) to hand back the key that
+   encrypts every provider secret in the system, or every GUC on the server
+   outright. A denylist has to be told about each of those by name; an
+   allowlist doesn't. Unknown names, and anything failing any of these
+   gates, are rejected rather than assumed safe;
 6. the parse tree must be exactly one non-writing `SELECT` (this also catches
    `SELECT ... INTO` and data-modifying CTEs, which are `SelectStmt` nodes);
 7. every relation named must be schema-qualified, outside the reserved schemas,

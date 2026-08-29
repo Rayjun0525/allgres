@@ -2,7 +2,7 @@
 
 Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
-reached to verify against — see item 3): `fn_selftest` 66/66, `tests/smoke.sql`
+reached to verify against — see item 3): `fn_selftest` 68/68, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
 socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
 (`curl` against `/api/v1/rpc`, CSRF checks included), including a live
@@ -409,3 +409,48 @@ check the write, or the read?
 Both were found the same way item 12's six were: an external review reading
 the actual code path end to end, not the tests passing. `fn_selftest` was
 green through both.
+
+## 14. SQL sandbox function check switched from denylist to positive allowlist
+
+Item 12 closed the `current_setting()` leak by adding `c_denied_fns`, an
+explicit denylist of `pg_catalog` functions that disclose configuration,
+session, or process state despite being non-volatile. A second review round
+pointed out the structural problem with that: a denylist can only ever name
+functions already known to be dangerous, and `pg_catalog` has hundreds of
+them. `pg_show_all_settings()` is `STABLE`, not `SECURITY DEFINER`, lives in
+`pg_catalog`, and was on no denylist that only thought to name
+`current_setting`/`set_config`/`version`/etc — it passed every gate that
+existed. Confirmed live before fixing:
+`SELECT setting FROM pg_catalog.pg_show_all_settings() WHERE name =
+'allgres.secret_key'` validated as ordinary safe SQL and would have handed
+back the same secret item 12 had just closed one specific path to.
+
+Fixed by adding `argo_private.sql_function_allowlist`, seeded with the
+aggregate/string/math/date/json functions an analyst actually needs
+(`sum`, `count`, `extract`, `generate_series`, `jsonb_build_object`, and
+similar — see the seed `INSERT` in `sql/control_plane.sql` for the full
+list). `fn_validate_sql` now requires a function to be on this allowlist
+*in addition to* every gate item 12 added (non-volatile, `pg_catalog` only,
+`NOT prosecdef`, not on the denylist — kept as one more backstop, not
+removed). This is a real shift in failure mode: previously an unnamed
+dangerous function slipped through silently; now a legitimate function
+nobody thought to seed yet fails loudly and has to be added to the
+allowlist. That is the safe direction to get this wrong in.
+
+Reproduced and reverified live: the `pg_show_all_settings()` query above,
+validated and rejected; a realistic analyst query
+(`SELECT region, sum(amount), count(*) FROM argo_public.v_sales GROUP BY
+region ORDER BY sum(amount) DESC`) run through the real background worker
+end to end, executed correctly under the new allowlist. `fn_selftest`
+68/68 (two new cases: the `pg_show_all_settings()` bypass rejected, and an
+unseeded-but-otherwise-safe function, `pg_get_userbyid`, rejected too —
+proving default-deny holds for anything not explicitly listed, not only
+the specific names already known to leak). `tests/smoke.sql` and
+`tests/e2e_mock.sql` green.
+
+The allowlist itself is seeded in `sql/control_plane.sql`, not yet exposed
+through the dashboard (no `sql_function_allowlist.list`/`.add`/`.remove`
+`dashboard_rpc` actions) — extending it today means editing the seed and
+reinstalling, the same as `sql_sandbox_allowlist` (the view/relation
+allowlist) worked before its own dashboard exposure landed. Worth the same
+treatment later if the seeded set turns out to be too narrow in practice.
