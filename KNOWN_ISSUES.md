@@ -4,11 +4,14 @@ Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
 reached to verify against — see item 3): `fn_selftest` 56/56, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
-socket → runtime SPI thread → PL/pgSQL works end to end, including a live
+socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
+(`curl` against `/api/v1/rpc`, CSRF checks included), including a live
 `dashboard_rpc` round trip for every action added so far (`projects.*`,
 `approvals.*`, `sessions.cancel`/`.list`/`.get`, `permissions.*`,
-`allowlist.*`, `policy.history`). Earlier builds were verified on
-PostgreSQL 18.6; nothing here is PG-version-specific.
+`allowlist.*`, `policy.history`) and the `web/index.html` pages that call
+them (`Projects`, `Sessions`, `Approvals`, plus the extended `Agents` and
+`Settings`). Earlier builds were verified on PostgreSQL 18.6; nothing here
+is PG-version-specific.
 
 Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
@@ -184,5 +187,55 @@ turned up:
   enforced in `fn_watchdog` against `created_at`, terminal like `max_steps` —
   straight to `failed`, no retry.
 
-None of this has a dashboard UI yet — no cancel button, no permission editor,
-no thread view, no version history panel. That is next.
+All of it now has a dashboard UI. `web/index.html` gained three pages
+(`Projects`, `Sessions`, `Approvals`) and extended two existing ones
+(`Agents`, `Settings`), all through one new generic client-side helper,
+`rpc(action, body)`, that POSTs to a single new HTTP route.
+
+That route was the actual gap: every `dashboard_rpc` action added in this
+pass and the previous one (`projects.*`, `approvals.*`, `sessions.*`,
+`permissions.*`, `allowlist.*`, `policy.history`) had no way to reach the
+runtime from a browser. `src/lib.rs`'s `api_route()` used to be a fixed
+match table, one named Rust route per action, so *every* new SQL-side
+capability needed a Rust recompile before the UI could call it — the same
+kind of unnecessary layer "Postgres Is All You Need" argues against
+elsewhere. It now also matches a generic `POST /api/v1/rpc`, whose body
+*is* the `dashboard_rpc` request (it just needs an `"action"` key); the
+named routes predating this stay for compatibility, but nothing new needs
+one. `allgres.dashboard_rpc` was already the real trust boundary — it
+decides what's a valid action and runs `SECURITY DEFINER` regardless of
+how the call reached it — so the per-route table was never doing
+security work, only adding friction.
+
+What's now reachable from a browser: cancel a session
+(`sessions.cancel`, from the new thread view or the Sessions list); grant
+or revoke a permission and browse a live view/tool/agent picker
+(`permissions.*`/`.options`, from an Agents-page editor); add or remove an
+SQL sandbox allowlist entry (`allowlist.*`, from Settings); read an
+agent's policy version history (`policy.history`); create/list/toggle
+projects and pick one when starting a run (`projects.*`); and the thread
+view itself (`sessions.get`) — one session's full message log across all
+its tasks, with a pending `await_human` approval, if any, rendered as a
+reply box with Approve/Reject inline, backed by the same
+`approvals.decide` the standalone Approvals inbox page uses.
+
+Verified the same way as every prior change in this file: rebuilt against
+local PostgreSQL 16.15, `fn_selftest` 56/56, `tests/smoke.sql` and
+`tests/e2e_mock.sql` both green, and every new action driven through the
+actual browser-facing path — HTTP → `allgres web` → unix socket →
+`allgres runtime`'s SPI thread → `dashboard_rpc` — via `curl` against the
+new `/api/v1/rpc` route, not just called directly in SQL: a full session
+create → thread-view → cancel round trip, a permission grant → list →
+revoke round trip, a policy edit → version-history round trip, an
+allowlist add → list → remove round trip, and a full `await_human` →
+operator reply → resumed-task round trip. The CSRF checks (`X-Allgres-Client`
+header, `Origin` match) already enforced in Rust ahead of `api_route`
+apply to the new route exactly as they do to every other one — confirmed
+both are still rejected on it.
+
+What's deliberately not here: no live-updating thread view (it's a
+request/response fetch on open, not a poll or a push); no operator
+identity attached to a cancel, grant, or approval decision, for the same
+reason item 10 gives (no accounts system yet); no confirmation dialog
+before `sessions.cancel` beyond the browser's own — an operator fat-fingering
+Cancel loses a running task with no undo.

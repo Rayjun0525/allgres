@@ -1171,6 +1171,22 @@ fn api_route(cfg: &WebConfig, r: &HttpRequest) -> Option<Value> {
             b["agent_id"] = json!(p.trim_start_matches("/api/v1/agents/"));
             Some(rpc(cfg, &b))
         }
+        // Generic passthrough: the request body IS the dashboard_rpc request
+        // (it just needs an "action" key). allgres.dashboard_rpc is already
+        // the actual trust boundary -- it decides what's a valid action, and
+        // runs SECURITY DEFINER regardless of how the call reached it -- so a
+        // named Rust route per action added nothing but boilerplate that
+        // needed a recompile for every new SQL-side capability. The routes
+        // above predate this and stay for compatibility; every action added
+        // since (projects.*, approvals.*, sessions.*, permissions.*,
+        // allowlist.*, policy.history, ...) reaches here instead.
+        ("POST", "/api/v1/rpc") => {
+            let b = body_json(r);
+            if b.get("action").and_then(Value::as_str).is_none() {
+                return Some(json!({"ok": false, "error": "action_required"}));
+            }
+            Some(rpc(cfg, &b))
+        }
         _ => None,
     }
 }
