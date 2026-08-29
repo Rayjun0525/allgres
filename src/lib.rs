@@ -499,16 +499,16 @@ fn dispatch_and_claim(limit: usize) -> Value {
     BackgroundWorker::transaction(|| {
         drop_privileges();
         if let Err(e) = Spi::get_one_with_args::<JsonB>(
-            "SELECT argo_public.fn_watchdog($1)",
+            "SELECT allgres_public.fn_watchdog($1)",
             &[(HTTP_TIMEOUT.as_secs() as i32 * 2).into()],
         ) {
             pgrx::warning!("Allgres: fn_watchdog failed: {}", e);
         }
-        if let Err(e) = Spi::get_one::<JsonB>("SELECT argo_public.fn_dispatch_tasks()") {
+        if let Err(e) = Spi::get_one::<JsonB>("SELECT allgres_public.fn_dispatch_tasks()") {
             pgrx::warning!("Allgres: fn_dispatch_tasks failed: {}", e);
         }
         Spi::get_one_with_args::<JsonB>(
-            "SELECT argo_public.fn_claim_outbound($1)",
+            "SELECT allgres_public.fn_claim_outbound($1)",
             &[(limit as i32).into()],
         )
         .ok()
@@ -524,7 +524,7 @@ fn submit_http_result(call_id: &str, status: i32, body: &str) {
     BackgroundWorker::transaction(|| {
         drop_privileges();
         if let Err(e) = Spi::get_one_with_args::<JsonB>(
-            "SELECT argo_public.fn_complete_outbound($1::uuid, $2, $3)",
+            "SELECT allgres_public.fn_complete_outbound($1::uuid, $2, $3)",
             &[call_id.into(), status.into(), body.as_str().into()],
         ) {
             pgrx::warning!("Allgres: fn_complete_outbound failed for call {}: {}", call_id, e);
@@ -559,7 +559,7 @@ fn dashboard_rpc(request: &str) -> String {
 fn claim_sql_jobs(limit: i32) -> Value {
     BackgroundWorker::transaction(|| {
         drop_privileges();
-        Spi::get_one_with_args::<JsonB>("SELECT argo_public.fn_claim_sql($1)", &[limit.into()])
+        Spi::get_one_with_args::<JsonB>("SELECT allgres_public.fn_claim_sql($1)", &[limit.into()])
             .ok()
             .flatten()
             .map(|j| j.0)
@@ -600,7 +600,7 @@ fn run_sandboxed_sql(agent_id: &str, sql: &str, pg_role: Option<&str>) -> Result
             return Err("sandbox role unavailable".to_string());
         }
         match Spi::get_one_with_args::<JsonB>(
-            "SELECT argo_public.fn_run_sandboxed_sql($1)",
+            "SELECT allgres_public.fn_run_sandboxed_sql($1)",
             &[sql.into()],
         ) {
             Ok(Some(JsonB(v))) => Ok(v),
@@ -636,7 +636,7 @@ fn submit_sql_result(call_id: &str, outcome: Result<Value, String>) {
     BackgroundWorker::transaction(|| {
         drop_privileges();
         if let Err(e) = Spi::get_one_with_args::<JsonB>(
-            "SELECT argo_public.fn_complete_sql($1::uuid, $2, $3, $4, $5, $6)",
+            "SELECT allgres_public.fn_complete_sql($1::uuid, $2, $3, $4, $5, $6)",
             &[
                 call_id.into(),
                 ok.into(),
@@ -694,7 +694,7 @@ struct OutboundResult {
     body: String,
 }
 
-/// Mirrors `argo_private.is_blocked_host`'s IPv4-literal ranges exactly, so
+/// Mirrors `allgres_private.is_blocked_host`'s IPv4-literal ranges exactly, so
 /// the two blocklists cannot drift: loopback, RFC1918, CGNAT (100.64/10),
 /// link-local (including the cloud-metadata address 169.254.169.254),
 /// TEST-NET/protocol-assignment (192.0.0/24, 192.0.2/24), benchmarking
@@ -1859,7 +1859,7 @@ mod tests {
     //
     // These exercise `analyze_dump` against the shape `nodeToString` produces.
     // The end-to-end path (real parser -> real dump) is covered by
-    // argo_public.fn_selftest, which runs inside the database.
+    // allgres_public.fn_selftest, which runs inside the database.
 
     fn rangevar(schema: &str, rel: &str) -> String {
         format!("{{RANGEVAR :schemaname {schema} :relname {rel} :inh true :relpersistence p :alias <> :location 14}}")
@@ -1871,21 +1871,21 @@ mod tests {
 
     #[test]
     fn reads_a_schema_qualified_relation() {
-        let d = analyze_dump(&select_dump(&rangevar("argo_public", "v_sales")));
+        let d = analyze_dump(&select_dump(&rangevar("allgres_public", "v_sales")));
         assert_eq!(d["kind"], "select");
         assert_eq!(d["statements"], 1);
         assert_eq!(d["writes"], false);
-        assert_eq!(d["relations"][0]["schema"], "argo_public");
+        assert_eq!(d["relations"][0]["schema"], "allgres_public");
         assert_eq!(d["relations"][0]["name"], "v_sales");
     }
 
     #[test]
     fn reads_every_relation_in_a_comma_join() {
-        let inner = format!("{} {}", rangevar("argo_public", "v_sales"), rangevar("argo_private", "sessions"));
+        let inner = format!("{} {}", rangevar("allgres_public", "v_sales"), rangevar("allgres_private", "sessions"));
         let d = analyze_dump(&select_dump(&inner));
         let rels = d["relations"].as_array().unwrap();
         assert_eq!(rels.len(), 2);
-        assert_eq!(rels[1]["schema"], "argo_private");
+        assert_eq!(rels[1]["schema"], "allgres_private");
     }
 
     #[test]

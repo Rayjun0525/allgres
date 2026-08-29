@@ -4,8 +4,16 @@
 
 -- Allgres 0.3.0 control plane.
 --
--- Internal argo_* schema names are intentionally retained for upgrade compatibility.
--- User-facing native functions are exposed under schema allgres.
+-- Internal state lives in the allgres_private/allgres_public schemas and the
+-- allgres_owner role; user-facing native functions are exposed under schema
+-- allgres. Earlier development used the project's original name, Argo, for
+-- these three identifiers (argo_private/argo_public/argo_owner) -- fully
+-- retired now, project-wide. An install from before the rename (0.2.0 or
+-- earlier; see sql/allgres--0.2.0.sql, kept frozen with the old names as a
+-- true historical snapshot) is migrated in place the first time this file
+-- runs against it -- see the ALTER ROLE/SCHEMA ... RENAME block in "1.
+-- Roles" below -- not recreated under the new names with the old ones left
+-- behind holding orphaned data.
 --
 -- This file is the single canonical definition of the control plane.  Every
 -- object is defined exactly once, in dependency order; there are no superseded
@@ -29,13 +37,45 @@
 --  13. allgres facade + dashboard RPC
 
 -- ---------------------------------------------------------------------------
--- 1. Roles.  Invariant 7: three runtime roles.  argo_owner is deploy-only.
+-- 1. Roles.  Invariant 7: three runtime roles.  allgres_owner is deploy-only.
 -- ---------------------------------------------------------------------------
+
+-- Rename-in-place, not recreate-and-abandon: an install from before Argo was
+-- fully retired (0.2.0 or earlier -- see sql/allgres--0.2.0.sql, frozen with
+-- the old names) has real data sitting under argo_owner/argo_private/
+-- argo_public. ALTER ROLE/SCHEMA ... RENAME keeps every object and every
+-- row exactly where it is, just under the new name; recreating
+-- allgres_owner/allgres_private/allgres_public fresh and leaving the old
+-- ones behind would silently orphan that data, the same way a logical
+-- backup silently dropped it all before pg_extension_config_dump was
+-- registered (see KNOWN_ISSUES.md, "the backup/PITR drill"). This has to
+-- run before the CREATE ROLE/CREATE SCHEMA IF NOT EXISTS block right below
+-- it -- otherwise that block, finding no allgres_owner yet, creates an
+-- empty one before this rename ever gets a chance to run, and the rename's
+-- own "allgres_owner must not already exist" guard then blocks it,
+-- orphaning the old role instead of renaming it. A fresh install has
+-- neither old name, so every guard here is a no-op.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'argo_owner')
+     AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_owner') THEN
+    ALTER ROLE argo_owner RENAME TO allgres_owner;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'argo_private')
+     AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'allgres_private') THEN
+    ALTER SCHEMA argo_private RENAME TO allgres_private;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'argo_public')
+     AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'allgres_public') THEN
+    ALTER SCHEMA argo_public RENAME TO allgres_public;
+  END IF;
+END
+$$;
 
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'argo_owner') THEN
-    CREATE ROLE argo_owner LOGIN;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_owner') THEN
+    CREATE ROLE allgres_owner LOGIN;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator') THEN
     CREATE ROLE operator LOGIN;
@@ -53,8 +93,8 @@ $$;
 -- narrows search_path to pg_temp before running model-generated SQL, and this
 -- default keeps that true for any other session that assumes the role.
 ALTER ROLE sandbox  SET search_path = pg_temp;
-ALTER ROLE worker   SET search_path = argo_public, pg_temp;
-ALTER ROLE operator SET search_path = argo_private, argo_public, pg_temp;
+ALTER ROLE worker   SET search_path = allgres_public, pg_temp;
+ALTER ROLE operator SET search_path = allgres_private, allgres_public, pg_temp;
 
 -- The runtime worker drops to `worker` per transaction, then drops further to
 -- `sandbox` to run agent SQL (fn_run_sandboxed_sql); that second hop needs
@@ -66,7 +106,7 @@ GRANT sandbox TO worker;
 -- CREATE OR REPLACE cannot do either, so upgrades need an explicit drop.
 -- ---------------------------------------------------------------------------
 
-DROP FUNCTION IF EXISTS argo_public.fn_set_provider(uuid, text, boolean, text, text, text, text);
+DROP FUNCTION IF EXISTS allgres_public.fn_set_provider(uuid, text, boolean, text, text, text, text);
 DROP FUNCTION IF EXISTS allgres.create_session(uuid, text);
 
 -- fn_execute_sql validated *and* ran agent SQL as its own (SECURITY DEFINER)
@@ -75,7 +115,7 @@ DROP FUNCTION IF EXISTS allgres.create_session(uuid, text);
 -- only, returns text) plus fn_run_sandboxed_sql (execution, run by the
 -- runtime worker as the sandbox role) -- a name and a return-type change, so
 -- CREATE OR REPLACE cannot land it.
-DROP FUNCTION IF EXISTS argo_private.fn_execute_sql(uuid, text);
+DROP FUNCTION IF EXISTS allgres_private.fn_execute_sql(uuid, text);
 
 -- fn_create_session gains an optional project_id; fn_decide_approval gains an
 -- optional human reply.  CREATE OR REPLACE cannot append a new parameter to
@@ -83,18 +123,18 @@ DROP FUNCTION IF EXISTS argo_private.fn_execute_sql(uuid, text);
 -- (verified: PostgreSQL treats a longer parameter list as a distinct
 -- function, which then makes the shorter call ambiguous) -- so both need an
 -- explicit drop first.
-DROP FUNCTION IF EXISTS argo_public.fn_create_session(uuid, text);
-DROP FUNCTION IF EXISTS argo_public.fn_decide_approval(uuid, boolean);
-DROP FUNCTION IF EXISTS argo_public.fn_set_policy(uuid, text, int, int, jsonb);
+DROP FUNCTION IF EXISTS allgres_public.fn_create_session(uuid, text);
+DROP FUNCTION IF EXISTS allgres_public.fn_decide_approval(uuid, boolean);
+DROP FUNCTION IF EXISTS allgres_public.fn_set_policy(uuid, text, int, int, jsonb);
 
 -- The SQL sandbox no longer inspects statement text with regexes; it reads the
 -- tree produced by PostgreSQL's own parser (allgres.analyze_sql).  These are
 -- the hand-rolled lexer that replaced.
-DROP FUNCTION IF EXISTS argo_private.sql_table_refs(text);
-DROP FUNCTION IF EXISTS argo_private.sql_relation_refs(text);
-DROP FUNCTION IF EXISTS argo_private.sql_cte_names(text);
-DROP FUNCTION IF EXISTS argo_private.sql_normalize(text);
-DROP FUNCTION IF EXISTS argo_private.strip_sql_noise(text);
+DROP FUNCTION IF EXISTS allgres_private.sql_table_refs(text);
+DROP FUNCTION IF EXISTS allgres_private.sql_relation_refs(text);
+DROP FUNCTION IF EXISTS allgres_private.sql_cte_names(text);
+DROP FUNCTION IF EXISTS allgres_private.sql_normalize(text);
+DROP FUNCTION IF EXISTS allgres_private.strip_sql_noise(text);
 
 -- The provider API key used to be decrypted and baked into the Authorization/
 -- x-api-key header inside build_llm_http, which fn_dispatch_tasks then wrote
@@ -107,23 +147,23 @@ DROP FUNCTION IF EXISTS argo_private.strip_sql_noise(text);
 -- touches a key at all); fn_dispatch_tasks drops it for the same reason;
 -- fn_claim_outbound gains it, since resolving the fallback key is now its
 -- job. All three signatures changed, so all three need an explicit drop.
-DROP FUNCTION IF EXISTS argo_private.build_llm_http(jsonb, text);
-DROP FUNCTION IF EXISTS argo_public.fn_dispatch_tasks(text);
-DROP FUNCTION IF EXISTS argo_public.fn_claim_outbound(int);
+DROP FUNCTION IF EXISTS allgres_private.build_llm_http(jsonb, text);
+DROP FUNCTION IF EXISTS allgres_public.fn_dispatch_tasks(text);
+DROP FUNCTION IF EXISTS allgres_public.fn_claim_outbound(int);
 
 -- agent_may_read now takes the agent_id as a parameter instead of resolving
 -- it itself -- see its own comment for why (current_user is not what it
 -- looks like from inside a SECURITY DEFINER function's own body).
-DROP FUNCTION IF EXISTS argo_private.agent_may_read(text);
+DROP FUNCTION IF EXISTS allgres_private.agent_may_read(text);
 
 -- ---------------------------------------------------------------------------
 -- 2. Schemas, tables, indexes, triggers.
 -- ---------------------------------------------------------------------------
 
-CREATE SCHEMA IF NOT EXISTS argo_private;
-CREATE SCHEMA IF NOT EXISTS argo_public;
+CREATE SCHEMA IF NOT EXISTS allgres_private;
+CREATE SCHEMA IF NOT EXISTS allgres_public;
 
-CREATE TABLE IF NOT EXISTS argo_private.agents (
+CREATE TABLE IF NOT EXISTS allgres_private.agents (
   agent_id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name        text NOT NULL UNIQUE,
   is_active   boolean NOT NULL DEFAULT true,
@@ -141,11 +181,11 @@ CREATE TABLE IF NOT EXISTS argo_private.agents (
 -- fn_run_sandboxed_sql runs as via `SET LOCAL ROLE` instead of the one
 -- shared `sandbox` role every agent used to run as indistinguishably. See
 -- fn_provision_agent_role and "6. SQL sandbox" below.
-ALTER TABLE argo_private.agents
+ALTER TABLE allgres_private.agents
   ADD COLUMN IF NOT EXISTS pg_role text UNIQUE;
 
-CREATE TABLE IF NOT EXISTS argo_private.policies (
-  agent_id        uuid PRIMARY KEY REFERENCES argo_private.agents(agent_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS allgres_private.policies (
+  agent_id        uuid PRIMARY KEY REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
   system_prompt   text NOT NULL,
   max_steps       int NOT NULL DEFAULT 20 CHECK (max_steps > 0),
   max_retries     int NOT NULL DEFAULT 2 CHECK (max_retries >= 0),
@@ -163,17 +203,17 @@ CREATE TABLE IF NOT EXISTS argo_private.policies (
 -- task may run start to finish regardless of step count (max_turn_seconds, a
 -- wall-clock ceiling from the task's created_at, enforced in fn_watchdog;
 -- NULL means uncapped).
-ALTER TABLE argo_private.policies
+ALTER TABLE allgres_private.policies
   ADD COLUMN IF NOT EXISTS generation int NOT NULL DEFAULT 1,
   ADD COLUMN IF NOT EXISTS max_concurrent_tasks int NOT NULL DEFAULT 4 CHECK (max_concurrent_tasks > 0),
   ADD COLUMN IF NOT EXISTS max_turn_seconds int CHECK (max_turn_seconds IS NULL OR max_turn_seconds > 0);
 
 -- Append-only: one row per version that was ever live, populated by
--- fn_set_policy just before it overwrites argo_private.policies.  There is no
--- row for the current version -- that's what argo_private.policies itself is.
-CREATE TABLE IF NOT EXISTS argo_private.policy_history (
+-- fn_set_policy just before it overwrites allgres_private.policies.  There is no
+-- row for the current version -- that's what allgres_private.policies itself is.
+CREATE TABLE IF NOT EXISTS allgres_private.policy_history (
   version_id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  agent_id             uuid NOT NULL REFERENCES argo_private.agents(agent_id) ON DELETE CASCADE,
+  agent_id             uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
   generation           int NOT NULL,
   system_prompt        text NOT NULL,
   max_steps            int NOT NULL,
@@ -186,18 +226,18 @@ CREATE TABLE IF NOT EXISTS argo_private.policy_history (
 );
 
 CREATE INDEX IF NOT EXISTS policy_history_agent_idx
-  ON argo_private.policy_history (agent_id, generation DESC);
+  ON allgres_private.policy_history (agent_id, generation DESC);
 
-CREATE TABLE IF NOT EXISTS argo_private.permissions (
+CREATE TABLE IF NOT EXISTS allgres_private.permissions (
   permission_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  agent_id      uuid NOT NULL REFERENCES argo_private.agents(agent_id) ON DELETE CASCADE,
+  agent_id      uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
   resource_type text NOT NULL CHECK (resource_type IN ('view', 'tool', 'agent', 'http_host')),
   resource_ref  text NOT NULL,
   granted_at    timestamptz NOT NULL DEFAULT now(),
   UNIQUE (agent_id, resource_type, resource_ref)
 );
 
-CREATE TABLE IF NOT EXISTS argo_private.sql_sandbox_allowlist (
+CREATE TABLE IF NOT EXISTS allgres_private.sql_sandbox_allowlist (
   resource_ref text PRIMARY KEY
 );
 
@@ -213,11 +253,11 @@ CREATE TABLE IF NOT EXISTS argo_private.sql_sandbox_allowlist (
 -- class of bug the denylist was added to close. An allowlist fails in the
 -- opposite, safe direction: a legitimate function an analyst needs might not
 -- be seeded here yet, which is a false rejection, not a leak.
-CREATE TABLE IF NOT EXISTS argo_private.sql_function_allowlist (
+CREATE TABLE IF NOT EXISTS allgres_private.sql_function_allowlist (
   function_name text PRIMARY KEY
 );
 
-INSERT INTO argo_private.sql_function_allowlist (function_name) VALUES
+INSERT INTO allgres_private.sql_function_allowlist (function_name) VALUES
   -- aggregates
   ('count'), ('sum'), ('avg'), ('min'), ('max'),
   ('array_agg'), ('string_agg'), ('jsonb_agg'), ('jsonb_object_agg'),
@@ -265,7 +305,7 @@ ON CONFLICT DO NOTHING;
 -- does not scope agents: an agent is reused across projects (the same way one
 -- bot can sit in several channels), so only sessions -- the actual
 -- conversation threads -- belong to a project.
-CREATE TABLE IF NOT EXISTS argo_private.projects (
+CREATE TABLE IF NOT EXISTS allgres_private.projects (
   project_id   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name         text NOT NULL UNIQUE,
   description  text,
@@ -274,9 +314,9 @@ CREATE TABLE IF NOT EXISTS argo_private.projects (
   updated_at   timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS argo_private.sessions (
+CREATE TABLE IF NOT EXISTS allgres_private.sessions (
   session_id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  agent_id      uuid NOT NULL REFERENCES argo_private.agents(agent_id),
+  agent_id      uuid NOT NULL REFERENCES allgres_private.agents(agent_id),
   goal          text NOT NULL,
   status        text NOT NULL CHECK (status IN ('open', 'completed', 'failed', 'cancelled')),
   final_answer  text,
@@ -286,18 +326,18 @@ CREATE TABLE IF NOT EXISTS argo_private.sessions (
 
 -- Nullable: a one-off session (the dashboard's "Run" page, or a smoke test)
 -- doesn't have to belong to a project.
-ALTER TABLE argo_private.sessions
-  ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES argo_private.projects(project_id);
+ALTER TABLE allgres_private.sessions
+  ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES allgres_private.projects(project_id);
 
 CREATE INDEX IF NOT EXISTS sessions_project_idx
-  ON argo_private.sessions (project_id, started_at DESC)
+  ON allgres_private.sessions (project_id, started_at DESC)
   WHERE project_id IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS argo_private.tasks (
+CREATE TABLE IF NOT EXISTS allgres_private.tasks (
   task_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  session_id      uuid NOT NULL REFERENCES argo_private.sessions(session_id),
-  agent_id        uuid NOT NULL REFERENCES argo_private.agents(agent_id),
-  parent_task_id  uuid REFERENCES argo_private.tasks(task_id),
+  session_id      uuid NOT NULL REFERENCES allgres_private.sessions(session_id),
+  agent_id        uuid NOT NULL REFERENCES allgres_private.agents(agent_id),
+  parent_task_id  uuid REFERENCES allgres_private.tasks(task_id),
   status          text NOT NULL CHECK (status IN
                     ('queued', 'running', 'completed', 'failed', 'waiting_human')),
   step_count      int NOT NULL DEFAULT 0,
@@ -315,7 +355,7 @@ CREATE TABLE IF NOT EXISTS argo_private.tasks (
 -- part of the agent's own turn budget, and counting it would let a busy
 -- agent's own concurrency cap starve tasks that are still waiting for their
 -- first turn.
-ALTER TABLE argo_private.tasks
+ALTER TABLE allgres_private.tasks
   ADD COLUMN IF NOT EXISTS started_at timestamptz;
 
 -- 'cancelled' is distinct from 'failed': an operator stopping a task is a
@@ -324,19 +364,19 @@ ALTER TABLE argo_private.tasks
 -- the idempotent way to widen one -- CREATE TABLE IF NOT EXISTS won't touch
 -- an existing table, and there is no ALTER TABLE ... ADD VALUE for a plain
 -- CHECK the way there is for an enum type.
-ALTER TABLE argo_private.tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
-ALTER TABLE argo_private.tasks ADD CONSTRAINT tasks_status_check CHECK (status IN
+ALTER TABLE allgres_private.tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
+ALTER TABLE allgres_private.tasks ADD CONSTRAINT tasks_status_check CHECK (status IN
   ('queued', 'running', 'completed', 'failed', 'waiting_human', 'cancelled'));
 
 CREATE INDEX IF NOT EXISTS tasks_ready_idx
-  ON argo_private.tasks (created_at)
+  ON allgres_private.tasks (created_at)
   WHERE status IN ('queued', 'running');
 CREATE INDEX IF NOT EXISTS tasks_session_idx
-  ON argo_private.tasks (session_id, created_at);
+  ON allgres_private.tasks (session_id, created_at);
 CREATE INDEX IF NOT EXISTS tasks_agent_status_idx
-  ON argo_private.tasks (agent_id, status);
+  ON allgres_private.tasks (agent_id, status);
 CREATE INDEX IF NOT EXISTS tasks_updated_idx
-  ON argo_private.tasks (updated_at DESC);
+  ON allgres_private.tasks (updated_at DESC);
 
 -- An agent's own proposal to change its behavior -- never its resource
 -- envelope or permissions, see fn_submit_result's propose_change handling
@@ -345,10 +385,10 @@ CREATE INDEX IF NOT EXISTS tasks_updated_idx
 -- the live policy has moved on by the time it's decided (an operator edit,
 -- or another proposal already applied), fn_decide_proposal marks it
 -- 'stale' instead of blindly applying it over whatever changed it.
-CREATE TABLE IF NOT EXISTS argo_private.change_proposals (
+CREATE TABLE IF NOT EXISTS allgres_private.change_proposals (
   proposal_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  agent_id         uuid NOT NULL REFERENCES argo_private.agents(agent_id) ON DELETE CASCADE,
-  task_id          uuid REFERENCES argo_private.tasks(task_id),
+  agent_id         uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  task_id          uuid REFERENCES allgres_private.tasks(task_id),
   proposed_changes jsonb NOT NULL,
   reason           text,
   base_generation  int NOT NULL,
@@ -360,14 +400,14 @@ CREATE TABLE IF NOT EXISTS argo_private.change_proposals (
 );
 
 CREATE INDEX IF NOT EXISTS change_proposals_pending_idx
-  ON argo_private.change_proposals (created_at)
+  ON allgres_private.change_proposals (created_at)
   WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS change_proposals_agent_idx
-  ON argo_private.change_proposals (agent_id, created_at DESC);
+  ON allgres_private.change_proposals (agent_id, created_at DESC);
 
-CREATE TABLE IF NOT EXISTS argo_private.execution_logs (
+CREATE TABLE IF NOT EXISTS allgres_private.execution_logs (
   log_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  task_id     uuid NOT NULL REFERENCES argo_private.tasks(task_id),
+  task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
   step_number int NOT NULL,
   role        text NOT NULL CHECK (role IN
                 ('system', 'user', 'assistant', 'tool', 'error', 'operator')),
@@ -376,13 +416,13 @@ CREATE TABLE IF NOT EXISTS argo_private.execution_logs (
 );
 
 CREATE INDEX IF NOT EXISTS execution_logs_task_idx
-  ON argo_private.execution_logs (task_id, step_number, created_at);
+  ON allgres_private.execution_logs (task_id, step_number, created_at);
 CREATE INDEX IF NOT EXISTS execution_logs_created_idx
-  ON argo_private.execution_logs (created_at DESC);
+  ON allgres_private.execution_logs (created_at DESC);
 
-CREATE TABLE IF NOT EXISTS argo_private.human_approvals (
+CREATE TABLE IF NOT EXISTS allgres_private.human_approvals (
   approval_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  task_id     uuid NOT NULL REFERENCES argo_private.tasks(task_id),
+  task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
   status      text NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
   payload     jsonb NOT NULL,
   decided_at  timestamptz
@@ -394,19 +434,19 @@ CREATE TABLE IF NOT EXISTS argo_private.human_approvals (
 -- fn_watchdog reclaim an approval nobody ever answers, the same "durable
 -- queue, self-healing" shape it already uses for stuck outbound_calls and
 -- sql_calls, just on human timescales instead of machine ones.
-ALTER TABLE argo_private.human_approvals
+ALTER TABLE allgres_private.human_approvals
   ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now(),
   ADD COLUMN IF NOT EXISTS reply_text text,
   ADD COLUMN IF NOT EXISTS expires_at timestamptz;
 
 CREATE INDEX IF NOT EXISTS human_approvals_pending_idx
-  ON argo_private.human_approvals (created_at)
+  ON allgres_private.human_approvals (created_at)
   WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS human_approvals_expiry_idx
-  ON argo_private.human_approvals (expires_at)
+  ON allgres_private.human_approvals (expires_at)
   WHERE status = 'pending' AND expires_at IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS argo_private.llm_providers (
+CREATE TABLE IF NOT EXISTS allgres_private.llm_providers (
   provider_id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name            text NOT NULL UNIQUE,
   kind            text NOT NULL CHECK (kind IN ('openai_compat', 'anthropic', 'oauth')),
@@ -423,12 +463,12 @@ CREATE TABLE IF NOT EXISTS argo_private.llm_providers (
   created_at      timestamptz NOT NULL DEFAULT now()
 );
 
-ALTER TABLE argo_private.llm_providers
+ALTER TABLE allgres_private.llm_providers
   ADD COLUMN IF NOT EXISTS allow_private_network boolean NOT NULL DEFAULT false;
 
 -- Never returned by list functions.  Operator writes via fn_set_provider_secret.
-CREATE TABLE IF NOT EXISTS argo_private.llm_secrets (
-  provider_id         uuid PRIMARY KEY REFERENCES argo_private.llm_providers(provider_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS allgres_private.llm_secrets (
+  provider_id         uuid PRIMARY KEY REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
   api_key             text,
   oauth_client_secret text,
   access_token        text,
@@ -436,15 +476,15 @@ CREATE TABLE IF NOT EXISTS argo_private.llm_secrets (
   expires_at          timestamptz
 );
 
-CREATE TABLE IF NOT EXISTS argo_private.oauth_states (
+CREATE TABLE IF NOT EXISTS allgres_private.oauth_states (
   state        text PRIMARY KEY,
-  provider_id  uuid NOT NULL REFERENCES argo_private.llm_providers(provider_id) ON DELETE CASCADE,
+  provider_id  uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
   created_at   timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS argo_private.outbound_calls (
+CREATE TABLE IF NOT EXISTS allgres_private.outbound_calls (
   call_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  task_id          uuid NOT NULL REFERENCES argo_private.tasks(task_id),
+  task_id          uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
   kind             text NOT NULL CHECK (kind IN ('llm', 'tool')),
   tool             text,
   url              text NOT NULL,
@@ -459,7 +499,7 @@ CREATE TABLE IF NOT EXISTS argo_private.outbound_calls (
   updated_at       timestamptz NOT NULL DEFAULT now()
 );
 
--- The URL's host string is checked against argo_private.is_blocked_host at
+-- The URL's host string is checked against allgres_private.is_blocked_host at
 -- queue time (see check_outbound_url), but the worker connects by hostname
 -- later, on its own HTTP thread, with its own DNS resolution -- a hostname
 -- that resolves to a public IP right now can resolve to 127.0.0.1 or an
@@ -472,7 +512,7 @@ CREATE TABLE IF NOT EXISTS argo_private.outbound_calls (
 -- reject a private address or accept it. http_get never sets it: the tool
 -- path passes p_allow_private = false into check_outbound_url unconditionally,
 -- so it stays at its default here too.
-ALTER TABLE argo_private.outbound_calls
+ALTER TABLE allgres_private.outbound_calls
   ADD COLUMN IF NOT EXISTS allow_private boolean NOT NULL DEFAULT false;
 
 -- Which provider (if any) this call needs a credential for, and which header
@@ -480,17 +520,17 @@ ALTER TABLE argo_private.outbound_calls
 -- decrypted key; fn_claim_outbound resolves it from provider_id at claim
 -- time and merges it only into the JSON handed to the worker. Both are NULL
 -- for a 'tool' call (http_get carries no credential at all).
-ALTER TABLE argo_private.outbound_calls
-  ADD COLUMN IF NOT EXISTS provider_id uuid REFERENCES argo_private.llm_providers(provider_id),
+ALTER TABLE allgres_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS provider_id uuid REFERENCES allgres_private.llm_providers(provider_id),
   ADD COLUMN IF NOT EXISTS auth_kind text CHECK (auth_kind IS NULL OR auth_kind IN ('authorization', 'x-api-key'));
 
 CREATE INDEX IF NOT EXISTS outbound_ready_idx
-  ON argo_private.outbound_calls (created_at)
+  ON allgres_private.outbound_calls (created_at)
   WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS outbound_task_idx
-  ON argo_private.outbound_calls (task_id, status);
+  ON allgres_private.outbound_calls (task_id, status);
 CREATE INDEX IF NOT EXISTS outbound_inflight_idx
-  ON argo_private.outbound_calls (updated_at)
+  ON allgres_private.outbound_calls (updated_at)
   WHERE status = 'in_flight';
 
 -- Agent SQL is validated here (fn_validate_sql) but executed by the runtime
@@ -498,10 +538,10 @@ CREATE INDEX IF NOT EXISTS outbound_inflight_idx
 -- forbids `SET ROLE` inside a SECURITY DEFINER function, so it cannot run
 -- inline in the same call that validates it.  This table is the handoff,
 -- shaped exactly like outbound_calls: queued -> in_flight -> harvested/lost.
-CREATE TABLE IF NOT EXISTS argo_private.sql_calls (
+CREATE TABLE IF NOT EXISTS allgres_private.sql_calls (
   call_id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  task_id     uuid NOT NULL REFERENCES argo_private.tasks(task_id),
-  agent_id    uuid NOT NULL REFERENCES argo_private.agents(agent_id),
+  task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
+  agent_id    uuid NOT NULL REFERENCES allgres_private.agents(agent_id),
   sql         text NOT NULL,
   status      text NOT NULL CHECK (status IN ('queued', 'in_flight', 'harvested', 'lost')),
   created_at  timestamptz NOT NULL DEFAULT now(),
@@ -509,17 +549,17 @@ CREATE TABLE IF NOT EXISTS argo_private.sql_calls (
 );
 
 CREATE INDEX IF NOT EXISTS sql_calls_ready_idx
-  ON argo_private.sql_calls (created_at)
+  ON allgres_private.sql_calls (created_at)
   WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS sql_calls_task_idx
-  ON argo_private.sql_calls (task_id, status);
+  ON allgres_private.sql_calls (task_id, status);
 CREATE INDEX IF NOT EXISTS sql_calls_inflight_idx
-  ON argo_private.sql_calls (updated_at)
+  ON allgres_private.sql_calls (updated_at)
   WHERE status = 'in_flight';
 
-CREATE TABLE IF NOT EXISTS argo_private.demo_sales (
+CREATE TABLE IF NOT EXISTS allgres_private.demo_sales (
   sale_id   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  agent_id  uuid REFERENCES argo_private.agents(agent_id) ON DELETE CASCADE,
+  agent_id  uuid REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
   region    text NOT NULL,
   sku       text NOT NULL,
   amount    numeric NOT NULL,
@@ -535,14 +575,14 @@ CREATE TABLE IF NOT EXISTS argo_private.demo_sales (
 -- Deliberately SECURITY INVOKER and table-free (the agent_id is parsed
 -- straight back out of the role name -- fn_provision_agent_role only ever
 -- names one 'allgres_agent_' || <uuid with dashes stripped>, so this is
--- exactly reversible) rather than looking it up in argo_private.agents.
+-- exactly reversible) rather than looking it up in allgres_private.agents.
 -- The reason is not the schema grant (that could be solved with
 -- SECURITY DEFINER, same as everywhere else in this file) but something
 -- SECURITY DEFINER cannot solve here: it changes current_user for the
 -- rest of that function's execution, to the function's *owner*, not the
 -- original caller -- and that change is in effect for anything called
 -- from inside it too, security definer or not. agent_may_read is already
--- SECURITY DEFINER (it has to be, to read argo_private.permissions and
+-- SECURITY DEFINER (it has to be, to read allgres_private.permissions and
 -- sql_sandbox_allowlist); calling this function from inside agent_may_read
 -- would see current_user as agent_may_read's owner on every single call,
 -- never the querying agent's own role -- confirmed live: that was this
@@ -560,7 +600,7 @@ CREATE TABLE IF NOT EXISTS argo_private.demo_sales (
 -- with set_config(..., true) survives a role or security-context change
 -- for the rest of the transaction, which is exactly why the original
 -- design used one instead of current_user in the first place.
-CREATE OR REPLACE FUNCTION argo_private.current_agent_id()
+CREATE OR REPLACE FUNCTION allgres_private.current_agent_id()
 RETURNS uuid
 LANGUAGE sql
 STABLE
@@ -581,7 +621,7 @@ AS $fn$
   )
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.touch_updated_at()
+CREATE OR REPLACE FUNCTION allgres_private.touch_updated_at()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $fn$
@@ -591,22 +631,22 @@ BEGIN
 END;
 $fn$;
 
-DROP TRIGGER IF EXISTS agents_touch ON argo_private.agents;
+DROP TRIGGER IF EXISTS agents_touch ON allgres_private.agents;
 CREATE TRIGGER agents_touch
-  BEFORE UPDATE ON argo_private.agents
-  FOR EACH ROW EXECUTE FUNCTION argo_private.touch_updated_at();
+  BEFORE UPDATE ON allgres_private.agents
+  FOR EACH ROW EXECUTE FUNCTION allgres_private.touch_updated_at();
 
-DROP TRIGGER IF EXISTS tasks_touch ON argo_private.tasks;
+DROP TRIGGER IF EXISTS tasks_touch ON allgres_private.tasks;
 CREATE TRIGGER tasks_touch
-  BEFORE UPDATE ON argo_private.tasks
-  FOR EACH ROW EXECUTE FUNCTION argo_private.touch_updated_at();
+  BEFORE UPDATE ON allgres_private.tasks
+  FOR EACH ROW EXECUTE FUNCTION allgres_private.touch_updated_at();
 
-DROP TRIGGER IF EXISTS projects_touch ON argo_private.projects;
+DROP TRIGGER IF EXISTS projects_touch ON allgres_private.projects;
 CREATE TRIGGER projects_touch
-  BEFORE UPDATE ON argo_private.projects
-  FOR EACH ROW EXECUTE FUNCTION argo_private.touch_updated_at();
+  BEFORE UPDATE ON allgres_private.projects
+  FOR EACH ROW EXECUTE FUNCTION allgres_private.touch_updated_at();
 
-CREATE OR REPLACE FUNCTION argo_private.forbid_log_mutation()
+CREATE OR REPLACE FUNCTION allgres_private.forbid_log_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $fn$
@@ -616,17 +656,17 @@ BEGIN
 END;
 $fn$;
 
-DROP TRIGGER IF EXISTS execution_logs_no_update ON argo_private.execution_logs;
+DROP TRIGGER IF EXISTS execution_logs_no_update ON allgres_private.execution_logs;
 CREATE TRIGGER execution_logs_no_update
-  BEFORE UPDATE OR DELETE ON argo_private.execution_logs
-  FOR EACH ROW EXECUTE FUNCTION argo_private.forbid_log_mutation();
+  BEFORE UPDATE OR DELETE ON allgres_private.execution_logs
+  FOR EACH ROW EXECUTE FUNCTION allgres_private.forbid_log_mutation();
 
-CREATE OR REPLACE FUNCTION argo_private.ensure_policy()
+CREATE OR REPLACE FUNCTION allgres_private.ensure_policy()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $fn$
 BEGIN
-  INSERT INTO argo_private.policies (agent_id, system_prompt, llm_config)
+  INSERT INTO allgres_private.policies (agent_id, system_prompt, llm_config)
   VALUES (
     NEW.agent_id,
     $prompt$You are an agent whose next action is decided only as JSON.
@@ -650,10 +690,10 @@ $prompt$,
 END;
 $fn$;
 
-DROP TRIGGER IF EXISTS agents_ensure_policy ON argo_private.agents;
+DROP TRIGGER IF EXISTS agents_ensure_policy ON allgres_private.agents;
 CREATE TRIGGER agents_ensure_policy
-  AFTER INSERT ON argo_private.agents
-  FOR EACH ROW EXECUTE FUNCTION argo_private.ensure_policy();
+  AFTER INSERT ON allgres_private.agents
+  FOR EACH ROW EXECUTE FUNCTION allgres_private.ensure_policy();
 
 -- ---------------------------------------------------------------------------
 -- 3. Generic helpers.
@@ -662,9 +702,9 @@ CREATE TRIGGER agents_ensure_policy
 -- base_url is deliberately NOT accepted here.  Per-agent llm_config used to be
 -- able to override the endpoint, which let anyone with dashboard access point
 -- the worker (carrying the provider API key) at an arbitrary address.  The
--- endpoint now comes only from argo_private.llm_providers, which is
+-- endpoint now comes only from allgres_private.llm_providers, which is
 -- operator-managed and validated by the outbound guard.
-CREATE OR REPLACE FUNCTION argo_private.sanitize_llm_config(p jsonb)
+CREATE OR REPLACE FUNCTION allgres_private.sanitize_llm_config(p jsonb)
 RETURNS jsonb
 LANGUAGE sql
 IMMUTABLE
@@ -677,7 +717,7 @@ AS $fn$
   ))
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.extract_first_json(p_text text)
+CREATE OR REPLACE FUNCTION allgres_private.extract_first_json(p_text text)
 RETURNS jsonb
 LANGUAGE plpgsql
 IMMUTABLE
@@ -743,7 +783,7 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.log_content_text(p jsonb)
+CREATE OR REPLACE FUNCTION allgres_private.log_content_text(p jsonb)
 RETURNS text
 LANGUAGE sql
 IMMUTABLE
@@ -755,7 +795,7 @@ AS $fn$
   END
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.append_log(
+CREATE OR REPLACE FUNCTION allgres_private.append_log(
   p_task_id uuid,
   p_step int,
   p_role text,
@@ -763,11 +803,11 @@ CREATE OR REPLACE FUNCTION argo_private.append_log(
 ) RETURNS void
 LANGUAGE sql
 AS $fn$
-  INSERT INTO argo_private.execution_logs (task_id, step_number, role, content)
+  INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content)
   VALUES (p_task_id, p_step, p_role, p_content)
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.maybe_complete_session(p_session_id uuid)
+CREATE OR REPLACE FUNCTION allgres_private.maybe_complete_session(p_session_id uuid)
 RETURNS void
 LANGUAGE plpgsql
 AS $fn$
@@ -780,7 +820,7 @@ BEGIN
     count(*) FILTER (WHERE status IN ('queued', 'running', 'waiting_human')),
     count(*) FILTER (WHERE status = 'failed')
   INTO v_open, v_failed
-  FROM argo_private.tasks
+  FROM allgres_private.tasks
   WHERE session_id = p_session_id;
 
   IF v_open > 0 THEN
@@ -789,7 +829,7 @@ BEGIN
 
   SELECT t.output->>'answer'
   INTO v_answer
-  FROM argo_private.tasks t
+  FROM allgres_private.tasks t
   WHERE t.session_id = p_session_id
     AND t.status = 'completed'
     AND t.parent_task_id IS NULL
@@ -797,11 +837,11 @@ BEGIN
   LIMIT 1;
 
   IF v_failed > 0 AND v_answer IS NULL THEN
-    UPDATE argo_private.sessions
+    UPDATE allgres_private.sessions
     SET status = 'failed', completed_at = now()
     WHERE session_id = p_session_id AND status = 'open';
   ELSE
-    UPDATE argo_private.sessions
+    UPDATE allgres_private.sessions
     SET status = 'completed',
         final_answer = COALESCE(v_answer, final_answer),
         completed_at = now()
@@ -815,7 +855,7 @@ $fn$;
 -- reaches a view it has no permission for sees no rows rather than a leak.
 -- Takes the agent_id as a parameter rather than calling
 -- current_agent_id() itself: this function has to be SECURITY DEFINER (it
--- reads argo_private.permissions and sql_sandbox_allowlist, which
+-- reads allgres_private.permissions and sql_sandbox_allowlist, which
 -- `sandbox` and per-agent roles have no direct grant on), and SECURITY
 -- DEFINER changes current_user -- to this function's *owner* -- for
 -- everything it calls internally too. current_agent_id() has to run
@@ -824,27 +864,27 @@ $fn$;
 -- failure this caused when it was called from in here instead. Every
 -- caller (v_my_tasks / v_sales below) calls current_agent_id() itself and
 -- passes the result in.
-CREATE OR REPLACE FUNCTION argo_private.agent_may_read(p_ref text, p_agent_id uuid)
+CREATE OR REPLACE FUNCTION allgres_private.agent_may_read(p_ref text, p_agent_id uuid)
 RETURNS boolean
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
   SELECT p_agent_id IS NOT NULL
      AND EXISTS (
-       SELECT 1 FROM argo_private.sql_sandbox_allowlist a
+       SELECT 1 FROM allgres_private.sql_sandbox_allowlist a
        WHERE a.resource_ref = p_ref
      )
      AND EXISTS (
-       SELECT 1 FROM argo_private.permissions p
+       SELECT 1 FROM allgres_private.permissions p
        WHERE p.agent_id = p_agent_id
          AND p.resource_type = 'view'
          AND p.resource_ref = p_ref
      )
 $fn$;
 
-CREATE OR REPLACE VIEW argo_public.v_my_tasks
+CREATE OR REPLACE VIEW allgres_public.v_my_tasks
   WITH (security_barrier = true)
 AS
   SELECT
@@ -854,17 +894,17 @@ AS
     step_count,
     created_at,
     updated_at
-  FROM argo_private.tasks
-  WHERE agent_id IS NOT DISTINCT FROM argo_private.current_agent_id()
-    AND argo_private.agent_may_read('argo_public.v_my_tasks', argo_private.current_agent_id());
+  FROM allgres_private.tasks
+  WHERE agent_id IS NOT DISTINCT FROM allgres_private.current_agent_id()
+    AND allgres_private.agent_may_read('allgres_public.v_my_tasks', allgres_private.current_agent_id());
 
-CREATE OR REPLACE VIEW argo_public.v_sales
+CREATE OR REPLACE VIEW allgres_public.v_sales
   WITH (security_barrier = true)
 AS
   SELECT sale_id, region, sku, amount, sold_on
-  FROM argo_private.demo_sales
-  WHERE agent_id IS NOT DISTINCT FROM argo_private.current_agent_id()
-    AND argo_private.agent_may_read('argo_public.v_sales', argo_private.current_agent_id());
+  FROM allgres_private.demo_sales
+  WHERE agent_id IS NOT DISTINCT FROM allgres_private.current_agent_id()
+    AND allgres_private.agent_may_read('allgres_public.v_sales', allgres_private.current_agent_id());
 
 -- ---------------------------------------------------------------------------
 -- 4. Outbound URL / host guards.
@@ -875,7 +915,7 @@ AS
 -- link-local metadata services with the provider credentials attached.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION argo_private.url_host(p_url text)
+CREATE OR REPLACE FUNCTION allgres_private.url_host(p_url text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
@@ -919,7 +959,7 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.is_blocked_host(p_host text)
+CREATE OR REPLACE FUNCTION allgres_private.is_blocked_host(p_host text)
 RETURNS boolean
 LANGUAGE plpgsql
 IMMUTABLE
@@ -935,7 +975,7 @@ BEGIN
   -- IPv4-mapped / -compatible IPv6 (::ffff:127.0.0.1) reduces to its IPv4 part.
   v4 := (regexp_match(h, '^::(ffff:)?([0-9]{1,3}(\.[0-9]{1,3}){3})$'))[2];
   IF v4 IS NOT NULL THEN
-    RETURN argo_private.is_blocked_host(v4);
+    RETURN allgres_private.is_blocked_host(v4);
   END IF;
 
   -- Non dotted-quad spellings of an IPv4 address (2130706433, 0x7f000001,
@@ -981,7 +1021,7 @@ $fn$;
 
 -- Returns NULL when the URL may be fetched, otherwise a short machine-readable
 -- reason.  p_allow_private is the per-provider opt-in for loopback/RFC1918.
-CREATE OR REPLACE FUNCTION argo_private.check_outbound_url(
+CREATE OR REPLACE FUNCTION allgres_private.check_outbound_url(
   p_url text,
   p_allow_private boolean DEFAULT false
 ) RETURNS text
@@ -1010,11 +1050,11 @@ BEGIN
     RETURN 'plaintext_http_not_allowed';
   END IF;
 
-  v_host := argo_private.url_host(p_url);
+  v_host := allgres_private.url_host(p_url);
   IF v_host IS NULL THEN
     RETURN 'url_host_unparseable';
   END IF;
-  IF argo_private.is_blocked_host(v_host) AND NOT coalesce(p_allow_private, false) THEN
+  IF allgres_private.is_blocked_host(v_host) AND NOT coalesce(p_allow_private, false) THEN
     RETURN 'host_blocked';
   END IF;
 
@@ -1032,7 +1072,7 @@ $fn$;
 -- there.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION argo_private.secret_key()
+CREATE OR REPLACE FUNCTION allgres_private.secret_key()
 RETURNS text
 LANGUAGE sql
 STABLE
@@ -1045,7 +1085,7 @@ $fn$;
 -- earlier version called `pgp_sym_encrypt` unqualified, failed to resolve it,
 -- and silently fell back to storing the secret in plaintext while still
 -- reporting "encrypted".
-CREATE OR REPLACE FUNCTION argo_private.pgcrypto_schema()
+CREATE OR REPLACE FUNCTION allgres_private.pgcrypto_schema()
 RETURNS text
 LANGUAGE sql
 STABLE
@@ -1057,13 +1097,13 @@ AS $fn$
   LIMIT 1
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.encrypt_secret(p_plain text)
+CREATE OR REPLACE FUNCTION allgres_private.encrypt_secret(p_plain text)
 RETURNS text
 LANGUAGE plpgsql
 AS $fn$
 DECLARE
-  v_key text := argo_private.secret_key();
-  v_ns  text := argo_private.pgcrypto_schema();
+  v_key text := allgres_private.secret_key();
+  v_ns  text := allgres_private.pgcrypto_schema();
   v_out text;
 BEGIN
   IF p_plain IS NULL OR p_plain = '' THEN
@@ -1089,13 +1129,13 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.decrypt_secret(p_stored text)
+CREATE OR REPLACE FUNCTION allgres_private.decrypt_secret(p_stored text)
 RETURNS text
 LANGUAGE plpgsql
 AS $fn$
 DECLARE
-  v_key text := argo_private.secret_key();
-  v_ns  text := argo_private.pgcrypto_schema();
+  v_key text := allgres_private.secret_key();
+  v_ns  text := allgres_private.pgcrypto_schema();
   v_out text;
 BEGIN
   IF p_stored IS NULL THEN
@@ -1121,7 +1161,7 @@ $fn$;
 -- Reports what the next write would actually do, by doing it.  Checking only
 -- that pgp_sym_encrypt exists somewhere is how the previous version came to
 -- report "encrypted" while storing plaintext.
-CREATE OR REPLACE FUNCTION argo_private.secret_storage_mode()
+CREATE OR REPLACE FUNCTION allgres_private.secret_storage_mode()
 RETURNS text
 LANGUAGE plpgsql
 STABLE
@@ -1129,36 +1169,36 @@ AS $fn$
 DECLARE
   v_probe text;
 BEGIN
-  IF argo_private.secret_key() IS NULL THEN
+  IF allgres_private.secret_key() IS NULL THEN
     RETURN 'plaintext_no_key';
   END IF;
-  IF argo_private.pgcrypto_schema() IS NULL THEN
+  IF allgres_private.pgcrypto_schema() IS NULL THEN
     RETURN 'plaintext_no_pgcrypto';
   END IF;
   BEGIN
-    v_probe := argo_private.encrypt_secret('allgres-probe');
+    v_probe := allgres_private.encrypt_secret('allgres-probe');
   EXCEPTION WHEN others THEN
     RETURN 'plaintext_encrypt_failed';
   END;
   IF v_probe IS NULL OR left(v_probe, 7) <> 'enc:v1:' THEN
     RETURN 'plaintext_encrypt_failed';
   END IF;
-  IF argo_private.decrypt_secret(v_probe) IS DISTINCT FROM 'allgres-probe' THEN
+  IF allgres_private.decrypt_secret(v_probe) IS DISTINCT FROM 'allgres-probe' THEN
     RETURN 'encrypted_but_not_readable';
   END IF;
   RETURN 'encrypted';
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.provider_secret(p_provider_id uuid)
+CREATE OR REPLACE FUNCTION allgres_private.provider_secret(p_provider_id uuid)
 RETURNS text
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
-  SELECT argo_private.decrypt_secret(api_key)
-  FROM argo_private.llm_secrets
+  SELECT allgres_private.decrypt_secret(api_key)
+  FROM allgres_private.llm_secrets
   WHERE provider_id = p_provider_id
 $fn$;
 
@@ -1175,7 +1215,7 @@ $fn$;
 -- PostgreSQL refuses `SET ROLE` inside a security-definer function ("cannot set
 -- parameter \"role\" within security-definer function", SQLSTATE 42501), and the
 -- restriction covers the whole call stack below one.  This function is
--- SECURITY DEFINER (it needs to read argo_private.permissions and pg_proc
+-- SECURITY DEFINER (it needs to read allgres_private.permissions and pg_proc
 -- regardless of who is asking), so it cannot itself drop to an unprivileged
 -- role.  Earlier versions of this file tried anyway and turned the failure
 -- into "sandbox role unavailable", which meant execute_sql never worked at
@@ -1183,11 +1223,11 @@ $fn$;
 --
 -- The fix is the split below: this function only validates and returns the
 -- normalized statement text; it executes nothing.  The runtime worker queues
--- that text in argo_private.sql_calls (fn_claim_sql / fn_complete_sql, the
+-- that text in allgres_private.sql_calls (fn_claim_sql / fn_complete_sql, the
 -- same claim/complete shape the outbound HTTP pump uses for LLM and tool
 -- calls), then runs it as a *top-level* SPI statement -- issued directly by
 -- the worker, not nested inside any SECURITY DEFINER function -- where
--- `SET LOCAL ROLE sandbox` is legal.  See argo_public.fn_run_sandboxed_sql
+-- `SET LOCAL ROLE sandbox` is legal.  See allgres_public.fn_run_sandboxed_sql
 -- below and src/lib.rs's `run_sandboxed_sql`.
 --
 -- Layering, strongest first:
@@ -1196,7 +1236,7 @@ $fn$;
 --   b. search_path = pg_temp, so an unqualified relation name cannot resolve
 --      to anything at all;
 --   c. the views themselves return no rows unless the current agent holds the
---      matching permission (argo_private.agent_may_read), so authorisation
+--      matching permission (allgres_private.agent_may_read), so authorisation
 --      does not depend on the analysis below being complete;
 --   d. transaction_read_only + statement_timeout, both real now that
 --      execution is a top-level statement instead of nested inside one;
@@ -1207,15 +1247,15 @@ $fn$;
 --      schemas, and in allowlist n per-agent permission.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION argo_private.fn_validate_sql(p_agent_id uuid, p_sql text)
+CREATE OR REPLACE FUNCTION allgres_private.fn_validate_sql(p_agent_id uuid, p_sql text)
 RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   c_reserved constant text[] := ARRAY[
-    'argo_private', 'allgres', 'pg_catalog', 'pg_toast', 'information_schema'
+    'allgres_private', 'allgres', 'pg_catalog', 'pg_toast', 'information_schema'
   ];
 
   -- Volatility alone is not a security boundary: STABLE means "cannot change
@@ -1319,10 +1359,10 @@ BEGIN
 
     v_ref := v_schema || '.' || (v_rel->>'name');
     SELECT EXISTS (
-      SELECT 1 FROM argo_private.sql_sandbox_allowlist a
+      SELECT 1 FROM allgres_private.sql_sandbox_allowlist a
       WHERE a.resource_ref = v_ref
     ) AND EXISTS (
-      SELECT 1 FROM argo_private.permissions p
+      SELECT 1 FROM allgres_private.permissions p
       WHERE p.agent_id = p_agent_id
         AND p.resource_type = 'view'
         AND p.resource_ref = v_ref
@@ -1358,7 +1398,7 @@ BEGIN
         USING ERRCODE = 'P0001';
     END IF;
     IF NOT EXISTS (
-      SELECT 1 FROM argo_private.sql_function_allowlist
+      SELECT 1 FROM allgres_private.sql_function_allowlist
       WHERE function_name = lower(v_fn->>'name')
     ) THEN
       RAISE EXCEPTION 'fn_validate_sql: function "%" is not in the sandbox allowlist', v_fn->>'name'
@@ -1413,7 +1453,7 @@ $fn$;
 -- src/lib.rs's `run_sandboxed_sql`) is granted EXECUTE on it -- see the grants
 -- section.  p_sql is trusted here precisely because it can only have reached
 -- this function by way of fn_validate_sql's return value.
-CREATE OR REPLACE FUNCTION argo_public.fn_run_sandboxed_sql(p_sql text)
+CREATE OR REPLACE FUNCTION allgres_public.fn_run_sandboxed_sql(p_sql text)
 RETURNS jsonb
 LANGUAGE plpgsql
 AS $fn$
@@ -1460,16 +1500,16 @@ $fn$;
 -- 7. Agent state machine.  Short transactions only; never waits on HTTP.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION argo_public.fn_next_step(p_task_id uuid)
+CREATE OR REPLACE FUNCTION allgres_public.fn_next_step(p_task_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
-  t argo_private.tasks%ROWTYPE;
-  a argo_private.agents%ROWTYPE;
-  p argo_private.policies%ROWTYPE;
+  t allgres_private.tasks%ROWTYPE;
+  a allgres_private.agents%ROWTYPE;
+  p allgres_private.policies%ROWTYPE;
   v_messages jsonb := '[]'::jsonb;
   v_log record;
   v_has_input boolean;
@@ -1481,7 +1521,7 @@ BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
   SELECT * INTO t
-  FROM argo_private.tasks
+  FROM allgres_private.tasks
   WHERE task_id = p_task_id
   FOR UPDATE;
 
@@ -1502,24 +1542,24 @@ BEGIN
     -- measure "time since most recently resumed" instead of "time since
     -- this task first started running" -- silently defeating the wall-clock
     -- ceiling for any task that ever waits on a human.
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
     WHERE task_id = p_task_id;
     t.status := 'running';
   END IF;
 
-  SELECT * INTO a FROM argo_private.agents WHERE agent_id = t.agent_id;
-  SELECT * INTO p FROM argo_private.policies WHERE agent_id = t.agent_id;
+  SELECT * INTO a FROM allgres_private.agents WHERE agent_id = t.agent_id;
+  SELECT * INTO p FROM allgres_private.policies WHERE agent_id = t.agent_id;
 
   IF a IS NULL OR NOT a.is_active THEN
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'failed', error = 'agent_inactive', updated_at = now()
     WHERE task_id = p_task_id;
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       p_task_id, t.step_count, 'error',
       jsonb_build_object('reason', 'agent_inactive')
     );
-    PERFORM argo_private.maybe_complete_session(t.session_id);
+    PERFORM allgres_private.maybe_complete_session(t.session_id);
     RETURN jsonb_build_object('action', 'done', 'reason', 'agent_inactive');
   END IF;
 
@@ -1528,25 +1568,25 @@ BEGIN
   END IF;
 
   IF t.step_count >= p.max_steps THEN
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'failed', error = 'max_steps', updated_at = now()
     WHERE task_id = p_task_id;
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       p_task_id, t.step_count, 'error',
       jsonb_build_object('reason', 'max_steps', 'max_steps', p.max_steps)
     );
-    PERFORM argo_private.maybe_complete_session(t.session_id);
+    PERFORM allgres_private.maybe_complete_session(t.session_id);
     RETURN jsonb_build_object('action', 'done', 'reason', 'max_steps');
   END IF;
 
   SELECT coalesce(jsonb_agg(resource_ref ORDER BY resource_ref), '[]'::jsonb)
   INTO v_views
-  FROM argo_private.permissions
+  FROM allgres_private.permissions
   WHERE agent_id = t.agent_id AND resource_type = 'view';
 
   SELECT coalesce(jsonb_agg(resource_ref ORDER BY resource_ref), '[]'::jsonb)
   INTO v_tools
-  FROM argo_private.permissions
+  FROM allgres_private.permissions
   WHERE agent_id = t.agent_id AND resource_type = 'tool';
 
   -- Bounds come from the database, not from worker code, so revoking a
@@ -1570,7 +1610,7 @@ BEGIN
 
   FOR v_log IN
     SELECT role, content
-    FROM argo_private.execution_logs
+    FROM allgres_private.execution_logs
     WHERE task_id = p_task_id
     ORDER BY step_number, created_at
   LOOP
@@ -1582,14 +1622,14 @@ BEGIN
       v_messages := v_messages || jsonb_build_array(
         jsonb_build_object(
           'role', CASE WHEN v_log.role IN ('tool', 'operator') THEN 'user' ELSE v_log.role END,
-          'content', argo_private.log_content_text(v_log.content)
+          'content', allgres_private.log_content_text(v_log.content)
         )
       );
     ELSIF v_log.role = 'error' THEN
       v_messages := v_messages || jsonb_build_array(
         jsonb_build_object(
           'role', 'user',
-          'content', 'Previous step error: ' || argo_private.log_content_text(v_log.content)
+          'content', 'Previous step error: ' || allgres_private.log_content_text(v_log.content)
           || '. Reply with a valid action JSON.'
         )
       );
@@ -1598,7 +1638,7 @@ BEGIN
 
   v_input_text := COALESCE(t.input->>'goal', t.input->>'text', t.input::text);
   SELECT EXISTS (
-    SELECT 1 FROM argo_private.execution_logs
+    SELECT 1 FROM allgres_private.execution_logs
     WHERE task_id = p_task_id AND role = 'user'
   ) INTO v_has_input;
   IF NOT v_has_input AND v_input_text IS NOT NULL AND v_input_text NOT IN ('', '{}') THEN
@@ -1607,7 +1647,7 @@ BEGIN
     );
   END IF;
 
-  v_cfg := argo_private.sanitize_llm_config(p.llm_config);
+  v_cfg := allgres_private.sanitize_llm_config(p.llm_config);
 
   RETURN jsonb_build_object(
     'action', 'call_llm',
@@ -1626,16 +1666,16 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_submit_result(p_task_id uuid, p_payload jsonb)
+CREATE OR REPLACE FUNCTION allgres_public.fn_submit_result(p_task_id uuid, p_payload jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
-  t argo_private.tasks%ROWTYPE;
-  a argo_private.agents%ROWTYPE;
-  p argo_private.policies%ROWTYPE;
+  t allgres_private.tasks%ROWTYPE;
+  a allgres_private.agents%ROWTYPE;
+  p allgres_private.policies%ROWTYPE;
   v_type text;
   v_parsed jsonb;
   v_action text;
@@ -1658,7 +1698,7 @@ BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
   SELECT * INTO t
-  FROM argo_private.tasks
+  FROM allgres_private.tasks
   WHERE task_id = p_task_id
   FOR UPDATE;
 
@@ -1670,85 +1710,85 @@ BEGIN
       USING ERRCODE = 'P0001';
   END IF;
 
-  SELECT * INTO a FROM argo_private.agents WHERE agent_id = t.agent_id;
-  SELECT * INTO p FROM argo_private.policies WHERE agent_id = t.agent_id;
+  SELECT * INTO a FROM allgres_private.agents WHERE agent_id = t.agent_id;
+  SELECT * INTO p FROM allgres_private.policies WHERE agent_id = t.agent_id;
 
   IF a IS NULL OR NOT a.is_active THEN
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'failed', error = 'agent_inactive', updated_at = now()
     WHERE task_id = p_task_id;
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       p_task_id, t.step_count, 'error',
       jsonb_build_object('reason', 'agent_inactive', 'discarded', true)
     );
-    PERFORM argo_private.maybe_complete_session(t.session_id);
+    PERFORM allgres_private.maybe_complete_session(t.session_id);
     RETURN jsonb_build_object('action', 'done', 'reason', 'agent_inactive');
   END IF;
 
   v_type := p_payload->>'type';
   IF v_type IS NULL OR v_type NOT IN ('llm_response', 'tool_result', 'error') THEN
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       p_task_id, t.step_count, 'error',
       jsonb_build_object('reason', 'payload_rejected', 'payload', p_payload)
     );
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'continue', 'reason', 'payload_rejected');
   END IF;
 
   IF v_type = 'error' THEN
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
       jsonb_build_object('message', COALESCE(p_payload->>'message', 'error'))
     );
     SELECT count(*) INTO v_err_n
-    FROM argo_private.execution_logs
+    FROM allgres_private.execution_logs
     WHERE task_id = p_task_id AND role = 'error';
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     IF v_err_n > p.max_retries THEN
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET status = 'failed', error = COALESCE(p_payload->>'message', 'error'), updated_at = now()
       WHERE task_id = p_task_id;
-      PERFORM argo_private.maybe_complete_session(t.session_id);
+      PERFORM allgres_private.maybe_complete_session(t.session_id);
       RETURN jsonb_build_object('action', 'done', 'reason', 'retries_exceeded');
     END IF;
     RETURN jsonb_build_object('action', 'continue');
   END IF;
 
   IF v_type = 'tool_result' THEN
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'tool',
       COALESCE(p_payload->'content', '{}'::jsonb)
     );
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'continue');
   END IF;
 
   -- llm_response
-  PERFORM argo_private.append_log(
+  PERFORM allgres_private.append_log(
     p_task_id, t.step_count + 1, 'assistant',
     to_jsonb(COALESCE(p_payload->>'content', ''))
   );
 
   v_parsed := p_payload->'parsed';
   IF v_parsed IS NULL OR jsonb_typeof(v_parsed) <> 'object' THEN
-    v_parsed := argo_private.extract_first_json(p_payload->>'content');
+    v_parsed := allgres_private.extract_first_json(p_payload->>'content');
   END IF;
 
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
     'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change'
   ) THEN
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
       jsonb_build_object('reason', 'unknown_action', 'parsed', v_parsed)
     );
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'continue', 'reason', 'unknown_action');
@@ -1756,44 +1796,44 @@ BEGIN
 
   IF v_action = 'final_answer' THEN
     v_answer := COALESCE(v_parsed->>'answer', '');
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'completed',
         output = jsonb_build_object('answer', v_answer),
         step_count = step_count + 1,
         updated_at = now()
     WHERE task_id = p_task_id;
-    UPDATE argo_private.sessions
+    UPDATE allgres_private.sessions
     SET final_answer = v_answer
     WHERE session_id = t.session_id;
-    PERFORM argo_private.maybe_complete_session(t.session_id);
+    PERFORM allgres_private.maybe_complete_session(t.session_id);
     RETURN jsonb_build_object('action', 'done');
   END IF;
 
   -- Validation happens here, synchronously, as this function's owner (it only
-  -- reads argo_private.permissions and pg_proc; see fn_validate_sql).
+  -- reads allgres_private.permissions and pg_proc; see fn_validate_sql).
   -- Execution does not: it is queued for the runtime worker, which runs it as
   -- a top-level statement under the `sandbox` role and reports back through
   -- fn_complete_sql, the same claim/complete shape used for outbound HTTP
   -- calls.  See "6. SQL sandbox" above for why this cannot happen inline.
   IF v_action = 'execute_sql' THEN
     BEGIN
-      v_valid_sql := argo_private.fn_validate_sql(t.agent_id, v_parsed->>'sql');
+      v_valid_sql := allgres_private.fn_validate_sql(t.agent_id, v_parsed->>'sql');
     EXCEPTION WHEN others THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('sql', v_parsed->>'sql', 'message', SQLERRM)
       );
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET step_count = step_count + 1, updated_at = now()
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END;
 
-    INSERT INTO argo_private.sql_calls (task_id, agent_id, sql, status)
+    INSERT INTO allgres_private.sql_calls (task_id, agent_id, sql, status)
     VALUES (p_task_id, t.agent_id, v_valid_sql, 'queued')
     RETURNING call_id INTO v_call;
 
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'execute_sql', 'sql', v_valid_sql, 'call_id', v_call);
@@ -1803,65 +1843,65 @@ BEGIN
     v_tool := v_parsed->>'tool';
     v_args := COALESCE(v_parsed->'args', '{}'::jsonb);
     SELECT EXISTS (
-      SELECT 1 FROM argo_private.permissions
+      SELECT 1 FROM allgres_private.permissions
       WHERE agent_id = t.agent_id
         AND resource_type = 'tool'
         AND resource_ref = v_tool
     ) INTO v_allowed;
     IF NOT v_allowed THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'tool_not_permitted', 'tool', v_tool)
       );
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET step_count = step_count + 1, updated_at = now()
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
     IF v_tool <> 'http_get' THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'unknown_tool', 'tool', v_tool)
       );
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET step_count = step_count + 1, updated_at = now()
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
     v_url := v_args->>'url';
-    v_reason := argo_private.check_outbound_url(v_url, false);
+    v_reason := allgres_private.check_outbound_url(v_url, false);
     IF v_reason IS NOT NULL THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', v_reason, 'url', v_url)
       );
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET step_count = step_count + 1, updated_at = now()
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
-    v_host := argo_private.url_host(v_url);
+    v_host := allgres_private.url_host(v_url);
     SELECT EXISTS (
-      SELECT 1 FROM argo_private.permissions
+      SELECT 1 FROM allgres_private.permissions
       WHERE agent_id = t.agent_id
         AND resource_type = 'http_host'
         AND lower(resource_ref) = v_host
     ) INTO v_allowed;
     IF NOT v_allowed THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'http_host_not_permitted', 'host', v_host)
       );
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET step_count = step_count + 1, updated_at = now()
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
-    INSERT INTO argo_private.outbound_calls (
+    INSERT INTO allgres_private.outbound_calls (
       task_id, kind, tool, url, request_headers, request_body, status
     ) VALUES (
       p_task_id, 'tool', v_tool, v_url,
@@ -1869,7 +1909,7 @@ BEGIN
       '{}'::jsonb, 'queued'
     ) RETURNING call_id INTO v_call;
 
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'call_tool', 'tool', v_tool, 'args', v_args, 'call_id', v_call);
@@ -1877,41 +1917,41 @@ BEGIN
 
   IF v_action = 'delegate' THEN
     SELECT agent_id INTO v_target
-    FROM argo_private.agents
+    FROM allgres_private.agents
     WHERE name = v_parsed->>'agent_name' AND is_active;
     IF v_target IS NULL THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'delegate_unknown', 'agent_name', v_parsed->>'agent_name')
       );
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET step_count = step_count + 1, updated_at = now()
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
     SELECT EXISTS (
-      SELECT 1 FROM argo_private.permissions
+      SELECT 1 FROM allgres_private.permissions
       WHERE agent_id = t.agent_id
         AND resource_type = 'agent'
         AND resource_ref = v_parsed->>'agent_name'
     ) INTO v_allowed;
     IF NOT v_allowed THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'delegate_not_permitted', 'agent_name', v_parsed->>'agent_name')
       );
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET step_count = step_count + 1, updated_at = now()
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
-    INSERT INTO argo_private.tasks (
+    INSERT INTO allgres_private.tasks (
       session_id, agent_id, parent_task_id, status, input
     ) VALUES (
       t.session_id, v_target, p_task_id, 'queued',
       COALESCE(v_parsed->'input', '{}'::jsonb)
     ) RETURNING task_id INTO v_child;
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'completed',
         output = jsonb_build_object('child_task_id', v_child),
         step_count = step_count + 1,
@@ -1937,22 +1977,22 @@ BEGIN
   IF v_action = 'propose_change' THEN
     v_changes := v_parsed->'changes';
     IF v_changes IS NULL OR jsonb_typeof(v_changes) <> 'object' OR v_changes = '{}'::jsonb THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'propose_change_empty', 'changes', v_changes)
       );
-      UPDATE argo_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
     SELECT bool_and(k IN ('system_prompt', 'llm_config')) INTO v_ok
     FROM jsonb_object_keys(v_changes) k;
     IF v_ok IS DISTINCT FROM true THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'propose_change_field_not_allowed', 'changes', v_changes)
       );
-      UPDATE argo_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
     IF v_changes ? 'llm_config' THEN
@@ -1963,29 +2003,29 @@ BEGIN
         FROM jsonb_object_keys(v_changes->'llm_config') k;
       END IF;
       IF v_ok IS DISTINCT FROM true THEN
-        PERFORM argo_private.append_log(
+        PERFORM allgres_private.append_log(
           p_task_id, t.step_count + 1, 'error',
           jsonb_build_object('reason', 'propose_change_field_not_allowed', 'changes', v_changes)
         );
-        UPDATE argo_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
         RETURN jsonb_build_object('action', 'continue');
       END IF;
     END IF;
 
-    INSERT INTO argo_private.change_proposals (agent_id, task_id, proposed_changes, reason, base_generation)
+    INSERT INTO allgres_private.change_proposals (agent_id, task_id, proposed_changes, reason, base_generation)
     VALUES (t.agent_id, p_task_id, v_changes, NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), ''), p.generation)
     RETURNING proposal_id INTO v_proposal;
 
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'assistant',
       jsonb_build_object('proposed_change', v_changes, 'proposal_id', v_proposal)
     );
-    UPDATE argo_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
   END IF;
 
   IF v_action = 'await_human' THEN
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'waiting_human',
         step_count = step_count + 1,
         updated_at = now()
@@ -1993,7 +2033,7 @@ BEGIN
     -- 24h default: long enough for an actual human to see and answer it,
     -- short enough that a forgotten approval doesn't hold a task open
     -- forever.  fn_watchdog reclaims it past this point.
-    INSERT INTO argo_private.human_approvals (task_id, status, payload, expires_at)
+    INSERT INTO allgres_private.human_approvals (task_id, status, payload, expires_at)
     VALUES (
       p_task_id, 'pending',
       jsonb_build_object('reason', COALESCE(v_parsed->>'reason', '')),
@@ -2012,18 +2052,18 @@ $fn$;
 --    threads, the latter back on its SPI thread as the `sandbox` role.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION argo_private.build_llm_http(
+CREATE OR REPLACE FUNCTION allgres_private.build_llm_http(
   p_spec jsonb
 ) RETURNS jsonb
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   v_cfg jsonb := COALESCE(p_spec->'llm_config', '{}'::jsonb);
   v_name text := COALESCE(v_cfg->>'provider', 'xai');
-  v_prov argo_private.llm_providers%ROWTYPE;
+  v_prov allgres_private.llm_providers%ROWTYPE;
   v_url text;
   v_reason text;
   v_headers jsonb;
@@ -2035,13 +2075,13 @@ DECLARE
   v_el jsonb;
 BEGIN
   SELECT * INTO v_prov
-  FROM argo_private.llm_providers
+  FROM allgres_private.llm_providers
   WHERE name = v_name AND is_enabled
   LIMIT 1;
 
   IF NOT FOUND THEN
     SELECT * INTO v_prov
-    FROM argo_private.llm_providers
+    FROM allgres_private.llm_providers
     WHERE is_enabled
     ORDER BY name
     LIMIT 1;
@@ -2067,7 +2107,7 @@ BEGIN
   -- The endpoint comes only from the provider row.  Per-agent llm_config can no
   -- longer redirect it (see sanitize_llm_config).
   v_url := rtrim(v_prov.base_url, '/');
-  v_reason := argo_private.check_outbound_url(v_url, v_prov.allow_private_network);
+  v_reason := allgres_private.check_outbound_url(v_url, v_prov.allow_private_network);
   IF v_reason IS NOT NULL THEN
     RAISE EXCEPTION 'llm provider "%" endpoint rejected: %', v_prov.name, v_reason
       USING ERRCODE = 'P0001';
@@ -2129,11 +2169,11 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_dispatch_tasks()
+CREATE OR REPLACE FUNCTION allgres_public.fn_dispatch_tasks()
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   t record;
@@ -2147,10 +2187,10 @@ BEGIN
 
   FOR t IN
     SELECT task_id, agent_id
-    FROM argo_private.tasks
+    FROM allgres_private.tasks
     WHERE status IN ('queued', 'running')
       AND NOT EXISTS (
-        SELECT 1 FROM argo_private.outbound_calls o
+        SELECT 1 FROM allgres_private.outbound_calls o
         WHERE o.task_id = tasks.task_id
           AND o.status IN ('queued', 'in_flight')
       )
@@ -2161,7 +2201,7 @@ BEGIN
       -- rebuild the same dangling execute_sql request from execution_logs,
       -- and fire a second LLM call racing the pending SQL result.
       AND NOT EXISTS (
-        SELECT 1 FROM argo_private.sql_calls sc
+        SELECT 1 FROM allgres_private.sql_calls sc
         WHERE sc.task_id = tasks.task_id
           AND sc.status IN ('queued', 'in_flight')
       )
@@ -2174,15 +2214,15 @@ BEGIN
     -- Excluding t.task_id itself matters for a 'running' task continuing its
     -- next turn: that's not a new slot, it already holds the one it's in.
     IF (
-      SELECT count(*) FROM argo_private.tasks x
+      SELECT count(*) FROM allgres_private.tasks x
       WHERE x.agent_id = t.agent_id AND x.task_id <> t.task_id
         AND x.status IN ('running', 'waiting_human')
-    ) >= (SELECT max_concurrent_tasks FROM argo_private.policies WHERE agent_id = t.agent_id) THEN
+    ) >= (SELECT max_concurrent_tasks FROM allgres_private.policies WHERE agent_id = t.agent_id) THEN
       CONTINUE;
     END IF;
 
     BEGIN
-      spec := argo_public.fn_next_step(t.task_id);
+      spec := allgres_public.fn_next_step(t.task_id);
     EXCEPTION WHEN others THEN
       -- Silently retrying forever is the failure mode this guards against:
       -- without the warning, a persistent (not transient) fn_next_step bug
@@ -2195,7 +2235,7 @@ BEGIN
       -- still captures that case).
       RAISE WARNING 'fn_dispatch_tasks: fn_next_step failed for task %: %', t.task_id, SQLERRM;
       BEGIN
-        PERFORM argo_public.fn_submit_result(
+        PERFORM allgres_public.fn_submit_result(
           t.task_id, jsonb_build_object('type', 'error', 'message', SQLERRM)
         );
       EXCEPTION WHEN others THEN
@@ -2207,9 +2247,9 @@ BEGIN
       CONTINUE;
     END IF;
     BEGIN
-      http := argo_private.build_llm_http(spec);
+      http := allgres_private.build_llm_http(spec);
     EXCEPTION WHEN others THEN
-      PERFORM argo_public.fn_submit_result(
+      PERFORM allgres_public.fn_submit_result(
         t.task_id,
         jsonb_build_object('type', 'error', 'message', SQLERRM)
       );
@@ -2218,7 +2258,7 @@ BEGIN
     -- request_headers holds only what build_llm_http returned -- no
     -- credential; provider_id/auth_kind are what fn_claim_outbound needs to
     -- inject one later, at claim time, without ever writing it here.
-    INSERT INTO argo_private.outbound_calls (
+    INSERT INTO allgres_private.outbound_calls (
       task_id, kind, url, request_headers, request_body, status, allow_private,
       provider_id, auth_kind
     ) VALUES (
@@ -2235,11 +2275,11 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_claim_outbound(p_limit int DEFAULT 4, p_fallback_key text DEFAULT NULL)
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_outbound(p_limit int DEFAULT 4, p_fallback_key text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   r record;
@@ -2258,15 +2298,15 @@ BEGIN
   FOR r IN
     SELECT o.call_id, o.task_id, o.kind, o.tool, o.url, o.request_headers, o.request_body,
            o.allow_private, o.provider_id, o.auth_kind, p.name AS provider_name
-    FROM argo_private.outbound_calls o
-    JOIN argo_private.tasks t ON t.task_id = o.task_id
-    LEFT JOIN argo_private.llm_providers p ON p.provider_id = o.provider_id
+    FROM allgres_private.outbound_calls o
+    JOIN allgres_private.tasks t ON t.task_id = o.task_id
+    LEFT JOIN allgres_private.llm_providers p ON p.provider_id = o.provider_id
     WHERE o.status = 'queued' AND t.status = 'running'
     ORDER BY o.created_at
     FOR UPDATE OF o SKIP LOCKED
     LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
   LOOP
-    UPDATE argo_private.outbound_calls
+    UPDATE allgres_private.outbound_calls
     SET status = 'in_flight', updated_at = now()
     WHERE call_id = r.call_id;
 
@@ -2278,7 +2318,7 @@ BEGIN
     -- worker's memory for the one HTTP request it is used for.
     v_headers := r.request_headers;
     IF r.auth_kind IS NOT NULL AND r.provider_id IS NOT NULL THEN
-      v_key := argo_private.provider_secret(r.provider_id);
+      v_key := allgres_private.provider_secret(r.provider_id);
       IF (v_key IS NULL OR v_key = '') AND r.provider_name IN ('xai', 'grok') THEN
         v_key := NULLIF(p_fallback_key, '');
       END IF;
@@ -2305,15 +2345,15 @@ BEGIN
 END;
 $fn$;
 
--- Same claim shape as fn_claim_outbound, for argo_private.sql_calls instead.
+-- Same claim shape as fn_claim_outbound, for allgres_private.sql_calls instead.
 -- The runtime worker executes each claimed call itself, as the `sandbox`
 -- role, via a top-level SPI statement (see fn_run_sandboxed_sql above and
 -- src/lib.rs's `run_sandboxed_sql`) -- there is no HTTP round trip here.
-CREATE OR REPLACE FUNCTION argo_public.fn_claim_sql(p_limit int DEFAULT 4)
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_sql(p_limit int DEFAULT 4)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   r record;
@@ -2327,15 +2367,15 @@ BEGIN
   -- left 'running'.
   FOR r IN
     SELECT sc.call_id, sc.task_id, sc.agent_id, sc.sql, a.pg_role
-    FROM argo_private.sql_calls sc
-    JOIN argo_private.tasks t ON t.task_id = sc.task_id
-    JOIN argo_private.agents a ON a.agent_id = sc.agent_id
+    FROM allgres_private.sql_calls sc
+    JOIN allgres_private.tasks t ON t.task_id = sc.task_id
+    JOIN allgres_private.agents a ON a.agent_id = sc.agent_id
     WHERE sc.status = 'queued' AND t.status = 'running'
     ORDER BY sc.created_at
     FOR UPDATE OF sc SKIP LOCKED
     LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
   LOOP
-    UPDATE argo_private.sql_calls
+    UPDATE allgres_private.sql_calls
     SET status = 'in_flight', updated_at = now()
     WHERE call_id = r.call_id;
     -- pg_role is NULL for an agent that predates per-agent roles; the
@@ -2354,7 +2394,7 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.llm_text_from_http(p_body text)
+CREATE OR REPLACE FUNCTION allgres_private.llm_text_from_http(p_body text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
@@ -2380,17 +2420,17 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_complete_outbound(
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_outbound(
   p_call_id uuid,
   p_status int,
   p_body text
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
-  c argo_private.outbound_calls%ROWTYPE;
+  c allgres_private.outbound_calls%ROWTYPE;
   v_text text;
   v_parsed jsonb;
   v_payload jsonb;
@@ -2400,7 +2440,7 @@ BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
   SELECT * INTO c
-  FROM argo_private.outbound_calls
+  FROM allgres_private.outbound_calls
   WHERE call_id = p_call_id
   FOR UPDATE;
 
@@ -2423,7 +2463,7 @@ BEGIN
     );
   END IF;
 
-  UPDATE argo_private.outbound_calls
+  UPDATE allgres_private.outbound_calls
   SET status = 'harvested',
       response_status = p_status,
       response_body = left(COALESCE(p_body, ''), 200000),
@@ -2444,8 +2484,8 @@ BEGIN
       'message', 'llm http ' || COALESCE(p_status::text, '0') || ': ' || left(COALESCE(p_body, ''), 2000)
     );
   ELSE
-    v_text := argo_private.llm_text_from_http(p_body);
-    v_parsed := argo_private.extract_first_json(v_text);
+    v_text := allgres_private.llm_text_from_http(p_body);
+    v_parsed := allgres_private.extract_first_json(v_text);
     v_payload := jsonb_build_object(
       'type', 'llm_response',
       'content', v_text,
@@ -2457,12 +2497,12 @@ BEGIN
   -- call was in flight.  Harvesting must still commit, so never let
   -- fn_submit_result abort the transaction that records the response.
   SELECT EXISTS (
-    SELECT 1 FROM argo_private.tasks WHERE task_id = c.task_id AND status = 'running'
+    SELECT 1 FROM allgres_private.tasks WHERE task_id = c.task_id AND status = 'running'
   ) INTO v_running;
 
   IF v_running THEN
     BEGIN
-      v_result := argo_public.fn_submit_result(c.task_id, v_payload);
+      v_result := allgres_public.fn_submit_result(c.task_id, v_payload);
     EXCEPTION WHEN others THEN
       v_result := jsonb_build_object('action', 'error', 'message', SQLERRM);
     END;
@@ -2480,7 +2520,7 @@ $fn$;
 -- role itself being unavailable); this function only records the outcome and
 -- continues the task, reusing fn_submit_result's tool_result/error handling
 -- (including its retry-count logic) rather than duplicating it.
-CREATE OR REPLACE FUNCTION argo_public.fn_complete_sql(
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_sql(
   p_call_id uuid,
   p_ok boolean,
   p_rows jsonb,
@@ -2490,10 +2530,10 @@ CREATE OR REPLACE FUNCTION argo_public.fn_complete_sql(
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
-  c argo_private.sql_calls%ROWTYPE;
+  c allgres_private.sql_calls%ROWTYPE;
   v_payload jsonb;
   v_result jsonb;
   v_running boolean;
@@ -2501,7 +2541,7 @@ BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
   SELECT * INTO c
-  FROM argo_private.sql_calls
+  FROM allgres_private.sql_calls
   WHERE call_id = p_call_id
   FOR UPDATE;
 
@@ -2520,7 +2560,7 @@ BEGIN
     );
   END IF;
 
-  UPDATE argo_private.sql_calls
+  UPDATE allgres_private.sql_calls
   SET status = 'harvested', updated_at = now()
   WHERE call_id = p_call_id;
 
@@ -2548,12 +2588,12 @@ BEGIN
   -- call was in flight.  Harvesting must still commit, so never let
   -- fn_submit_result abort the transaction that records the response.
   SELECT EXISTS (
-    SELECT 1 FROM argo_private.tasks WHERE task_id = c.task_id AND status = 'running'
+    SELECT 1 FROM allgres_private.tasks WHERE task_id = c.task_id AND status = 'running'
   ) INTO v_running;
 
   IF v_running THEN
     BEGIN
-      v_result := argo_public.fn_submit_result(c.task_id, v_payload);
+      v_result := allgres_public.fn_submit_result(c.task_id, v_payload);
     EXCEPTION WHEN others THEN
       v_result := jsonb_build_object('action', 'error', 'message', SQLERRM);
     END;
@@ -2565,11 +2605,11 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_watchdog(p_timeout_seconds int DEFAULT 90)
+CREATE OR REPLACE FUNCTION allgres_public.fn_watchdog(p_timeout_seconds int DEFAULT 90)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   r record;
@@ -2580,17 +2620,17 @@ BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
   FOR r IN
     SELECT call_id, task_id
-    FROM argo_private.outbound_calls
+    FROM allgres_private.outbound_calls
     WHERE status = 'in_flight'
       AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
     FOR UPDATE SKIP LOCKED
   LOOP
-    UPDATE argo_private.outbound_calls
+    UPDATE allgres_private.outbound_calls
     SET status = 'lost', error = 'timeout', updated_at = now()
     WHERE call_id = r.call_id;
-    IF EXISTS (SELECT 1 FROM argo_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
+    IF EXISTS (SELECT 1 FROM allgres_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
       BEGIN
-        PERFORM argo_public.fn_submit_result(
+        PERFORM allgres_public.fn_submit_result(
           r.task_id,
           jsonb_build_object('type', 'error', 'message', 'outbound timeout')
         );
@@ -2607,17 +2647,17 @@ BEGIN
   -- this only ever fires on that kind of crash, not on a slow query.
   FOR r IN
     SELECT call_id, task_id
-    FROM argo_private.sql_calls
+    FROM allgres_private.sql_calls
     WHERE status = 'in_flight'
       AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
     FOR UPDATE SKIP LOCKED
   LOOP
-    UPDATE argo_private.sql_calls
+    UPDATE allgres_private.sql_calls
     SET status = 'lost', updated_at = now()
     WHERE call_id = r.call_id;
-    IF EXISTS (SELECT 1 FROM argo_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
+    IF EXISTS (SELECT 1 FROM allgres_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
       BEGIN
-        PERFORM argo_public.fn_submit_result(
+        PERFORM allgres_public.fn_submit_result(
           r.task_id,
           jsonb_build_object('type', 'error', 'message', 'sql execution timeout')
         );
@@ -2636,29 +2676,29 @@ BEGIN
   -- an HTTP call's or a sandboxed query's.
   FOR r IN
     SELECT approval_id, task_id
-    FROM argo_private.human_approvals
+    FROM allgres_private.human_approvals
     WHERE status = 'pending'
       AND expires_at IS NOT NULL AND expires_at < now()
     FOR UPDATE SKIP LOCKED
   LOOP
-    UPDATE argo_private.human_approvals
+    UPDATE allgres_private.human_approvals
     SET status = 'rejected', reply_text = 'approval_timeout', decided_at = now()
     WHERE approval_id = r.approval_id;
 
     SELECT step_count, session_id INTO v_step, v_session
-    FROM argo_private.tasks
+    FROM allgres_private.tasks
     WHERE task_id = r.task_id AND status = 'waiting_human'
     FOR UPDATE;
 
     IF FOUND THEN
-      PERFORM argo_private.append_log(
+      PERFORM allgres_private.append_log(
         r.task_id, v_step + 1, 'operator',
         to_jsonb('No response before the approval expired.'::text)
       );
-      UPDATE argo_private.tasks
+      UPDATE allgres_private.tasks
       SET status = 'failed', error = 'approval_timeout', step_count = step_count + 1, updated_at = now()
       WHERE task_id = r.task_id;
-      PERFORM argo_private.maybe_complete_session(v_session);
+      PERFORM allgres_private.maybe_complete_session(v_session);
     END IF;
     n := n + 1;
   END LOOP;
@@ -2675,30 +2715,30 @@ BEGIN
   -- max_steps: no retry, straight to failed.
   FOR r IN
     SELECT t.task_id, t.session_id, t.step_count
-    FROM argo_private.tasks t
-    JOIN argo_private.policies p USING (agent_id)
+    FROM allgres_private.tasks t
+    JOIN allgres_private.policies p USING (agent_id)
     WHERE t.status IN ('running', 'waiting_human')
       AND p.max_turn_seconds IS NOT NULL
       AND t.started_at IS NOT NULL
       AND t.started_at < now() - make_interval(secs => p.max_turn_seconds)
     FOR UPDATE SKIP LOCKED
   LOOP
-    PERFORM argo_private.append_log(
+    PERFORM allgres_private.append_log(
       r.task_id, r.step_count + 1, 'error', jsonb_build_object('reason', 'turn_timeout')
     );
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'failed', error = 'turn_timeout', step_count = step_count + 1, updated_at = now()
     WHERE task_id = r.task_id;
     -- Same reasoning as fn_cancel_session: whatever this task had queued or
     -- in flight when its wall clock ran out must not still fire after it is
     -- failed.
-    UPDATE argo_private.outbound_calls
+    UPDATE allgres_private.outbound_calls
     SET status = 'lost', error = 'turn_timeout', updated_at = now()
     WHERE task_id = r.task_id AND status IN ('queued', 'in_flight');
-    UPDATE argo_private.sql_calls
+    UPDATE allgres_private.sql_calls
     SET status = 'lost', updated_at = now()
     WHERE task_id = r.task_id AND status IN ('queued', 'in_flight');
-    PERFORM argo_private.maybe_complete_session(r.session_id);
+    PERFORM allgres_private.maybe_complete_session(r.session_id);
     n := n + 1;
   END LOOP;
 
@@ -2706,11 +2746,11 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_pump(p_fallback_key text DEFAULT NULL)
+CREATE OR REPLACE FUNCTION allgres_public.fn_pump(p_fallback_key text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   d jsonb;
@@ -2720,10 +2760,10 @@ DECLARE
 BEGIN
   -- Does not perform HTTP or run sandboxed SQL.  Caller claims queued rows
   -- AFTER this commits.
-  w := argo_public.fn_watchdog();
-  d := argo_public.fn_dispatch_tasks();
-  c := argo_public.fn_claim_outbound(4, p_fallback_key);
-  s := argo_public.fn_claim_sql(4);
+  w := allgres_public.fn_watchdog();
+  d := allgres_public.fn_dispatch_tasks();
+  c := allgres_public.fn_claim_outbound(4, p_fallback_key);
+  s := allgres_public.fn_claim_sql(4);
   RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s);
 END;
 $fn$;
@@ -2743,23 +2783,23 @@ $fn$;
 -- the existing role name.
 --
 -- This needs the ability to CREATE ROLE, which is not a new privilege
--- boundary: whatever installs the extension already creates argo_owner,
+-- boundary: whatever installs the extension already creates allgres_owner,
 -- operator, worker, and sandbox in the roles bootstrap above, so it already
 -- has that power (typically as a superuser, or an installer role granted
 -- CREATEROLE for exactly this). This function, like every other
 -- SECURITY DEFINER function in this file, is owned by that same installer;
 -- it does not need or request any privilege the installer did not already
 -- have.
-CREATE OR REPLACE FUNCTION argo_private.fn_provision_agent_role(p_agent_id uuid)
+CREATE OR REPLACE FUNCTION allgres_private.fn_provision_agent_role(p_agent_id uuid)
 RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
   v_role text;
 BEGIN
-  SELECT pg_role INTO v_role FROM argo_private.agents WHERE agent_id = p_agent_id;
+  SELECT pg_role INTO v_role FROM allgres_private.agents WHERE agent_id = p_agent_id;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'fn_provision_agent_role: agent not found' USING ERRCODE = 'P0001';
   END IF;
@@ -2779,16 +2819,16 @@ BEGIN
     EXECUTE format('ALTER ROLE %I SET search_path = pg_temp', v_role);
   END IF;
 
-  UPDATE argo_private.agents SET pg_role = v_role WHERE agent_id = p_agent_id;
+  UPDATE allgres_private.agents SET pg_role = v_role WHERE agent_id = p_agent_id;
   RETURN v_role;
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_create_agent(p_name text, p_prompt text DEFAULT NULL)
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_agent(p_name text, p_prompt text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   v_id uuid;
@@ -2797,27 +2837,27 @@ BEGIN
   IF btrim(COALESCE(p_name, '')) = '' THEN
     RAISE EXCEPTION 'agent name required' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO argo_private.agents (name)
+  INSERT INTO allgres_private.agents (name)
   VALUES (btrim(p_name))
   RETURNING agent_id INTO v_id;
   IF p_prompt IS NOT NULL AND btrim(p_prompt) <> '' THEN
-    UPDATE argo_private.policies
+    UPDATE allgres_private.policies
     SET system_prompt = p_prompt, updated_at = now()
     WHERE agent_id = v_id;
   END IF;
-  v_role := argo_private.fn_provision_agent_role(v_id);
+  v_role := allgres_private.fn_provision_agent_role(v_id);
   RETURN jsonb_build_object('ok', true, 'agent_id', v_id, 'pg_role', v_role);
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_set_agent_active(p_agent_id uuid, p_active boolean)
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_agent_active(p_agent_id uuid, p_active boolean)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 BEGIN
-  UPDATE argo_private.agents
+  UPDATE allgres_private.agents
   SET is_active = p_active, updated_at = now()
   WHERE agent_id = p_agent_id;
   IF NOT FOUND THEN
@@ -2827,11 +2867,11 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_create_project(p_name text, p_description text DEFAULT NULL)
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_project(p_name text, p_description text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
   v_id uuid;
@@ -2839,21 +2879,21 @@ BEGIN
   IF btrim(COALESCE(p_name, '')) = '' THEN
     RAISE EXCEPTION 'project name required' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO argo_private.projects (name, description)
+  INSERT INTO allgres_private.projects (name, description)
   VALUES (btrim(p_name), NULLIF(btrim(COALESCE(p_description, '')), ''))
   RETURNING project_id INTO v_id;
   RETURN jsonb_build_object('ok', true, 'project_id', v_id);
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_set_project_active(p_project_id uuid, p_active boolean)
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_project_active(p_project_id uuid, p_active boolean)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 BEGIN
-  UPDATE argo_private.projects
+  UPDATE allgres_private.projects
   SET is_active = p_active, updated_at = now()
   WHERE project_id = p_project_id;
   IF NOT FOUND THEN
@@ -2869,7 +2909,7 @@ $fn$;
 -- would be identical no-op copies of the row next to it.  IS DISTINCT FROM
 -- against the row as it stood at the top of this call is what tells the two
 -- apart.
-CREATE OR REPLACE FUNCTION argo_public.fn_set_policy(
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_policy(
   p_agent_id uuid,
   p_prompt text DEFAULT NULL,
   p_max_steps int DEFAULT NULL,
@@ -2881,10 +2921,10 @@ CREATE OR REPLACE FUNCTION argo_public.fn_set_policy(
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
-  p_row argo_private.policies%ROWTYPE;
+  p_row allgres_private.policies%ROWTYPE;
   v_prompt text;
   v_steps int;
   v_retries int;
@@ -2893,7 +2933,7 @@ DECLARE
   v_turn_secs int;
   v_changed boolean;
 BEGIN
-  SELECT * INTO p_row FROM argo_private.policies WHERE agent_id = p_agent_id FOR UPDATE;
+  SELECT * INTO p_row FROM allgres_private.policies WHERE agent_id = p_agent_id FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'policy not found' USING ERRCODE = 'P0001';
   END IF;
@@ -2902,7 +2942,7 @@ BEGIN
   v_steps      := COALESCE(p_max_steps, p_row.max_steps);
   v_retries    := COALESCE(p_max_retries, p_row.max_retries);
   v_cfg        := CASE WHEN p_llm_config IS NULL THEN p_row.llm_config
-                       ELSE argo_private.sanitize_llm_config(p_row.llm_config || p_llm_config) END;
+                       ELSE allgres_private.sanitize_llm_config(p_row.llm_config || p_llm_config) END;
   v_concurrent := COALESCE(p_max_concurrent_tasks, p_row.max_concurrent_tasks);
   -- max_turn_seconds is the one field whose desired value can legitimately be
   -- NULL ("no cap"), so unlike the others a NULL argument can't just mean
@@ -2919,7 +2959,7 @@ BEGIN
     OR v_turn_secs IS DISTINCT FROM p_row.max_turn_seconds;
 
   IF v_changed THEN
-    INSERT INTO argo_private.policy_history (
+    INSERT INTO allgres_private.policy_history (
       agent_id, generation, system_prompt, max_steps, max_retries, llm_config,
       max_concurrent_tasks, max_turn_seconds
     ) VALUES (
@@ -2928,7 +2968,7 @@ BEGIN
     );
   END IF;
 
-  UPDATE argo_private.policies
+  UPDATE allgres_private.policies
   SET system_prompt = v_prompt,
       max_steps = v_steps,
       max_retries = v_retries,
@@ -2952,19 +2992,19 @@ $fn$;
 -- applies the change through fn_set_policy -- the same versioning path any
 -- other policy edit goes through, so a promoted proposal shows up in
 -- policy_history exactly like an operator's own edit would.
-CREATE OR REPLACE FUNCTION argo_public.fn_decide_proposal(
+CREATE OR REPLACE FUNCTION allgres_public.fn_decide_proposal(
   p_proposal_id uuid, p_approve boolean, p_reply text DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
-  r argo_private.change_proposals%ROWTYPE;
+  r allgres_private.change_proposals%ROWTYPE;
   v_cur_gen int;
   v_policy jsonb;
 BEGIN
-  SELECT * INTO r FROM argo_private.change_proposals WHERE proposal_id = p_proposal_id FOR UPDATE;
+  SELECT * INTO r FROM allgres_private.change_proposals WHERE proposal_id = p_proposal_id FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'fn_decide_proposal: not found' USING ERRCODE = 'P0001';
   END IF;
@@ -2973,7 +3013,7 @@ BEGIN
   END IF;
 
   IF NOT p_approve THEN
-    UPDATE argo_private.change_proposals
+    UPDATE allgres_private.change_proposals
     SET status = 'rejected', decided_at = now(), decided_reply = p_reply
     WHERE proposal_id = p_proposal_id;
     RETURN jsonb_build_object('ok', true, 'status', 'rejected');
@@ -2984,16 +3024,16 @@ BEGIN
   -- here would silently clobber whatever changed it with a decision made
   -- against a policy that no longer exists; mark it stale instead and let
   -- the operator re-propose or handle it directly.
-  SELECT generation INTO v_cur_gen FROM argo_private.policies WHERE agent_id = r.agent_id;
+  SELECT generation INTO v_cur_gen FROM allgres_private.policies WHERE agent_id = r.agent_id;
   IF v_cur_gen IS DISTINCT FROM r.base_generation THEN
-    UPDATE argo_private.change_proposals
+    UPDATE allgres_private.change_proposals
     SET status = 'stale', decided_at = now(),
         decided_reply = COALESCE(p_reply, 'base policy changed since this was proposed')
     WHERE proposal_id = p_proposal_id;
     RETURN jsonb_build_object('ok', false, 'status', 'stale');
   END IF;
 
-  v_policy := argo_public.fn_set_policy(
+  v_policy := allgres_public.fn_set_policy(
     r.agent_id,
     r.proposed_changes->>'system_prompt',
     NULL, NULL,
@@ -3001,7 +3041,7 @@ BEGIN
     NULL, NULL, false
   );
 
-  UPDATE argo_private.change_proposals
+  UPDATE allgres_private.change_proposals
   SET status = 'approved', decided_at = now(), decided_reply = p_reply
   WHERE proposal_id = p_proposal_id;
 
@@ -3014,59 +3054,59 @@ $fn$;
 -- only ever a new version that happens to match an old one -- the current
 -- live row still gets snapshotted into history before being overwritten,
 -- same as always.
-CREATE OR REPLACE FUNCTION argo_public.fn_rollback_policy(p_agent_id uuid, p_generation int)
+CREATE OR REPLACE FUNCTION allgres_public.fn_rollback_policy(p_agent_id uuid, p_generation int)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
-  h argo_private.policy_history%ROWTYPE;
+  h allgres_private.policy_history%ROWTYPE;
 BEGIN
-  SELECT * INTO h FROM argo_private.policy_history
+  SELECT * INTO h FROM allgres_private.policy_history
   WHERE agent_id = p_agent_id AND generation = p_generation;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'fn_rollback_policy: no history for that agent at generation %', p_generation
       USING ERRCODE = 'P0001';
   END IF;
 
-  RETURN argo_public.fn_set_policy(
+  RETURN allgres_public.fn_set_policy(
     p_agent_id, h.system_prompt, h.max_steps, h.max_retries, h.llm_config,
     h.max_concurrent_tasks, h.max_turn_seconds, h.max_turn_seconds IS NULL
   );
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_grant_permission(
+CREATE OR REPLACE FUNCTION allgres_public.fn_grant_permission(
   p_agent_id uuid, p_type text, p_ref text
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 BEGIN
-  INSERT INTO argo_private.permissions (agent_id, resource_type, resource_ref)
+  INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
   VALUES (p_agent_id, p_type, p_ref)
   ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_revoke_permission(
+CREATE OR REPLACE FUNCTION allgres_public.fn_revoke_permission(
   p_agent_id uuid, p_type text, p_ref text
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 BEGIN
-  DELETE FROM argo_private.permissions
+  DELETE FROM allgres_private.permissions
   WHERE agent_id = p_agent_id AND resource_type = p_type AND resource_ref = p_ref;
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_create_session(
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_session(
   p_agent_id uuid,
   p_goal text,
   p_project_id uuid DEFAULT NULL
@@ -3074,7 +3114,7 @@ CREATE OR REPLACE FUNCTION argo_public.fn_create_session(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
   v_sid uuid;
@@ -3083,49 +3123,49 @@ BEGIN
   IF btrim(COALESCE(p_goal, '')) = '' THEN
     RAISE EXCEPTION 'goal required' USING ERRCODE = 'P0001';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM argo_private.agents WHERE agent_id = p_agent_id AND is_active) THEN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_active) THEN
     RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
   END IF;
   IF p_project_id IS NOT NULL AND NOT EXISTS (
-    SELECT 1 FROM argo_private.projects WHERE project_id = p_project_id AND is_active
+    SELECT 1 FROM allgres_private.projects WHERE project_id = p_project_id AND is_active
   ) THEN
     RAISE EXCEPTION 'project inactive or missing' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO argo_private.sessions (agent_id, project_id, goal, status)
+  INSERT INTO allgres_private.sessions (agent_id, project_id, goal, status)
   VALUES (p_agent_id, p_project_id, btrim(p_goal), 'open')
   RETURNING session_id INTO v_sid;
-  INSERT INTO argo_private.tasks (session_id, agent_id, status, input)
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status, input)
   VALUES (v_sid, p_agent_id, 'queued', jsonb_build_object('goal', btrim(p_goal)))
   RETURNING task_id INTO v_tid;
-  INSERT INTO argo_private.execution_logs (task_id, step_number, role, content)
+  INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content)
   VALUES (v_tid, 0, 'user', to_jsonb(btrim(p_goal)));
   RETURN jsonb_build_object('ok', true, 'session_id', v_sid, 'task_id', v_tid);
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_set_provider_secret(p_provider_id uuid, p_api_key text)
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_provider_secret(p_provider_id uuid, p_api_key text)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 BEGIN
-  INSERT INTO argo_private.llm_secrets (provider_id, api_key)
-  VALUES (p_provider_id, argo_private.encrypt_secret(NULLIF(p_api_key, '')))
+  INSERT INTO allgres_private.llm_secrets (provider_id, api_key)
+  VALUES (p_provider_id, allgres_private.encrypt_secret(NULLIF(p_api_key, '')))
   ON CONFLICT (provider_id) DO UPDATE
     SET api_key = COALESCE(
-          argo_private.encrypt_secret(NULLIF(p_api_key, '')),
-          argo_private.llm_secrets.api_key
+          allgres_private.encrypt_secret(NULLIF(p_api_key, '')),
+          allgres_private.llm_secrets.api_key
         );
   RETURN jsonb_build_object(
     'ok', true,
     'has_secret', true,
-    'storage', argo_private.secret_storage_mode()
+    'storage', allgres_private.secret_storage_mode()
   );
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_set_provider(
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_provider(
   p_provider_id uuid,
   p_base_url text DEFAULT NULL,
   p_enabled boolean DEFAULT NULL,
@@ -3137,7 +3177,7 @@ CREATE OR REPLACE FUNCTION argo_public.fn_set_provider(
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
   v_allow  boolean;
@@ -3147,7 +3187,7 @@ BEGIN
   SELECT COALESCE(p_allow_private_network, allow_private_network),
          rtrim(COALESCE(NULLIF(p_base_url, ''), base_url), '/')
   INTO v_allow, v_url
-  FROM argo_private.llm_providers
+  FROM allgres_private.llm_providers
   WHERE provider_id = p_provider_id;
 
   IF NOT FOUND THEN
@@ -3156,26 +3196,26 @@ BEGIN
 
   -- Validate here as well as at request build time, so a bad endpoint is
   -- rejected while the operator is looking at the error.
-  v_reason := argo_private.check_outbound_url(v_url, v_allow);
+  v_reason := allgres_private.check_outbound_url(v_url, v_allow);
   IF v_reason IS NOT NULL THEN
     RAISE EXCEPTION 'provider endpoint rejected: % (%)', v_reason, v_url
       USING ERRCODE = 'P0001';
   END IF;
 
   IF p_oauth_auth_url IS NOT NULL AND p_oauth_auth_url <> '' THEN
-    v_reason := argo_private.check_outbound_url(p_oauth_auth_url, v_allow);
+    v_reason := allgres_private.check_outbound_url(p_oauth_auth_url, v_allow);
     IF v_reason IS NOT NULL THEN
       RAISE EXCEPTION 'oauth auth url rejected: %', v_reason USING ERRCODE = 'P0001';
     END IF;
   END IF;
   IF p_oauth_token_url IS NOT NULL AND p_oauth_token_url <> '' THEN
-    v_reason := argo_private.check_outbound_url(p_oauth_token_url, v_allow);
+    v_reason := allgres_private.check_outbound_url(p_oauth_token_url, v_allow);
     IF v_reason IS NOT NULL THEN
       RAISE EXCEPTION 'oauth token url rejected: %', v_reason USING ERRCODE = 'P0001';
     END IF;
   END IF;
 
-  UPDATE argo_private.llm_providers
+  UPDATE allgres_private.llm_providers
   SET
     base_url = v_url,
     is_enabled = COALESCE(p_enabled, is_enabled),
@@ -3186,8 +3226,8 @@ BEGIN
   WHERE provider_id = p_provider_id;
 
   IF p_oauth_client_secret IS NOT NULL AND p_oauth_client_secret <> '' THEN
-    INSERT INTO argo_private.llm_secrets (provider_id, oauth_client_secret)
-    VALUES (p_provider_id, argo_private.encrypt_secret(p_oauth_client_secret))
+    INSERT INTO allgres_private.llm_secrets (provider_id, oauth_client_secret)
+    VALUES (p_provider_id, allgres_private.encrypt_secret(p_oauth_client_secret))
     ON CONFLICT (provider_id) DO UPDATE
       SET oauth_client_secret = EXCLUDED.oauth_client_secret;
   END IF;
@@ -3196,25 +3236,25 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_oauth_start(p_provider_id uuid, p_redirect text)
+CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_start(p_provider_id uuid, p_redirect text)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
-  v argo_private.llm_providers%ROWTYPE;
+  v allgres_private.llm_providers%ROWTYPE;
   v_state text := replace(gen_random_uuid()::text, '-', '');
   v_url text;
 BEGIN
-  SELECT * INTO v FROM argo_private.llm_providers WHERE provider_id = p_provider_id;
+  SELECT * INTO v FROM allgres_private.llm_providers WHERE provider_id = p_provider_id;
   IF v.provider_id IS NULL OR v.kind <> 'oauth' THEN
     RAISE EXCEPTION 'provider is not oauth' USING ERRCODE = 'P0001';
   END IF;
   IF v.oauth_auth_url IS NULL OR v.oauth_client_id IS NULL THEN
     RAISE EXCEPTION 'oauth urls / client id missing' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO argo_private.oauth_states (state, provider_id) VALUES (v_state, p_provider_id);
+  INSERT INTO allgres_private.oauth_states (state, provider_id) VALUES (v_state, p_provider_id);
   v_url := v.oauth_auth_url
     || CASE WHEN v.oauth_auth_url LIKE '%?' THEN '&' ELSE '?' END
     || 'response_type=code'
@@ -3228,37 +3268,37 @@ $fn$;
 
 -- OAuth token exchange is queued like an LLM call: SQL builds the request, HTTP
 -- runs after commit, SQL stores the tokens.
-CREATE OR REPLACE FUNCTION argo_public.fn_oauth_token_request(
+CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_token_request(
   p_state text,
   p_code text,
   p_redirect text
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
   v_pid uuid;
-  v argo_private.llm_providers%ROWTYPE;
+  v allgres_private.llm_providers%ROWTYPE;
   v_secret text;
   v_reason text;
 BEGIN
-  SELECT provider_id INTO v_pid FROM argo_private.oauth_states WHERE state = p_state;
+  SELECT provider_id INTO v_pid FROM allgres_private.oauth_states WHERE state = p_state;
   IF v_pid IS NULL THEN
     RAISE EXCEPTION 'unknown oauth state' USING ERRCODE = 'P0001';
   END IF;
-  SELECT * INTO v FROM argo_private.llm_providers WHERE provider_id = v_pid;
+  SELECT * INTO v FROM allgres_private.llm_providers WHERE provider_id = v_pid;
   IF v.oauth_token_url IS NULL OR v.oauth_client_id IS NULL THEN
     RAISE EXCEPTION 'oauth token url / client id missing' USING ERRCODE = 'P0001';
   END IF;
 
-  v_reason := argo_private.check_outbound_url(v.oauth_token_url, v.allow_private_network);
+  v_reason := allgres_private.check_outbound_url(v.oauth_token_url, v.allow_private_network);
   IF v_reason IS NOT NULL THEN
     RAISE EXCEPTION 'oauth token url rejected: %', v_reason USING ERRCODE = 'P0001';
   END IF;
 
-  SELECT argo_private.decrypt_secret(oauth_client_secret) INTO v_secret
-  FROM argo_private.llm_secrets WHERE provider_id = v_pid;
+  SELECT allgres_private.decrypt_secret(oauth_client_secret) INTO v_secret
+  FROM allgres_private.llm_secrets WHERE provider_id = v_pid;
 
   RETURN jsonb_build_object(
     'ok', true,
@@ -3276,7 +3316,7 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_oauth_store_tokens(
+CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_store_tokens(
   p_state text,
   p_access text,
   p_refresh text,
@@ -3284,27 +3324,27 @@ CREATE OR REPLACE FUNCTION argo_public.fn_oauth_store_tokens(
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
   v_pid uuid;
 BEGIN
-  SELECT provider_id INTO v_pid FROM argo_private.oauth_states WHERE state = p_state;
+  SELECT provider_id INTO v_pid FROM allgres_private.oauth_states WHERE state = p_state;
   IF v_pid IS NULL THEN
     RAISE EXCEPTION 'unknown oauth state' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO argo_private.llm_secrets (provider_id, access_token, refresh_token, expires_at)
+  INSERT INTO allgres_private.llm_secrets (provider_id, access_token, refresh_token, expires_at)
   VALUES (
     v_pid,
-    argo_private.encrypt_secret(p_access),
-    argo_private.encrypt_secret(p_refresh),
+    allgres_private.encrypt_secret(p_access),
+    allgres_private.encrypt_secret(p_refresh),
     CASE WHEN p_expires_in IS NULL THEN NULL ELSE now() + make_interval(secs => p_expires_in) END
   )
   ON CONFLICT (provider_id) DO UPDATE SET
     access_token = EXCLUDED.access_token,
-    refresh_token = COALESCE(EXCLUDED.refresh_token, argo_private.llm_secrets.refresh_token),
+    refresh_token = COALESCE(EXCLUDED.refresh_token, allgres_private.llm_secrets.refresh_token),
     expires_at = EXCLUDED.expires_at;
-  DELETE FROM argo_private.oauth_states WHERE state = p_state;
+  DELETE FROM allgres_private.oauth_states WHERE state = p_state;
   RETURN jsonb_build_object('ok', true, 'provider_id', v_pid);
 END;
 $fn$;
@@ -3316,7 +3356,7 @@ $fn$;
 -- continue. Before this, fn_decide_approval only recorded approved/rejected;
 -- the reason text a human gave was never fed back into the conversation the
 -- agent replays on its next turn.
-CREATE OR REPLACE FUNCTION argo_public.fn_decide_approval(
+CREATE OR REPLACE FUNCTION allgres_public.fn_decide_approval(
   p_approval_id uuid,
   p_accept boolean,
   p_reply text DEFAULT NULL
@@ -3324,25 +3364,25 @@ CREATE OR REPLACE FUNCTION argo_public.fn_decide_approval(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
-  v argo_private.human_approvals%ROWTYPE;
-  t argo_private.tasks%ROWTYPE;
+  v allgres_private.human_approvals%ROWTYPE;
+  t allgres_private.tasks%ROWTYPE;
   v_reply text;
 BEGIN
-  SELECT * INTO v FROM argo_private.human_approvals WHERE approval_id = p_approval_id FOR UPDATE;
+  SELECT * INTO v FROM allgres_private.human_approvals WHERE approval_id = p_approval_id FOR UPDATE;
   IF NOT FOUND OR v.status <> 'pending' THEN
     RAISE EXCEPTION 'approval not pending' USING ERRCODE = 'P0001';
   END IF;
 
-  UPDATE argo_private.human_approvals
+  UPDATE allgres_private.human_approvals
   SET status = CASE WHEN p_accept THEN 'approved' ELSE 'rejected' END,
       reply_text = p_reply,
       decided_at = now()
   WHERE approval_id = p_approval_id;
 
-  SELECT * INTO t FROM argo_private.tasks WHERE task_id = v.task_id FOR UPDATE;
+  SELECT * INTO t FROM allgres_private.tasks WHERE task_id = v.task_id FOR UPDATE;
   IF NOT FOUND OR t.status <> 'waiting_human' THEN
     -- The task moved on without this decision (e.g. fn_watchdog already
     -- expired it).  The approval row itself is still recorded above; there
@@ -3351,17 +3391,17 @@ BEGIN
   END IF;
 
   v_reply := COALESCE(NULLIF(btrim(p_reply), ''), CASE WHEN p_accept THEN 'Approved.' ELSE 'Rejected.' END);
-  PERFORM argo_private.append_log(t.task_id, t.step_count + 1, 'operator', to_jsonb(v_reply));
+  PERFORM allgres_private.append_log(t.task_id, t.step_count + 1, 'operator', to_jsonb(v_reply));
 
   IF p_accept THEN
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'queued', step_count = step_count + 1, updated_at = now()
     WHERE task_id = t.task_id;
   ELSE
-    UPDATE argo_private.tasks
+    UPDATE allgres_private.tasks
     SET status = 'failed', error = 'human_rejected', step_count = step_count + 1, updated_at = now()
     WHERE task_id = t.task_id;
-    PERFORM argo_private.maybe_complete_session(t.session_id);
+    PERFORM allgres_private.maybe_complete_session(t.session_id);
   END IF;
   RETURN jsonb_build_object('ok', true, 'task_updated', true);
 END;
@@ -3374,29 +3414,29 @@ $fn$;
 -- and closes the session as 'cancelled' -- distinct from maybe_complete_session's
 -- 'completed'/'failed', which this deliberately bypasses: that function has
 -- no notion of an operator-initiated stop.
-CREATE OR REPLACE FUNCTION argo_public.fn_cancel_session(p_session_id uuid, p_reason text DEFAULT NULL)
+CREATE OR REPLACE FUNCTION allgres_public.fn_cancel_session(p_session_id uuid, p_reason text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
   r record;
   v_reason text := COALESCE(NULLIF(btrim(p_reason), ''), 'Cancelled by operator.');
   v_n int := 0;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM argo_private.sessions WHERE session_id = p_session_id) THEN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.sessions WHERE session_id = p_session_id) THEN
     RAISE EXCEPTION 'session not found' USING ERRCODE = 'P0001';
   END IF;
 
   FOR r IN
     SELECT task_id, step_count
-    FROM argo_private.tasks
+    FROM allgres_private.tasks
     WHERE session_id = p_session_id AND status IN ('queued', 'running', 'waiting_human')
     FOR UPDATE
   LOOP
-    PERFORM argo_private.append_log(r.task_id, r.step_count + 1, 'operator', to_jsonb(v_reason));
-    UPDATE argo_private.tasks
+    PERFORM allgres_private.append_log(r.task_id, r.step_count + 1, 'operator', to_jsonb(v_reason));
+    UPDATE allgres_private.tasks
     SET status = 'cancelled', error = 'operator_cancelled', step_count = step_count + 1, updated_at = now()
     WHERE task_id = r.task_id;
     v_n := v_n + 1;
@@ -3412,24 +3452,24 @@ BEGIN
   -- 'lost' here just means its eventual fn_complete_outbound/fn_complete_sql
   -- call finds the task no longer 'running' and discards the result, the
   -- same as any other post-cancel completion.
-  UPDATE argo_private.outbound_calls o
+  UPDATE allgres_private.outbound_calls o
   SET status = 'lost', error = 'session_cancelled', updated_at = now()
-  FROM argo_private.tasks t
+  FROM allgres_private.tasks t
   WHERE o.task_id = t.task_id AND t.session_id = p_session_id
     AND o.status IN ('queued', 'in_flight');
 
-  UPDATE argo_private.sql_calls sc
+  UPDATE allgres_private.sql_calls sc
   SET status = 'lost', updated_at = now()
-  FROM argo_private.tasks t
+  FROM allgres_private.tasks t
   WHERE sc.task_id = t.task_id AND t.session_id = p_session_id
     AND sc.status IN ('queued', 'in_flight');
 
-  UPDATE argo_private.human_approvals h
+  UPDATE allgres_private.human_approvals h
   SET status = 'rejected', reply_text = 'session_cancelled', decided_at = now()
-  FROM argo_private.tasks t
+  FROM allgres_private.tasks t
   WHERE h.task_id = t.task_id AND t.session_id = p_session_id AND h.status = 'pending';
 
-  UPDATE argo_private.sessions
+  UPDATE allgres_private.sessions
   SET status = 'cancelled', completed_at = now()
   WHERE session_id = p_session_id AND status = 'open';
 
@@ -3437,40 +3477,40 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_allowlist_add(p_ref text)
+CREATE OR REPLACE FUNCTION allgres_public.fn_allowlist_add(p_ref text)
 RETURNS jsonb
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
-  INSERT INTO argo_private.sql_sandbox_allowlist (resource_ref)
+  INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
   VALUES (p_ref)
   ON CONFLICT DO NOTHING
   RETURNING jsonb_build_object('ok', true, 'resource_ref', resource_ref);
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_allowlist_del(p_ref text)
+CREATE OR REPLACE FUNCTION allgres_public.fn_allowlist_del(p_ref text)
 RETURNS jsonb
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = argo_private, pg_temp
+SET search_path = allgres_private, pg_temp
 AS $fn$
-  DELETE FROM argo_private.sql_sandbox_allowlist WHERE resource_ref = p_ref
+  DELETE FROM allgres_private.sql_sandbox_allowlist WHERE resource_ref = p_ref
   RETURNING jsonb_build_object('ok', true);
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_private.selftest_cleanup()
+CREATE OR REPLACE FUNCTION allgres_private.selftest_cleanup()
 RETURNS void
 LANGUAGE plpgsql
 AS $fn$
 BEGIN
-  UPDATE argo_private.tasks t
+  UPDATE allgres_private.tasks t
   SET status = 'failed', error = 'selftest', updated_at = now()
-  FROM argo_private.sessions s
+  FROM allgres_private.sessions s
   WHERE t.session_id = s.session_id
     AND s.goal LIKE 'selftest%'
     AND t.status IN ('queued', 'running', 'waiting_human');
-  UPDATE argo_private.sessions
+  UPDATE allgres_private.sessions
   SET status = 'cancelled', completed_at = now()
   WHERE goal LIKE 'selftest%' AND status = 'open';
 END;
@@ -3490,7 +3530,7 @@ $fn$;
 -- install that already seeded these rows before this fix keeps whatever
 -- random id it already has, since the row already exists by name; only a
 -- fresh install (or a restore onto one) gets the fixed id from here on.
-INSERT INTO argo_private.llm_providers (provider_id, name, kind, base_url, is_enabled, allow_private_network)
+INSERT INTO allgres_private.llm_providers (provider_id, name, kind, base_url, is_enabled, allow_private_network)
 VALUES
   ('157b9a61-537b-4faf-a88a-c673ab3fad8e', 'xai',           'openai_compat', 'https://api.x.ai/v1',        true,  false),
   ('f87649ff-8541-4404-a505-5508d59812e2', 'openai',        'openai_compat', 'https://api.openai.com/v1',  true,  false),
@@ -3499,21 +3539,21 @@ VALUES
   ('93ad5476-8d3a-4443-8b98-f50b6d1d4fbc', 'openai_compat', 'openai_compat', 'https://api.openai.com/v1',  true,  false)
 ON CONFLICT (name) DO NOTHING;
 
-INSERT INTO argo_private.sql_sandbox_allowlist (resource_ref)
-VALUES ('argo_public.v_sales'), ('argo_public.v_my_tasks')
+INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
+VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks')
 ON CONFLICT DO NOTHING;
 
 DO $seed$
 DECLARE
   v_agent uuid;
 BEGIN
-  SELECT agent_id INTO v_agent FROM argo_private.agents WHERE name = 'analyst';
+  SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst';
 
   IF v_agent IS NULL THEN
-    INSERT INTO argo_private.agents (name) VALUES ('analyst') RETURNING agent_id INTO v_agent;
+    INSERT INTO allgres_private.agents (name) VALUES ('analyst') RETURNING agent_id INTO v_agent;
 
     -- Only on first creation, so an upgrade never overwrites a tuned policy.
-    UPDATE argo_private.policies
+    UPDATE allgres_private.policies
     SET system_prompt = $prompt$You are ARGO analyst. Reply with one JSON object only. No markdown, no prose.
 
 Allowed:
@@ -3522,8 +3562,8 @@ Allowed:
 {"action":"call_tool","tool":"http_get","args":{"url":"https://..."}}
 {"action":"await_human","reason":"..."}
 
-For numbers use execute_sql against argo_public.v_sales (region, sku, amount, sold_on).
-Example: {"action":"execute_sql","sql":"SELECT region, sum(amount) AS total FROM argo_public.v_sales GROUP BY region"}
+For numbers use execute_sql against allgres_public.v_sales (region, sku, amount, sold_on).
+Example: {"action":"execute_sql","sql":"SELECT region, sum(amount) AS total FROM allgres_public.v_sales GROUP BY region"}
 When you have the result, emit final_answer in one short sentence.
 $prompt$,
         max_steps = 8,
@@ -3538,17 +3578,17 @@ $prompt$,
     WHERE agent_id = v_agent;
   END IF;
 
-  INSERT INTO argo_private.permissions (agent_id, resource_type, resource_ref)
+  INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
   SELECT v_agent, x.resource_type, x.resource_ref
   FROM (VALUES
-    ('view', 'argo_public.v_sales'),
-    ('view', 'argo_public.v_my_tasks'),
+    ('view', 'allgres_public.v_sales'),
+    ('view', 'allgres_public.v_my_tasks'),
     ('tool', 'http_get')
   ) AS x(resource_type, resource_ref)
   ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
 
-  IF NOT EXISTS (SELECT 1 FROM argo_private.demo_sales WHERE agent_id = v_agent) THEN
-    INSERT INTO argo_private.demo_sales (agent_id, region, sku, amount, sold_on)
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.demo_sales WHERE agent_id = v_agent) THEN
+    INSERT INTO allgres_private.demo_sales (agent_id, region, sku, amount, sold_on)
     SELECT v_agent, s.region, s.sku, s.amount, s.sold_on
     FROM (VALUES
       ('seoul',   'ARB-1', 1200.00, DATE '2026-08-01'),
@@ -3598,39 +3638,39 @@ $seed$;
 -- backup.
 -- ---------------------------------------------------------------------------
 
-SELECT pg_catalog.pg_extension_config_dump('argo_private.agents',
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.agents',
   $cfgdump$WHERE name <> 'analyst'$cfgdump$);
-SELECT pg_catalog.pg_extension_config_dump('argo_private.policies',
-  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM argo_private.agents WHERE name = 'analyst')$cfgdump$);
-SELECT pg_catalog.pg_extension_config_dump('argo_private.permissions',
-  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM argo_private.agents WHERE name = 'analyst')$cfgdump$);
-SELECT pg_catalog.pg_extension_config_dump('argo_private.demo_sales',
-  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM argo_private.agents WHERE name = 'analyst')$cfgdump$);
-SELECT pg_catalog.pg_extension_config_dump('argo_private.llm_providers',
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.policies',
+  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.permissions',
+  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.demo_sales',
+  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_providers',
   $cfgdump$WHERE name NOT IN ('xai', 'openai', 'anthropic', 'ollama', 'openai_compat')$cfgdump$);
-SELECT pg_catalog.pg_extension_config_dump('argo_private.sql_sandbox_allowlist',
-  $cfgdump$WHERE resource_ref NOT IN ('argo_public.v_sales', 'argo_public.v_my_tasks')$cfgdump$);
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_sandbox_allowlist',
+  $cfgdump$WHERE resource_ref NOT IN ('allgres_public.v_sales', 'allgres_public.v_my_tasks')$cfgdump$);
 
-SELECT pg_catalog.pg_extension_config_dump('argo_private.policy_history', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.projects', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.sessions', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.tasks', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.execution_logs', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.human_approvals', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.change_proposals', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.llm_secrets', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.outbound_calls', '');
-SELECT pg_catalog.pg_extension_config_dump('argo_private.sql_calls', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.policy_history', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.projects', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.sessions', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.tasks', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.execution_logs', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.human_approvals', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.change_proposals', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_secrets', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.outbound_calls', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION argo_public.fn_selftest()
+CREATE OR REPLACE FUNCTION allgres_public.fn_selftest()
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   v jsonb := '[]'::jsonb;
@@ -3659,95 +3699,95 @@ DECLARE
   v_proposal uuid;
   v_prompt_before text;
 BEGIN
-  SELECT agent_id INTO v_agent FROM argo_private.agents WHERE name = 'analyst' LIMIT 1;
-  SELECT system_prompt INTO v_saved_prompt FROM argo_private.policies WHERE agent_id = v_agent;
+  SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst' LIMIT 1;
+  SELECT system_prompt INTO v_saved_prompt FROM allgres_private.policies WHERE agent_id = v_agent;
 
   -- 1. next_step messages[0] is the current prompt
-  UPDATE argo_private.policies
+  UPDATE allgres_private.policies
   SET system_prompt = 'PROMPT_A_' || extract(epoch from now())::text
   WHERE agent_id = v_agent;
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest policy')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  spec := argo_public.fn_next_step(v_tid);
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest policy')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  spec := allgres_public.fn_next_step(v_tid);
   ok := (spec->'messages'->0->>'content') LIKE 'PROMPT_A_%';
   v := v || jsonb_build_array(jsonb_build_object('name', 'policy_propagates_to_next_step', 'ok', ok));
 
   -- 2. inactive agent -> done/failed, no side effect
-  UPDATE argo_private.agents SET is_active = false WHERE agent_id = v_agent;
-  spec := argo_public.fn_next_step(v_tid);
+  UPDATE allgres_private.agents SET is_active = false WHERE agent_id = v_agent;
+  spec := allgres_public.fn_next_step(v_tid);
   ok := spec->>'action' = 'done' AND spec->>'reason' = 'agent_inactive';
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := ok AND detail = 'failed';
   v := v || jsonb_build_array(jsonb_build_object('name', 'inactive_agent_fails_task', 'ok', ok));
-  UPDATE argo_private.agents SET is_active = true WHERE agent_id = v_agent;
+  UPDATE allgres_private.agents SET is_active = true WHERE agent_id = v_agent;
 
   -- 3. unknown action -> continue, still running
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest unknown')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest unknown')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"hack_the_planet"}',
     'parsed', jsonb_build_object('action', 'hack_the_planet')
   ));
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := sub->>'action' = 'continue' AND detail = 'running';
   v := v || jsonb_build_array(jsonb_build_object('name', 'unknown_action_continue', 'ok', ok));
 
   -- 4. execute_sql INSERT rejected
-  PERFORM argo_public.fn_next_step(v_tid);
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"execute_sql"}',
-    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'INSERT INTO argo_private.sessions DEFAULT VALUES')
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'INSERT INTO allgres_private.sessions DEFAULT VALUES')
   ));
   SELECT count(*) INTO n_logs
-  FROM argo_private.execution_logs
+  FROM allgres_private.execution_logs
   WHERE task_id = v_tid AND role = 'error';
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := n_logs >= 1 AND detail = 'running';
   v := v || jsonb_build_array(jsonb_build_object('name', 'insert_rejected_stays_running', 'ok', ok));
 
   -- 5. sandbox rejects everything outside the allowlist
   FOREACH detail IN ARRAY ARRAY[
-    'SELECT * FROM argo_private.sessions',
+    'SELECT * FROM allgres_private.sessions',
     'select * from ARGO_PRIVATE.SESSIONS',
-    'SELECT * FROM argo_private.sessions; SELECT 1',
-    E'SELECT * FROM argo_private./*x*/sessions',
-    E'SELECT * FROM argo_private.\nsessions',
+    'SELECT * FROM allgres_private.sessions; SELECT 1',
+    E'SELECT * FROM allgres_private./*x*/sessions',
+    E'SELECT * FROM allgres_private.\nsessions',
     'SELECT * FROM sessions',
-    'SELECT * FROM "argo_private"."sessions"',
-    'WITH x AS (SELECT 1) SELECT * FROM argo_private.sessions',
+    'SELECT * FROM "allgres_private"."sessions"',
+    'WITH x AS (SELECT 1) SELECT * FROM allgres_private.sessions',
     -- comma joins used to slip past the parser entirely
-    'SELECT * FROM argo_public.v_sales a, argo_private.sessions b',
-    'SELECT * FROM argo_public.v_sales, argo_private.demo_sales',
+    'SELECT * FROM allgres_public.v_sales a, allgres_private.sessions b',
+    'SELECT * FROM allgres_public.v_sales, allgres_private.demo_sales',
     -- catalogue access in a subquery, not in the top-level FROM
-    'SELECT (SELECT count(*) FROM pg_catalog.pg_authid) FROM argo_public.v_sales',
-    'SELECT * FROM argo_public.v_sales UNION ALL SELECT * FROM argo_private.demo_sales',
+    'SELECT (SELECT count(*) FROM pg_catalog.pg_authid) FROM allgres_public.v_sales',
+    'SELECT * FROM allgres_public.v_sales UNION ALL SELECT * FROM allgres_private.demo_sales',
     -- a comment splicing a second relation into the FROM list: the grammar sees
     -- through this, a text scanner has to be taught to
-    E'SELECT * FROM argo_public.v_sales --x\n, argo_private.sessions',
+    E'SELECT * FROM allgres_public.v_sales --x\n, allgres_private.sessions',
     -- SELECT ... INTO and data-modifying CTEs both parse as a SelectStmt
-    'SELECT * INTO argo_private.stolen FROM argo_public.v_sales',
-    'WITH w AS (DELETE FROM argo_private.sessions RETURNING 1) SELECT * FROM w',
+    'SELECT * INTO allgres_private.stolen FROM allgres_public.v_sales',
+    'WITH w AS (DELETE FROM allgres_private.sessions RETURNING 1) SELECT * FROM w',
     -- volatile functions: without the sandbox role fix these would run as
     -- this function's own owner, so the volatility check exists to stop them
     -- even though execution is now sandboxed too (belt and suspenders)
     'SELECT * FROM pg_ls_dir(''.'')',
-    'SELECT pg_read_file(''/etc/passwd'') FROM argo_public.v_sales',
-    'SELECT pg_sleep(30) FROM argo_public.v_sales',
+    'SELECT pg_read_file(''/etc/passwd'') FROM allgres_public.v_sales',
+    'SELECT pg_sleep(30) FROM allgres_public.v_sales',
     'SELECT lo_import(''/etc/passwd'')',
-    'SELECT random() FROM argo_public.v_sales',
-    'SELECT no_such_function_xyz(1) FROM argo_public.v_sales',
+    'SELECT random() FROM allgres_public.v_sales',
+    'SELECT no_such_function_xyz(1) FROM allgres_public.v_sales',
     -- STABLE, not VOLATILE -- the volatility check alone let this through,
     -- and it hands back the key that encrypts every provider secret.
     'SELECT current_setting(''allgres.secret_key'', true) AS leak',
-    'SELECT current_setting(''allgres.secret_key'', true) AS leak FROM argo_public.v_sales',
+    'SELECT current_setting(''allgres.secret_key'', true) AS leak FROM allgres_public.v_sales',
     'SELECT version()',
     'SELECT inet_server_addr()',
     -- a user-defined SECURITY DEFINER function, even one Allgres ships
     -- itself, must never be callable from inside the sandbox
-    'SELECT argo_private.secret_key() AS leak',
+    'SELECT allgres_private.secret_key() AS leak',
     -- STABLE, non-security-definer, pg_catalog -- passes every gate a
     -- denylist-only check has, and isn't the kind of name a hand-written
     -- denylist thinks to include. Confirmed live before the allowlist
@@ -3760,7 +3800,7 @@ BEGIN
     'SELECT pg_get_userbyid(10) AS whoever'
   ] LOOP
     BEGIN
-      PERFORM argo_private.fn_validate_sql(v_agent, detail);
+      PERFORM allgres_private.fn_validate_sql(v_agent, detail);
       ok := false;
     EXCEPTION WHEN others THEN
       ok := true;
@@ -3775,20 +3815,20 @@ BEGIN
   --    strict); fn_validate_sql only normalizes and returns text now, it does
   --    not execute -- that is covered separately below (item 13)
   FOREACH detail IN ARRAY ARRAY[
-    'SELECT region, amount FROM argo_public.v_sales',
-    'SELECT region, sum(amount) AS total FROM argo_public.v_sales GROUP BY region ORDER BY total DESC',
-    'WITH x AS (SELECT region, amount FROM argo_public.v_sales) SELECT region FROM x',
+    'SELECT region, amount FROM allgres_public.v_sales',
+    'SELECT region, sum(amount) AS total FROM allgres_public.v_sales GROUP BY region ORDER BY total DESC',
+    'WITH x AS (SELECT region, amount FROM allgres_public.v_sales) SELECT region FROM x',
     'SELECT n FROM generate_series(1, 3) AS g(n)',
-    'SELECT s.region, t.status FROM argo_public.v_sales s, argo_public.v_my_tasks t',
+    'SELECT s.region, t.status FROM allgres_public.v_sales s, allgres_public.v_my_tasks t',
     -- `FROM` as an operator inside extract(); a text scanner reads this as a
     -- relation reference unless it is special-cased
-    'SELECT extract(year FROM sold_on) AS y FROM argo_public.v_sales',
+    'SELECT extract(year FROM sold_on) AS y FROM allgres_public.v_sales',
     -- a schema name inside a string literal is data, not a reference
-    'SELECT ''argo_private.sessions'' AS note FROM argo_public.v_sales',
-    'SELECT region FROM argo_public.v_sales WHERE sku = ''ARB-1'' /* join argo_private.x */'
+    'SELECT ''allgres_private.sessions'' AS note FROM allgres_public.v_sales',
+    'SELECT region FROM allgres_public.v_sales WHERE sku = ''ARB-1'' /* join allgres_private.x */'
   ] LOOP
     BEGIN
-      ok := argo_private.fn_validate_sql(v_agent, detail) IS NOT NULL;
+      ok := allgres_private.fn_validate_sql(v_agent, detail) IS NOT NULL;
     EXCEPTION WHEN others THEN
       ok := false;
     END;
@@ -3800,7 +3840,7 @@ BEGIN
 
   -- 7. logs append-only
   BEGIN
-    UPDATE argo_private.execution_logs SET role = 'user' WHERE task_id = v_tid;
+    UPDATE allgres_private.execution_logs SET role = 'user' WHERE task_id = v_tid;
     ok := false;
   EXCEPTION WHEN others THEN
     ok := true;
@@ -3808,71 +3848,71 @@ BEGIN
   v := v || jsonb_build_array(jsonb_build_object('name', 'logs_append_only', 'ok', ok));
 
   -- 8. final_answer completes
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest done')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest done')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"final_answer","answer":"ok"}',
     'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'ok')
   ));
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := sub->>'action' = 'done' AND detail = 'completed';
   v := v || jsonb_build_array(jsonb_build_object('name', 'final_answer_completes', 'ok', ok));
 
   -- 9. outbound guard blocks the SSRF shapes on every path, not just http_get
-  ok := argo_private.is_blocked_host('169.254.169.254')
-    AND argo_private.is_blocked_host('127.0.0.1')
-    AND argo_private.is_blocked_host('::1')
-    AND argo_private.is_blocked_host('::ffff:127.0.0.1')
-    AND argo_private.is_blocked_host('fd00::1')
-    AND argo_private.is_blocked_host('fe80::1')
-    AND argo_private.is_blocked_host('2130706433')
-    AND argo_private.is_blocked_host('0x7f000001')
-    AND argo_private.is_blocked_host('metadata.internal')
-    AND argo_private.is_blocked_host('10.1.2.3')
-    AND argo_private.is_blocked_host('172.16.0.1')
-    AND argo_private.is_blocked_host('100.64.0.1')
-    AND NOT argo_private.is_blocked_host('api.openai.com')
-    AND NOT argo_private.is_blocked_host('api.x.ai');
+  ok := allgres_private.is_blocked_host('169.254.169.254')
+    AND allgres_private.is_blocked_host('127.0.0.1')
+    AND allgres_private.is_blocked_host('::1')
+    AND allgres_private.is_blocked_host('::ffff:127.0.0.1')
+    AND allgres_private.is_blocked_host('fd00::1')
+    AND allgres_private.is_blocked_host('fe80::1')
+    AND allgres_private.is_blocked_host('2130706433')
+    AND allgres_private.is_blocked_host('0x7f000001')
+    AND allgres_private.is_blocked_host('metadata.internal')
+    AND allgres_private.is_blocked_host('10.1.2.3')
+    AND allgres_private.is_blocked_host('172.16.0.1')
+    AND allgres_private.is_blocked_host('100.64.0.1')
+    AND NOT allgres_private.is_blocked_host('api.openai.com')
+    AND NOT allgres_private.is_blocked_host('api.x.ai');
   v := v || jsonb_build_array(jsonb_build_object('name', 'blocked_host_matrix', 'ok', ok));
 
-  ok := argo_private.check_outbound_url('https://169.254.169.254/latest/meta-data/') IS NOT NULL
-    AND argo_private.check_outbound_url('http://api.openai.com/v1') IS NOT NULL
-    AND argo_private.check_outbound_url('file:///etc/passwd') IS NOT NULL
-    AND argo_private.check_outbound_url('https://evil.example.com@127.0.0.1/') IS NOT NULL
-    AND argo_private.check_outbound_url('https://api.openai.com/v1') IS NULL
-    AND argo_private.check_outbound_url('http://127.0.0.1:11434/v1', true) IS NULL;
+  ok := allgres_private.check_outbound_url('https://169.254.169.254/latest/meta-data/') IS NOT NULL
+    AND allgres_private.check_outbound_url('http://api.openai.com/v1') IS NOT NULL
+    AND allgres_private.check_outbound_url('file:///etc/passwd') IS NOT NULL
+    AND allgres_private.check_outbound_url('https://evil.example.com@127.0.0.1/') IS NOT NULL
+    AND allgres_private.check_outbound_url('https://api.openai.com/v1') IS NULL
+    AND allgres_private.check_outbound_url('http://127.0.0.1:11434/v1', true) IS NULL;
   v := v || jsonb_build_array(jsonb_build_object('name', 'outbound_url_guard', 'ok', ok));
 
   -- 10. per-agent llm_config can no longer redirect the provider endpoint
-  ok := NOT (argo_private.sanitize_llm_config(
+  ok := NOT (allgres_private.sanitize_llm_config(
           '{"model":"m","base_url":"http://169.254.169.254"}'::jsonb) ? 'base_url');
   v := v || jsonb_build_array(jsonb_build_object('name', 'llm_config_cannot_set_base_url', 'ok', ok));
 
   -- 11. the views enforce permission on their own, so authorisation does not
   --     depend on fn_validate_sql having spotted every reference
   PERFORM set_config('argo.agent_id', gen_random_uuid()::text, true);
-  SELECT count(*) INTO n_logs FROM argo_public.v_sales;
+  SELECT count(*) INTO n_logs FROM allgres_public.v_sales;
   ok := (n_logs = 0);
   PERFORM set_config('argo.agent_id', v_agent::text, true);
-  SELECT count(*) INTO n_logs FROM argo_public.v_sales;
+  SELECT count(*) INTO n_logs FROM allgres_public.v_sales;
   ok := ok AND (n_logs > 0);
   PERFORM set_config('argo.agent_id', '', true);
-  SELECT count(*) INTO n_logs FROM argo_public.v_sales;
+  SELECT count(*) INTO n_logs FROM allgres_public.v_sales;
   ok := ok AND (n_logs = 0);
   v := v || jsonb_build_array(jsonb_build_object('name', 'views_enforce_permission', 'ok', ok));
 
   -- 12. the analyser reads the real parse tree, not the statement text
   ok := (allgres.analyze_sql('SELECT 1')->>'kind') = 'select'
     AND (allgres.analyze_sql('SELECT 1; SELECT 2')->>'statements')::int = 2
-    AND (allgres.analyze_sql('UPDATE argo_private.agents SET name = ''x''')->>'kind') = 'other'
-    AND (allgres.analyze_sql('SELECT * INTO t FROM argo_public.v_sales')->>'writes')::boolean
+    AND (allgres.analyze_sql('UPDATE allgres_private.agents SET name = ''x''')->>'kind') = 'other'
+    AND (allgres.analyze_sql('SELECT * INTO t FROM allgres_public.v_sales')->>'writes')::boolean
     AND (allgres.analyze_sql(
-           E'SELECT * FROM argo_public.v_sales --x\n, argo_private.sessions'
-         )->'relations') @> '[{"schema":"argo_private","name":"sessions"}]'::jsonb
-    AND NOT ((allgres.analyze_sql('SELECT ''argo_private.sessions'' FROM argo_public.v_sales')->'relations')
-             @> '[{"schema":"argo_private"}]'::jsonb);
+           E'SELECT * FROM allgres_public.v_sales --x\n, allgres_private.sessions'
+         )->'relations') @> '[{"schema":"allgres_private","name":"sessions"}]'::jsonb
+    AND NOT ((allgres.analyze_sql('SELECT ''allgres_private.sessions'' FROM allgres_public.v_sales')->'relations')
+             @> '[{"schema":"allgres_private"}]'::jsonb);
   v := v || jsonb_build_array(jsonb_build_object('name', 'native_parser_analysis', 'ok', ok));
 
   -- 13. execute_sql queues a call instead of running inline; the runtime
@@ -3882,18 +3922,18 @@ BEGIN
   --     itself do the SET ROLE), and posts the result back through
   --     fn_claim_sql/fn_complete_sql, the same claim/complete shape the
   --     outbound HTTP pump uses.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest execute_sql_queue')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest execute_sql_queue')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"execute_sql"}',
-    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM argo_public.v_sales')
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM allgres_public.v_sales')
   ));
   v_call := (sub->>'call_id')::uuid;
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := sub->>'action' = 'execute_sql' AND v_call IS NOT NULL AND detail = 'running';
-  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  SELECT status INTO detail FROM allgres_private.sql_calls WHERE call_id = v_call;
   ok := ok AND detail = 'queued';
   v := v || jsonb_build_array(jsonb_build_object('name', 'execute_sql_queues_a_call', 'ok', ok));
 
@@ -3905,48 +3945,48 @@ BEGIN
   --      it yet), and fire a second, racing LLM call before the pending SQL
   --      result was ever seen. It must dispatch nothing while that sql_calls
   --      row is still queued.
-  PERFORM argo_public.fn_dispatch_tasks();
+  PERFORM allgres_public.fn_dispatch_tasks();
   ok := NOT EXISTS (
-    SELECT 1 FROM argo_private.outbound_calls WHERE task_id = v_tid
+    SELECT 1 FROM allgres_private.outbound_calls WHERE task_id = v_tid
   );
   v := v || jsonb_build_array(jsonb_build_object('name', 'dispatch_holds_back_pending_sql_task', 'ok', ok));
 
-  claim := argo_public.fn_claim_sql(10);
+  claim := allgres_public.fn_claim_sql(10);
   ok := (claim->>'count')::int >= 1
     AND EXISTS (
       SELECT 1 FROM jsonb_array_elements(claim->'calls') c
-      WHERE (c->>'call_id')::uuid = v_call AND c->>'sql' = 'SELECT region FROM argo_public.v_sales'
+      WHERE (c->>'call_id')::uuid = v_call AND c->>'sql' = 'SELECT region FROM allgres_public.v_sales'
     );
-  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  SELECT status INTO detail FROM allgres_private.sql_calls WHERE call_id = v_call;
   ok := ok AND detail = 'in_flight';
   v := v || jsonb_build_array(jsonb_build_object('name', 'claim_sql_marks_in_flight', 'ok', ok));
 
-  comp := argo_public.fn_complete_sql(v_call, true, '[{"region":"west"}]'::jsonb, 1, false, NULL);
+  comp := allgres_public.fn_complete_sql(v_call, true, '[{"region":"west"}]'::jsonb, 1, false, NULL);
   SELECT count(*) INTO n_logs
-  FROM argo_private.execution_logs
-  WHERE task_id = v_tid AND role = 'tool' AND content->>'sql' = 'SELECT region FROM argo_public.v_sales';
-  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  FROM allgres_private.execution_logs
+  WHERE task_id = v_tid AND role = 'tool' AND content->>'sql' = 'SELECT region FROM allgres_public.v_sales';
+  SELECT status INTO detail FROM allgres_private.sql_calls WHERE call_id = v_call;
   ok := (comp->'submit'->>'action') = 'continue' AND n_logs = 1 AND detail = 'harvested';
   v := v || jsonb_build_array(jsonb_build_object('name', 'complete_sql_appends_tool_log', 'ok', ok));
 
   -- a worker-side execution failure (sandbox unavailable, statement timeout,
   -- ...) is logged as an error and retried, not treated as validation having
   -- missed something
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest execute_sql_failure')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest execute_sql_failure')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"execute_sql"}',
-    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM argo_public.v_sales')
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM allgres_public.v_sales')
   ));
   v_call := (sub->>'call_id')::uuid;
-  PERFORM argo_public.fn_claim_sql(10);
-  comp := argo_public.fn_complete_sql(v_call, false, NULL, NULL, false, 'statement timeout');
+  PERFORM allgres_public.fn_claim_sql(10);
+  comp := allgres_public.fn_complete_sql(v_call, false, NULL, NULL, false, 'statement timeout');
   SELECT count(*) INTO n_logs
-  FROM argo_private.execution_logs
+  FROM allgres_private.execution_logs
   WHERE task_id = v_tid AND role = 'error';
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := n_logs >= 1 AND detail = 'running';
   v := v || jsonb_build_array(jsonb_build_object('name', 'complete_sql_failure_logs_error', 'ok', ok));
 
@@ -3955,42 +3995,42 @@ BEGIN
   --      task has already moved past) must be discarded, not recorded --
   --      accepting it would inject a stale response into whatever the task
   --      is doing now, which could by now be a completely different turn.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest sql_fencing')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest sql_fencing')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"execute_sql"}',
-    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM argo_public.v_sales')
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM allgres_public.v_sales')
   ));
   v_call := (sub->>'call_id')::uuid;
-  PERFORM argo_public.fn_claim_sql(10);
+  PERFORM allgres_public.fn_claim_sql(10);
   -- Simulate what fn_watchdog does to a stuck in_flight call.
-  UPDATE argo_private.sql_calls SET status = 'lost', updated_at = now() WHERE call_id = v_call;
-  SELECT count(*) INTO n_logs FROM argo_private.execution_logs WHERE task_id = v_tid;
-  comp := argo_public.fn_complete_sql(v_call, true, '[{"region":"west"}]'::jsonb, 1, false, NULL);
+  UPDATE allgres_private.sql_calls SET status = 'lost', updated_at = now() WHERE call_id = v_call;
+  SELECT count(*) INTO n_logs FROM allgres_private.execution_logs WHERE task_id = v_tid;
+  comp := allgres_public.fn_complete_sql(v_call, true, '[{"region":"west"}]'::jsonb, 1, false, NULL);
   ok := comp->'submit'->>'action' = 'stale';
-  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  SELECT status INTO detail FROM allgres_private.sql_calls WHERE call_id = v_call;
   ok := ok AND detail = 'lost';
-  SELECT count(*) INTO v_gen FROM argo_private.execution_logs WHERE task_id = v_tid;
+  SELECT count(*) INTO v_gen FROM allgres_private.execution_logs WHERE task_id = v_tid;
   ok := ok AND v_gen = n_logs;
   v := v || jsonb_build_array(jsonb_build_object('name', 'complete_sql_fences_stale_result', 'ok', ok));
 
   -- Same fencing, for fn_complete_outbound. A synthetic row stands in for
   -- one fn_dispatch_tasks would have queued; exercising the fence does not
   -- need the provider machinery that inserts it normally.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest outbound_fencing')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  INSERT INTO argo_private.outbound_calls (task_id, kind, url, status)
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest outbound_fencing')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status)
   VALUES (v_tid, 'llm', 'https://api.x.ai/v1/chat/completions', 'in_flight')
   RETURNING call_id INTO v_call;
-  UPDATE argo_private.outbound_calls SET status = 'lost', updated_at = now() WHERE call_id = v_call;
-  SELECT count(*) INTO n_logs FROM argo_private.execution_logs WHERE task_id = v_tid;
-  comp := argo_public.fn_complete_outbound(v_call, 200, '{"choices":[{"message":{"content":"{\"action\":\"final_answer\",\"answer\":\"stale\"}"}}]}');
+  UPDATE allgres_private.outbound_calls SET status = 'lost', updated_at = now() WHERE call_id = v_call;
+  SELECT count(*) INTO n_logs FROM allgres_private.execution_logs WHERE task_id = v_tid;
+  comp := allgres_public.fn_complete_outbound(v_call, 200, '{"choices":[{"message":{"content":"{\"action\":\"final_answer\",\"answer\":\"stale\"}"}}]}');
   ok := comp->'submit'->>'action' = 'stale';
-  SELECT status INTO detail FROM argo_private.outbound_calls WHERE call_id = v_call;
+  SELECT status INTO detail FROM allgres_private.outbound_calls WHERE call_id = v_call;
   ok := ok AND detail = 'lost';
-  SELECT count(*) INTO v_gen FROM argo_private.execution_logs WHERE task_id = v_tid;
+  SELECT count(*) INTO v_gen FROM allgres_private.execution_logs WHERE task_id = v_tid;
   ok := ok AND v_gen = n_logs;
   v := v || jsonb_build_array(jsonb_build_object('name', 'complete_outbound_fences_stale_result', 'ok', ok));
 
@@ -3998,16 +4038,16 @@ BEGIN
   --     inactive or missing project the same way it already rejects an
   --     inactive or missing agent.  Project name carries a timestamp so
   --     repeat selftest runs don't collide on the UNIQUE constraint.
-  v_project := (argo_public.fn_create_project(
+  v_project := (allgres_public.fn_create_project(
     'selftest project ' || extract(epoch from clock_timestamp())::text
   )->>'project_id')::uuid;
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest project_scoped', v_project)->>'session_id')::uuid;
-  SELECT (project_id = v_project) INTO ok FROM argo_private.sessions WHERE session_id = v_sid;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest project_scoped', v_project)->>'session_id')::uuid;
+  SELECT (project_id = v_project) INTO ok FROM allgres_private.sessions WHERE session_id = v_sid;
   v := v || jsonb_build_array(jsonb_build_object('name', 'session_scoped_to_project', 'ok', ok));
 
-  PERFORM argo_public.fn_set_project_active(v_project, false);
+  PERFORM allgres_public.fn_set_project_active(v_project, false);
   BEGIN
-    PERFORM argo_public.fn_create_session(v_agent, 'selftest inactive_project', v_project);
+    PERFORM allgres_public.fn_create_session(v_agent, 'selftest inactive_project', v_project);
     ok := false;
   EXCEPTION WHEN others THEN
     ok := true;
@@ -4017,29 +4057,29 @@ BEGIN
   -- 15. await_human sets an expiry, and once decided the human's actual
   --     reply is fed back into the conversation as an 'operator' log entry
   --     -- not just an approve/reject bit fn_next_step can't see.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest approval_reply')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  SELECT started_at INTO v_started FROM argo_private.tasks WHERE task_id = v_tid;
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest approval_reply')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  SELECT started_at INTO v_started FROM allgres_private.tasks WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"await_human"}',
     'parsed', jsonb_build_object('action', 'await_human', 'reason', 'Which quarter definition?')
   ));
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := sub->>'action' = 'wait' AND detail = 'waiting_human';
   SELECT approval_id, expires_at INTO v_approval, v_expires
-  FROM argo_private.human_approvals WHERE task_id = v_tid AND status = 'pending';
+  FROM allgres_private.human_approvals WHERE task_id = v_tid AND status = 'pending';
   ok := ok AND v_approval IS NOT NULL
     AND v_expires > now() AND v_expires <= now() + interval '24 hours 1 minute';
   v := v || jsonb_build_array(jsonb_build_object('name', 'await_human_creates_pending_approval', 'ok', ok));
 
-  comp := argo_public.fn_decide_approval(v_approval, true, 'Use the fiscal-year quarter.');
+  comp := allgres_public.fn_decide_approval(v_approval, true, 'Use the fiscal-year quarter.');
   SELECT count(*) INTO n_logs
-  FROM argo_private.execution_logs
+  FROM allgres_private.execution_logs
   WHERE task_id = v_tid AND role = 'operator'
     AND content = to_jsonb('Use the fiscal-year quarter.'::text);
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := COALESCE((comp->>'task_updated')::boolean, false) AND n_logs = 1 AND detail = 'queued';
   v := v || jsonb_build_array(jsonb_build_object('name', 'approval_reply_feeds_back_into_log', 'ok', ok));
 
@@ -4049,7 +4089,7 @@ BEGIN
   --      into the message list), so the dashboard showed the human's reply
   --      but the agent's next call_llm never carried it. It has to arrive as
   --      a 'user' turn, the same way a tool result does.
-  spec := argo_public.fn_next_step(v_tid);
+  spec := allgres_public.fn_next_step(v_tid);
   ok := spec->>'action' = 'call_llm'
     AND EXISTS (
       SELECT 1 FROM jsonb_array_elements(spec->'messages') m
@@ -4064,31 +4104,31 @@ BEGIN
   --      reset it on every human resume, silently turning max_turn_seconds
   --      into "time since last resume" instead of "time since this task
   --      first ran" for any task that ever waits on a human.
-  SELECT started_at INTO v_expires FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT started_at INTO v_expires FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := v_started IS NOT NULL AND v_expires = v_started;
   v := v || jsonb_build_array(jsonb_build_object('name', 'started_at_survives_human_resume', 'ok', ok));
 
   -- 16. fn_watchdog reclaims an approval nobody ever answers -- the same
   --     self-healing shape it already applies to stuck outbound/sql calls,
   --     just on a per-row deadline instead of p_timeout_seconds.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest approval_expiry')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  PERFORM argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest approval_expiry')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"await_human"}',
     'parsed', jsonb_build_object('action', 'await_human', 'reason', 'will never be answered')
   ));
-  UPDATE argo_private.human_approvals
+  UPDATE allgres_private.human_approvals
   SET expires_at = now() - interval '1 minute'
   WHERE task_id = v_tid AND status = 'pending';
-  PERFORM argo_public.fn_watchdog();
-  SELECT status INTO detail FROM argo_private.human_approvals WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_watchdog();
+  SELECT status INTO detail FROM allgres_private.human_approvals WHERE task_id = v_tid;
   ok := detail = 'rejected';
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := ok AND detail = 'failed';
   SELECT count(*) INTO n_logs
-  FROM argo_private.execution_logs
+  FROM allgres_private.execution_logs
   WHERE task_id = v_tid AND role = 'operator'
     AND content = to_jsonb('No response before the approval expired.'::text);
   ok := ok AND n_logs = 1;
@@ -4097,24 +4137,24 @@ BEGIN
   -- 17. fn_cancel_session stops every open task in the session, rejects any
   --     pending approval so it doesn't linger, and closes the session --
   --     the control that was simply missing before this pass.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest cancel_session')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  PERFORM argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest cancel_session')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"await_human"}',
     'parsed', jsonb_build_object('action', 'await_human', 'reason', 'irrelevant, session gets cancelled')
   ));
-  comp := argo_public.fn_cancel_session(v_sid, 'selftest stop');
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  comp := allgres_public.fn_cancel_session(v_sid, 'selftest stop');
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := (comp->>'tasks_cancelled')::int = 1 AND detail = 'cancelled';
-  SELECT status INTO detail FROM argo_private.sessions WHERE session_id = v_sid;
+  SELECT status INTO detail FROM allgres_private.sessions WHERE session_id = v_sid;
   ok := ok AND detail = 'cancelled';
   ok := ok AND NOT EXISTS (
-    SELECT 1 FROM argo_private.human_approvals WHERE task_id = v_tid AND status = 'pending'
+    SELECT 1 FROM allgres_private.human_approvals WHERE task_id = v_tid AND status = 'pending'
   );
   SELECT count(*) INTO n_logs
-  FROM argo_private.execution_logs
+  FROM allgres_private.execution_logs
   WHERE task_id = v_tid AND role = 'operator' AND content = to_jsonb('selftest stop'::text);
   ok := ok AND n_logs = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'cancel_session_stops_open_task', 'ok', ok));
@@ -4126,31 +4166,31 @@ BEGIN
   --      fn_cancel_session must also mark those rows 'lost' itself, and
   --      fn_claim_outbound/fn_claim_sql's own task-status join is the second
   --      layer in case anything is queued in the race window before that.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest cancel_pending_calls')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest cancel_pending_calls')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"execute_sql"}',
-    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM argo_public.v_sales')
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM allgres_public.v_sales')
   ));
   v_call := (sub->>'call_id')::uuid;
   -- A synthetic queued outbound row on the same task, standing in for one
   -- fn_dispatch_tasks would have queued for a real LLM turn -- exercising the
   -- cleanup does not require the provider machinery that inserts it normally.
-  INSERT INTO argo_private.outbound_calls (task_id, kind, url, status)
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status)
   VALUES (v_tid, 'llm', 'https://api.x.ai/v1/chat/completions', 'queued')
   RETURNING call_id INTO v_tid2;
-  comp := argo_public.fn_cancel_session(v_sid, 'selftest stop pending calls');
-  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  comp := allgres_public.fn_cancel_session(v_sid, 'selftest stop pending calls');
+  SELECT status INTO detail FROM allgres_private.sql_calls WHERE call_id = v_call;
   ok := (comp->>'tasks_cancelled')::int = 1 AND detail = 'lost';
-  SELECT status INTO detail FROM argo_private.outbound_calls WHERE call_id = v_tid2;
+  SELECT status INTO detail FROM allgres_private.outbound_calls WHERE call_id = v_tid2;
   ok := ok AND detail = 'lost';
-  claim := argo_public.fn_claim_sql(10);
+  claim := allgres_public.fn_claim_sql(10);
   ok := ok AND NOT EXISTS (
     SELECT 1 FROM jsonb_array_elements(claim->'calls') c WHERE (c->>'call_id')::uuid = v_call
   );
-  claim := argo_public.fn_claim_outbound(10);
+  claim := allgres_public.fn_claim_outbound(10);
   ok := ok AND NOT EXISTS (
     SELECT 1 FROM jsonb_array_elements(claim->'calls') c WHERE (c->>'call_id')::uuid = v_tid2
   );
@@ -4161,16 +4201,16 @@ BEGIN
   --     exercising them here covers both.  Uses a scratch http_host ref
   --     rather than a real view grant, so it can't disturb the seeded
   --     permissions the sandbox_allow/reject cases above depend on.
-  PERFORM argo_public.fn_grant_permission(v_agent, 'http_host', 'selftest.invalid');
+  PERFORM allgres_public.fn_grant_permission(v_agent, 'http_host', 'selftest.invalid');
   ok := EXISTS (
-    SELECT 1 FROM argo_private.permissions
+    SELECT 1 FROM allgres_private.permissions
     WHERE agent_id = v_agent AND resource_type = 'http_host' AND resource_ref = 'selftest.invalid'
   );
   v := v || jsonb_build_array(jsonb_build_object('name', 'grant_permission_creates_row', 'ok', ok));
 
-  PERFORM argo_public.fn_revoke_permission(v_agent, 'http_host', 'selftest.invalid');
+  PERFORM allgres_public.fn_revoke_permission(v_agent, 'http_host', 'selftest.invalid');
   ok := NOT EXISTS (
-    SELECT 1 FROM argo_private.permissions
+    SELECT 1 FROM allgres_private.permissions
     WHERE agent_id = v_agent AND resource_type = 'http_host' AND resource_ref = 'selftest.invalid'
   );
   v := v || jsonb_build_array(jsonb_build_object('name', 'revoke_permission_removes_row', 'ok', ok));
@@ -4181,33 +4221,33 @@ BEGIN
   --     is_active, and that must not manufacture a version.  A call that
   --     actually changes something must do both, and the pre-change values
   --     must land in policy_history under the *old* generation number.
-  SELECT generation INTO v_gen FROM argo_private.policies WHERE agent_id = v_agent;
-  PERFORM argo_public.fn_set_policy(v_agent);
-  ok := (SELECT generation FROM argo_private.policies WHERE agent_id = v_agent) = v_gen;
+  SELECT generation INTO v_gen FROM allgres_private.policies WHERE agent_id = v_agent;
+  PERFORM allgres_public.fn_set_policy(v_agent);
+  ok := (SELECT generation FROM allgres_private.policies WHERE agent_id = v_agent) = v_gen;
   ok := ok AND NOT EXISTS (
-    SELECT 1 FROM argo_private.policy_history WHERE agent_id = v_agent AND generation = v_gen
+    SELECT 1 FROM allgres_private.policy_history WHERE agent_id = v_agent AND generation = v_gen
   );
   v := v || jsonb_build_array(jsonb_build_object('name', 'noop_policy_update_does_not_version', 'ok', ok));
 
-  comp := argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, 7);
+  comp := allgres_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, 7);
   ok := COALESCE((comp->>'changed')::boolean, false) AND (comp->>'generation')::int = v_gen + 1;
-  ok := ok AND (SELECT max_concurrent_tasks FROM argo_private.policies WHERE agent_id = v_agent) = 7;
+  ok := ok AND (SELECT max_concurrent_tasks FROM allgres_private.policies WHERE agent_id = v_agent) = 7;
   ok := ok AND EXISTS (
-    SELECT 1 FROM argo_private.policy_history
+    SELECT 1 FROM allgres_private.policy_history
     WHERE agent_id = v_agent AND generation = v_gen AND max_concurrent_tasks = 4
   );
   v := v || jsonb_build_array(jsonb_build_object('name', 'real_policy_update_versions_the_old_row', 'ok', ok));
-  PERFORM argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, 4);
+  PERFORM allgres_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, 4);
 
   -- 19b. propose_change: an agent's own request to change its behavior
   --      never touches the live policy directly -- it only ever queues a
   --      row for an operator to decide. Not blocking, unlike await_human:
   --      the task keeps running.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest propose_change')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  SELECT system_prompt, generation INTO v_prompt_before, v_gen FROM argo_private.policies WHERE agent_id = v_agent;
-  PERFORM argo_public.fn_next_step(v_tid);
-  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest propose_change')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  SELECT system_prompt, generation INTO v_prompt_before, v_gen FROM allgres_private.policies WHERE agent_id = v_agent;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"propose_change"}',
     'parsed', jsonb_build_object(
@@ -4217,15 +4257,15 @@ BEGIN
     )
   ));
   v_proposal := (sub->>'proposal_id')::uuid;
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := sub->>'action' = 'continue' AND v_proposal IS NOT NULL AND detail = 'running';
   ok := ok AND EXISTS (
-    SELECT 1 FROM argo_private.change_proposals
+    SELECT 1 FROM allgres_private.change_proposals
     WHERE proposal_id = v_proposal AND agent_id = v_agent AND status = 'pending'
       AND proposed_changes = jsonb_build_object('system_prompt', 'Be terser.')
       AND base_generation = v_gen
   );
-  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = v_prompt_before;
+  ok := ok AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_agent) = v_prompt_before;
   v := v || jsonb_build_array(jsonb_build_object('name', 'propose_change_queues_a_proposal', 'ok', ok));
 
   -- 19c. Only system_prompt and llm_config.{model,temperature,max_tokens}
@@ -4233,12 +4273,12 @@ BEGIN
   --      expand its own resource envelope or redirect its own provider
   --      endpoint. Both rejections must be logged, not silently dropped,
   --      and must not create a proposal row.
-  PERFORM argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"propose_change"}',
     'parsed', jsonb_build_object('action', 'propose_change', 'changes', jsonb_build_object('max_steps', 999))
   ));
-  PERFORM argo_public.fn_submit_result(v_tid, jsonb_build_object(
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"propose_change"}',
     'parsed', jsonb_build_object(
@@ -4246,88 +4286,88 @@ BEGIN
       'changes', jsonb_build_object('llm_config', jsonb_build_object('provider', 'evil'))
     )
   ));
-  SELECT count(*) INTO n_logs FROM argo_private.execution_logs
+  SELECT count(*) INTO n_logs FROM allgres_private.execution_logs
   WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'propose_change_field_not_allowed';
   ok := n_logs = 2 AND NOT EXISTS (
-    SELECT 1 FROM argo_private.change_proposals
+    SELECT 1 FROM allgres_private.change_proposals
     WHERE task_id = v_tid AND (proposed_changes ? 'max_steps' OR proposed_changes->'llm_config' ? 'provider')
   );
   v := v || jsonb_build_array(jsonb_build_object('name', 'propose_change_rejects_disallowed_fields', 'ok', ok));
 
   -- 19d. fn_decide_proposal: reject leaves the policy untouched.
-  comp := argo_public.fn_decide_proposal(v_proposal, false, 'not now');
+  comp := allgres_public.fn_decide_proposal(v_proposal, false, 'not now');
   ok := comp->>'status' = 'rejected';
-  ok := ok AND (SELECT status FROM argo_private.change_proposals WHERE proposal_id = v_proposal) = 'rejected';
-  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = v_prompt_before;
+  ok := ok AND (SELECT status FROM allgres_private.change_proposals WHERE proposal_id = v_proposal) = 'rejected';
+  ok := ok AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_agent) = v_prompt_before;
   v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_reject_leaves_policy_untouched', 'ok', ok));
 
   -- 19e. Approve applies the change through fn_set_policy -- the same
   --      versioning path an operator's own edit takes, so a promoted
   --      proposal shows up in policy_history exactly like one would.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest propose_change_approve')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid2 FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid2);
-  sub := argo_public.fn_submit_result(v_tid2, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest propose_change_approve')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid2 FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid2);
+  sub := allgres_public.fn_submit_result(v_tid2, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"propose_change"}',
     'parsed', jsonb_build_object('action', 'propose_change', 'changes', jsonb_build_object('system_prompt', 'Be terser.'))
   ));
   v_proposal := (sub->>'proposal_id')::uuid;
-  comp := argo_public.fn_decide_proposal(v_proposal, true, 'looks fine');
+  comp := allgres_public.fn_decide_proposal(v_proposal, true, 'looks fine');
   ok := comp->>'status' = 'approved';
-  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = 'Be terser.';
-  ok := ok AND (SELECT generation FROM argo_private.policies WHERE agent_id = v_agent) = v_gen + 1;
+  ok := ok AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_agent) = 'Be terser.';
+  ok := ok AND (SELECT generation FROM allgres_private.policies WHERE agent_id = v_agent) = v_gen + 1;
   ok := ok AND EXISTS (
-    SELECT 1 FROM argo_private.policy_history
+    SELECT 1 FROM allgres_private.policy_history
     WHERE agent_id = v_agent AND generation = v_gen AND system_prompt = v_prompt_before
   );
-  ok := ok AND (SELECT status FROM argo_private.change_proposals WHERE proposal_id = v_proposal) = 'approved';
+  ok := ok AND (SELECT status FROM allgres_private.change_proposals WHERE proposal_id = v_proposal) = 'approved';
   v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_approve_versions_and_applies', 'ok', ok));
 
   -- 19f. Staleness: the live policy moved on since this proposal was made
   --      (an operator edit, simulated here) -- approving must not blindly
   --      clobber whatever changed it.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest propose_change_stale')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid2 FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid2);
-  sub := argo_public.fn_submit_result(v_tid2, jsonb_build_object(
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest propose_change_stale')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid2 FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid2);
+  sub := allgres_public.fn_submit_result(v_tid2, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"propose_change"}',
     'parsed', jsonb_build_object('action', 'propose_change', 'changes', jsonb_build_object('system_prompt', 'stale attempt'))
   ));
   v_proposal := (sub->>'proposal_id')::uuid;
-  PERFORM argo_public.fn_set_policy(v_agent, 'operator changed it meanwhile');
-  comp := argo_public.fn_decide_proposal(v_proposal, true);
+  PERFORM allgres_public.fn_set_policy(v_agent, 'operator changed it meanwhile');
+  comp := allgres_public.fn_decide_proposal(v_proposal, true);
   ok := comp->>'status' = 'stale';
-  ok := ok AND (SELECT status FROM argo_private.change_proposals WHERE proposal_id = v_proposal) = 'stale';
-  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = 'operator changed it meanwhile';
+  ok := ok AND (SELECT status FROM allgres_private.change_proposals WHERE proposal_id = v_proposal) = 'stale';
+  ok := ok AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_agent) = 'operator changed it meanwhile';
   v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_detects_stale_base', 'ok', ok));
 
   -- 19g. fn_rollback_policy restores a prior version through the same
   --      fn_set_policy path -- itself versioned, never a mutation of
   --      policy_history.
-  SELECT generation INTO v_gen FROM argo_private.policies WHERE agent_id = v_agent;
-  comp := argo_public.fn_rollback_policy(v_agent, v_gen - 2);
+  SELECT generation INTO v_gen FROM allgres_private.policies WHERE agent_id = v_agent;
+  comp := allgres_public.fn_rollback_policy(v_agent, v_gen - 2);
   ok := COALESCE((comp->>'changed')::boolean, false);
-  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = v_prompt_before;
-  ok := ok AND (SELECT generation FROM argo_private.policies WHERE agent_id = v_agent) = v_gen + 1;
+  ok := ok AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_agent) = v_prompt_before;
+  ok := ok AND (SELECT generation FROM allgres_private.policies WHERE agent_id = v_agent) = v_gen + 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'rollback_policy_restores_prior_version', 'ok', ok));
 
   -- 20. max_concurrent_tasks holds a task back from fn_dispatch_tasks once
   --     the agent's cap is already occupied by another running task, rather
   --     than dispatching it anyway.
-  UPDATE argo_private.policies SET max_concurrent_tasks = 1 WHERE agent_id = v_agent;
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest concurrency_a')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  UPDATE argo_private.tasks SET status = 'running', updated_at = now() WHERE task_id = v_tid;
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest concurrency_b')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid2 FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_dispatch_tasks();
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid2;
+  UPDATE allgres_private.policies SET max_concurrent_tasks = 1 WHERE agent_id = v_agent;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest concurrency_a')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  UPDATE allgres_private.tasks SET status = 'running', updated_at = now() WHERE task_id = v_tid;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest concurrency_b')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid2 FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_dispatch_tasks();
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid2;
   ok := detail = 'queued';
   v := v || jsonb_build_array(jsonb_build_object('name', 'max_concurrent_tasks_holds_back_dispatch', 'ok', ok));
-  UPDATE argo_private.policies SET max_concurrent_tasks = 4 WHERE agent_id = v_agent;
-  UPDATE argo_private.tasks SET status = 'cancelled' WHERE task_id IN (v_tid, v_tid2);
+  UPDATE allgres_private.policies SET max_concurrent_tasks = 4 WHERE agent_id = v_agent;
+  UPDATE allgres_private.tasks SET status = 'cancelled' WHERE task_id IN (v_tid, v_tid2);
 
   -- 21. max_turn_seconds is a wall-clock ceiling on a task's whole lifetime
   --     once it has actually started; fn_watchdog reclaims one that has been
@@ -4335,16 +4375,16 @@ BEGIN
   --     the same terminal shape as max_steps. fn_next_step (called here to
   --     simulate a real turn) is what sets started_at, so this backdates
   --     that instead of created_at.
-  UPDATE argo_private.policies SET max_turn_seconds = 60 WHERE agent_id = v_agent;
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest turn_timeout')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  PERFORM argo_public.fn_next_step(v_tid);
-  UPDATE argo_private.tasks SET started_at = now() - interval '2 minutes' WHERE task_id = v_tid;
-  PERFORM argo_public.fn_watchdog();
-  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  UPDATE allgres_private.policies SET max_turn_seconds = 60 WHERE agent_id = v_agent;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest turn_timeout')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  UPDATE allgres_private.tasks SET started_at = now() - interval '2 minutes' WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_watchdog();
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := detail = 'failed';
   SELECT count(*) INTO n_logs
-  FROM argo_private.execution_logs
+  FROM allgres_private.execution_logs
   WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'turn_timeout';
   ok := ok AND n_logs = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_expires_stale_task', 'ok', ok));
@@ -4355,14 +4395,14 @@ BEGIN
   --     is. Without this a busy agent's own concurrency cap could starve a
   --     task long enough for max_turn_seconds to kill it before its first
   --     turn -- exactly the bug this loop's started_at rewrite closes.
-  v_sid := (argo_public.fn_create_session(v_agent, 'selftest turn_timeout_queued')->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
-  UPDATE argo_private.tasks SET created_at = now() - interval '2 minutes' WHERE task_id = v_tid;
-  PERFORM argo_public.fn_watchdog();
-  SELECT status, started_at INTO detail, v_expires FROM argo_private.tasks WHERE task_id = v_tid;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest turn_timeout_queued')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  UPDATE allgres_private.tasks SET created_at = now() - interval '2 minutes' WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_watchdog();
+  SELECT status, started_at INTO detail, v_expires FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := detail = 'queued' AND v_expires IS NULL;
   v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_spares_queued_task', 'ok', ok));
-  PERFORM argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, NULL, NULL, true);
+  PERFORM allgres_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, NULL, NULL, true);
 
   -- 23. fn_provision_agent_role is idempotent (a second call for an
   --     already-provisioned agent returns the same role, no duplicate
@@ -4376,27 +4416,27 @@ BEGIN
   --     reason the sandbox-role check is: fn_selftest is itself
   --     SECURITY DEFINER and cannot SET ROLE.
   SELECT agent_id INTO v_prov_agent
-  FROM argo_private.agents WHERE name = 'selftest_provision_agent';
+  FROM allgres_private.agents WHERE name = 'selftest_provision_agent';
   IF NOT FOUND THEN
-    v_prov_agent := (argo_public.fn_create_agent('selftest_provision_agent')->>'agent_id')::uuid;
+    v_prov_agent := (allgres_public.fn_create_agent('selftest_provision_agent')->>'agent_id')::uuid;
   END IF;
-  SELECT pg_role INTO v_role1 FROM argo_private.agents WHERE agent_id = v_prov_agent;
-  v_role2 := argo_private.fn_provision_agent_role(v_prov_agent);
+  SELECT pg_role INTO v_role1 FROM allgres_private.agents WHERE agent_id = v_prov_agent;
+  v_role2 := allgres_private.fn_provision_agent_role(v_prov_agent);
   ok := v_role1 IS NOT NULL AND v_role1 = v_role2 AND v_role1 LIKE 'allgres\_agent\_%';
   v := v || jsonb_build_array(jsonb_build_object('name', 'provision_agent_role_is_idempotent', 'ok', ok));
 
   BEGIN
-    PERFORM argo_private.fn_provision_agent_role(gen_random_uuid());
+    PERFORM allgres_private.fn_provision_agent_role(gen_random_uuid());
     ok := false;
   EXCEPTION WHEN others THEN
     ok := true;
   END;
   v := v || jsonb_build_array(jsonb_build_object('name', 'provision_agent_role_rejects_unknown_agent', 'ok', ok));
 
-  PERFORM argo_private.selftest_cleanup();
+  PERFORM allgres_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
-  UPDATE argo_private.policies SET system_prompt = v_saved_prompt WHERE agent_id = v_agent;
+  UPDATE allgres_private.policies SET system_prompt = v_saved_prompt WHERE agent_id = v_agent;
 
   RETURN jsonb_build_object(
     'passed', (SELECT count(*) FROM jsonb_array_elements(v) e WHERE (e->>'ok')::boolean),
@@ -4410,76 +4450,76 @@ $fn$;
 -- 12. Grants.
 -- ---------------------------------------------------------------------------
 
-REVOKE ALL ON SCHEMA argo_private FROM PUBLIC;
-REVOKE ALL ON SCHEMA argo_public FROM PUBLIC;
+REVOKE ALL ON SCHEMA allgres_private FROM PUBLIC;
+REVOKE ALL ON SCHEMA allgres_public FROM PUBLIC;
 
-GRANT USAGE ON SCHEMA argo_public TO worker, operator, sandbox;
-GRANT USAGE ON SCHEMA argo_private TO operator;
+GRANT USAGE ON SCHEMA allgres_public TO worker, operator, sandbox;
+GRANT USAGE ON SCHEMA allgres_private TO operator;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA argo_private TO operator;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA argo_private TO operator;
-ALTER DEFAULT PRIVILEGES IN SCHEMA argo_private
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA allgres_private TO operator;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA allgres_private TO operator;
+ALTER DEFAULT PRIVILEGES IN SCHEMA allgres_private
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO operator;
 
 -- Logs are append-only even for operator (the trigger enforces it too).
-REVOKE UPDATE, DELETE ON argo_private.execution_logs FROM operator;
+REVOKE UPDATE, DELETE ON allgres_private.execution_logs FROM operator;
 
-REVOKE ALL ON argo_private.llm_secrets FROM PUBLIC;
-REVOKE ALL ON argo_private.llm_secrets FROM operator;
-REVOKE ALL ON argo_private.llm_secrets FROM worker;
+REVOKE ALL ON allgres_private.llm_secrets FROM PUBLIC;
+REVOKE ALL ON allgres_private.llm_secrets FROM operator;
+REVOKE ALL ON allgres_private.llm_secrets FROM worker;
 
--- The sandbox reaches allowlisted views only; argo_public holds nothing else.
-GRANT SELECT ON ALL TABLES IN SCHEMA argo_public TO sandbox;
-ALTER DEFAULT PRIVILEGES IN SCHEMA argo_public GRANT SELECT ON TABLES TO sandbox;
+-- The sandbox reaches allowlisted views only; allgres_public holds nothing else.
+GRANT SELECT ON ALL TABLES IN SCHEMA allgres_public TO sandbox;
+ALTER DEFAULT PRIVILEGES IN SCHEMA allgres_public GRANT SELECT ON TABLES TO sandbox;
 
-REVOKE ALL ON FUNCTION argo_public.fn_next_step(uuid) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_submit_result(uuid, jsonb) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_pump(text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_dispatch_tasks() FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_claim_outbound(int, text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_complete_outbound(uuid, int, text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_claim_sql(int) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_watchdog(int) FROM PUBLIC;
-REVOKE ALL ON FUNCTION argo_public.fn_selftest() FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_next_step(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_submit_result(uuid, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_pump(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_dispatch_tasks() FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_claim_outbound(int, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_complete_outbound(uuid, int, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_claim_sql(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_watchdog(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_selftest() FROM PUBLIC;
 
 -- fn_run_sandboxed_sql is SECURITY INVOKER and does not itself validate what
 -- it is given: it must only ever be reachable as the `sandbox` role, which
 -- the runtime worker assumes with a top-level SET ROLE right before calling
 -- it (see src/lib.rs's `run_sandboxed_sql`).  A default grant to PUBLIC would
 -- defeat that, since sandbox already has USAGE on this schema.
-REVOKE ALL ON FUNCTION argo_public.fn_run_sandboxed_sql(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) FROM PUBLIC;
 
-GRANT EXECUTE ON FUNCTION argo_public.fn_next_step(uuid) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_submit_result(uuid, jsonb) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_pump(text) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_dispatch_tasks() TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_claim_outbound(int, text) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_complete_outbound(uuid, int, text) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_claim_sql(int) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_watchdog(int) TO worker;
-GRANT EXECUTE ON FUNCTION argo_public.fn_run_sandboxed_sql(text) TO sandbox;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_next_step(uuid) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_submit_result(uuid, jsonb) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_pump(text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_dispatch_tasks() TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_outbound(int, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_outbound(uuid, int, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_sql(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
 
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA argo_public TO operator;
-REVOKE EXECUTE ON FUNCTION argo_private.fn_validate_sql(uuid, text) FROM worker;
-REVOKE EXECUTE ON FUNCTION argo_private.provider_secret(uuid) FROM operator;
-REVOKE EXECUTE ON FUNCTION argo_private.provider_secret(uuid) FROM worker;
-REVOKE EXECUTE ON FUNCTION argo_private.decrypt_secret(text) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION argo_private.encrypt_secret(text) FROM PUBLIC;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres_public TO operator;
+REVOKE EXECUTE ON FUNCTION allgres_private.fn_validate_sql(uuid, text) FROM worker;
+REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM operator;
+REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM worker;
+REVOKE EXECUTE ON FUNCTION allgres_private.decrypt_secret(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION allgres_private.encrypt_secret(text) FROM PUBLIC;
 
 -- PostgreSQL grants EXECUTE to PUBLIC on a new function by default; relying
--- on that here would mean anything with USAGE on argo_private (operator has
+-- on that here would mean anything with USAGE on allgres_private (operator has
 -- it) could trigger a CREATE ROLE through this SECURITY DEFINER function
 -- without that being a deliberate choice. It is one -- operator is the
 -- trusted admin/dashboard role and manually re-provisioning an agent's role
 -- is a legitimate maintenance action -- but explicit beats ambient, the
 -- same reasoning already applied to provider_secret above. worker never
--- needs this directly: fn_create_agent (argo_public, same owner) calls it
+-- needs this directly: fn_create_agent (allgres_public, same owner) calls it
 -- internally, which needs no grant at all between two objects owned by the
 -- same role.
-REVOKE ALL ON FUNCTION argo_private.fn_provision_agent_role(uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION argo_private.fn_provision_agent_role(uuid) TO operator;
+REVOKE ALL ON FUNCTION allgres_private.fn_provision_agent_role(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_agent_role(uuid) TO operator;
 
 -- ---------------------------------------------------------------------------
 -- 13. allgres facade + dashboard RPC.
@@ -4490,20 +4530,20 @@ COMMENT ON SCHEMA allgres IS 'Allgres public facade. Postgres Is All You Need.';
 
 CREATE OR REPLACE FUNCTION allgres.create_agent(p_name text)
 RETURNS jsonb LANGUAGE sql SECURITY DEFINER
-SET search_path = argo_public, argo_private, pg_temp
-AS $$ SELECT argo_public.fn_create_agent(p_name) $$;
+SET search_path = allgres_public, allgres_private, pg_temp
+AS $$ SELECT allgres_public.fn_create_agent(p_name) $$;
 
 -- Returns jsonb: fn_create_session returns an object, and the old `RETURNS uuid`
 -- declaration made this function fail its return-type check at CREATE time.
 CREATE OR REPLACE FUNCTION allgres.create_session(p_agent_id uuid, p_goal text)
 RETURNS jsonb LANGUAGE sql SECURITY DEFINER
-SET search_path = argo_public, argo_private, pg_temp
-AS $$ SELECT argo_public.fn_create_session(p_agent_id, p_goal) $$;
+SET search_path = allgres_public, allgres_private, pg_temp
+AS $$ SELECT allgres_public.fn_create_session(p_agent_id, p_goal) $$;
 
 CREATE OR REPLACE FUNCTION allgres.pump()
 RETURNS jsonb LANGUAGE sql SECURITY DEFINER
-SET search_path = argo_public, argo_private, pg_temp
-AS $$ SELECT argo_public.fn_dispatch_tasks() $$;
+SET search_path = allgres_public, allgres_private, pg_temp
+AS $$ SELECT allgres_public.fn_dispatch_tasks() $$;
 
 -- Best-effort privilege drop for the runtime background worker.  It connects as
 -- the bootstrap superuser (so a missing role can never crash-loop the worker at
@@ -4523,16 +4563,16 @@ $fn$;
 
 CREATE OR REPLACE VIEW allgres.agents AS
 SELECT a.agent_id, a.name, a.is_active, a.created_at, a.updated_at
-FROM argo_private.agents a;
+FROM allgres_private.agents a;
 
 CREATE OR REPLACE VIEW allgres.tasks AS
 SELECT task_id, session_id, agent_id, parent_task_id, status, step_count,
        input, output, error, created_at, updated_at
-FROM argo_private.tasks;
+FROM allgres_private.tasks;
 
 CREATE OR REPLACE VIEW allgres.projects AS
 SELECT project_id, name, description, is_active, created_at, updated_at
-FROM argo_private.projects;
+FROM allgres_private.projects;
 
 REVOKE ALL ON SCHEMA allgres FROM PUBLIC;
 GRANT USAGE ON SCHEMA allgres TO operator, worker;
@@ -4547,7 +4587,7 @@ CREATE OR REPLACE FUNCTION allgres.dashboard_rpc(p_request jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = argo_private, argo_public, allgres, pg_catalog, pg_temp
+SET search_path = allgres_private, allgres_public, allgres, pg_catalog, pg_temp
 AS $fn$
 DECLARE
   v_action text := COALESCE(p_request->>'action', '');
@@ -4559,15 +4599,15 @@ BEGIN
         'ok', true,
         'server_time', now(),
         'version', '0.2.0',
-        'agents', (SELECT count(*) FROM argo_private.agents),
-        'active_agents', (SELECT count(*) FROM argo_private.agents WHERE is_active),
-        'running_tasks', (SELECT count(*) FROM argo_private.tasks WHERE status IN ('queued','running','waiting_human')),
-        'queued_outbound', (SELECT count(*) FROM argo_private.outbound_calls WHERE status = 'queued'),
-        'queued_sql', (SELECT count(*) FROM argo_private.sql_calls WHERE status = 'queued'),
-        'pending_approvals', (SELECT count(*) FROM argo_private.human_approvals WHERE status = 'pending'),
-        'failed_tasks', (SELECT count(*) FROM argo_private.tasks WHERE status = 'failed'),
-        'sessions', (SELECT count(*) FROM argo_private.sessions),
-        'secret_storage', argo_private.secret_storage_mode(),
+        'agents', (SELECT count(*) FROM allgres_private.agents),
+        'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active),
+        'running_tasks', (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued','running','waiting_human')),
+        'queued_outbound', (SELECT count(*) FROM allgres_private.outbound_calls WHERE status = 'queued'),
+        'queued_sql', (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'queued'),
+        'pending_approvals', (SELECT count(*) FROM allgres_private.human_approvals WHERE status = 'pending'),
+        'failed_tasks', (SELECT count(*) FROM allgres_private.tasks WHERE status = 'failed'),
+        'sessions', (SELECT count(*) FROM allgres_private.sessions),
+        'secret_storage', allgres_private.secret_storage_mode(),
         'workers', COALESCE((
           SELECT jsonb_agg(jsonb_build_object('name', backend_type, 'pid', pid) ORDER BY backend_type)
           FROM pg_stat_activity
@@ -4578,9 +4618,9 @@ BEGIN
           FROM (
             SELECT t.task_id, a.name AS agent, t.status, t.step_count,
                    s.goal, t.error, t.created_at, t.updated_at
-            FROM argo_private.tasks t
-            JOIN argo_private.agents a USING (agent_id)
-            JOIN argo_private.sessions s USING (session_id)
+            FROM allgres_private.tasks t
+            JOIN allgres_private.agents a USING (agent_id)
+            JOIN allgres_private.sessions s USING (session_id)
             ORDER BY t.updated_at DESC LIMIT 8
           ) q
         ), '[]'::jsonb)
@@ -4605,23 +4645,23 @@ BEGIN
             'permissions', COALESCE((
               SELECT jsonb_agg(jsonb_build_object('type', x.resource_type, 'ref', x.resource_ref)
                      ORDER BY x.resource_type, x.resource_ref)
-              FROM argo_private.permissions x WHERE x.agent_id = a.agent_id
+              FROM allgres_private.permissions x WHERE x.agent_id = a.agent_id
             ), '[]'::jsonb)
           ) ORDER BY a.name
         )
-        FROM argo_private.agents a
-        JOIN argo_private.policies p USING (agent_id)
+        FROM allgres_private.agents a
+        JOIN allgres_private.policies p USING (agent_id)
       ), '[]'::jsonb));
 
     WHEN 'agents.create' THEN
-      RETURN argo_public.fn_create_agent(p_request->>'name', p_request->>'system_prompt');
+      RETURN allgres_public.fn_create_agent(p_request->>'name', p_request->>'system_prompt');
 
     WHEN 'agents.update' THEN
       v_id := (p_request->>'agent_id')::uuid;
       IF p_request ? 'is_active' THEN
-        PERFORM argo_public.fn_set_agent_active(v_id, (p_request->>'is_active')::boolean);
+        PERFORM allgres_public.fn_set_agent_active(v_id, (p_request->>'is_active')::boolean);
       END IF;
-      PERFORM argo_public.fn_set_policy(
+      PERFORM allgres_public.fn_set_policy(
         v_id,
         NULLIF(p_request->>'system_prompt',''),
         CASE WHEN p_request ? 'max_steps'   THEN (p_request->>'max_steps')::int    ELSE NULL END,
@@ -4639,13 +4679,13 @@ BEGIN
         FROM (
           SELECT version_id, generation, system_prompt, max_steps, max_retries,
                  llm_config, max_concurrent_tasks, max_turn_seconds, changed_at
-          FROM argo_private.policy_history
+          FROM allgres_private.policy_history
           WHERE agent_id = (p_request->>'agent_id')::uuid
         ) q
       ), '[]'::jsonb));
 
     WHEN 'policy.rollback' THEN
-      RETURN argo_public.fn_rollback_policy(
+      RETURN allgres_public.fn_rollback_policy(
         (p_request->>'agent_id')::uuid, (p_request->>'generation')::int
       );
 
@@ -4661,14 +4701,14 @@ BEGIN
           'status', cp.status, 'created_at', cp.created_at,
           'decided_at', cp.decided_at, 'decided_reply', cp.decided_reply
         ) ORDER BY cp.created_at DESC)
-        FROM argo_private.change_proposals cp
-        JOIN argo_private.agents a ON a.agent_id = cp.agent_id
+        FROM allgres_private.change_proposals cp
+        JOIN allgres_private.agents a ON a.agent_id = cp.agent_id
         WHERE (NOT (p_request ? 'agent_id') OR cp.agent_id = (p_request->>'agent_id')::uuid)
           AND (NOT (p_request ? 'status') OR cp.status = p_request->>'status')
       ), '[]'::jsonb));
 
     WHEN 'proposals.decide' THEN
-      RETURN argo_public.fn_decide_proposal(
+      RETURN allgres_public.fn_decide_proposal(
         (p_request->>'proposal_id')::uuid,
         (p_request->>'approve')::boolean,
         NULLIF(p_request->>'reply', '')
@@ -4680,17 +4720,17 @@ BEGIN
           'permission_id', p.permission_id, 'type', p.resource_type,
           'ref', p.resource_ref, 'granted_at', p.granted_at
         ) ORDER BY p.resource_type, p.resource_ref)
-        FROM argo_private.permissions p
+        FROM allgres_private.permissions p
         WHERE p.agent_id = (p_request->>'agent_id')::uuid
       ), '[]'::jsonb));
 
     WHEN 'permissions.grant' THEN
-      RETURN argo_public.fn_grant_permission(
+      RETURN allgres_public.fn_grant_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
 
     WHEN 'permissions.revoke' THEN
-      RETURN argo_public.fn_revoke_permission(
+      RETURN allgres_public.fn_revoke_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
 
@@ -4704,11 +4744,11 @@ BEGIN
         'ok', true,
         'views', COALESCE((
           SELECT jsonb_agg(schemaname || '.' || viewname ORDER BY viewname)
-          FROM pg_catalog.pg_views WHERE schemaname = 'argo_public'
+          FROM pg_catalog.pg_views WHERE schemaname = 'allgres_public'
         ), '[]'::jsonb),
         'tools', '["http_get"]'::jsonb,
         'agents', COALESCE((
-          SELECT jsonb_agg(name ORDER BY name) FROM argo_private.agents WHERE is_active
+          SELECT jsonb_agg(name ORDER BY name) FROM allgres_private.agents WHERE is_active
         ), '[]'::jsonb),
         'http_hosts', 'free text -- any hostname the outbound guard allows'
       );
@@ -4716,43 +4756,43 @@ BEGIN
     WHEN 'allowlist.list' THEN
       RETURN jsonb_build_object('ok', true, 'allowlist', COALESCE((
         SELECT jsonb_agg(resource_ref ORDER BY resource_ref)
-        FROM argo_private.sql_sandbox_allowlist
+        FROM allgres_private.sql_sandbox_allowlist
       ), '[]'::jsonb));
 
     WHEN 'allowlist.add' THEN
-      RETURN argo_public.fn_allowlist_add(p_request->>'ref');
+      RETURN allgres_public.fn_allowlist_add(p_request->>'ref');
 
     WHEN 'allowlist.remove' THEN
-      RETURN argo_public.fn_allowlist_del(p_request->>'ref');
+      RETURN allgres_public.fn_allowlist_del(p_request->>'ref');
 
     WHEN 'projects.list' THEN
       RETURN jsonb_build_object('ok', true, 'projects', COALESCE((
         SELECT jsonb_agg(to_jsonb(pr) ORDER BY pr.name)
         FROM (
           SELECT project_id, name, description, is_active, created_at, updated_at
-          FROM argo_private.projects
+          FROM allgres_private.projects
         ) pr
       ), '[]'::jsonb));
 
     WHEN 'projects.create' THEN
-      RETURN argo_public.fn_create_project(p_request->>'name', p_request->>'description');
+      RETURN allgres_public.fn_create_project(p_request->>'name', p_request->>'description');
 
     WHEN 'projects.update' THEN
       v_id := (p_request->>'project_id')::uuid;
       IF p_request ? 'is_active' THEN
-        PERFORM argo_public.fn_set_project_active(v_id, (p_request->>'is_active')::boolean);
+        PERFORM allgres_public.fn_set_project_active(v_id, (p_request->>'is_active')::boolean);
       END IF;
       RETURN jsonb_build_object('ok', true, 'project_id', v_id);
 
     WHEN 'run' THEN
-      RETURN argo_public.fn_create_session(
+      RETURN allgres_public.fn_create_session(
         (p_request->>'agent_id')::uuid,
         p_request->>'goal',
         NULLIF(p_request->>'project_id', '')::uuid
       );
 
     WHEN 'sessions.cancel' THEN
-      RETURN argo_public.fn_cancel_session(
+      RETURN allgres_public.fn_cancel_session(
         (p_request->>'session_id')::uuid,
         p_request->>'reason'
       );
@@ -4763,8 +4803,8 @@ BEGIN
         FROM (
           SELECT s.session_id, s.agent_id, a.name AS agent, s.project_id,
                  s.goal, s.status, s.final_answer, s.started_at, s.completed_at
-          FROM argo_private.sessions s
-          JOIN argo_private.agents a USING (agent_id)
+          FROM allgres_private.sessions s
+          JOIN allgres_private.agents a USING (agent_id)
           WHERE NOT (p_request ? 'project_id')
              OR s.project_id IS NOT DISTINCT FROM NULLIF(p_request->>'project_id', '')::uuid
           ORDER BY s.started_at DESC
@@ -4774,7 +4814,7 @@ BEGIN
 
     WHEN 'sessions.get' THEN
       v_id := (p_request->>'session_id')::uuid;
-      IF NOT EXISTS (SELECT 1 FROM argo_private.sessions WHERE session_id = v_id) THEN
+      IF NOT EXISTS (SELECT 1 FROM allgres_private.sessions WHERE session_id = v_id) THEN
         RETURN jsonb_build_object('ok', false, 'error', 'session_not_found');
       END IF;
       RETURN jsonb_build_object(
@@ -4785,22 +4825,22 @@ BEGIN
             'project_id', s.project_id, 'goal', s.goal, 'status', s.status,
             'final_answer', s.final_answer, 'started_at', s.started_at, 'completed_at', s.completed_at
           )
-          FROM argo_private.sessions s JOIN argo_private.agents a USING (agent_id)
+          FROM allgres_private.sessions s JOIN allgres_private.agents a USING (agent_id)
           WHERE s.session_id = v_id
         ),
         'tasks', COALESCE((
           SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at)
           FROM (
             SELECT task_id, parent_task_id, status, step_count, output, error, created_at, updated_at
-            FROM argo_private.tasks WHERE session_id = v_id
+            FROM allgres_private.tasks WHERE session_id = v_id
           ) q
         ), '[]'::jsonb),
         'logs', COALESCE((
           SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at)
           FROM (
             SELECT l.log_id, l.task_id, l.step_number, l.role, l.content, l.created_at
-            FROM argo_private.execution_logs l
-            JOIN argo_private.tasks t USING (task_id)
+            FROM allgres_private.execution_logs l
+            JOIN allgres_private.tasks t USING (task_id)
             WHERE t.session_id = v_id
           ) q
         ), '[]'::jsonb)
@@ -4813,9 +4853,9 @@ BEGIN
           SELECT t.task_id, t.session_id, t.parent_task_id, a.agent_id, a.name AS agent,
                  t.status, t.step_count, s.goal, s.final_answer,
                  t.output, t.error, t.created_at, t.updated_at
-          FROM argo_private.tasks t
-          JOIN argo_private.agents a USING (agent_id)
-          JOIN argo_private.sessions s USING (session_id)
+          FROM allgres_private.tasks t
+          JOIN allgres_private.agents a USING (agent_id)
+          JOIN allgres_private.sessions s USING (session_id)
           ORDER BY t.updated_at DESC
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 100), 1), 500)
         ) q
@@ -4827,9 +4867,9 @@ BEGIN
         FROM (
           SELECT l.log_id, l.task_id, l.step_number, l.role, l.content, l.created_at,
                  a.name AS agent
-          FROM argo_private.execution_logs l
-          JOIN argo_private.tasks t USING (task_id)
-          JOIN argo_private.agents a USING (agent_id)
+          FROM allgres_private.execution_logs l
+          JOIN allgres_private.tasks t USING (task_id)
+          JOIN allgres_private.agents a USING (agent_id)
           ORDER BY l.created_at DESC
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 150), 1), 1000)
         ) q
@@ -4838,7 +4878,7 @@ BEGIN
     WHEN 'settings.get' THEN
       RETURN jsonb_build_object(
         'ok', true,
-        'secret_storage', argo_private.secret_storage_mode(),
+        'secret_storage', allgres_private.secret_storage_mode(),
         'providers', COALESCE((
           SELECT jsonb_agg(jsonb_build_object(
             'provider_id', p.provider_id,
@@ -4848,7 +4888,7 @@ BEGIN
             'is_enabled', p.is_enabled,
             'allow_private_network', p.allow_private_network,
             'has_secret', EXISTS (
-              SELECT 1 FROM argo_private.llm_secrets s
+              SELECT 1 FROM allgres_private.llm_secrets s
               WHERE s.provider_id = p.provider_id AND (
                 NULLIF(s.api_key,'') IS NOT NULL
                 OR NULLIF(s.access_token,'') IS NOT NULL
@@ -4856,13 +4896,13 @@ BEGIN
               )
             )
           ) ORDER BY p.name)
-          FROM argo_private.llm_providers p
+          FROM allgres_private.llm_providers p
         ), '[]'::jsonb)
       );
 
     WHEN 'provider.update' THEN
       v_id := (p_request->>'provider_id')::uuid;
-      PERFORM argo_public.fn_set_provider(
+      PERFORM allgres_public.fn_set_provider(
         v_id,
         NULLIF(p_request->>'base_url',''),
         CASE WHEN p_request ? 'is_enabled' THEN (p_request->>'is_enabled')::boolean ELSE NULL END,
@@ -4871,7 +4911,7 @@ BEGIN
         NULL, NULL, NULL, NULL
       );
       IF NULLIF(p_request->>'api_key','') IS NOT NULL THEN
-        PERFORM argo_public.fn_set_provider_secret(v_id, p_request->>'api_key');
+        PERFORM allgres_public.fn_set_provider_secret(v_id, p_request->>'api_key');
       END IF;
       RETURN jsonb_build_object('ok', true, 'provider_id', v_id);
 
@@ -4884,7 +4924,7 @@ BEGIN
           FROM (
             SELECT t.task_id, a.name AS agent, t.status, t.step_count, t.updated_at,
                    left(COALESCE(t.error,''), 240) AS error
-            FROM argo_private.tasks t JOIN argo_private.agents a USING (agent_id)
+            FROM allgres_private.tasks t JOIN allgres_private.agents a USING (agent_id)
             ORDER BY t.updated_at DESC LIMIT 12
           ) q
         ), '[]'::jsonb),
@@ -4892,7 +4932,7 @@ BEGIN
           SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
           FROM (
             SELECT l.log_id, l.task_id, l.step_number, l.role, l.content, l.created_at
-            FROM argo_private.execution_logs l
+            FROM allgres_private.execution_logs l
             ORDER BY l.created_at DESC LIMIT 15
           ) q
         ), '[]'::jsonb)
@@ -4905,10 +4945,10 @@ BEGIN
           SELECT h.approval_id, h.task_id, t.session_id, a.name AS agent,
                  s.goal, h.payload->>'reason' AS reason,
                  h.created_at, h.expires_at
-          FROM argo_private.human_approvals h
-          JOIN argo_private.tasks t USING (task_id)
-          JOIN argo_private.agents a USING (agent_id)
-          JOIN argo_private.sessions s USING (session_id)
+          FROM allgres_private.human_approvals h
+          JOIN allgres_private.tasks t USING (task_id)
+          JOIN allgres_private.agents a USING (agent_id)
+          JOIN allgres_private.sessions s USING (session_id)
           WHERE h.status = 'pending'
           ORDER BY h.created_at
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 100), 1), 500)
@@ -4916,14 +4956,14 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'approvals.decide' THEN
-      RETURN argo_public.fn_decide_approval(
+      RETURN allgres_public.fn_decide_approval(
         (p_request->>'approval_id')::uuid,
         (p_request->>'accept')::boolean,
         NULLIF(p_request->>'reply', '')
       );
 
     WHEN 'selftest' THEN
-      RETURN argo_public.fn_selftest();
+      RETURN allgres_public.fn_selftest();
 
     ELSE
       RETURN jsonb_build_object('ok', false, 'error', 'unknown_action', 'action', v_action);

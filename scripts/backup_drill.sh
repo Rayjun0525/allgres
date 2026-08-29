@@ -75,12 +75,12 @@ fi
 as_pg "$PG_BIN/pg_basebackup" -D "$SCRATCH/basebackup" -Fp -X stream -c fast
 
 as_pg psql -d postgres -v ON_ERROR_STOP=1 -c \
-  "SELECT argo_public.fn_create_agent('backup_drill_before_$SUFFIX', 'created before the PITR target');" >/dev/null
+  "SELECT allgres_public.fn_create_agent('backup_drill_before_$SUFFIX', 'created before the PITR target');" >/dev/null
 as_pg psql -d postgres -c "SELECT pg_switch_wal();" >/dev/null
 T1=$(as_pg psql -d postgres -t -A -c "SELECT now();")
 sleep 2
 as_pg psql -d postgres -v ON_ERROR_STOP=1 -c \
-  "SELECT argo_public.fn_create_agent('backup_drill_after_$SUFFIX', 'created after the PITR target -- must NOT survive the restore');" >/dev/null
+  "SELECT allgres_public.fn_create_agent('backup_drill_after_$SUFFIX', 'created after the PITR target -- must NOT survive the restore');" >/dev/null
 as_pg psql -d postgres -c "SELECT pg_switch_wal();" >/dev/null
 
 cp -a "$SCRATCH/basebackup" "$SCRATCH/pitr_restore"
@@ -115,15 +115,15 @@ as_pg "$PG_BIN/pg_ctl" -D "$SCRATCH/pitr_restore" -l "$SCRATCH/logs/pitr_restore
 for _ in $(seq 1 30); do as_pg pg_isready -h "$SCRATCH/sock" -p "$RESTORE_PORT" -q && break; sleep 1; done
 
 BEFORE=$(as_pg psql -h "$SCRATCH/sock" -p "$RESTORE_PORT" -d postgres -t -A -c \
-  "SELECT count(*) FROM argo_private.agents WHERE name = 'backup_drill_before_$SUFFIX';")
+  "SELECT count(*) FROM allgres_private.agents WHERE name = 'backup_drill_before_$SUFFIX';")
 AFTER=$(as_pg psql -h "$SCRATCH/sock" -p "$RESTORE_PORT" -d postgres -t -A -c \
-  "SELECT count(*) FROM argo_private.agents WHERE name = 'backup_drill_after_$SUFFIX';")
+  "SELECT count(*) FROM allgres_private.agents WHERE name = 'backup_drill_after_$SUFFIX';")
 if [ "$BEFORE" != "1" ] || [ "$AFTER" != "0" ]; then
   echo "FAIL: PITR did not land at the intended point in time (before=$BEFORE after=$AFTER)" >&2
   exit 1
 fi
 SELFTEST=$(as_pg psql -h "$SCRATCH/sock" -p "$RESTORE_PORT" -d postgres -t -A -c \
-  "SELECT (argo_public.fn_selftest()->>'failed')::int;")
+  "SELECT (allgres_public.fn_selftest()->>'failed')::int;")
 if [ "$SELFTEST" != "0" ]; then
   echo "FAIL: fn_selftest had $SELFTEST failures on the PITR-restored instance" >&2
   exit 1
@@ -138,9 +138,9 @@ as_pg psql -d postgres -v ON_ERROR_STOP=1 -c "
 DO \$\$
 DECLARE v_agent uuid;
 BEGIN
-  v_agent := (argo_public.fn_create_agent('backup_drill_logical_$SUFFIX', 'logical restore check')->>'agent_id')::uuid;
-  PERFORM argo_public.fn_grant_permission(v_agent, 'view', 'argo_public.v_my_tasks');
-  PERFORM argo_public.fn_create_session(v_agent, 'logical restore drill session');
+  v_agent := (allgres_public.fn_create_agent('backup_drill_logical_$SUFFIX', 'logical restore check')->>'agent_id')::uuid;
+  PERFORM allgres_public.fn_grant_permission(v_agent, 'view', 'allgres_public.v_my_tasks');
+  PERFORM allgres_public.fn_create_session(v_agent, 'logical restore drill session');
 END \$\$;" >/dev/null
 
 as_pg pg_dump -Fc -d postgres -f "$SCRATCH/dumps/postgres.dump" 2>/dev/null
@@ -174,11 +174,11 @@ DO \$\$
 DECLARE
   v_role text; v_sql text; v_agent uuid; v_result jsonb;
 BEGIN
-  SELECT agent_id, pg_role INTO v_agent, v_role FROM argo_private.agents WHERE name = 'backup_drill_logical_$SUFFIX';
-  v_sql := argo_private.fn_validate_sql(v_agent, 'SELECT task_id FROM argo_public.v_my_tasks');
+  SELECT agent_id, pg_role INTO v_agent, v_role FROM allgres_private.agents WHERE name = 'backup_drill_logical_$SUFFIX';
+  v_sql := allgres_private.fn_validate_sql(v_agent, 'SELECT task_id FROM allgres_public.v_my_tasks');
   EXECUTE format('SET LOCAL ROLE %I', v_role);
   IF current_user <> v_role THEN RAISE EXCEPTION 'role not assumed: %', current_user; END IF;
-  v_result := argo_public.fn_run_sandboxed_sql(v_sql);
+  v_result := allgres_public.fn_run_sandboxed_sql(v_sql);
   IF NOT COALESCE((v_result->>'ok')::boolean, false) OR COALESCE(jsonb_array_length(v_result->'rows'), 0) = 0 THEN
     RAISE EXCEPTION 'agent could not see its own task after restore: %', v_result;
   END IF;
@@ -188,7 +188,7 @@ END \$\$;" 2>&1)
 echo "$ROLE_OK" | grep -q "role isolation ok" || { echo "FAIL: role isolation did not survive logical restore:"; echo "$ROLE_OK" >&2; exit 1; }
 
 SELFTEST2=$(as_pg psql -h "$SCRATCH/sock" -p "$FRESH_PORT" -d postgres -t -A -c \
-  "SELECT (argo_public.fn_selftest()->>'failed')::int;")
+  "SELECT (allgres_public.fn_selftest()->>'failed')::int;")
 if [ "$SELFTEST2" != "0" ]; then
   echo "FAIL: fn_selftest had $SELFTEST2 failures on the logically-restored instance" >&2
   exit 1

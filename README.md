@@ -119,16 +119,16 @@ is planned, rewritten, or executed during analysis.
 
 This replaced a regex layer. Text scanning has to re-implement lexing, and every
 piece of that is a way to be wrong in one direction or the other — comment
-injection (`FROM v_sales --x\n, argo_private.sessions`), quoted identifiers,
+injection (`FROM v_sales --x\n, allgres_private.sessions`), quoted identifiers,
 comma joins, `extract(year FROM col)`, dollar quotes, a schema name that is
 really just a string literal. The grammar has already settled all of it.
 
 Validated statements do not run inline. PostgreSQL refuses `SET ROLE` inside a
 security-definer function (`cannot set parameter "role" within
 security-definer function`, SQLSTATE 42501), and `fn_validate_sql` is
-`SECURITY DEFINER` — it has to be, since it reads `argo_private.permissions`
+`SECURITY DEFINER` — it has to be, since it reads `allgres_private.permissions`
 and `pg_proc` regardless of who is asking. So it only validates and returns
-the normalized statement text; it queues that text in `argo_private.sql_calls`
+the normalized statement text; it queues that text in `allgres_private.sql_calls`
 and the runtime worker's SPI thread claims it and runs it as a **top-level**
 statement, issued directly by the worker with no enclosing `SECURITY DEFINER`
 frame — the same claim/complete shape already used for outbound LLM and tool
@@ -141,11 +141,11 @@ Layered, strongest first:
 2. `search_path = pg_temp`, so an unqualified relation name cannot resolve to
    anything at all;
 3. the agent-visible views return no rows unless the current agent holds the
-   matching permission (`argo_private.agent_may_read`), so authorisation does
+   matching permission (`allgres_private.agent_may_read`), so authorisation does
    not depend on the analysis being complete;
 4. `transaction_read_only` and a 5s `statement_timeout` — both real now that
    execution is a top-level statement instead of nested inside one;
-5. a function must be on `argo_private.sql_function_allowlist` — a seeded,
+5. a function must be on `allgres_private.sql_function_allowlist` — a seeded,
    positive allowlist of the aggregate, string, math, date and json
    functions an analyst actually needs — **and** pass every other gate:
    non-volatile (the property that separates a read from a side effect;
@@ -175,7 +175,7 @@ Outstanding gaps — the unverified Docker/PG17 build, the untested upgrade path
 and OAuth flow, secret key rotation, and more — are tracked in
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
 
-`argo_public.fn_selftest()` exercises the validate/queue/claim/complete state
+`allgres_public.fn_selftest()` exercises the validate/queue/claim/complete state
 machine and every shape that defeated the old text scanner, and runs as part
 of `tests/smoke.sql`. It cannot exercise the role drop itself, though, being
 `SECURITY DEFINER` too; `tests/smoke.sql` separately asserts that against a
@@ -271,7 +271,7 @@ plaintext and the dashboard shows a banner saying so. The dashboard never
 returns a secret, only whether one is set.
 
 That covers `llm_secrets`, the one table meant to hold a credential. A
-decrypted key never reaches any other table: `argo_private.outbound_calls`
+decrypted key never reaches any other table: `allgres_private.outbound_calls`
 (the queue an LLM call sits in between being built and actually sent) holds
 only `provider_id` and which header name a credential belongs in
 (`auth_kind`) — never the credential itself. `fn_claim_outbound` resolves and
@@ -284,7 +284,7 @@ WAL, a physical backup, a PITR archive, a replica, or a plain `SELECT` on
 
 ### Privileges
 
-Four fixed roles: `argo_owner` (deploy only), `operator`, `worker`, `sandbox`.
+Four fixed roles: `allgres_owner` (deploy only), `operator`, `worker`, `sandbox`.
 
 The runtime worker connects as the bootstrap superuser — a role that does not
 exist yet must never crash-loop a background worker at startup — and then calls
@@ -309,7 +309,7 @@ existed stays on the shared `sandbox` role — `agents.pg_role` is `NULL` for
 it — until `fn_provision_agent_role` is called for it explicitly; this is an
 additive migration, not a breaking one.
 
-`argo_private.current_agent_id()` prefers this role identity
+`allgres_private.current_agent_id()` prefers this role identity
 (`current_user`, parsed back against the naming scheme, no table lookup)
 over the `argo.agent_id` GUC the worker also sets, falling back to the GUC
 only for an unprovisioned agent. It is deliberately `SECURITY INVOKER` and
@@ -345,7 +345,7 @@ between what the agent can touch and what only an operator can:
   operator-managed provider row regardless (`sanitize_llm_config`, applies
   here exactly as it does to a normal `agents.update`).
 - **A proposal never touches the live policy by itself.** It only inserts a
-  `pending` row into `argo_private.change_proposals`; the task that
+  `pending` row into `allgres_private.change_proposals`; the task that
   proposed it keeps running unaffected, unlike `await_human`, which blocks.
 - **An operator decides it explicitly** — `fn_decide_proposal` /
   `proposals.decide`, approve or reject, with an optional reply. Approving
@@ -484,7 +484,7 @@ extension does that a generic `pg_dump` would otherwise miss silently:
 ```bash
 cargo pgrx test --features pg17   # Rust unit tests (request parsing, auth, parse-tree reader)
 ./scripts/smoke.sh                # container smoke, end-to-end, and security checks
-psql -c "SELECT argo_public.fn_selftest()"
+psql -c "SELECT allgres_public.fn_selftest()"
 ```
 
 ## License

@@ -27,7 +27,7 @@ is exactly what made `SET ROLE sandbox` illegal (PostgreSQL refuses `SET ROLE`
 inside a security-definer function, and the restriction covers the whole call
 stack below one). It is now split: `fn_validate_sql` only validates and
 returns the normalized statement text; the runtime worker queues that text in
-`argo_private.sql_calls` and its SPI thread claims and runs it
+`allgres_private.sql_calls` and its SPI thread claims and runs it
 (`fn_run_sandboxed_sql`) as a **top-level** statement — issued directly by the
 worker, no enclosing `SECURITY DEFINER` frame — under `SET LOCAL ROLE
 sandbox`, the same claim/complete shape (`fn_claim_sql` / `fn_complete_sql`)
@@ -139,13 +139,13 @@ reasoning was never fed back to the agent, which resumed with no idea what was
 decided or why. It now takes an optional `p_reply text`, appends it to
 `execution_logs` as an `operator`-role message (a role the log's `CHECK`
 constraint has allowed since day one but that nothing ever wrote), and the
-resumed agent sees it on its next turn. `argo_private.human_approvals` also
+resumed agent sees it on its next turn. `allgres_private.human_approvals` also
 gained `expires_at` (`fn_submit_result` sets a 24h default) and `fn_watchdog`
 auto-rejects a `waiting_human` task nobody ever answers, the same
 durable-queue-plus-watchdog shape used for `outbound_calls`/`sql_calls`, on
 human timescales instead of machine ones.
 
-`argo_private.projects` was added to group sessions (agents stay
+`allgres_private.projects` was added to group sessions (agents stay
 project-agnostic and reusable across projects, the way a bot can sit in
 several Slack channels); `fn_create_session` takes an optional `p_project_id`.
 `dashboard_rpc` exposes `projects.list` / `projects.create` / `projects.update`
@@ -184,8 +184,8 @@ The gaps this pass filled:
   one session's full `execution_logs` across all its tasks, in order. Did not
   exist before; `logs.list` only ever returned a flat, unscoped, 150-row-capped
   slice of every agent's logs mixed together.
-- **Policy version history** — `argo_private.policies` gained `generation`;
-  `argo_private.policy_history` is an append-only snapshot of every prior
+- **Policy version history** — `allgres_private.policies` gained `generation`;
+  `allgres_private.policy_history` is an append-only snapshot of every prior
   version, written by `fn_set_policy` immediately before it overwrites the
   live row. Versions only on an actual change (compared field by field with
   `IS DISTINCT FROM`) — `agents.update` calls `fn_set_policy` on every save,
@@ -325,9 +325,9 @@ were sitting under passing tests.
   live after the fix, including that the block survives an uppercase call
   and a schema-qualified one (`pg_catalog.current_setting(...)`). Selftest:
   five new `sandbox_reject` cases, including the exact secret-key query and
-  a call to Allgres's own `argo_private.secret_key()`.
+  a call to Allgres's own `allgres_private.secret_key()`.
 - **SSRF: the outbound guard checked a hostname string, never the address it
-  resolves to.** `argo_private.is_blocked_host` (used at SQL build/queue
+  resolves to.** `allgres_private.is_blocked_host` (used at SQL build/queue
   time) and the Rust HTTP client's own DNS resolution were two separate
   steps with nothing tying them together: a hostname that resolves to a
   public address when the agent's request is validated can resolve to
@@ -383,7 +383,7 @@ check the write, or the read?
 - **A provider's decrypted API key sat in a table in plaintext.**
   `build_llm_http` decrypted the key and baked it into the
   `Authorization`/`x-api-key` header it returned; `fn_dispatch_tasks` wrote
-  that header straight into `argo_private.outbound_calls.request_headers`
+  that header straight into `allgres_private.outbound_calls.request_headers`
   — an ordinary table column, not a transient value. From the moment a
   call was queued until it was harvested (and after, since nothing purges
   it), the plaintext key sat in WAL, in any physical backup or PITR
@@ -439,7 +439,7 @@ existed. Confirmed live before fixing:
 'allgres.secret_key'` validated as ordinary safe SQL and would have handed
 back the same secret item 12 had just closed one specific path to.
 
-Fixed by adding `argo_private.sql_function_allowlist`, seeded with the
+Fixed by adding `allgres_private.sql_function_allowlist`, seeded with the
 aggregate/string/math/date/json functions an analyst actually needs
 (`sum`, `count`, `extract`, `generate_series`, `jsonb_build_object`, and
 similar — see the seed `INSERT` in `sql/control_plane.sql` for the full
@@ -453,7 +453,7 @@ allowlist. That is the safe direction to get this wrong in.
 
 Reproduced and reverified live: the `pg_show_all_settings()` query above,
 validated and rejected; a realistic analyst query
-(`SELECT region, sum(amount), count(*) FROM argo_public.v_sales GROUP BY
+(`SELECT region, sum(amount), count(*) FROM allgres_public.v_sales GROUP BY
 region ORDER BY sum(amount) DESC`) run through the real background worker
 end to end, executed correctly under the new allowlist. `fn_selftest`
 68/68 (two new cases: the `pg_show_all_settings()` bypass rejected, and an
@@ -503,7 +503,7 @@ interpolated into a `SET LOCAL ROLE` string, since that statement has no
 parameterized form.
 
 This did not need a new privilege boundary, on inspection: whatever
-installs the extension already creates `argo_owner`/`operator`/`worker`/
+installs the extension already creates `allgres_owner`/`operator`/`worker`/
 `sandbox` in the roles bootstrap, so it already has `CREATE ROLE` power
 (typically as a superuser); `fn_provision_agent_role`, like every other
 `SECURITY DEFINER` function in this file, is owned by that same installer
@@ -511,14 +511,14 @@ and asks for nothing new.
 
 **A real bug this slice caught, live, before it shipped**: the first
 version of `current_agent_id()` looked `pg_role` up in
-`argo_private.agents` by `current_user`, and was `SECURITY DEFINER` (it
+`allgres_private.agents` by `current_user`, and was `SECURITY DEFINER` (it
 has to read a table `sandbox` has no grant on). That silently broke
 every agent's own permission check — confirmed live: an agent granted
 its own view read back zero rows. The reason is a `SECURITY DEFINER`
 property easy to forget: it changes `current_user` to the function's
 *owner*, for everything nested inside it, for the rest of that function's
 execution — `agent_may_read` is already `SECURITY DEFINER` (it reads
-`argo_private.permissions`/`sql_sandbox_allowlist`), so calling
+`allgres_private.permissions`/`sql_sandbox_allowlist`), so calling
 `current_agent_id()` from inside it saw `current_user` as
 `agent_may_read`'s owner on every single call, never the querying agent's
 actual role. Fixed by making `current_agent_id()` table-free (the
@@ -672,7 +672,7 @@ memory/provenance subsystem the same review round proposed; both stay out
 of scope.
 
 **What was built**: a `propose_change` agent action
-(`fn_submit_result`), a new `argo_private.change_proposals` table, and two
+(`fn_submit_result`), a new `allgres_private.change_proposals` table, and two
 new operator-only functions (`fn_decide_proposal`, `fn_rollback_policy`),
 exposed through three new `dashboard_rpc` actions
 (`proposals.list`/`proposals.decide`/`policy.rollback`) and a new
@@ -701,10 +701,10 @@ clobbering whatever changed it.
 
 **A table-ordering bug caught before it shipped**: `change_proposals` was
 first placed early in `control_plane.sql`, alongside `policy_history`,
-with a `REFERENCES argo_private.tasks(task_id)` foreign key — but `tasks`
+with a `REFERENCES allgres_private.tasks(task_id)` foreign key — but `tasks`
 is not defined until much later in the same file, which replays linearly
 in one transaction. `CREATE EXTENSION allgres;` failed outright
-(`relation "argo_private.tasks" does not exist`) rather than doing
+(`relation "allgres_private.tasks" does not exist`) rather than doing
 anything silently wrong. Fixed by moving the table definition to
 immediately after `tasks`'s own indexes, matching the file's existing
 dependency-order convention.
@@ -880,3 +880,79 @@ a migration path for an already-seeded install to adopt the new fixed
 provider ids; secret key rotation (item 7, unrelated to this pass but still
 open); per-operator dashboard accounts (items 10/11, still open — the SSE
 ticket mechanism authenticates the *session*, not a *person*).
+
+## 19. Argo fully retired: internal schema/role names are now `allgres_*`
+
+The project's original name, Argo, had never been fully removed: three
+internal identifiers — the `argo_private`/`argo_public` schemas and the
+`argo_owner` role — still carried it, kept for what the file's own header
+comment called "upgrade compatibility." That reasoning did not hold up:
+this project has never had a real prior release to be compatible *with* —
+item 18 already established that "0.1.0" was never a genuine install, only
+a placeholder — so nothing was actually gated on the old names surviving.
+Renamed everywhere, on explicit direction: `argo_private` →
+`allgres_private`, `argo_public` → `allgres_public`, `argo_owner` →
+`allgres_owner`, across `sql/control_plane.sql`, `src/lib.rs`,
+`tests/*.sql`, `scripts/backup_drill.sh`, `web/index.html`, and this
+project's own docs — roughly 2,800 occurrences, all three identifiers used
+consistently enough that a global substitution was safe (confirmed by
+enumerating every distinct `argo_*` token in the codebase first: there
+were exactly these three, nothing else).
+
+**This is not just a text rename — it changes what `ALTER EXTENSION ...
+UPDATE` has to do**, since the *just-shipped* item 18 froze a real
+`sql/allgres--0.2.0.sql` base under the *old* names (a true historical
+snapshot — it stays that way; do not edit it to match this rename). Without
+a real migration, upgrading from that frozen 0.2.0 base to 0.3.0 would have
+either failed outright (a plain `CREATE SCHEMA IF NOT EXISTS
+allgres_private` next to an existing, still-populated `argo_private` leaves
+two parallel schemas, one dead) or silently orphaned every row already
+sitting under the old names. Fixed with an explicit migration block at the
+top of "1. Roles" in `sql/control_plane.sql`: `ALTER ROLE argo_owner RENAME
+TO allgres_owner` and `ALTER SCHEMA argo_private/argo_public RENAME TO
+allgres_private/allgres_public`, guarded by `IF EXISTS <old> AND NOT EXISTS
+<new>` so it is a no-op on a fresh install (neither old name ever existed)
+and a real rename-in-place on an upgrade from 0.2.0 or earlier — every
+object and every row stays exactly where it is, just reachable under the
+new name. This has to run *before* the ordinary `CREATE ROLE`/`CREATE
+SCHEMA IF NOT EXISTS` block that follows it, not after: that block, finding
+no `allgres_owner` yet, would otherwise create an empty one first, and the
+rename's own `NOT EXISTS <new>` guard would then block the real rename from
+ever running — caught in review before it shipped, not live, this once.
+
+Verified live, both directions:
+
+- **Fresh install** (`CREATE EXTENSION allgres;`, no history): produces
+  `allgres_private`, `allgres_public`, `allgres_owner` directly; the
+  migration guards are no-ops since neither old name exists.
+  `fn_selftest` 78/78, `tests/smoke.sql` and `tests/e2e_mock.sql` green.
+- **Upgrade from a real 0.2.0** (`CREATE EXTENSION allgres VERSION
+  '0.2.0';`, seeded with a real agent, a session, a granted permission, and
+  a provider secret under the *old* schema names, then `ALTER EXTENSION
+  allgres UPDATE TO '0.3.0';`): confirmed `argo_owner`/`argo_private`/
+  `argo_public` are gone afterward (not left behind alongside the new
+  ones), `allgres_owner` exists exactly once (not duplicated), and every
+  piece of seeded data — the agent, its per-agent PostgreSQL role, the
+  session, the decrypted provider secret — reads back correctly under
+  `allgres_private`/`allgres_public`. `fn_selftest`, `tests/smoke.sql`, and
+  `tests/e2e_mock.sql` all green on the migrated instance too. A first
+  attempt at this test gave a false pass: a leftover `allgres_owner` role
+  from earlier ad hoc testing in the same PostgreSQL cluster (roles are
+  cluster-global, not per-database) satisfied the migration's `NOT EXISTS
+  <new>` guard by coincidence, masking whether the rename logic itself was
+  correct. Redone from a fully clean cluster (both old and new role/schema
+  names dropped first) to get an uncontaminated result.
+- `scripts/backup_drill.sh` (item 18) re-run end to end against the
+  renamed schema: both the physical (PITR) and logical (`pg_dump`) paths
+  still pass unmodified beyond the identifier rename itself.
+
+One operational note for anyone applying this upgrade to a real 0.2.0
+install outside this repo: `CREATE EXTENSION allgres VERSION '0.2.0';`
+must run in a database with no other `allgres_owner`/`allgres_private`/
+`allgres_public` already present in that cluster (which, for a real prior
+install, should never be the case) — the same ambiguity the "false pass"
+above hit in testing. The migration deliberately does not force a rename
+when the new name already exists (it would either fail on a real conflict
+or silently clobber something), so that specific case needs a human to
+look at what is actually there before proceeding, rather than the upgrade
+script guessing.
