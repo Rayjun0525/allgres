@@ -1,6 +1,5 @@
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Local overrides for docker compose (POSTGRES_PASSWORD, ALLGRES_SECRET_KEY,
 # ALLGRES_DASHBOARD_TOKEN). Never commit these.
