@@ -30,7 +30,7 @@ set -euo pipefail
 PG_BIN="${PG_BIN:-/usr/lib/postgresql/16/bin}"
 PGCONF="${PGCONF:-/etc/postgresql/16/main/postgresql.conf}"
 CLUSTER="${CLUSTER:-16 main}"
-SCRATCH="${SCRATCH:-/var/lib/postgresql/backup_drill}"
+SCRATCH="${SCRATCH:-/var/lib/postgresql/allgres-backup-drill}"
 RESTORE_PORT="${RESTORE_PORT:-5433}"
 FRESH_PORT="${FRESH_PORT:-5434}"
 
@@ -47,22 +47,41 @@ SUFFIX="$(date +%s)_$$"
 
 # SCRATCH is overridable (SCRATCH=... in the environment) and gets rm -rf'd
 # twice below; refuse anything that isn't a plausible scratch path rather
-# than trusting an override blindly -- an empty or mistyped value here
-# (SCRATCH=/ being the sharpest case) would otherwise turn a cleanup step
-# into an unbounded delete.
+# than trusting an override blindly. The previous check here
+# (/var/lib/postgresql/*) was too wide -- confirmed by inspection: a
+# mistyped override like SCRATCH=/var/lib/postgresql/16/main, a real
+# cluster's own data directory, would have passed it and then been
+# rm -rf'd outright. realpath -m canonicalizes first (resolves any ".."
+# and symlinks before the prefix check runs, so neither can walk the
+# check out of the directory it approved), and the prefix now names this
+# script's own scratch directory specifically, not the whole
+# /var/lib/postgresql/ tree any real cluster also lives under.
+SCRATCH="$(realpath -m "$SCRATCH")"
 case "$SCRATCH" in
-  /var/lib/postgresql/*) ;;
+  /var/lib/postgresql/allgres-backup-drill*) ;;
   *)
-    echo "FAIL: SCRATCH ('$SCRATCH') must be under /var/lib/postgresql/ -- refusing to rm -rf it" >&2
+    echo "FAIL: SCRATCH ('$SCRATCH') must be under /var/lib/postgresql/allgres-backup-drill* -- refusing to rm -rf it" >&2
     exit 1
     ;;
 esac
+
+# Defense in depth beyond the path check above: only ever rm -rf a
+# directory this script itself created and marked. A first run (or a
+# SCRATCH that does not exist yet) has nothing to check -- this only fires
+# when something is already sitting at this exact path without the marker,
+# which the narrowed prefix above makes unlikely but not impossible (a
+# stray directory created by hand, for instance).
+if [ -d "$SCRATCH" ] && [ ! -f "$SCRATCH/.allgres_backup_drill_marker" ]; then
+  echo "FAIL: '$SCRATCH' already exists and has no .allgres_backup_drill_marker -- refusing to rm -rf a directory this script did not create" >&2
+  exit 1
+fi
 
 echo "=== backup_drill: cleaning any previous run's scratch clusters ==="
 as_pg "$PG_BIN/pg_ctl" -D "$SCRATCH/pitr_restore" stop -m fast 2>/dev/null || true
 as_pg "$PG_BIN/pg_ctl" -D "$SCRATCH/logical_restore" stop -m fast 2>/dev/null || true
 rm -rf "$SCRATCH"
 mkdir -p "$SCRATCH/wal_archive" "$SCRATCH/logs" "$SCRATCH/dumps" "$SCRATCH/sock"
+touch "$SCRATCH/.allgres_backup_drill_marker"
 chown -R postgres:postgres "$SCRATCH"
 ARCHIVE_ADDED=0
 trap '

@@ -56,8 +56,9 @@
 -- role/schema instead of renaming it. A fresh install has neither old
 -- name, so every guard here is a no-op.
 --
--- Two safety properties an external review (correctly) pointed out the
--- first version of this block lacked, both fixed here:
+-- Three safety properties an external review (correctly) pointed out the
+-- first version of this block lacked; the first two were fixed in the
+-- previous round, the third fixed here:
 --   - fail loud, not silent, on an ambiguous state (old and new both
 --     present) -- proceeding either would either error confusingly deep
 --     into the rest of this file or silently leave data stranded under
@@ -65,22 +66,49 @@
 --   - "a schema literally named argo_private/argo_public exists" is not by
 --     itself proof it is *this* extension's schema -- "Argo" is not an
 --     exotic enough name to rule out an unrelated coincidence on the same
---     cluster. Each schema is checked for one object only Allgres would
---     have put there (argo_private.agents, argo_public.fn_selftest)
---     before it is touched. argo_owner has no object of its own to check
---     this way (ownership was never actually transferred to it in any
---     0.2.0-era install either -- see the ownership-transfer block later
---     in this file, itself new); its only real link to Allgres is having
---     been created alongside the two schemas, so it is only renamed once
---     at least one of them was independently confirmed genuine.
+--     cluster. The previous round's answer was to also check for one
+--     object only Allgres would have put there (argo_private.agents,
+--     argo_public.fn_selftest) -- better than nothing, but a second review
+--     round pointed out it is still just a name-shaped guess: an unrelated
+--     schema that happens to be named argo_private and happens to have an
+--     "agents" table would still pass;
+--   - the actually reliable signal was sitting in pg_depend the whole
+--     time: CREATE EXTENSION (and ALTER EXTENSION UPDATE, which keeps the
+--     same pg_extension row across a version bump) automatically records
+--     every object it creates as a member of that extension as it creates
+--     it. A schema this file itself created, in any prior version, is
+--     therefore *always* a pg_depend member of the 'allgres' extension
+--     specifically -- something no coincidentally-named unrelated schema
+--     could ever be, regardless of what tables happen to live in it. That
+--     is now the primary check; the object-existence check from the
+--     previous round stays as a secondary sanity assertion (a genuine but
+--     somehow-corrupted old install should still fail loud with a clearer
+--     message than a bare "not an extension member" would give).
+--   argo_owner has no object of its own to check this way (ownership was
+--   never actually transferred to it in any 0.2.0-era install either --
+--   see the ownership-transfer block later in this file, itself new; and
+--   roles are cluster-global, not owned by any one database's extension,
+--   so pg_depend extension-membership does not apply to it the way it
+--   does to a schema); its only real link to Allgres is having been
+--   created alongside the two schemas, so it is only renamed once at
+--   least one of them was independently confirmed genuine.
 DO $$
 DECLARE
   v_had_argo_private boolean := false;
   v_had_argo_public boolean := false;
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'argo_private') THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
+      WHERE d.classid = 'pg_namespace'::regclass
+        AND d.objid = (SELECT oid FROM pg_namespace WHERE nspname = 'argo_private')
+        AND d.deptype = 'e'
+    ) THEN
+      RAISE EXCEPTION 'schema "argo_private" exists but is not a member of the "allgres" extension (a genuine prior Allgres install would be, per pg_depend) -- this does not look like an Allgres install; refusing to rename it automatically. Resolve the name collision manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'argo_private' AND tablename = 'agents') THEN
-      RAISE EXCEPTION 'schema "argo_private" exists but has no "agents" table -- this does not look like an Allgres install; refusing to rename it automatically. Resolve the name collision manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+      RAISE EXCEPTION 'schema "argo_private" is an "allgres" extension member but has no "agents" table -- this looks like a corrupted or partial Allgres install; refusing to rename it automatically. Resolve manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'allgres_private') THEN
       RAISE EXCEPTION 'both "argo_private" and "allgres_private" already exist -- ambiguous, refusing to guess which is current. Resolve manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
@@ -91,10 +119,19 @@ BEGIN
 
   IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'argo_public') THEN
     IF NOT EXISTS (
+      SELECT 1 FROM pg_depend d
+      JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
+      WHERE d.classid = 'pg_namespace'::regclass
+        AND d.objid = (SELECT oid FROM pg_namespace WHERE nspname = 'argo_public')
+        AND d.deptype = 'e'
+    ) THEN
+      RAISE EXCEPTION 'schema "argo_public" exists but is not a member of the "allgres" extension (a genuine prior Allgres install would be, per pg_depend) -- this does not look like an Allgres install; refusing to rename it automatically. Resolve the name collision manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+    END IF;
+    IF NOT EXISTS (
       SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = 'argo_public' AND p.proname = 'fn_selftest'
     ) THEN
-      RAISE EXCEPTION 'schema "argo_public" exists but has no "fn_selftest" function -- this does not look like an Allgres install; refusing to rename it automatically. Resolve the name collision manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
+      RAISE EXCEPTION 'schema "argo_public" is an "allgres" extension member but has no "fn_selftest" function -- this looks like a corrupted or partial Allgres install; refusing to rename it automatically. Resolve manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'allgres_public') THEN
       RAISE EXCEPTION 'both "argo_public" and "allgres_public" already exist -- ambiguous, refusing to guess which is current. Resolve manually before installing/upgrading Allgres.' USING ERRCODE = 'P0001';
@@ -4538,12 +4575,24 @@ $fn$;
 -- (a GRANT does not depend on ownership, but keeping the two together
 -- keeps this section legible as "how access to these schemas actually
 -- works," start to finish).
+-- Scoped to actual members of the 'allgres' extension (pg_depend, deptype
+-- 'e') rather than "everything currently sitting in these three schema
+-- namespaces" -- a second-round review pointed out the blanket version
+-- would silently take ownership of any unrelated object a user happened to
+-- create inside allgres_private/allgres_public/allgres, which has nothing
+-- to do with this extension. CREATE EXTENSION (and ALTER EXTENSION UPDATE,
+-- which keeps the same pg_extension row) automatically records every
+-- object this file creates as an extension member as it creates it, so
+-- this scoping needs no separate bookkeeping of its own.
 DO $$
 DECLARE r record;
 BEGIN
   FOR r IN
     SELECT n.nspname, c.relname, c.relkind
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+    JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND c.relkind IN ('r', 'v', 'S')
       AND c.relowner <> 'allgres_owner'::regrole
@@ -4557,7 +4606,10 @@ BEGIN
 
   FOR r IN
     SELECT p.oid::regprocedure AS sig, p.proname
-    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+    JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
       AND p.proname <> 'fn_provision_agent_role'
@@ -4587,6 +4639,13 @@ BEGIN
   -- live, this was missed on the first pass and fn_selftest failed with
   -- "permission denied for schema allgres" the moment allgres_owner
   -- stopped being a superuser stand-in and became a real, limited role.
+  -- On a fresh install this schema does not exist yet at this point in the
+  -- file (it is only declared, redundantly, by "13." below -- pgrx's own
+  -- native entity for this schema runs before section 1 and is what
+  -- actually creates it that early) -- the IF's NULL <> ... short-circuits
+  -- to skip rather than error either way, and the final pass after "13."
+  -- covers this schema's ownership again regardless, so nothing here is
+  -- required to succeed on every replay, only to be idempotent when it can.
   IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres') <> 'allgres_owner'::regrole THEN
     ALTER SCHEMA allgres OWNER TO allgres_owner;
   END IF;
@@ -4866,7 +4925,7 @@ BEGIN
       RETURN jsonb_build_object(
         'ok', true,
         'server_time', now(),
-        'version', '0.2.0',
+        'version', allgres.native_version(),
         'agents', (SELECT count(*) FROM allgres_private.agents),
         'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active),
         'running_tasks', (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued','running','waiting_human')),
@@ -5247,3 +5306,63 @@ GRANT EXECUTE ON FUNCTION allgres.dashboard_rpc(jsonb) TO operator, worker;
 -- analyze_sql only parses, but there is no reason for the sandbox to reach it.
 REVOKE ALL ON FUNCTION allgres.analyze_sql(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION allgres.analyze_sql(text) TO operator, worker;
+
+-- ---------------------------------------------------------------------------
+-- 14. Final ownership pass.
+-- ---------------------------------------------------------------------------
+
+-- "12. Grants" runs its ownership-transfer pass before this section exists --
+-- on a fresh install, allgres.create_agent/create_session/pump/
+-- assume_worker_role/dashboard_rpc and the allgres.agents/tasks/projects
+-- views are all created after that pass already ran, so they were never
+-- caught by it and stayed owned by whichever superuser ran CREATE
+-- EXTENSION -- confirmed live by a second-round review, then reproduced
+-- here: a fresh install left exactly those objects, and no others, owned
+-- by the installer instead of allgres_owner. An upgrade from a real 0.2.0
+-- install did not show this, since those objects already existed (under
+-- their old owner from that install's own history) before this file's
+-- ownership pass ran at all -- fresh-install-only bugs like this are
+-- exactly what testing only the upgrade path misses.
+--
+-- Same logic as "12. Grants", not duplicated by hand: literally the same
+-- extension-membership-scoped, idempotent pass, run again now that every
+-- object in the file (this section included) actually exists. A no-op for
+-- anything the first pass already caught.
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT n.nspname, c.relname, c.relkind
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+    JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
+    WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
+      AND c.relkind IN ('r', 'v', 'S')
+      AND c.relowner <> 'allgres_owner'::regrole
+  LOOP
+    EXECUTE format(
+      'ALTER %s %I.%I OWNER TO allgres_owner',
+      CASE r.relkind WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' WHEN 'S' THEN 'SEQUENCE' END,
+      r.nspname, r.relname
+    );
+  END LOOP;
+
+  FOR r IN
+    SELECT p.oid::regprocedure AS sig, p.proname
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+    JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
+    WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
+      AND p.proowner <> 'allgres_owner'::regrole
+      AND p.proname <> 'fn_provision_agent_role'
+  LOOP
+    EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
+  END LOOP;
+
+  IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres') <> 'allgres_owner'::regrole THEN
+    ALTER SCHEMA allgres OWNER TO allgres_owner;
+  END IF;
+END
+$$;

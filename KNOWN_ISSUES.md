@@ -1204,3 +1204,128 @@ logs, PostgreSQL's own log lines) rather than assumption at each step, but
 neither has yet been confirmed green end-to-end on GitHub's infrastructure
 as of this writing — the same "added" vs. "verified" distinction item 3
 already draws for the rest of this CI matrix.
+
+## 22. A third review round: fresh-install ownership gap, a name-only migration check, and two smaller fixes
+
+A third-round review of items 19-21 found the CI port fix (item 21) real
+and working, then named three merge blockers and two smaller issues, all
+now fixed and verified live (fresh install, a real 0.2.0 → 0.3.0 upgrade
+seeded with real data, `fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql`
+on both, and a deliberate negative test) — the same "confirmed against the
+real database, not the review's own wording" standard as items 18-21.
+
+- **The ownership-transfer pass never covered five objects on a fresh
+  install.** Item 20's fix ran once, in "12. Grants" — but
+  `allgres.create_agent`/`create_session`/`pump`/`assume_worker_role`/
+  `dashboard_rpc` and the `allgres.agents`/`tasks`/`projects` views are all
+  defined later, in "13.", which runs *after* that pass. On a fresh
+  install (the only place this shows: an upgrade's own objects already
+  existed, under whatever owner that install's history left them, before
+  this file's ownership pass ever touched them) those five functions and
+  three views stayed owned by whichever superuser ran `CREATE EXTENSION`
+  — `allgres_owner` existed and owned almost everything, but not quite
+  everything a real security boundary needs it to. Confirmed live before
+  fixing: a fresh install, cluster fully cleaned of every Allgres role
+  first (leftover roles from earlier test runs can mask exactly this kind
+  of gap — see item 19's own account of the same trap), left those five
+  functions owned by `postgres`.
+
+  Fixed with a second pass, "14. Final ownership pass," identical logic to
+  item 20's — reused, not hand-duplicated — run again after every object
+  in the file, section 13 included, actually exists. Also tightened while
+  here, per the same review: both passes now scope to actual `pg_depend`
+  members of the `allgres` extension (`deptype = 'e'`) instead of
+  "everything currently sitting in these three schema namespaces," so an
+  unrelated object a user happened to create inside
+  `allgres_private`/`allgres_public`/`allgres` is left alone rather than
+  silently annexed. Verified live: a completely clean fresh install now
+  shows every extension-member function and view in all three schemas
+  owned by `allgres_owner` (or `allgres_role_admin` for
+  `fn_provision_agent_role` alone) with zero exceptions — checked by
+  query, not by re-reading the file — and the same check on a real
+  0.2.0 → 0.3.0 upgrade (seeded with a real agent first) comes back
+  equally clean. `fn_selftest` 78/78 and `tests/smoke.sql`/
+  `tests/e2e_mock.sql` both green on both paths.
+
+- **The rename migration's genuineness check was still just a name-shaped
+  guess.** Item 19 added a check that `argo_private` has an `agents`
+  table (and `argo_public` an `fn_selftest` function) before trusting it
+  as a real prior Allgres install — real hardening over the original
+  unconditional rename, but a review round pointed out it is still not
+  proof: an unrelated schema that happens to be named `argo_private` and
+  happens to contain a table named `agents` would pass exactly the same
+  way. The actually reliable signal was already sitting in `pg_depend`:
+  `CREATE EXTENSION` (and `ALTER EXTENSION UPDATE`, which keeps the same
+  `pg_extension` row across a version bump) automatically records every
+  object it creates as a member of that extension the moment it creates
+  it — a schema this file itself created, in any prior version, is
+  therefore always a real `pg_depend` member of the `allgres` extension
+  specifically, which no coincidentally-named unrelated schema could ever
+  be regardless of what tables happen to live in it.
+
+  Fixed by making extension membership the primary check, ahead of the
+  existing object-existence check (kept as a secondary sanity assertion —
+  a genuine but somehow-corrupted old install should still fail with a
+  clearer message than a bare "not an extension member" would give).
+  Reproduced and confirmed live exactly the way the review posed it:
+  created a schema named `argo_private` with its own unrelated `agents`
+  table, *not* created by the `allgres` extension, then ran
+  `CREATE EXTENSION allgres;` — it refused with `schema "argo_private"
+  exists but is not a member of the "allgres" extension`, rather than
+  silently renaming an unrelated schema out from under whatever was using
+  it. Roles are unaffected by this change: `argo_owner` is cluster-global,
+  not owned by any one database's extension, so `pg_depend` membership
+  does not apply to it the way it does to a schema — it keeps the existing
+  "only rename once at least one schema was independently confirmed
+  genuine" rule, which does not have the same coincidence problem a role
+  named `argo_owner` alone would.
+
+  The review's alternative suggestion — move the rename logic into a
+  dedicated 0.2.0→0.3.0-only upgrade script, checked against
+  `pg_extension.extversion` — does not fit how this project's upgrades
+  actually work: `sql/control_plane.sql` is a single idempotent file
+  replayed as both the fresh-install body and the entire content of every
+  generated upgrade script (`scripts/gen-upgrade.sh`), guarded throughout
+  with `IF NOT EXISTS`/`CREATE OR REPLACE`/explicit drops rather than
+  split into separate from-version-specific files. Splitting one block out
+  into a different mechanism the rest of the file doesn't use would be a
+  bigger, differently-shaped change than the gap it closes; the
+  `pg_depend` fix above closes the same gap the review actually cared
+  about (a name collision fooling the check) without it.
+
+- **The dashboard's `overview` action reported a hardcoded, stale
+  version.** `'version', '0.2.0'` was a string literal, never updated when
+  the crate moved to 0.3.0 — confirmed live: the RPC returned `"0.2.0"`
+  against an actual 0.3.0 install. Fixed to call
+  `allgres.native_version()`, which already existed (returns
+  `CARGO_PKG_VERSION` at compile time) and was already used for exactly
+  this elsewhere, just never wired into this one call site. Confirmed
+  live: now returns `"0.3.0"`.
+
+- **`scripts/backup_drill.sh`'s `SCRATCH` validation was still too wide.**
+  Item 21 added a check requiring `SCRATCH` to be under
+  `/var/lib/postgresql/` before `rm -rf`-ing it — real hardening against
+  an empty or wildly wrong override, but a review round pointed out that
+  pattern still admits `/var/lib/postgresql/16/main`, a real cluster's own
+  data directory, since the whole point of that path prefix is that every
+  real cluster lives under it too. Fixed three ways: the default `SCRATCH`
+  is now `/var/lib/postgresql/allgres-backup-drill` (a name specific to
+  this script, not a generic subdirectory of the tree every cluster
+  shares); the prefix check is narrowed to match that name specifically;
+  and the value is run through `realpath -m` before the check, so neither
+  a relative path nor a `..` component can walk it out of the directory
+  the check just approved. A marker file
+  (`.allgres_backup_drill_marker`), written once a run's own `SCRATCH`
+  directory is created and checked for on every subsequent run before any
+  `rm -rf`, is defense in depth beyond the path check alone. Confirmed
+  live: `SCRATCH=/var/lib/postgresql/16/main` and a `..`-traversal variant
+  of the same path are both now refused before touching anything, the
+  live cluster answers a query unaffected either time, and a full drill
+  run with the new default `SCRATCH` still passes both phases end to end.
+
+None of the five were architectural — same pattern as items 12 and 18:
+each fix is local to the function or block that had the gap. Also
+verified once more, across all of it: `fn_selftest` 78/78,
+`tests/smoke.sql`/`tests/e2e_mock.sql` green on a fresh install and on a
+real 0.2.0 → 0.3.0 upgrade seeded with a real agent beforehand, and
+`scripts/backup_drill.sh` green end to end.
