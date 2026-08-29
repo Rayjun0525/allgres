@@ -1295,8 +1295,15 @@ BEGIN
   END IF;
 
   IF t.status = 'queued' THEN
+    -- COALESCE, not a bare now(): a task revisits 'queued' every time it
+    -- resumes from waiting_human (fn_decide_approval sets it back to
+    -- 'queued'), and possibly other paths later. A bare assignment here
+    -- would reset started_at on every resume, so max_turn_seconds would
+    -- measure "time since most recently resumed" instead of "time since
+    -- this task first started running" -- silently defeating the wall-clock
+    -- ceiling for any task that ever waits on a human.
     UPDATE argo_private.tasks
-    SET status = 'running', started_at = now(), updated_at = now()
+    SET status = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
     WHERE task_id = p_task_id;
     t.status := 'running';
   END IF;
@@ -3082,6 +3089,7 @@ DECLARE
   v_project uuid;
   v_approval uuid;
   v_expires timestamptz;
+  v_started timestamptz;
   v_tid2 uuid;
   v_gen int;
 BEGIN
@@ -3392,6 +3400,7 @@ BEGIN
   v_sid := (argo_public.fn_create_session(v_agent, 'selftest approval_reply')->>'session_id')::uuid;
   SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
   PERFORM argo_public.fn_next_step(v_tid);
+  SELECT started_at INTO v_started FROM argo_private.tasks WHERE task_id = v_tid;
   sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
     'type', 'llm_response',
     'content', '{"action":"await_human"}',
@@ -3427,6 +3436,17 @@ BEGIN
       WHERE m->>'role' = 'user' AND m->>'content' = 'Use the fiscal-year quarter.'
     );
   v := v || jsonb_build_array(jsonb_build_object('name', 'operator_reply_reaches_llm_messages', 'ok', ok));
+
+  -- 15c. fn_next_step just drove the task through 'waiting_human' -> 'queued'
+  --      -> 'running' again (fn_decide_approval put it back to 'queued'; the
+  --      call above resumed it). started_at must survive that: a bare
+  --      `started_at = now()` on every queued->running transition would
+  --      reset it on every human resume, silently turning max_turn_seconds
+  --      into "time since last resume" instead of "time since this task
+  --      first ran" for any task that ever waits on a human.
+  SELECT started_at INTO v_expires FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := v_started IS NOT NULL AND v_expires = v_started;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'started_at_survives_human_resume', 'ok', ok));
 
   -- 16. fn_watchdog reclaims an approval nobody ever answers -- the same
   --     self-healing shape it already applies to stuck outbound/sql calls,
