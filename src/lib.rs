@@ -466,21 +466,37 @@ fn extension_is_installed() -> bool {
 /// Best-effort privilege drop, run at the top of every runtime transaction.
 /// The worker connects as the bootstrap superuser so a not-yet-created role can
 /// never crash-loop it at startup; this puts ordinary work back on `worker`.
+/// A silently discarded error here used to mean this: the drop failed and
+/// every following statement in that transaction ran as the bootstrap
+/// superuser instead of `worker`, with nothing anywhere -- no log, no
+/// warning -- to say so. It is still best-effort (there is no separate
+/// backend to abort into instead), but it is no longer silent.
 fn drop_privileges() {
     if std::env::var("ALLGRES_DROP_PRIVILEGES").as_deref() == Ok("0") {
         return;
     }
-    let _ = Spi::get_one::<bool>("SELECT allgres.assume_worker_role()");
+    match Spi::get_one::<bool>("SELECT allgres.assume_worker_role()") {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => {
+            pgrx::warning!("Allgres: assume_worker_role() reports the worker role is not ready")
+        }
+        Ok(None) => pgrx::warning!("Allgres: assume_worker_role() returned no result"),
+        Err(e) => pgrx::warning!("Allgres: assume_worker_role() failed: {}", e),
+    }
 }
 
 fn dispatch_and_claim(limit: usize) -> Value {
     BackgroundWorker::transaction(|| {
         drop_privileges();
-        let _ = Spi::get_one_with_args::<JsonB>(
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
             "SELECT argo_public.fn_watchdog($1)",
             &[(HTTP_TIMEOUT.as_secs() as i32 * 2).into()],
-        );
-        let _ = Spi::get_one::<JsonB>("SELECT argo_public.fn_dispatch_tasks()");
+        ) {
+            pgrx::warning!("Allgres: fn_watchdog failed: {}", e);
+        }
+        if let Err(e) = Spi::get_one::<JsonB>("SELECT argo_public.fn_dispatch_tasks()") {
+            pgrx::warning!("Allgres: fn_dispatch_tasks failed: {}", e);
+        }
         Spi::get_one_with_args::<JsonB>(
             "SELECT argo_public.fn_claim_outbound($1)",
             &[(limit as i32).into()],
@@ -497,10 +513,12 @@ fn submit_http_result(call_id: &str, status: i32, body: &str) {
     let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
     BackgroundWorker::transaction(|| {
         drop_privileges();
-        let _ = Spi::get_one_with_args::<JsonB>(
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
             "SELECT argo_public.fn_complete_outbound($1::uuid, $2, $3)",
             &[call_id.into(), status.into(), body.as_str().into()],
-        );
+        ) {
+            pgrx::warning!("Allgres: fn_complete_outbound failed for call {}: {}", call_id, e);
+        }
     });
 }
 
@@ -607,7 +625,7 @@ fn submit_sql_result(call_id: &str, outcome: Result<Value, String>) {
     };
     BackgroundWorker::transaction(|| {
         drop_privileges();
-        let _ = Spi::get_one_with_args::<JsonB>(
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
             "SELECT argo_public.fn_complete_sql($1::uuid, $2, $3, $4, $5, $6)",
             &[
                 call_id.into(),
@@ -617,7 +635,9 @@ fn submit_sql_result(call_id: &str, outcome: Result<Value, String>) {
                 truncated.into(),
                 error.into(),
             ],
-        );
+        ) {
+            pgrx::warning!("Allgres: fn_complete_sql failed for call {}: {}", call_id, e);
+        }
     });
 }
 

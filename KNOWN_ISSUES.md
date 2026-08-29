@@ -2,7 +2,7 @@
 
 Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
-reached to verify against — see item 3): `fn_selftest` 70/70, `tests/smoke.sql`
+reached to verify against — see item 3): `fn_selftest` 72/72, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
 socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
 (`curl` against `/api/v1/rpc`, CSRF checks included), including a live
@@ -556,3 +556,88 @@ left for later, on purpose — not attempted shallowly here):
   a full restore, and this has not been written or tested (see item 7's
   and item 4's existing backup/upgrade gaps, now with one more thing they
   need to cover).
+
+## 16. Stale-completion fencing, and silent errors that used to hide real failures
+
+Phase 3 of the second review round: "실행 정합성과 복구" (execution
+consistency and recovery) — lease/fencing, a reconciler, cancellation
+semantics, dead-letter/retry policy, and no silently swallowed errors.
+Most of the list turned out to already be covered by what earlier passes
+built, once checked against the actual code rather than assumed missing:
+
+- **Reconciler** — `fn_watchdog` already is one: it reclaims stuck
+  in-flight outbound/SQL calls, expires unanswered approvals, and fails a
+  task that blew its wall-clock budget, all on its own periodic schedule,
+  not as a manual operator action. Nothing new needed here beyond what
+  items 10–15 already added to it.
+- **Dead-letter / retry policy** — already exists: `fn_submit_result`
+  counts `error`-role log entries per task and fails it permanently once
+  `max_retries` is exceeded, no further retry. A per-call (rather than
+  per-task) retry ceiling was never built, and still isn't; each new
+  `execute_sql`/`call_llm` attempt is a fresh row, not a retried one.
+- **Cancellation semantics** — item 12 already closed the main gap
+  (queued/in-flight calls voided on cancel, claim functions joined to task
+  status). What's still true and not fixed here: an *already in-flight*
+  HTTP request or an *already executing* sandboxed query cannot be
+  interrupted mid-flight — there is no separate backend to send
+  `pg_cancel_backend()` at (sandboxed SQL runs on the runtime worker's own
+  SPI thread, the same one running everything else), and no HTTP
+  cancellation token wired into the pool threads. Cancel stops new work
+  from starting and stops a stale result from being recorded (see below);
+  it does not abort work already underway.
+
+What genuinely was missing, found by reading the actual claim/complete
+code rather than assuming the durable-queue shape was enough on its own:
+
+- **No fencing on `fn_complete_outbound`/`fn_complete_sql`.** Both
+  unconditionally overwrote the row to `'harvested'` and called
+  `fn_submit_result` regardless of the row's current status. Concretely: a
+  call gets claimed (`'in_flight'`); the worker hangs long enough for
+  `fn_watchdog` to reclaim it as `'lost'`, which pushes a timeout error
+  into the task and lets it retry; the *original* worker, unaware it was
+  reclaimed, eventually finishes anyway and calls
+  `fn_complete_outbound`/`fn_complete_sql` on the same `call_id` — and
+  that belated result got recorded, into whatever the task is doing *now*,
+  which by then may be a completely different turn. Fixed by checking the
+  row is still `'in_flight'` (under the same `FOR UPDATE` lock already
+  held) before touching anything; a call that has already moved on returns
+  `{"action": "stale", ...}` and changes nothing. The row's own state is
+  the fence — no separate token or table needed. Selftest:
+  `complete_sql_fences_stale_result`, `complete_outbound_fences_stale_result`
+  (mark a row `'lost'` the way `fn_watchdog` does, then complete it, assert
+  nothing changed and no log was written).
+- **Silent errors that hid real failures, not just benign ones.** The
+  worst: `fn_dispatch_tasks`'s `EXCEPTION WHEN others THEN CONTINUE` around
+  `fn_next_step` had no logging at all — a *persistent* (not transient)
+  bug affecting one task would get silently retried, and silently skipped,
+  every single dispatch tick, forever, with nothing anywhere to say so.
+  Fixed with `RAISE WARNING` (always) plus a best-effort push into the
+  task's own error/retry accounting via `fn_submit_result` (so a
+  persistent failure eventually reaches `failed` via the existing
+  `max_retries` dead-letter path, rather than looping forever). The same
+  treatment went to `fn_watchdog`'s two nested
+  `fn_submit_result`-inside-timeout-handling swallows (now
+  `RAISE WARNING` instead of bare `NULL`), and to four Rust-side
+  `let _ = Spi::run(...)` sites (`drop_privileges`, the `fn_watchdog`/
+  `fn_dispatch_tasks` calls in `dispatch_and_claim`, and both
+  `submit_http_result`/`submit_sql_result`) — each now logs via
+  `pgrx::warning!` on failure instead of discarding the `Result` outright.
+  `drop_privileges`'s case is the sharpest one: a silently discarded
+  failure there used to mean every following statement in that transaction
+  ran as the bootstrap superuser instead of `worker`, with zero trace.
+  None of these become hard failures — the self-healing shape (watchdog
+  reclaim, retry accounting) stays exactly as resilient as before — this
+  is purely about an operator being able to *see* a persistent problem in
+  the PostgreSQL log instead of it being invisible. Confirmed live: forced
+  a `fn_next_step` failure (deleted an agent's policy row) and saw the
+  `RAISE WARNING` fire with the task ID and `SQLERRM` in it; confirmed the
+  healthy path (a full `fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql`
+  run) produces no warnings at all, so this isn't just moving the noise
+  problem from "invisible" to "log spam" in the other direction.
+
+Still not done, deliberately out of scope for this slice: a full
+`task_attempts` table with heartbeats and fencing tokens (the row-status
+check above is a lighter-weight fence that closes the concrete race that
+existed, not the general primitive the review describes); actually
+interrupting in-flight work on cancel; a per-call retry ceiling separate
+from the per-task one.

@@ -2082,6 +2082,23 @@ BEGIN
     BEGIN
       spec := argo_public.fn_next_step(t.task_id);
     EXCEPTION WHEN others THEN
+      -- Silently retrying forever is the failure mode this guards against:
+      -- without the warning, a persistent (not transient) fn_next_step bug
+      -- for one task would just get skipped every single dispatch tick,
+      -- with zero trace anywhere that anything was ever wrong. The warning
+      -- always fires; pushing the error into the task's own retry
+      -- accounting is best-effort on top of that (fn_next_step may have
+      -- thrown before the task even reached 'running', in which case
+      -- fn_submit_result can't accept it either -- the warning is what
+      -- still captures that case).
+      RAISE WARNING 'fn_dispatch_tasks: fn_next_step failed for task %: %', t.task_id, SQLERRM;
+      BEGIN
+        PERFORM argo_public.fn_submit_result(
+          t.task_id, jsonb_build_object('type', 'error', 'message', SQLERRM)
+        );
+      EXCEPTION WHEN others THEN
+        NULL;
+      END;
       CONTINUE;
     END;
     IF spec->>'action' <> 'call_llm' THEN
@@ -2289,6 +2306,21 @@ BEGIN
     RAISE EXCEPTION 'fn_complete_outbound: not found' USING ERRCODE = 'P0001';
   END IF;
 
+  -- Fencing: a call only ever completes from 'in_flight'. If it isn't
+  -- anymore -- fn_watchdog already reclaimed it as 'lost' after a timeout,
+  -- most likely -- this is a zombie worker's belated result for a call
+  -- that has already been retried or failed as a *different* attempt.
+  -- Accepting it here would inject a stale response into whatever the task
+  -- is doing now, possibly an entirely different turn. The row already
+  -- reflects what actually happened to this call; recording nothing and
+  -- returning is correct, not a gap -- the task has already moved on.
+  IF c.status <> 'in_flight' THEN
+    RETURN jsonb_build_object(
+      'submit', jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status),
+      'call_id', p_call_id
+    );
+  END IF;
+
   UPDATE argo_private.outbound_calls
   SET status = 'harvested',
       response_status = p_status,
@@ -2375,6 +2407,17 @@ BEGIN
     RAISE EXCEPTION 'fn_complete_sql: not found' USING ERRCODE = 'P0001';
   END IF;
 
+  -- Fencing: same reasoning as fn_complete_outbound. A sandboxed-SQL
+  -- execution only ever completes from 'in_flight'; if fn_watchdog already
+  -- reclaimed it as 'lost', this is a stale result from an attempt the task
+  -- has already moved past.
+  IF c.status <> 'in_flight' THEN
+    RETURN jsonb_build_object(
+      'submit', jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status),
+      'call_id', p_call_id
+    );
+  END IF;
+
   UPDATE argo_private.sql_calls
   SET status = 'harvested', updated_at = now()
   WHERE call_id = p_call_id;
@@ -2450,7 +2493,7 @@ BEGIN
           jsonb_build_object('type', 'error', 'message', 'outbound timeout')
         );
       EXCEPTION WHEN others THEN
-        NULL;
+        RAISE WARNING 'fn_watchdog: fn_submit_result failed for task % after outbound timeout: %', r.task_id, SQLERRM;
       END;
     END IF;
     n := n + 1;
@@ -2477,7 +2520,7 @@ BEGIN
           jsonb_build_object('type', 'error', 'message', 'sql execution timeout')
         );
       EXCEPTION WHEN others THEN
-        NULL;
+        RAISE WARNING 'fn_watchdog: fn_submit_result failed for task % after sql timeout: %', r.task_id, SQLERRM;
       END;
     END IF;
     n := n + 1;
@@ -3642,6 +3685,50 @@ BEGIN
   SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
   ok := n_logs >= 1 AND detail = 'running';
   v := v || jsonb_build_array(jsonb_build_object('name', 'complete_sql_failure_logs_error', 'ok', ok));
+
+  -- 13b. Fencing: a belated completion for a call fn_watchdog already
+  --      reclaimed as 'lost' (a zombie worker's result for an attempt the
+  --      task has already moved past) must be discarded, not recorded --
+  --      accepting it would inject a stale response into whatever the task
+  --      is doing now, which could by now be a completely different turn.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest sql_fencing')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid);
+  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"execute_sql"}',
+    'parsed', jsonb_build_object('action', 'execute_sql', 'sql', 'SELECT region FROM argo_public.v_sales')
+  ));
+  v_call := (sub->>'call_id')::uuid;
+  PERFORM argo_public.fn_claim_sql(10);
+  -- Simulate what fn_watchdog does to a stuck in_flight call.
+  UPDATE argo_private.sql_calls SET status = 'lost', updated_at = now() WHERE call_id = v_call;
+  SELECT count(*) INTO n_logs FROM argo_private.execution_logs WHERE task_id = v_tid;
+  comp := argo_public.fn_complete_sql(v_call, true, '[{"region":"west"}]'::jsonb, 1, false, NULL);
+  ok := comp->'submit'->>'action' = 'stale';
+  SELECT status INTO detail FROM argo_private.sql_calls WHERE call_id = v_call;
+  ok := ok AND detail = 'lost';
+  SELECT count(*) INTO v_gen FROM argo_private.execution_logs WHERE task_id = v_tid;
+  ok := ok AND v_gen = n_logs;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_sql_fences_stale_result', 'ok', ok));
+
+  -- Same fencing, for fn_complete_outbound. A synthetic row stands in for
+  -- one fn_dispatch_tasks would have queued; exercising the fence does not
+  -- need the provider machinery that inserts it normally.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest outbound_fencing')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  INSERT INTO argo_private.outbound_calls (task_id, kind, url, status)
+  VALUES (v_tid, 'llm', 'https://api.x.ai/v1/chat/completions', 'in_flight')
+  RETURNING call_id INTO v_call;
+  UPDATE argo_private.outbound_calls SET status = 'lost', updated_at = now() WHERE call_id = v_call;
+  SELECT count(*) INTO n_logs FROM argo_private.execution_logs WHERE task_id = v_tid;
+  comp := argo_public.fn_complete_outbound(v_call, 200, '{"choices":[{"message":{"content":"{\"action\":\"final_answer\",\"answer\":\"stale\"}"}}]}');
+  ok := comp->'submit'->>'action' = 'stale';
+  SELECT status INTO detail FROM argo_private.outbound_calls WHERE call_id = v_call;
+  ok := ok AND detail = 'lost';
+  SELECT count(*) INTO v_gen FROM argo_private.execution_logs WHERE task_id = v_tid;
+  ok := ok AND v_gen = n_logs;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_outbound_fences_stale_result', 'ok', ok));
 
   -- 14. sessions can be scoped to a project; fn_create_session rejects an
   --     inactive or missing project the same way it already rejects an
