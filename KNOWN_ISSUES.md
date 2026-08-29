@@ -2,16 +2,16 @@
 
 Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
-reached to verify against — see item 3): `fn_selftest` 72/72, `tests/smoke.sql`
+reached to verify against — see item 3): `fn_selftest` 78/78, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
 socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
 (`curl` against `/api/v1/rpc`, CSRF checks included), including a live
 `dashboard_rpc` round trip for every action added so far (`projects.*`,
 `approvals.*`, `sessions.cancel`/`.list`/`.get`, `permissions.*`,
-`allowlist.*`, `policy.history`) and the `web/index.html` pages that call
-them (`Projects`, `Sessions`, `Approvals`, plus the extended `Agents` and
-`Settings`). Earlier builds were verified on PostgreSQL 18.6; nothing here
-is PG-version-specific.
+`allowlist.*`, `policy.history`, `policy.rollback`, `proposals.*`) and the
+`web/index.html` pages that call them (`Projects`, `Sessions`, `Approvals`,
+`Proposals`, plus the extended `Agents` and `Settings`). Earlier builds
+were verified on PostgreSQL 18.6; nothing here is PG-version-specific.
 
 Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
@@ -641,3 +641,82 @@ check above is a lighter-weight fence that closes the concrete race that
 existed, not the general primitive the review describes); actually
 interrupting in-flight work on cancel; a per-call retry ceiling separate
 from the per-task one.
+
+## 17. Agent self-modification (`propose_change`), operator-governed
+
+Phase 4 of the second review round: "안전한 자가성장" (safe self-growth) —
+the review's own framing was that an agent should be able to improve its
+knowledge and behavior spec, but never expand its own trust boundary.
+Before this pass, Allgres had zero self-modification capability at all:
+the action set was exactly `{final_answer, execute_sql, call_tool,
+delegate, await_human}`, and `fn_set_policy` was reachable only from
+`dashboard_rpc`'s operator-only `agents.update`. This is a new capability
+built from scratch, not a hardening of something that already existed —
+scoped deliberately by the user up front to exclude a regression-
+evaluation engine (test cases, scoring, an LLM judge) and the separate
+memory/provenance subsystem the same review round proposed; both stay out
+of scope.
+
+**What was built**: a `propose_change` agent action
+(`fn_submit_result`), a new `argo_private.change_proposals` table, and two
+new operator-only functions (`fn_decide_proposal`, `fn_rollback_policy`),
+exposed through three new `dashboard_rpc` actions
+(`proposals.list`/`proposals.decide`/`policy.rollback`) and a new
+`Proposals` dashboard page plus a rollback button on each row of the
+existing policy-history view. Full design and the exact allowed-field list
+are in README, "Self-modification" — not duplicated here.
+
+The trust-boundary line is enforced at the point of insertion, not just
+described: `fn_submit_result` checks every key in `changes` (and every key
+inside `changes.llm_config`, if present) against a fixed allow-list before
+a proposal row is even created; anything outside it is rejected with a
+logged `error` entry and no row written, rather than silently dropped or
+partially applied. Approval reuses the existing `fn_set_policy`/
+`policy_history` versioning machinery as-is (the same merge semantics —
+`llm_config` merges key-by-key, `NULL` leaves a field unchanged — and the
+same field-by-field `IS DISTINCT FROM` no-op detection), so a promoted
+proposal is indistinguishable in history from a manual operator edit, and
+a rollback is a new version, never a mutation of an old one.
+
+**Staleness, not blind overwrite**: `change_proposals.base_generation`
+captures `policies.generation` at propose time; `fn_decide_proposal`
+compares it against the *current* generation before applying an approval.
+A live policy that moved on in the meantime — an operator edit, or another
+proposal approved first — makes the decision `stale` instead of silently
+clobbering whatever changed it.
+
+**A table-ordering bug caught before it shipped**: `change_proposals` was
+first placed early in `control_plane.sql`, alongside `policy_history`,
+with a `REFERENCES argo_private.tasks(task_id)` foreign key — but `tasks`
+is not defined until much later in the same file, which replays linearly
+in one transaction. `CREATE EXTENSION allgres;` failed outright
+(`relation "argo_private.tasks" does not exist`) rather than doing
+anything silently wrong. Fixed by moving the table definition to
+immediately after `tasks`'s own indexes, matching the file's existing
+dependency-order convention.
+
+Verified the same way as every prior pass: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 78/78 (six new cases: a proposal queues
+without touching the live policy; disallowed fields — `max_steps`,
+`llm_config.provider` — are rejected with no row created; reject leaves
+the policy untouched; approve versions and applies; a stale base is
+detected and does not overwrite; rollback restores a prior version as a
+new generation), `tests/smoke.sql` and `tests/e2e_mock.sql` both green.
+Also driven through the real `dashboard_rpc` entry point end to end, not
+just `fn_selftest`'s direct calls: a real agent's `execute_sql`-adjacent
+`propose_change` action queued through the actual `fn_submit_result` path,
+listed via `proposals.list`, approved via `proposals.decide`, confirmed
+the live `system_prompt`/`generation` actually changed and a *new*
+session for that agent picks up the new prompt (not just that the row
+says so), then rolled back via `policy.rollback` and confirmed the
+original prompt came back under a further-incremented generation, not a
+history rewrite.
+
+What's deliberately not here, beyond the two exclusions named above: no
+confirmation dialog before a dashboard rollback beyond the browser's
+own — same caveat item 11 already names for `sessions.cancel`; no operator
+identity attached to a decision or a rollback, for the same reason item
+10 gives (no accounts system yet); no rate limit or cooldown on how often
+one agent can propose (a persistently misbehaving agent can fill the
+pending queue, though every entry still requires an explicit operator
+decision — nothing auto-applies).

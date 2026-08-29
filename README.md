@@ -27,9 +27,15 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
 - **Projects & sessions** — sessions can be grouped into projects, an
   operator can cancel a running session, and a full per-session thread
   view is available.
+- **Self-modification, operator-governed** — an agent can propose a change
+  to its own `system_prompt`/`llm_config` tuning; it can never expand its
+  own resource envelope, permissions, or provider endpoint. Every proposal
+  is queued for an explicit operator approve/reject, applied through the
+  same versioned policy path an operator's own edit takes, and any version
+  can be rolled back later. See [Self-modification](#self-modification).
 - **Dashboard** — a single static HTML file (no build step) covering
-  Overview, Agents, Projects, Run, Sessions, Approvals, Tasks, Logs, and
-  Settings, all reachable through one generic `/api/v1/rpc` route.
+  Overview, Agents, Projects, Run, Sessions, Approvals, Proposals, Tasks,
+  Logs, and Settings, all reachable through one generic `/api/v1/rpc` route.
 
 Not yet built:
 
@@ -287,6 +293,52 @@ DEFINER`, was always the function owner, never the querying agent's role).
 exactly this reason.
 
 `execution_logs` is append-only, enforced by trigger and by `REVOKE`.
+
+### Self-modification
+
+An agent can emit `{"action":"propose_change","changes":{...},"reason":"..."}`
+alongside its other actions. This is the one place Allgres lets an agent
+change its own future behavior — deliberately narrow, and split cleanly
+between what the agent can touch and what only an operator can:
+
+- **The agent can improve its own knowledge and behavior spec.** `changes`
+  may contain `system_prompt` and/or `llm_config.{model,temperature,
+  max_tokens}` — nothing else. Any other key anywhere in the payload
+  (`max_steps`, `max_retries`, `max_concurrent_tasks`, `max_turn_seconds`,
+  `llm_config.provider`/`base_url`, permissions — anything at all) is
+  rejected outright, not silently dropped, and nothing is applied.
+- **The agent can never expand its own trust boundary.** Its resource
+  envelope stays operator-only via `agents.update`, unchanged by this
+  action; `llm_config.provider`/`base_url` stay locked to the
+  operator-managed provider row regardless (`sanitize_llm_config`, applies
+  here exactly as it does to a normal `agents.update`).
+- **A proposal never touches the live policy by itself.** It only inserts a
+  `pending` row into `argo_private.change_proposals`; the task that
+  proposed it keeps running unaffected, unlike `await_human`, which blocks.
+- **An operator decides it explicitly** — `fn_decide_proposal` /
+  `proposals.decide`, approve or reject, with an optional reply. Approving
+  applies the change through the *same* `fn_set_policy` path any operator
+  edit takes, so a promoted proposal versions into `policy_history` exactly
+  like a manual change would. If the live policy has moved on since the
+  proposal was made (an operator edit, or another proposal already
+  applied — tracked via `change_proposals.base_generation` against the
+  live `policies.generation`), approving does not blindly overwrite it:
+  the proposal is marked `stale` instead, changing nothing.
+- **Any policy version can be rolled back** — `fn_rollback_policy` /
+  `policy.rollback` restores a `policy_history` snapshot through
+  `fn_set_policy` too, so a rollback is never a mutation of history, only
+  ever a new version that happens to match an old one.
+
+Reachable from the dashboard: the `Proposals` page (a pending/decided
+inbox, optionally filtered to one agent from that agent's editor) and a
+"Rollback to this version" button on each row of an agent's policy
+history.
+
+Deliberately not built: automatic evaluation of a proposal before it
+reaches an operator (no test-case/scoring/LLM-judge pipeline) — every
+proposal is a human decision, not an auto-merge; and no memory/provenance
+subsystem for *why* an agent proposed what it did beyond the free-text
+`reason` field.
 
 ### RPC socket
 

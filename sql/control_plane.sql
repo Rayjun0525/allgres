@@ -333,6 +333,33 @@ CREATE INDEX IF NOT EXISTS tasks_agent_status_idx
 CREATE INDEX IF NOT EXISTS tasks_updated_idx
   ON argo_private.tasks (updated_at DESC);
 
+-- An agent's own proposal to change its behavior -- never its resource
+-- envelope or permissions, see fn_submit_result's propose_change handling
+-- for the exact allowed-field list -- pending an operator's decision.
+-- base_generation is the policy generation this was proposed against: if
+-- the live policy has moved on by the time it's decided (an operator edit,
+-- or another proposal already applied), fn_decide_proposal marks it
+-- 'stale' instead of blindly applying it over whatever changed it.
+CREATE TABLE IF NOT EXISTS argo_private.change_proposals (
+  proposal_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id         uuid NOT NULL REFERENCES argo_private.agents(agent_id) ON DELETE CASCADE,
+  task_id          uuid REFERENCES argo_private.tasks(task_id),
+  proposed_changes jsonb NOT NULL,
+  reason           text,
+  base_generation  int NOT NULL,
+  status           text NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'approved', 'rejected', 'stale')),
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  decided_at       timestamptz,
+  decided_reply    text
+);
+
+CREATE INDEX IF NOT EXISTS change_proposals_pending_idx
+  ON argo_private.change_proposals (created_at)
+  WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS change_proposals_agent_idx
+  ON argo_private.change_proposals (agent_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS argo_private.execution_logs (
   log_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id     uuid NOT NULL REFERENCES argo_private.tasks(task_id),
@@ -1528,8 +1555,11 @@ BEGIN
       || v_views::text
       || E'\ntools: '
       || v_tools::text
-      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_human.'
+      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_human | propose_change.'
       || E'\nFor numeric questions, execute_sql first. Do not invent keys.'
+      || E'\npropose_change: {"action":"propose_change","changes":{"system_prompt":"..."},"reason":"..."}'
+      || E' -- only system_prompt and llm_config.model/temperature/max_tokens may be proposed;'
+      || E' an operator decides it later, it does not change your policy right now.'
     )
   );
 
@@ -1616,6 +1646,9 @@ DECLARE
   v_call uuid;
   v_answer text;
   v_valid_sql text;
+  v_changes jsonb;
+  v_ok boolean;
+  v_proposal uuid;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -1704,7 +1737,7 @@ BEGIN
 
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
-    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human'
+    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change'
   ) THEN
     PERFORM argo_private.append_log(
       p_task_id, t.step_count + 1, 'error',
@@ -1880,6 +1913,70 @@ BEGIN
         updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'continue', 'child_task_id', v_child);
+  END IF;
+
+  -- An agent may propose a change to its own behavior -- system_prompt, and
+  -- the generation-tuning parts of llm_config -- but never to its own
+  -- resource envelope (max_steps, max_retries, max_concurrent_tasks,
+  -- max_turn_seconds, all operator-only via agents.update, unchanged by
+  -- this action), its own permissions, or where its provider endpoint
+  -- points (llm_config.provider/base_url -- already locked to the
+  -- operator-managed provider row, see sanitize_llm_config). Any other key,
+  -- anywhere in the proposal, is rejected outright rather than silently
+  -- dropped: an agent can improve its own knowledge and behavior spec, not
+  -- expand its own trust boundary. This never touches the live policy by
+  -- itself -- it only ever queues a row for fn_decide_proposal, an
+  -- operator-only function, to accept or reject. Not blocking, unlike
+  -- await_human: proposing an improvement for future turns has nothing to
+  -- do with whether the current task can finish.
+  IF v_action = 'propose_change' THEN
+    v_changes := v_parsed->'changes';
+    IF v_changes IS NULL OR jsonb_typeof(v_changes) <> 'object' OR v_changes = '{}'::jsonb THEN
+      PERFORM argo_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'propose_change_empty', 'changes', v_changes)
+      );
+      UPDATE argo_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    SELECT bool_and(k IN ('system_prompt', 'llm_config')) INTO v_ok
+    FROM jsonb_object_keys(v_changes) k;
+    IF v_ok IS DISTINCT FROM true THEN
+      PERFORM argo_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'propose_change_field_not_allowed', 'changes', v_changes)
+      );
+      UPDATE argo_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+    IF v_changes ? 'llm_config' THEN
+      IF jsonb_typeof(v_changes->'llm_config') <> 'object' THEN
+        v_ok := false;
+      ELSE
+        SELECT bool_and(k IN ('model', 'temperature', 'max_tokens')) INTO v_ok
+        FROM jsonb_object_keys(v_changes->'llm_config') k;
+      END IF;
+      IF v_ok IS DISTINCT FROM true THEN
+        PERFORM argo_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'propose_change_field_not_allowed', 'changes', v_changes)
+        );
+        UPDATE argo_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+    END IF;
+
+    INSERT INTO argo_private.change_proposals (agent_id, task_id, proposed_changes, reason, base_generation)
+    VALUES (t.agent_id, p_task_id, v_changes, NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), ''), p.generation)
+    RETURNING proposal_id INTO v_proposal;
+
+    PERFORM argo_private.append_log(
+      p_task_id, t.step_count + 1, 'assistant',
+      jsonb_build_object('proposed_change', v_changes, 'proposal_id', v_proposal)
+    );
+    UPDATE argo_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
   END IF;
 
   IF v_action = 'await_human' THEN
@@ -2845,6 +2942,96 @@ BEGIN
 END;
 $fn$;
 
+-- Operator-only: an agent's own propose_change action (fn_submit_result)
+-- only ever reaches this table, never the live policy directly. Approving
+-- applies the change through fn_set_policy -- the same versioning path any
+-- other policy edit goes through, so a promoted proposal shows up in
+-- policy_history exactly like an operator's own edit would.
+CREATE OR REPLACE FUNCTION argo_public.fn_decide_proposal(
+  p_proposal_id uuid, p_approve boolean, p_reply text DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = argo_private, argo_public, pg_temp
+AS $fn$
+DECLARE
+  r argo_private.change_proposals%ROWTYPE;
+  v_cur_gen int;
+  v_policy jsonb;
+BEGIN
+  SELECT * INTO r FROM argo_private.change_proposals WHERE proposal_id = p_proposal_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_decide_proposal: not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF r.status <> 'pending' THEN
+    RAISE EXCEPTION 'fn_decide_proposal: already decided (%)', r.status USING ERRCODE = 'P0001';
+  END IF;
+
+  IF NOT p_approve THEN
+    UPDATE argo_private.change_proposals
+    SET status = 'rejected', decided_at = now(), decided_reply = p_reply
+    WHERE proposal_id = p_proposal_id;
+    RETURN jsonb_build_object('ok', true, 'status', 'rejected');
+  END IF;
+
+  -- The live policy may have moved on since this was proposed -- an
+  -- operator edit, or another proposal already applied. Approving blindly
+  -- here would silently clobber whatever changed it with a decision made
+  -- against a policy that no longer exists; mark it stale instead and let
+  -- the operator re-propose or handle it directly.
+  SELECT generation INTO v_cur_gen FROM argo_private.policies WHERE agent_id = r.agent_id;
+  IF v_cur_gen IS DISTINCT FROM r.base_generation THEN
+    UPDATE argo_private.change_proposals
+    SET status = 'stale', decided_at = now(),
+        decided_reply = COALESCE(p_reply, 'base policy changed since this was proposed')
+    WHERE proposal_id = p_proposal_id;
+    RETURN jsonb_build_object('ok', false, 'status', 'stale');
+  END IF;
+
+  v_policy := argo_public.fn_set_policy(
+    r.agent_id,
+    r.proposed_changes->>'system_prompt',
+    NULL, NULL,
+    r.proposed_changes->'llm_config',
+    NULL, NULL, false
+  );
+
+  UPDATE argo_private.change_proposals
+  SET status = 'approved', decided_at = now(), decided_reply = p_reply
+  WHERE proposal_id = p_proposal_id;
+
+  RETURN jsonb_build_object('ok', true, 'status', 'approved', 'policy', v_policy);
+END;
+$fn$;
+
+-- Restores a prior policy version through the same fn_set_policy path any
+-- other change takes: rolling back is never a mutation of policy_history,
+-- only ever a new version that happens to match an old one -- the current
+-- live row still gets snapshotted into history before being overwritten,
+-- same as always.
+CREATE OR REPLACE FUNCTION argo_public.fn_rollback_policy(p_agent_id uuid, p_generation int)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = argo_private, argo_public, pg_temp
+AS $fn$
+DECLARE
+  h argo_private.policy_history%ROWTYPE;
+BEGIN
+  SELECT * INTO h FROM argo_private.policy_history
+  WHERE agent_id = p_agent_id AND generation = p_generation;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_rollback_policy: no history for that agent at generation %', p_generation
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  RETURN argo_public.fn_set_policy(
+    p_agent_id, h.system_prompt, h.max_steps, h.max_retries, h.llm_config,
+    h.max_concurrent_tasks, h.max_turn_seconds, h.max_turn_seconds IS NULL
+  );
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION argo_public.fn_grant_permission(
   p_agent_id uuid, p_type text, p_ref text
 ) RETURNS jsonb
@@ -3394,6 +3581,8 @@ DECLARE
   v_prov_agent uuid;
   v_role1 text;
   v_role2 text;
+  v_proposal uuid;
+  v_prompt_before text;
 BEGIN
   SELECT agent_id INTO v_agent FROM argo_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM argo_private.policies WHERE agent_id = v_agent;
@@ -3935,6 +4124,120 @@ BEGIN
   v := v || jsonb_build_array(jsonb_build_object('name', 'real_policy_update_versions_the_old_row', 'ok', ok));
   PERFORM argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, 4);
 
+  -- 19b. propose_change: an agent's own request to change its behavior
+  --      never touches the live policy directly -- it only ever queues a
+  --      row for an operator to decide. Not blocking, unlike await_human:
+  --      the task keeps running.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest propose_change')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  SELECT system_prompt, generation INTO v_prompt_before, v_gen FROM argo_private.policies WHERE agent_id = v_agent;
+  PERFORM argo_public.fn_next_step(v_tid);
+  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"propose_change"}',
+    'parsed', jsonb_build_object(
+      'action', 'propose_change',
+      'changes', jsonb_build_object('system_prompt', 'Be terser.'),
+      'reason', 'selftest'
+    )
+  ));
+  v_proposal := (sub->>'proposal_id')::uuid;
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'continue' AND v_proposal IS NOT NULL AND detail = 'running';
+  ok := ok AND EXISTS (
+    SELECT 1 FROM argo_private.change_proposals
+    WHERE proposal_id = v_proposal AND agent_id = v_agent AND status = 'pending'
+      AND proposed_changes = jsonb_build_object('system_prompt', 'Be terser.')
+      AND base_generation = v_gen
+  );
+  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = v_prompt_before;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'propose_change_queues_a_proposal', 'ok', ok));
+
+  -- 19c. Only system_prompt and llm_config.{model,temperature,max_tokens}
+  --      may be proposed -- an agent can improve its own behavior, never
+  --      expand its own resource envelope or redirect its own provider
+  --      endpoint. Both rejections must be logged, not silently dropped,
+  --      and must not create a proposal row.
+  PERFORM argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"propose_change"}',
+    'parsed', jsonb_build_object('action', 'propose_change', 'changes', jsonb_build_object('max_steps', 999))
+  ));
+  PERFORM argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"propose_change"}',
+    'parsed', jsonb_build_object(
+      'action', 'propose_change',
+      'changes', jsonb_build_object('llm_config', jsonb_build_object('provider', 'evil'))
+    )
+  ));
+  SELECT count(*) INTO n_logs FROM argo_private.execution_logs
+  WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'propose_change_field_not_allowed';
+  ok := n_logs = 2 AND NOT EXISTS (
+    SELECT 1 FROM argo_private.change_proposals
+    WHERE task_id = v_tid AND (proposed_changes ? 'max_steps' OR proposed_changes->'llm_config' ? 'provider')
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'propose_change_rejects_disallowed_fields', 'ok', ok));
+
+  -- 19d. fn_decide_proposal: reject leaves the policy untouched.
+  comp := argo_public.fn_decide_proposal(v_proposal, false, 'not now');
+  ok := comp->>'status' = 'rejected';
+  ok := ok AND (SELECT status FROM argo_private.change_proposals WHERE proposal_id = v_proposal) = 'rejected';
+  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = v_prompt_before;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_reject_leaves_policy_untouched', 'ok', ok));
+
+  -- 19e. Approve applies the change through fn_set_policy -- the same
+  --      versioning path an operator's own edit takes, so a promoted
+  --      proposal shows up in policy_history exactly like one would.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest propose_change_approve')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid2 FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid2);
+  sub := argo_public.fn_submit_result(v_tid2, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"propose_change"}',
+    'parsed', jsonb_build_object('action', 'propose_change', 'changes', jsonb_build_object('system_prompt', 'Be terser.'))
+  ));
+  v_proposal := (sub->>'proposal_id')::uuid;
+  comp := argo_public.fn_decide_proposal(v_proposal, true, 'looks fine');
+  ok := comp->>'status' = 'approved';
+  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = 'Be terser.';
+  ok := ok AND (SELECT generation FROM argo_private.policies WHERE agent_id = v_agent) = v_gen + 1;
+  ok := ok AND EXISTS (
+    SELECT 1 FROM argo_private.policy_history
+    WHERE agent_id = v_agent AND generation = v_gen AND system_prompt = v_prompt_before
+  );
+  ok := ok AND (SELECT status FROM argo_private.change_proposals WHERE proposal_id = v_proposal) = 'approved';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_approve_versions_and_applies', 'ok', ok));
+
+  -- 19f. Staleness: the live policy moved on since this proposal was made
+  --      (an operator edit, simulated here) -- approving must not blindly
+  --      clobber whatever changed it.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest propose_change_stale')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid2 FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid2);
+  sub := argo_public.fn_submit_result(v_tid2, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"propose_change"}',
+    'parsed', jsonb_build_object('action', 'propose_change', 'changes', jsonb_build_object('system_prompt', 'stale attempt'))
+  ));
+  v_proposal := (sub->>'proposal_id')::uuid;
+  PERFORM argo_public.fn_set_policy(v_agent, 'operator changed it meanwhile');
+  comp := argo_public.fn_decide_proposal(v_proposal, true);
+  ok := comp->>'status' = 'stale';
+  ok := ok AND (SELECT status FROM argo_private.change_proposals WHERE proposal_id = v_proposal) = 'stale';
+  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = 'operator changed it meanwhile';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_detects_stale_base', 'ok', ok));
+
+  -- 19g. fn_rollback_policy restores a prior version through the same
+  --      fn_set_policy path -- itself versioned, never a mutation of
+  --      policy_history.
+  SELECT generation INTO v_gen FROM argo_private.policies WHERE agent_id = v_agent;
+  comp := argo_public.fn_rollback_policy(v_agent, v_gen - 2);
+  ok := COALESCE((comp->>'changed')::boolean, false);
+  ok := ok AND (SELECT system_prompt FROM argo_private.policies WHERE agent_id = v_agent) = v_prompt_before;
+  ok := ok AND (SELECT generation FROM argo_private.policies WHERE agent_id = v_agent) = v_gen + 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'rollback_policy_restores_prior_version', 'ok', ok));
+
   -- 20. max_concurrent_tasks holds a task back from fn_dispatch_tasks once
   --     the agent's cap is already occupied by another running task, rather
   --     than dispatching it anyway.
@@ -4265,6 +4568,36 @@ BEGIN
           WHERE agent_id = (p_request->>'agent_id')::uuid
         ) q
       ), '[]'::jsonb));
+
+    WHEN 'policy.rollback' THEN
+      RETURN argo_public.fn_rollback_policy(
+        (p_request->>'agent_id')::uuid, (p_request->>'generation')::int
+      );
+
+    -- Optional filters: agent_id (one agent's proposals) and status (e.g.
+    -- 'pending' for an inbox view); neither is required, so this also
+    -- serves "every proposal, newest first".
+    WHEN 'proposals.list' THEN
+      RETURN jsonb_build_object('ok', true, 'proposals', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'proposal_id', cp.proposal_id, 'agent_id', cp.agent_id, 'agent', a.name,
+          'task_id', cp.task_id, 'proposed_changes', cp.proposed_changes,
+          'reason', cp.reason, 'base_generation', cp.base_generation,
+          'status', cp.status, 'created_at', cp.created_at,
+          'decided_at', cp.decided_at, 'decided_reply', cp.decided_reply
+        ) ORDER BY cp.created_at DESC)
+        FROM argo_private.change_proposals cp
+        JOIN argo_private.agents a ON a.agent_id = cp.agent_id
+        WHERE (NOT (p_request ? 'agent_id') OR cp.agent_id = (p_request->>'agent_id')::uuid)
+          AND (NOT (p_request ? 'status') OR cp.status = p_request->>'status')
+      ), '[]'::jsonb));
+
+    WHEN 'proposals.decide' THEN
+      RETURN argo_public.fn_decide_proposal(
+        (p_request->>'proposal_id')::uuid,
+        (p_request->>'approve')::boolean,
+        NULLIF(p_request->>'reply', '')
+      );
 
     WHEN 'permissions.list' THEN
       RETURN jsonb_build_object('ok', true, 'permissions', COALESCE((
