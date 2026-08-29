@@ -110,6 +110,11 @@ DROP FUNCTION IF EXISTS argo_private.build_llm_http(jsonb, text);
 DROP FUNCTION IF EXISTS argo_public.fn_dispatch_tasks(text);
 DROP FUNCTION IF EXISTS argo_public.fn_claim_outbound(int);
 
+-- agent_may_read now takes the agent_id as a parameter instead of resolving
+-- it itself -- see its own comment for why (current_user is not what it
+-- looks like from inside a SECURITY DEFINER function's own body).
+DROP FUNCTION IF EXISTS argo_private.agent_may_read(text);
+
 -- ---------------------------------------------------------------------------
 -- 2. Schemas, tables, indexes, triggers.
 -- ---------------------------------------------------------------------------
@@ -124,6 +129,19 @@ CREATE TABLE IF NOT EXISTS argo_private.agents (
   created_at  timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now()
 );
+
+-- NULL until fn_provision_agent_role runs (fn_create_agent does this for
+-- every new agent; an agent that existed before this column was added stays
+-- NULL, and its sandboxed SQL falls back to the shared `sandbox` role, the
+-- same as before -- opt-in, not a breaking migration). Once set, this is the
+-- agent's actual PostgreSQL security identity for sandboxed execution: a
+-- NOLOGIN role, a member of `sandbox` (so it inherits exactly the grants
+-- `sandbox` already has, nothing duplicated per agent), that
+-- fn_run_sandboxed_sql runs as via `SET LOCAL ROLE` instead of the one
+-- shared `sandbox` role every agent used to run as indistinguishably. See
+-- fn_provision_agent_role and "6. SQL sandbox" below.
+ALTER TABLE argo_private.agents
+  ADD COLUMN IF NOT EXISTS pg_role text UNIQUE;
 
 CREATE TABLE IF NOT EXISTS argo_private.policies (
   agent_id        uuid PRIMARY KEY REFERENCES argo_private.agents(agent_id) ON DELETE CASCADE,
@@ -480,12 +498,59 @@ CREATE TABLE IF NOT EXISTS argo_private.demo_sales (
   sold_on   date NOT NULL
 );
 
+-- Prefers the caller's actual PostgreSQL role identity over the
+-- argo.agent_id GUC: an agent provisioned with its own role (see
+-- fn_provision_agent_role) is running sandboxed SQL as that role, and
+-- current_user is PostgreSQL's own session state, not a value this or any
+-- other function has to trust a GUC for.
+--
+-- Deliberately SECURITY INVOKER and table-free (the agent_id is parsed
+-- straight back out of the role name -- fn_provision_agent_role only ever
+-- names one 'allgres_agent_' || <uuid with dashes stripped>, so this is
+-- exactly reversible) rather than looking it up in argo_private.agents.
+-- The reason is not the schema grant (that could be solved with
+-- SECURITY DEFINER, same as everywhere else in this file) but something
+-- SECURITY DEFINER cannot solve here: it changes current_user for the
+-- rest of that function's execution, to the function's *owner*, not the
+-- original caller -- and that change is in effect for anything called
+-- from inside it too, security definer or not. agent_may_read is already
+-- SECURITY DEFINER (it has to be, to read argo_private.permissions and
+-- sql_sandbox_allowlist); calling this function from inside agent_may_read
+-- would see current_user as agent_may_read's owner on every single call,
+-- never the querying agent's own role -- confirmed live: that was this
+-- function's first version, and every agent's own grants resolved as
+-- "no permission" against its own view. So this stays SECURITY INVOKER,
+-- and every caller (see v_sales / v_my_tasks below) calls it directly,
+-- before crossing into agent_may_read's SECURITY DEFINER boundary, not
+-- from inside it -- current_user is only ever the real caller up to the
+-- point something SECURITY DEFINER runs, never past it.
+--
+-- The GUC path stays as a fallback for an agent that predates per-agent
+-- roles and still runs sandboxed SQL as the one shared `sandbox` role --
+-- see fn_run_sandboxed_sql's caller in src/lib.rs for how that GUC gets
+-- set. GUCs do not have the SECURITY DEFINER problem above: a value set
+-- with set_config(..., true) survives a role or security-context change
+-- for the rest of the transaction, which is exactly why the original
+-- design used one instead of current_user in the first place.
 CREATE OR REPLACE FUNCTION argo_private.current_agent_id()
 RETURNS uuid
 LANGUAGE sql
 STABLE
 AS $fn$
-  SELECT nullif(current_setting('argo.agent_id', true), '')::uuid
+  SELECT COALESCE(
+    (
+      SELECT (
+        substr(hex, 1, 8) || '-' || substr(hex, 9, 4) || '-' || substr(hex, 13, 4) || '-' ||
+        substr(hex, 17, 4) || '-' || substr(hex, 21, 12)
+      )::uuid
+      FROM (SELECT substr(current_user, length('allgres_agent_') + 1) AS hex) s
+      -- Not just a length check: an unrelated role that happens to start
+      -- with this prefix must fall through to the GUC, not blow up the
+      -- ::uuid cast below with an "invalid input syntax" error.
+      WHERE hex ~ '^[0-9a-f]{32}$'
+    ),
+    nullif(current_setting('argo.agent_id', true), '')::uuid
+  )
 $fn$;
 
 CREATE OR REPLACE FUNCTION argo_private.touch_updated_at()
@@ -720,21 +785,32 @@ $fn$;
 -- Authorisation for agent-visible views lives in the views, so it holds even if
 -- the statement analysis in fn_validate_sql misses a reference.  An agent that
 -- reaches a view it has no permission for sees no rows rather than a leak.
-CREATE OR REPLACE FUNCTION argo_private.agent_may_read(p_ref text)
+-- Takes the agent_id as a parameter rather than calling
+-- current_agent_id() itself: this function has to be SECURITY DEFINER (it
+-- reads argo_private.permissions and sql_sandbox_allowlist, which
+-- `sandbox` and per-agent roles have no direct grant on), and SECURITY
+-- DEFINER changes current_user -- to this function's *owner* -- for
+-- everything it calls internally too. current_agent_id() has to run
+-- before that boundary, in the caller's own context, to see the real
+-- querying role at all; see its own comment for the live-confirmed
+-- failure this caused when it was called from in here instead. Every
+-- caller (v_my_tasks / v_sales below) calls current_agent_id() itself and
+-- passes the result in.
+CREATE OR REPLACE FUNCTION argo_private.agent_may_read(p_ref text, p_agent_id uuid)
 RETURNS boolean
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
 SET search_path = argo_private, pg_temp
 AS $fn$
-  SELECT argo_private.current_agent_id() IS NOT NULL
+  SELECT p_agent_id IS NOT NULL
      AND EXISTS (
        SELECT 1 FROM argo_private.sql_sandbox_allowlist a
        WHERE a.resource_ref = p_ref
      )
      AND EXISTS (
        SELECT 1 FROM argo_private.permissions p
-       WHERE p.agent_id = argo_private.current_agent_id()
+       WHERE p.agent_id = p_agent_id
          AND p.resource_type = 'view'
          AND p.resource_ref = p_ref
      )
@@ -752,7 +828,7 @@ AS
     updated_at
   FROM argo_private.tasks
   WHERE agent_id IS NOT DISTINCT FROM argo_private.current_agent_id()
-    AND argo_private.agent_may_read('argo_public.v_my_tasks');
+    AND argo_private.agent_may_read('argo_public.v_my_tasks', argo_private.current_agent_id());
 
 CREATE OR REPLACE VIEW argo_public.v_sales
   WITH (security_barrier = true)
@@ -760,7 +836,7 @@ AS
   SELECT sale_id, region, sku, amount, sold_on
   FROM argo_private.demo_sales
   WHERE agent_id IS NOT DISTINCT FROM argo_private.current_agent_id()
-    AND argo_private.agent_may_read('argo_public.v_sales');
+    AND argo_private.agent_may_read('argo_public.v_sales', argo_private.current_agent_id());
 
 -- ---------------------------------------------------------------------------
 -- 4. Outbound URL / host guards.
@@ -2135,9 +2211,10 @@ BEGIN
   -- execute under the sandbox role, even if it was queued before the task
   -- left 'running'.
   FOR r IN
-    SELECT sc.call_id, sc.task_id, sc.agent_id, sc.sql
+    SELECT sc.call_id, sc.task_id, sc.agent_id, sc.sql, a.pg_role
     FROM argo_private.sql_calls sc
     JOIN argo_private.tasks t ON t.task_id = sc.task_id
+    JOIN argo_private.agents a ON a.agent_id = sc.agent_id
     WHERE sc.status = 'queued' AND t.status = 'running'
     ORDER BY sc.created_at
     FOR UPDATE OF sc SKIP LOCKED
@@ -2146,11 +2223,15 @@ BEGIN
     UPDATE argo_private.sql_calls
     SET status = 'in_flight', updated_at = now()
     WHERE call_id = r.call_id;
+    -- pg_role is NULL for an agent that predates per-agent roles; the
+    -- worker falls back to the shared `sandbox` role for those (see
+    -- run_sandboxed_sql in src/lib.rs).
     v_out := v_out || jsonb_build_array(jsonb_build_object(
       'call_id', r.call_id,
       'task_id', r.task_id,
       'agent_id', r.agent_id,
-      'sql', r.sql
+      'sql', r.sql,
+      'pg_role', r.pg_role
     ));
     v_n := v_n + 1;
   END LOOP;
@@ -2510,6 +2591,58 @@ $fn$;
 -- 9. Operator API.  The console never SELECTs llm_secrets.
 -- ---------------------------------------------------------------------------
 
+-- Gives an agent its own PostgreSQL security identity: a NOLOGIN role,
+-- named only from the agent's own uuid (never from operator- or
+-- agent-supplied text, so the dynamic CREATE ROLE below has no injection
+-- surface), a member of `sandbox` and of `worker` (the latter so the
+-- runtime worker -- which only ever holds `worker` membership, never
+-- `sandbox` directly beyond what GRANT sandbox TO worker already covers --
+-- can SET LOCAL ROLE to it; SET ROLE requires membership in the target).
+-- Idempotent: re-running it for an already-provisioned agent just returns
+-- the existing role name.
+--
+-- This needs the ability to CREATE ROLE, which is not a new privilege
+-- boundary: whatever installs the extension already creates argo_owner,
+-- operator, worker, and sandbox in the roles bootstrap above, so it already
+-- has that power (typically as a superuser, or an installer role granted
+-- CREATEROLE for exactly this). This function, like every other
+-- SECURITY DEFINER function in this file, is owned by that same installer;
+-- it does not need or request any privilege the installer did not already
+-- have.
+CREATE OR REPLACE FUNCTION argo_private.fn_provision_agent_role(p_agent_id uuid)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = argo_private, pg_temp
+AS $fn$
+DECLARE
+  v_role text;
+BEGIN
+  SELECT pg_role INTO v_role FROM argo_private.agents WHERE agent_id = p_agent_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_provision_agent_role: agent not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_role IS NOT NULL THEN
+    RETURN v_role;
+  END IF;
+
+  v_role := 'allgres_agent_' || replace(p_agent_id::text, '-', '');
+
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+    EXECUTE format(
+      'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT',
+      v_role
+    );
+    EXECUTE format('GRANT sandbox TO %I', v_role);
+    EXECUTE format('GRANT %I TO worker', v_role);
+    EXECUTE format('ALTER ROLE %I SET search_path = pg_temp', v_role);
+  END IF;
+
+  UPDATE argo_private.agents SET pg_role = v_role WHERE agent_id = p_agent_id;
+  RETURN v_role;
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION argo_public.fn_create_agent(p_name text, p_prompt text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -2518,6 +2651,7 @@ SET search_path = argo_private, argo_public, pg_temp
 AS $fn$
 DECLARE
   v_id uuid;
+  v_role text;
 BEGIN
   IF btrim(COALESCE(p_name, '')) = '' THEN
     RAISE EXCEPTION 'agent name required' USING ERRCODE = 'P0001';
@@ -2530,7 +2664,8 @@ BEGIN
     SET system_prompt = p_prompt, updated_at = now()
     WHERE agent_id = v_id;
   END IF;
-  RETURN jsonb_build_object('ok', true, 'agent_id', v_id);
+  v_role := argo_private.fn_provision_agent_role(v_id);
+  RETURN jsonb_build_object('ok', true, 'agent_id', v_id, 'pg_role', v_role);
 END;
 $fn$;
 
@@ -3217,6 +3352,9 @@ DECLARE
   v_started timestamptz;
   v_tid2 uuid;
   v_gen int;
+  v_prov_agent uuid;
+  v_role1 text;
+  v_role2 text;
 BEGIN
   SELECT agent_id INTO v_agent FROM argo_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM argo_private.policies WHERE agent_id = v_agent;
@@ -3765,6 +3903,35 @@ BEGIN
   v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_spares_queued_task', 'ok', ok));
   PERFORM argo_public.fn_set_policy(v_agent, NULL, NULL, NULL, NULL, NULL, NULL, true);
 
+  -- 23. fn_provision_agent_role is idempotent (a second call for an
+  --     already-provisioned agent returns the same role, no duplicate
+  --     CREATE ROLE) and rejects an unknown agent. Reuses one fixed test
+  --     agent across repeated fn_selftest calls, rather than creating a
+  --     fresh one every time: fn_selftest is meant to be callable
+  --     repeatedly (a health check), and a per-agent PostgreSQL role is a
+  --     real cluster-wide object this should not quietly accumulate one of
+  --     forever. Actually assuming the role and proving cross-agent
+  --     isolation live is in tests/smoke.sql, not here, for the same
+  --     reason the sandbox-role check is: fn_selftest is itself
+  --     SECURITY DEFINER and cannot SET ROLE.
+  SELECT agent_id INTO v_prov_agent
+  FROM argo_private.agents WHERE name = 'selftest_provision_agent';
+  IF NOT FOUND THEN
+    v_prov_agent := (argo_public.fn_create_agent('selftest_provision_agent')->>'agent_id')::uuid;
+  END IF;
+  SELECT pg_role INTO v_role1 FROM argo_private.agents WHERE agent_id = v_prov_agent;
+  v_role2 := argo_private.fn_provision_agent_role(v_prov_agent);
+  ok := v_role1 IS NOT NULL AND v_role1 = v_role2 AND v_role1 LIKE 'allgres\_agent\_%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'provision_agent_role_is_idempotent', 'ok', ok));
+
+  BEGIN
+    PERFORM argo_private.fn_provision_agent_role(gen_random_uuid());
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'provision_agent_role_rejects_unknown_agent', 'ok', ok));
+
   PERFORM argo_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -3839,6 +4006,19 @@ REVOKE EXECUTE ON FUNCTION argo_private.provider_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION argo_private.provider_secret(uuid) FROM worker;
 REVOKE EXECUTE ON FUNCTION argo_private.decrypt_secret(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION argo_private.encrypt_secret(text) FROM PUBLIC;
+
+-- PostgreSQL grants EXECUTE to PUBLIC on a new function by default; relying
+-- on that here would mean anything with USAGE on argo_private (operator has
+-- it) could trigger a CREATE ROLE through this SECURITY DEFINER function
+-- without that being a deliberate choice. It is one -- operator is the
+-- trusted admin/dashboard role and manually re-provisioning an agent's role
+-- is a legitimate maintenance action -- but explicit beats ambient, the
+-- same reasoning already applied to provider_secret above. worker never
+-- needs this directly: fn_create_agent (argo_public, same owner) calls it
+-- internally, which needs no grant at all between two objects owned by the
+-- same role.
+REVOKE ALL ON FUNCTION argo_private.fn_provision_agent_role(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION argo_private.fn_provision_agent_role(uuid) TO operator;
 
 -- ---------------------------------------------------------------------------
 -- 13. allgres facade + dashboard RPC.

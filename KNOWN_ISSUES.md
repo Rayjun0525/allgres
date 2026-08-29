@@ -2,7 +2,7 @@
 
 Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
 (Docker/PG17, this environment's actual deployment target, could not be
-reached to verify against — see item 3): `fn_selftest` 68/68, `tests/smoke.sql`
+reached to verify against — see item 3): `fn_selftest` 70/70, `tests/smoke.sql`
 and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
 socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
 (`curl` against `/api/v1/rpc`, CSRF checks included), including a live
@@ -454,3 +454,105 @@ through the dashboard (no `sql_function_allowlist.list`/`.add`/`.remove`
 reinstalling, the same as `sql_sandbox_allowlist` (the view/relation
 allowlist) worked before its own dashboard exposure landed. Worth the same
 treatment later if the seeded set turns out to be too narrow in practice.
+
+## 15. Agent-as-PostgreSQL-role, slice one: per-agent identity for the SQL sandbox
+
+A second-round review (the same one that found items 13 and 14) argued
+Allgres's strongest differentiator from other agent frameworks is
+PostgreSQL's own role/ACL system as the actual trust boundary, not an
+application-level permission table alone — an agent as a real `NOLOGIN`
+role, gated by native `GRANT`/RLS, rather than "an agent ID a
+`SECURITY DEFINER` function happens to check." The full version of that is
+a large redesign: capability roles, RLS across every agent-scoped table,
+sub-agent capabilities enforced as a strict subset of the parent's, a
+broader provisioner. This is a first, deliberately narrow slice: does the
+core mechanism — a real per-agent PostgreSQL identity, actually used to
+gate something — work at all, end to end, verified live, before any of
+the rest is built on top of it.
+
+**What exists now**: `agents.pg_role`, `NULL` until
+`fn_provision_agent_role` runs (`fn_create_agent` calls it for every new
+agent; an agent from before this column existed stays `NULL`, opt-in not
+breaking). Provisioning creates a `NOLOGIN` role named only from the
+agent's own uuid (`allgres_agent_<uuid, no dashes>` — never from any
+operator- or agent-supplied text, so there is no injection surface in the
+dynamic `CREATE ROLE`), a member of `sandbox` (inherits its grants,
+nothing duplicated per agent) and of `worker` (so the runtime worker,
+the only thing that ever assumes it, can `SET LOCAL ROLE` to it).
+`fn_run_sandboxed_sql` now runs an agent's `execute_sql` as that role
+instead of the one shared `sandbox` role every agent used to be
+indistinguishable under; an unprovisioned agent still falls back to
+`sandbox`, unchanged. `fn_claim_sql`/`run_sandboxed_sql` in `src/lib.rs`
+thread the role name through the same claim/complete shape as everything
+else, with a Rust-side format check (`valid_pg_role`) before it is ever
+interpolated into a `SET LOCAL ROLE` string, since that statement has no
+parameterized form.
+
+This did not need a new privilege boundary, on inspection: whatever
+installs the extension already creates `argo_owner`/`operator`/`worker`/
+`sandbox` in the roles bootstrap, so it already has `CREATE ROLE` power
+(typically as a superuser); `fn_provision_agent_role`, like every other
+`SECURITY DEFINER` function in this file, is owned by that same installer
+and asks for nothing new.
+
+**A real bug this slice caught, live, before it shipped**: the first
+version of `current_agent_id()` looked `pg_role` up in
+`argo_private.agents` by `current_user`, and was `SECURITY DEFINER` (it
+has to read a table `sandbox` has no grant on). That silently broke
+every agent's own permission check — confirmed live: an agent granted
+its own view read back zero rows. The reason is a `SECURITY DEFINER`
+property easy to forget: it changes `current_user` to the function's
+*owner*, for everything nested inside it, for the rest of that function's
+execution — `agent_may_read` is already `SECURITY DEFINER` (it reads
+`argo_private.permissions`/`sql_sandbox_allowlist`), so calling
+`current_agent_id()` from inside it saw `current_user` as
+`agent_may_read`'s owner on every single call, never the querying agent's
+actual role. Fixed by making `current_agent_id()` table-free (the
+agent_id is parsed back out of the role name string, which the naming
+scheme makes exactly reversible) so it can stay `SECURITY INVOKER`, and by
+having `v_sales`/`v_my_tasks` call it *directly*, before crossing into
+`agent_may_read`'s `SECURITY DEFINER` boundary, with the result threaded
+in as a parameter (`agent_may_read(p_ref, p_agent_id)`) rather than
+`agent_may_read` resolving it itself. `current_user` is only ever the real
+caller up to the point something `SECURITY DEFINER` runs — never past it,
+regardless of what the nested function's own security mode is.
+
+**Verified live, not just via `fn_selftest`** (same reasoning as items 12
+and 13: this is exactly the kind of bug a test that only checks a write
+happened would miss): two freshly created agents, each running real
+`execute_sql` under its own role via `fn_run_sandboxed_sql`, one able to
+read its own `v_my_tasks` row, the other — same view permission, no task
+of its own — reading zero rows, proving row visibility follows PostgreSQL
+role identity and not the permission table alone (`tests/smoke.sql`).
+Separately, a brand-new agent's `execute_sql` was run through the actual
+Rust background worker (queued via `fn_submit_result`, picked up by the
+real `pump_sql` loop, not called directly) and correctly saw only its own
+task. `fn_selftest` also gained `provision_agent_role_is_idempotent` and
+`provision_agent_role_rejects_unknown_agent` — using one reused, fixed-name
+test agent rather than creating a fresh one (and its role, a real
+cluster-wide object) on every call, since `fn_selftest` is meant to be
+callable repeatedly. Confirmed calling it twice in a row still leaves
+exactly one `allgres_agent_*` role behind, not two.
+
+**Deliberately not in this slice** (the rest of the review's proposal,
+left for later, on purpose — not attempted shallowly here):
+
+- capability roles (`allgres_cap_llm_call`, etc.) as an intermediate grant
+  layer — right now a provisioned agent's role inherits `sandbox` as a
+  whole, the same fixed grant set every agent gets, not a per-agent subset;
+- RLS on any table other than what `v_sales`/`v_my_tasks` already enforced
+  before this slice — `sessions`, `tasks`, `execution_logs`, `memories` (if
+  one existed) are still gated by `SECURITY DEFINER` functions checking an
+  `agent_id` parameter, not by PostgreSQL RLS keyed on role identity;
+- sub-agent capabilities enforced as a subset of the parent's — `delegate`
+  targets an existing agent, it does not create one, so there is no
+  agent-driven role-provisioning path to restrict yet;
+- provisioning is not exposed through the dashboard (no
+  `agents.provision_role` RPC action) — today it only happens implicitly,
+  inside `fn_create_agent`;
+- role backup/restore: `agents.pg_role` values are cluster-global
+  PostgreSQL roles, so `pg_dump` alone will not carry them —
+  `pg_dumpall --globals-only` or an equivalent role manifest is needed for
+  a full restore, and this has not been written or tested (see item 7's
+  and item 4's existing backup/upgrade gaps, now with one more thing they
+  need to cover).

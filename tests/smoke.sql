@@ -103,6 +103,98 @@ BEGIN
   RESET ROLE;
 END $$;
 
+-- Per-agent PostgreSQL roles (fn_provision_agent_role): a persistent agent
+-- created through fn_create_agent gets its own NOLOGIN role, and
+-- fn_run_sandboxed_sql can run it as that role instead of the one shared
+-- `sandbox` role every agent used to run as indistinguishably. Same
+-- SECURITY DEFINER limitation as the block above keeps this out of
+-- fn_selftest -- SET ROLE has to happen top level.
+DO $$
+DECLARE
+  v_agent_a  uuid;
+  v_role_a   text;
+  v_agent_b  uuid;
+  v_role_b   text;
+  v_sql      text;
+  v_result   jsonb;
+BEGIN
+  -- Reuse by name rather than creating fresh agents unconditionally: this
+  -- script can run more than once against the same live database (not just
+  -- once per fresh install), and agents.name is unique.
+  SELECT agent_id INTO v_agent_a FROM argo_private.agents WHERE name = 'smoke_role_agent_a';
+  IF NOT FOUND THEN
+    v_agent_a := (argo_public.fn_create_agent('smoke_role_agent_a')->>'agent_id')::uuid;
+  END IF;
+  SELECT agent_id INTO v_agent_b FROM argo_private.agents WHERE name = 'smoke_role_agent_b';
+  IF NOT FOUND THEN
+    v_agent_b := (argo_public.fn_create_agent('smoke_role_agent_b')->>'agent_id')::uuid;
+  END IF;
+  SELECT pg_role INTO v_role_a FROM argo_private.agents WHERE agent_id = v_agent_a;
+  SELECT pg_role INTO v_role_b FROM argo_private.agents WHERE agent_id = v_agent_b;
+  IF v_role_a IS NULL THEN
+    v_role_a := argo_private.fn_provision_agent_role(v_agent_a);
+  END IF;
+  IF v_role_b IS NULL THEN
+    v_role_b := argo_private.fn_provision_agent_role(v_agent_b);
+  END IF;
+  IF v_role_a IS NULL OR v_role_b IS NULL OR v_role_a = v_role_b THEN
+    RAISE EXCEPTION 'agents did not get distinct pg_role values: % / %', v_role_a, v_role_b;
+  END IF;
+
+  -- Give agent A exactly one task of its own (fn_create_session scopes the
+  -- resulting task to whichever agent_id it is given), and none to agent B
+  -- -- but grant BOTH the view permission, so the only thing standing
+  -- between agent B and agent A's row is v_my_tasks's own
+  -- `agent_id IS NOT DISTINCT FROM current_agent_id()` filter, not the
+  -- separate permission-table check (already covered by
+  -- views_enforce_permission in fn_selftest). This isolates exactly what
+  -- changed in this pass: whether row visibility actually follows
+  -- PostgreSQL role identity.
+  IF NOT EXISTS (
+    SELECT 1 FROM argo_private.tasks t JOIN argo_private.sessions s USING (session_id)
+    WHERE s.goal = 'smoke role isolation probe' AND t.agent_id = v_agent_a
+  ) THEN
+    PERFORM argo_public.fn_create_session(v_agent_a, 'smoke role isolation probe');
+  END IF;
+  PERFORM argo_public.fn_grant_permission(v_agent_a, 'view', 'argo_public.v_my_tasks');
+  PERFORM argo_public.fn_grant_permission(v_agent_b, 'view', 'argo_public.v_my_tasks');
+  v_sql := argo_private.fn_validate_sql(v_agent_a, 'SELECT task_id FROM argo_public.v_my_tasks');
+
+  EXECUTE format('SET LOCAL ROLE %I', v_role_a);
+  IF current_user <> v_role_a THEN
+    RAISE EXCEPTION 'agent role was not assumed: current_user = %, expected %', current_user, v_role_a;
+  END IF;
+  -- No argo.agent_id GUC set here on purpose: this proves role identity
+  -- alone, not a GUC the worker would normally also set, resolves the right
+  -- agent -- v_my_tasks's own definition calls
+  -- argo_private.agent_may_read(), which needs current_agent_id(); neither
+  -- is called directly here, the same as the real runtime worker never
+  -- calls them directly either, only through the view.
+  v_result := argo_public.fn_run_sandboxed_sql(v_sql);
+  IF NOT COALESCE((v_result->>'ok')::boolean, false)
+     OR COALESCE(jsonb_array_length(v_result->'rows'), 0) = 0 THEN
+    RAISE EXCEPTION 'agent A could not see its own task: %', v_result;
+  END IF;
+  RESET ROLE;
+
+  -- Same validated statement text, run as agent B's own role. Agent B has
+  -- the same view permission as A but no task of its own, so
+  -- v_my_tasks's row filter (re-evaluated at execution time against
+  -- whoever current_agent_id() resolves to right now, not carried over
+  -- from validating it as A) must return zero rows -- proving row
+  -- visibility actually follows PostgreSQL role identity, not the query
+  -- text or which agent it was granted to.
+  EXECUTE format('SET LOCAL ROLE %I', v_role_b);
+  IF current_user <> v_role_b THEN
+    RAISE EXCEPTION 'agent role was not assumed: current_user = %, expected %', current_user, v_role_b;
+  END IF;
+  v_result := argo_public.fn_run_sandboxed_sql(v_sql);
+  IF COALESCE(jsonb_array_length(v_result->'rows'), 0) <> 0 THEN
+    RAISE EXCEPTION 'agent B saw agent A''s task, isolated only by role: %', v_result;
+  END IF;
+  RESET ROLE;
+END $$;
+
 -- transaction_read_only still blocks a write even when this execution
 -- primitive is reached directly, bypassing fn_validate_sql -- defence in
 -- depth, since fn_run_sandboxed_sql trusts its input completely.

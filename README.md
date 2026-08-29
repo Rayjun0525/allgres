@@ -246,7 +246,7 @@ WAL, a physical backup, a PITR archive, a replica, or a plain `SELECT` on
 
 ### Privileges
 
-Four roles: `argo_owner` (deploy only), `operator`, `worker`, `sandbox`.
+Four fixed roles: `argo_owner` (deploy only), `operator`, `worker`, `sandbox`.
 
 The runtime worker connects as the bootstrap superuser — a role that does not
 exist yet must never crash-loop a background worker at startup — and then calls
@@ -255,7 +255,36 @@ runs as `worker`. Set `ALLGRES_DROP_PRIVILEGES=0` to disable that.
 
 The control-plane functions are `SECURITY DEFINER`, so this is defence in depth
 rather than the primary boundary; the primary boundary for model-generated SQL
-is the `sandbox` role.
+is the `sandbox` role — or, for an agent with its own role (below), that role.
+
+#### Per-agent roles
+
+A persistent agent gets its own real PostgreSQL identity, not just a row.
+`fn_create_agent` provisions a `NOLOGIN` role (`allgres_agent_<uuid, no
+dashes>`) as a member of `sandbox` — inheriting exactly the grants `sandbox`
+already has, nothing duplicated per agent — and of `worker` (so the runtime
+worker, the only thing that ever assumes it, can `SET LOCAL ROLE` to it,
+membership being what that requires). `fn_run_sandboxed_sql` runs an agent's
+`execute_sql` as *that* role instead of the one shared `sandbox` role every
+agent used to be indistinguishable under. An agent created before this
+existed stays on the shared `sandbox` role — `agents.pg_role` is `NULL` for
+it — until `fn_provision_agent_role` is called for it explicitly; this is an
+additive migration, not a breaking one.
+
+`argo_private.current_agent_id()` prefers this role identity
+(`current_user`, parsed back against the naming scheme, no table lookup)
+over the `argo.agent_id` GUC the worker also sets, falling back to the GUC
+only for an unprovisioned agent. It is deliberately `SECURITY INVOKER` and
+called directly by `v_sales`/`v_my_tasks`'s own `WHERE` clauses, never from
+inside another `SECURITY DEFINER` function: `SECURITY DEFINER` changes
+`current_user` to the function's *owner* for everything nested inside it,
+`current_agent_id()` included, which silently breaks role-based identity if
+it is ever called that way — confirmed live while building this (every
+agent's own view read as "no permission" against its own data, because
+`current_user` inside `agent_may_read`, which has to stay `SECURITY
+DEFINER`, was always the function owner, never the querying agent's role).
+`agent_may_read` takes the resolved agent_id as a parameter instead, for
+exactly this reason.
 
 `execution_logs` is append-only, enforced by trigger and by `REVOKE`.
 

@@ -539,13 +539,27 @@ fn claim_sql_jobs(limit: i32) -> Value {
     })
 }
 
-/// Runs one already-validated agent statement as the `sandbox` role.  `sql`
-/// must be `fn_validate_sql`'s return value, never raw agent input: this
-/// function trusts it completely and so does the database function it calls.
-fn run_sandboxed_sql(agent_id: &str, sql: &str) -> Result<Value, String> {
+/// A role fn_provision_agent_role could actually have produced: a fixed
+/// prefix plus a uuid with its dashes stripped, hex digits only. SET LOCAL
+/// ROLE has no parameterized form, so this is what stands between a
+/// database value and a string built with `format!` -- belt and suspenders
+/// alongside the fact that the column this comes from is only ever written
+/// by that one function, never by anything agent- or operator-controlled.
+fn valid_pg_role(s: &str) -> bool {
+    s.strip_prefix("allgres_agent_")
+        .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Runs one already-validated agent statement as the agent's own sandboxed
+/// role if it has one (see fn_provision_agent_role), or the shared
+/// `sandbox` role for an agent that predates per-agent roles. `sql` must be
+/// `fn_validate_sql`'s return value, never raw agent input: this function
+/// trusts it completely and so does the database function it calls.
+fn run_sandboxed_sql(agent_id: &str, sql: &str, pg_role: Option<&str>) -> Result<Value, String> {
+    let role = pg_role.filter(|r| valid_pg_role(r)).unwrap_or("sandbox");
     BackgroundWorker::transaction(|| {
         drop_privileges();
-        let dropped = Spi::run("SET LOCAL ROLE sandbox").is_ok()
+        let dropped = Spi::run(&format!("SET LOCAL ROLE {role}")).is_ok()
             && Spi::run("SET LOCAL search_path = pg_temp").is_ok()
             && Spi::run("SET LOCAL transaction_read_only = on").is_ok()
             && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT}'")).is_ok()
@@ -627,7 +641,8 @@ fn pump_sql() -> usize {
         if !valid_uuid(call_id) || !valid_uuid(agent_id) {
             continue;
         }
-        let outcome = run_sandboxed_sql(agent_id, sql);
+        let pg_role = call.get("pg_role").and_then(Value::as_str);
+        let outcome = run_sandboxed_sql(agent_id, sql, pg_role);
         submit_sql_result(call_id, outcome);
         n += 1;
     }
