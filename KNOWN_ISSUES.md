@@ -1,9 +1,12 @@
 # Known issues and future work
 
-Status as of 0.2.0. Verified on PostgreSQL 18.6 with pgrx 0.19.2: `fn_selftest`
-40/40, 27 Rust unit tests, `tests/smoke.sql` and `tests/e2e_mock.sql` pass, and
-the full path browser → web worker → unix socket → runtime SPI thread →
-PL/pgSQL works end to end.
+Status as of 0.2.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
+(Docker/PG17, this environment's actual deployment target, could not be
+reached to verify against — see item 3): `fn_selftest` 49/49, `tests/smoke.sql`
+and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
+socket → runtime SPI thread → PL/pgSQL works end to end, including a live
+`dashboard_rpc` round trip for `projects.*` and `approvals.*`. Earlier builds
+were verified on PostgreSQL 18.6; nothing here is PG-version-specific.
 
 Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
@@ -77,10 +80,15 @@ No test covers these; they are wired up but unexercised:
   the token exchange HTTP call;
 - the `delegate` action end to end (child task creation is covered by unit-level
   assertions only);
-- the `await_human` action and `fn_decide_approval`;
-- `fn_watchdog` reclaiming a genuinely stuck in-flight call, for either
-  `outbound_calls` or the new `sql_calls` (a runtime worker crash between
-  `fn_claim_sql` and `fn_complete_sql`).
+- `fn_watchdog` reclaiming a genuinely stuck **in-flight** call, for either
+  `outbound_calls` or `sql_calls` (a runtime worker crash between claim and
+  complete). This is distinct from the pending-**approval** expiry path, which
+  is now covered (`fn_selftest`'s `watchdog_expires_stale_approval`) — the
+  await_human timeout and the in-flight-call timeout are two different loops
+  inside `fn_watchdog`; only the second remains unexercised.
+
+`await_human` / `fn_decide_approval` themselves are no longer on this list —
+see item 10.
 
 ## 7. Secret key rotation
 
@@ -101,3 +109,34 @@ ever exposed through a proxy.
 containing multi-byte UTF-8 is mangled. The failure is closed — a mangled name
 matches no allowlist entry and no `pg_proc` row, so the statement is rejected —
 but the error message will be confusing.
+
+## 10. Projects and a real `await_human` reply loop
+
+`fn_decide_approval` used to be a bare approve/reject bit: the human's actual
+reasoning was never fed back to the agent, which resumed with no idea what was
+decided or why. It now takes an optional `p_reply text`, appends it to
+`execution_logs` as an `operator`-role message (a role the log's `CHECK`
+constraint has allowed since day one but that nothing ever wrote), and the
+resumed agent sees it on its next turn. `argo_private.human_approvals` also
+gained `expires_at` (`fn_submit_result` sets a 24h default) and `fn_watchdog`
+auto-rejects a `waiting_human` task nobody ever answers, the same
+durable-queue-plus-watchdog shape used for `outbound_calls`/`sql_calls`, on
+human timescales instead of machine ones.
+
+`argo_private.projects` was added to group sessions (agents stay
+project-agnostic and reusable across projects, the way a bot can sit in
+several Slack channels); `fn_create_session` takes an optional `p_project_id`.
+`dashboard_rpc` exposes `projects.list` / `projects.create` / `projects.update`
+and `approvals.list` / `approvals.decide`; there is no dashboard UI for any of
+it yet (no thread view, no project switcher, no approve/reject button) —
+that's the next layer, not this one.
+
+Deliberately out of scope for this pass, worth revisiting:
+
+- the 24h approval expiry is a hardcoded default, not configurable per call or
+  per agent;
+- neither `fn_decide_approval` nor `projects.*` records *who* decided or
+  created something — there is no per-operator identity anywhere in the
+  system (the dashboard has one shared token, not accounts), so "who approved
+  this" is unanswerable by design, not by oversight. Adding real identity
+  would be a bigger change than this one.

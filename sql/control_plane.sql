@@ -72,6 +72,15 @@ DROP FUNCTION IF EXISTS allgres.create_session(uuid, text);
 -- CREATE OR REPLACE cannot land it.
 DROP FUNCTION IF EXISTS argo_private.fn_execute_sql(uuid, text);
 
+-- fn_create_session gains an optional project_id; fn_decide_approval gains an
+-- optional human reply.  CREATE OR REPLACE cannot append a new parameter to
+-- an existing signature -- it creates a second overload instead of replacing
+-- (verified: PostgreSQL treats a longer parameter list as a distinct
+-- function, which then makes the shorter call ambiguous) -- so both need an
+-- explicit drop first.
+DROP FUNCTION IF EXISTS argo_public.fn_create_session(uuid, text);
+DROP FUNCTION IF EXISTS argo_public.fn_decide_approval(uuid, boolean);
+
 -- The SQL sandbox no longer inspects statement text with regexes; it reads the
 -- tree produced by PostgreSQL's own parser (allgres.analyze_sql).  These are
 -- the hand-rolled lexer that replaced.
@@ -118,6 +127,19 @@ CREATE TABLE IF NOT EXISTS argo_private.sql_sandbox_allowlist (
   resource_ref text PRIMARY KEY
 );
 
+-- Groups sessions the way a Slack workspace groups channels.  Deliberately
+-- does not scope agents: an agent is reused across projects (the same way one
+-- bot can sit in several channels), so only sessions -- the actual
+-- conversation threads -- belong to a project.
+CREATE TABLE IF NOT EXISTS argo_private.projects (
+  project_id   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name         text NOT NULL UNIQUE,
+  description  text,
+  is_active    boolean NOT NULL DEFAULT true,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS argo_private.sessions (
   session_id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   agent_id      uuid NOT NULL REFERENCES argo_private.agents(agent_id),
@@ -127,6 +149,15 @@ CREATE TABLE IF NOT EXISTS argo_private.sessions (
   started_at    timestamptz NOT NULL DEFAULT now(),
   completed_at  timestamptz
 );
+
+-- Nullable: a one-off session (the dashboard's "Run" page, or a smoke test)
+-- doesn't have to belong to a project.
+ALTER TABLE argo_private.sessions
+  ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES argo_private.projects(project_id);
+
+CREATE INDEX IF NOT EXISTS sessions_project_idx
+  ON argo_private.sessions (project_id, started_at DESC)
+  WHERE project_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS argo_private.tasks (
   task_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -175,6 +206,24 @@ CREATE TABLE IF NOT EXISTS argo_private.human_approvals (
   payload     jsonb NOT NULL,
   decided_at  timestamptz
 );
+
+-- created_at was missing entirely (no way to sort/age pending approvals);
+-- reply_text carries what the human actually said, so the agent isn't just
+-- unblocked but told why -- see fn_decide_approval; expires_at is what lets
+-- fn_watchdog reclaim an approval nobody ever answers, the same "durable
+-- queue, self-healing" shape it already uses for stuck outbound_calls and
+-- sql_calls, just on human timescales instead of machine ones.
+ALTER TABLE argo_private.human_approvals
+  ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS reply_text text,
+  ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+
+CREATE INDEX IF NOT EXISTS human_approvals_pending_idx
+  ON argo_private.human_approvals (created_at)
+  WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS human_approvals_expiry_idx
+  ON argo_private.human_approvals (expires_at)
+  WHERE status = 'pending' AND expires_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS argo_private.llm_providers (
   provider_id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -297,6 +346,11 @@ CREATE TRIGGER agents_touch
 DROP TRIGGER IF EXISTS tasks_touch ON argo_private.tasks;
 CREATE TRIGGER tasks_touch
   BEFORE UPDATE ON argo_private.tasks
+  FOR EACH ROW EXECUTE FUNCTION argo_private.touch_updated_at();
+
+DROP TRIGGER IF EXISTS projects_touch ON argo_private.projects;
+CREATE TRIGGER projects_touch
+  BEFORE UPDATE ON argo_private.projects
   FOR EACH ROW EXECUTE FUNCTION argo_private.touch_updated_at();
 
 CREATE OR REPLACE FUNCTION argo_private.forbid_log_mutation()
@@ -1544,10 +1598,14 @@ BEGIN
         step_count = step_count + 1,
         updated_at = now()
     WHERE task_id = p_task_id;
-    INSERT INTO argo_private.human_approvals (task_id, status, payload)
+    -- 24h default: long enough for an actual human to see and answer it,
+    -- short enough that a forgotten approval doesn't hold a task open
+    -- forever.  fn_watchdog reclaims it past this point.
+    INSERT INTO argo_private.human_approvals (task_id, status, payload, expires_at)
     VALUES (
       p_task_id, 'pending',
-      jsonb_build_object('reason', COALESCE(v_parsed->>'reason', ''))
+      jsonb_build_object('reason', COALESCE(v_parsed->>'reason', '')),
+      now() + interval '24 hours'
     );
     RETURN jsonb_build_object('action', 'wait');
   END IF;
@@ -2007,6 +2065,8 @@ AS $fn$
 DECLARE
   r record;
   n int := 0;
+  v_step int;
+  v_session uuid;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
   FOR r IN
@@ -2055,6 +2115,41 @@ BEGIN
       EXCEPTION WHEN others THEN
         NULL;
       END;
+    END IF;
+    n := n + 1;
+  END LOOP;
+
+  -- Same self-healing shape again, on human timescales: an await_human that
+  -- nobody ever answers before its expires_at (set by fn_submit_result, 24h
+  -- default) gets auto-rejected instead of holding the task open forever.
+  -- Unlike the two loops above this has its own per-row deadline rather than
+  -- p_timeout_seconds, since a human's response time has nothing to do with
+  -- an HTTP call's or a sandboxed query's.
+  FOR r IN
+    SELECT approval_id, task_id
+    FROM argo_private.human_approvals
+    WHERE status = 'pending'
+      AND expires_at IS NOT NULL AND expires_at < now()
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE argo_private.human_approvals
+    SET status = 'rejected', reply_text = 'approval_timeout', decided_at = now()
+    WHERE approval_id = r.approval_id;
+
+    SELECT step_count, session_id INTO v_step, v_session
+    FROM argo_private.tasks
+    WHERE task_id = r.task_id AND status = 'waiting_human'
+    FOR UPDATE;
+
+    IF FOUND THEN
+      PERFORM argo_private.append_log(
+        r.task_id, v_step + 1, 'operator',
+        to_jsonb('No response before the approval expired.'::text)
+      );
+      UPDATE argo_private.tasks
+      SET status = 'failed', error = 'approval_timeout', step_count = step_count + 1, updated_at = now()
+      WHERE task_id = r.task_id;
+      PERFORM argo_private.maybe_complete_session(v_session);
     END IF;
     n := n + 1;
   END LOOP;
@@ -2130,6 +2225,42 @@ BEGIN
 END;
 $fn$;
 
+CREATE OR REPLACE FUNCTION argo_public.fn_create_project(p_name text, p_description text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = argo_private, pg_temp
+AS $fn$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF btrim(COALESCE(p_name, '')) = '' THEN
+    RAISE EXCEPTION 'project name required' USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO argo_private.projects (name, description)
+  VALUES (btrim(p_name), NULLIF(btrim(COALESCE(p_description, '')), ''))
+  RETURNING project_id INTO v_id;
+  RETURN jsonb_build_object('ok', true, 'project_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION argo_public.fn_set_project_active(p_project_id uuid, p_active boolean)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = argo_private, pg_temp
+AS $fn$
+BEGIN
+  UPDATE argo_private.projects
+  SET is_active = p_active, updated_at = now()
+  WHERE project_id = p_project_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'project not found' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('ok', true, 'is_active', p_active);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION argo_public.fn_set_policy(
   p_agent_id uuid,
   p_prompt text DEFAULT NULL,
@@ -2189,7 +2320,11 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_create_session(p_agent_id uuid, p_goal text)
+CREATE OR REPLACE FUNCTION argo_public.fn_create_session(
+  p_agent_id uuid,
+  p_goal text,
+  p_project_id uuid DEFAULT NULL
+)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -2205,8 +2340,13 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM argo_private.agents WHERE agent_id = p_agent_id AND is_active) THEN
     RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO argo_private.sessions (agent_id, goal, status)
-  VALUES (p_agent_id, btrim(p_goal), 'open')
+  IF p_project_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM argo_private.projects WHERE project_id = p_project_id AND is_active
+  ) THEN
+    RAISE EXCEPTION 'project inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO argo_private.sessions (agent_id, project_id, goal, status)
+  VALUES (p_agent_id, p_project_id, btrim(p_goal), 'open')
   RETURNING session_id INTO v_sid;
   INSERT INTO argo_private.tasks (session_id, agent_id, status, input)
   VALUES (v_sid, p_agent_id, 'queued', jsonb_build_object('goal', btrim(p_goal)))
@@ -2423,7 +2563,18 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION argo_public.fn_decide_approval(p_approval_id uuid, p_accept boolean)
+-- p_reply is what makes this a conversation instead of a bare gate: it is
+-- appended to execution_logs as an 'operator' message (a role the log CHECK
+-- constraint has allowed since day one, previously never written to), so the
+-- resumed agent sees what the human actually said, not just that it may
+-- continue. Before this, fn_decide_approval only recorded approved/rejected;
+-- the reason text a human gave was never fed back into the conversation the
+-- agent replays on its next turn.
+CREATE OR REPLACE FUNCTION argo_public.fn_decide_approval(
+  p_approval_id uuid,
+  p_accept boolean,
+  p_reply text DEFAULT NULL
+)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -2431,28 +2582,42 @@ SET search_path = argo_private, pg_temp
 AS $fn$
 DECLARE
   v argo_private.human_approvals%ROWTYPE;
+  t argo_private.tasks%ROWTYPE;
+  v_reply text;
 BEGIN
   SELECT * INTO v FROM argo_private.human_approvals WHERE approval_id = p_approval_id FOR UPDATE;
   IF NOT FOUND OR v.status <> 'pending' THEN
     RAISE EXCEPTION 'approval not pending' USING ERRCODE = 'P0001';
   END IF;
+
   UPDATE argo_private.human_approvals
   SET status = CASE WHEN p_accept THEN 'approved' ELSE 'rejected' END,
+      reply_text = p_reply,
       decided_at = now()
   WHERE approval_id = p_approval_id;
+
+  SELECT * INTO t FROM argo_private.tasks WHERE task_id = v.task_id FOR UPDATE;
+  IF NOT FOUND OR t.status <> 'waiting_human' THEN
+    -- The task moved on without this decision (e.g. fn_watchdog already
+    -- expired it).  The approval row itself is still recorded above; there
+    -- is nothing left to resume or log against.
+    RETURN jsonb_build_object('ok', true, 'task_updated', false);
+  END IF;
+
+  v_reply := COALESCE(NULLIF(btrim(p_reply), ''), CASE WHEN p_accept THEN 'Approved.' ELSE 'Rejected.' END);
+  PERFORM argo_private.append_log(t.task_id, t.step_count + 1, 'operator', to_jsonb(v_reply));
+
   IF p_accept THEN
     UPDATE argo_private.tasks
-    SET status = 'queued', updated_at = now()
-    WHERE task_id = v.task_id AND status = 'waiting_human';
+    SET status = 'queued', step_count = step_count + 1, updated_at = now()
+    WHERE task_id = t.task_id;
   ELSE
     UPDATE argo_private.tasks
-    SET status = 'failed', error = 'human_rejected', updated_at = now()
-    WHERE task_id = v.task_id AND status = 'waiting_human';
-    PERFORM argo_private.maybe_complete_session(
-      (SELECT session_id FROM argo_private.tasks WHERE task_id = v.task_id)
-    );
+    SET status = 'failed', error = 'human_rejected', step_count = step_count + 1, updated_at = now()
+    WHERE task_id = t.task_id;
+    PERFORM argo_private.maybe_complete_session(t.session_id);
   END IF;
-  RETURN jsonb_build_object('ok', true);
+  RETURN jsonb_build_object('ok', true, 'task_updated', true);
 END;
 $fn$;
 
@@ -2596,6 +2761,9 @@ DECLARE
   v_call uuid;
   claim jsonb;
   comp jsonb;
+  v_project uuid;
+  v_approval uuid;
+  v_expires timestamptz;
 BEGIN
   SELECT agent_id INTO v_agent FROM argo_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM argo_private.policies WHERE agent_id = v_agent;
@@ -2855,6 +3023,80 @@ BEGIN
   ok := n_logs >= 1 AND detail = 'running';
   v := v || jsonb_build_array(jsonb_build_object('name', 'complete_sql_failure_logs_error', 'ok', ok));
 
+  -- 14. sessions can be scoped to a project; fn_create_session rejects an
+  --     inactive or missing project the same way it already rejects an
+  --     inactive or missing agent.  Project name carries a timestamp so
+  --     repeat selftest runs don't collide on the UNIQUE constraint.
+  v_project := (argo_public.fn_create_project(
+    'selftest project ' || extract(epoch from clock_timestamp())::text
+  )->>'project_id')::uuid;
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest project_scoped', v_project)->>'session_id')::uuid;
+  SELECT (project_id = v_project) INTO ok FROM argo_private.sessions WHERE session_id = v_sid;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'session_scoped_to_project', 'ok', ok));
+
+  PERFORM argo_public.fn_set_project_active(v_project, false);
+  BEGIN
+    PERFORM argo_public.fn_create_session(v_agent, 'selftest inactive_project', v_project);
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'inactive_project_rejected', 'ok', ok));
+
+  -- 15. await_human sets an expiry, and once decided the human's actual
+  --     reply is fed back into the conversation as an 'operator' log entry
+  --     -- not just an approve/reject bit fn_next_step can't see.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest approval_reply')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid);
+  sub := argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"await_human"}',
+    'parsed', jsonb_build_object('action', 'await_human', 'reason', 'Which quarter definition?')
+  ));
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'wait' AND detail = 'waiting_human';
+  SELECT approval_id, expires_at INTO v_approval, v_expires
+  FROM argo_private.human_approvals WHERE task_id = v_tid AND status = 'pending';
+  ok := ok AND v_approval IS NOT NULL
+    AND v_expires > now() AND v_expires <= now() + interval '24 hours 1 minute';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'await_human_creates_pending_approval', 'ok', ok));
+
+  comp := argo_public.fn_decide_approval(v_approval, true, 'Use the fiscal-year quarter.');
+  SELECT count(*) INTO n_logs
+  FROM argo_private.execution_logs
+  WHERE task_id = v_tid AND role = 'operator'
+    AND content = to_jsonb('Use the fiscal-year quarter.'::text);
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := COALESCE((comp->>'task_updated')::boolean, false) AND n_logs = 1 AND detail = 'queued';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'approval_reply_feeds_back_into_log', 'ok', ok));
+
+  -- 16. fn_watchdog reclaims an approval nobody ever answers -- the same
+  --     self-healing shape it already applies to stuck outbound/sql calls,
+  --     just on a per-row deadline instead of p_timeout_seconds.
+  v_sid := (argo_public.fn_create_session(v_agent, 'selftest approval_expiry')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM argo_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM argo_public.fn_next_step(v_tid);
+  PERFORM argo_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"await_human"}',
+    'parsed', jsonb_build_object('action', 'await_human', 'reason', 'will never be answered')
+  ));
+  UPDATE argo_private.human_approvals
+  SET expires_at = now() - interval '1 minute'
+  WHERE task_id = v_tid AND status = 'pending';
+  PERFORM argo_public.fn_watchdog();
+  SELECT status INTO detail FROM argo_private.human_approvals WHERE task_id = v_tid;
+  ok := detail = 'rejected';
+  SELECT status INTO detail FROM argo_private.tasks WHERE task_id = v_tid;
+  ok := ok AND detail = 'failed';
+  SELECT count(*) INTO n_logs
+  FROM argo_private.execution_logs
+  WHERE task_id = v_tid AND role = 'operator'
+    AND content = to_jsonb('No response before the approval expired.'::text);
+  ok := ok AND n_logs = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_expires_stale_approval', 'ok', ok));
+
   PERFORM argo_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -2979,9 +3221,13 @@ SELECT task_id, session_id, agent_id, parent_task_id, status, step_count,
        input, output, error, created_at, updated_at
 FROM argo_private.tasks;
 
+CREATE OR REPLACE VIEW allgres.projects AS
+SELECT project_id, name, description, is_active, created_at, updated_at
+FROM argo_private.projects;
+
 REVOKE ALL ON SCHEMA allgres FROM PUBLIC;
 GRANT USAGE ON SCHEMA allgres TO operator, worker;
-GRANT SELECT ON allgres.agents, allgres.tasks TO operator;
+GRANT SELECT ON allgres.agents, allgres.tasks, allgres.projects TO operator;
 GRANT EXECUTE ON FUNCTION allgres.create_agent(text) TO operator;
 GRANT EXECUTE ON FUNCTION allgres.create_session(uuid, text) TO operator;
 GRANT EXECUTE ON FUNCTION allgres.pump() TO worker, operator;
@@ -3009,6 +3255,7 @@ BEGIN
         'running_tasks', (SELECT count(*) FROM argo_private.tasks WHERE status IN ('queued','running','waiting_human')),
         'queued_outbound', (SELECT count(*) FROM argo_private.outbound_calls WHERE status = 'queued'),
         'queued_sql', (SELECT count(*) FROM argo_private.sql_calls WHERE status = 'queued'),
+        'pending_approvals', (SELECT count(*) FROM argo_private.human_approvals WHERE status = 'pending'),
         'failed_tasks', (SELECT count(*) FROM argo_private.tasks WHERE status = 'failed'),
         'sessions', (SELECT count(*) FROM argo_private.sessions),
         'secret_storage', argo_private.secret_storage_mode(),
@@ -3071,8 +3318,31 @@ BEGIN
       );
       RETURN jsonb_build_object('ok', true, 'agent_id', v_id);
 
+    WHEN 'projects.list' THEN
+      RETURN jsonb_build_object('ok', true, 'projects', COALESCE((
+        SELECT jsonb_agg(to_jsonb(pr) ORDER BY pr.name)
+        FROM (
+          SELECT project_id, name, description, is_active, created_at, updated_at
+          FROM argo_private.projects
+        ) pr
+      ), '[]'::jsonb));
+
+    WHEN 'projects.create' THEN
+      RETURN argo_public.fn_create_project(p_request->>'name', p_request->>'description');
+
+    WHEN 'projects.update' THEN
+      v_id := (p_request->>'project_id')::uuid;
+      IF p_request ? 'is_active' THEN
+        PERFORM argo_public.fn_set_project_active(v_id, (p_request->>'is_active')::boolean);
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'project_id', v_id);
+
     WHEN 'run' THEN
-      RETURN argo_public.fn_create_session((p_request->>'agent_id')::uuid, p_request->>'goal');
+      RETURN argo_public.fn_create_session(
+        (p_request->>'agent_id')::uuid,
+        p_request->>'goal',
+        NULLIF(p_request->>'project_id', '')::uuid
+      );
 
     WHEN 'tasks.list' THEN
       RETURN jsonb_build_object('ok', true, 'tasks', COALESCE((
@@ -3164,6 +3434,30 @@ BEGIN
             ORDER BY l.created_at DESC LIMIT 15
           ) q
         ), '[]'::jsonb)
+      );
+
+    WHEN 'approvals.list' THEN
+      RETURN jsonb_build_object('ok', true, 'approvals', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at)
+        FROM (
+          SELECT h.approval_id, h.task_id, t.session_id, a.name AS agent,
+                 s.goal, h.payload->>'reason' AS reason,
+                 h.created_at, h.expires_at
+          FROM argo_private.human_approvals h
+          JOIN argo_private.tasks t USING (task_id)
+          JOIN argo_private.agents a USING (agent_id)
+          JOIN argo_private.sessions s USING (session_id)
+          WHERE h.status = 'pending'
+          ORDER BY h.created_at
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 100), 1), 500)
+        ) q
+      ), '[]'::jsonb));
+
+    WHEN 'approvals.decide' THEN
+      RETURN argo_public.fn_decide_approval(
+        (p_request->>'approval_id')::uuid,
+        (p_request->>'accept')::boolean,
+        NULLIF(p_request->>'reply', '')
       );
 
     WHEN 'selftest' THEN
