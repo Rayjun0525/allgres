@@ -92,9 +92,9 @@ worker is down while it is serving the page you are looking at.
 
 No test covers these; they are wired up but unexercised:
 
-- the OAuth flow (`fn_oauth_start`, `fn_oauth_token_request`,
-  `fn_oauth_store_tokens`) — including the fact that nothing currently performs
-  the token exchange HTTP call;
+- ~~the OAuth flow~~ — fixed, see item 24: the token exchange HTTP call is
+  now actually performed, by the runtime worker, and covered by both
+  `fn_selftest` and a real `tests/e2e_mock.sql` round trip.
 - the `delegate` action end to end (child task creation is covered by unit-level
   assertions only);
 - `fn_watchdog` reclaiming a genuinely stuck **in-flight** call, for either
@@ -1079,6 +1079,15 @@ verification, not named by the review at all.
   credential at claim time, inject it only into the runtime worker's own
   response, never write it back anywhere a caller's result or a table
   could expose it) is the template, not attempted here.
+
+  Done in item 24, exactly on that template: `fn_oauth_token_request` no
+  longer returns anything secret, so the explicit revoke-from-operator this
+  bullet describes is gone too — `fn_oauth_start`/`fn_oauth_token_request`
+  are back under the ordinary blanket grant, the same as
+  `fn_claim_outbound`/`fn_complete_outbound` always were despite handling
+  the LLM credential internally (ownership, not the caller's grants, is
+  what actually runs their body — ibid.). `fn_oauth_store_tokens` itself is
+  gone outright rather than merely re-revoked.
 - **`drop_privileges()` failing was logged but not actually fail-closed** —
   confirmed real, though independent analysis found the practical
   severity lower than the review's framing for five of its six call
@@ -1434,3 +1443,125 @@ round trip for the two new operator-configurable fields this added.
   that already seeded the old prompt keeps it — this only changes what a
   fresh install (or a restore onto one) gets from here on, the same
   forward-only shape as the fixed provider ids in item 18.
+
+## 24. OAuth token exchange, actually performed, queued the way item 13 already fixed the same leak once
+
+Item 6 named this from the start: OAuth had three functions
+(`fn_oauth_start`, `fn_oauth_token_request`, `fn_oauth_store_tokens`) and no
+code path that ever performed the token exchange HTTP call. Item 20 found
+`fn_oauth_token_request` was also actively unsafe the moment anything called
+it: it decrypted the provider's `oauth_client_secret` and returned the built
+request straight to its caller, which the blanket
+`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres_public TO operator` (see
+item 20's own account) would have handed to `operator` the instant a
+dashboard action reached it. Both gaps are closed together, since finishing
+the feature and fixing the leak turned out to be the same change.
+
+**What was built**: a new queue, `allgres_private.oauth_calls`, shaped
+exactly like `outbound_calls`/`sql_calls` (`queued -> in_flight ->
+harvested/lost`) but with no `task_id` — connecting a provider is an
+operator dashboard action, not an agent turn, so there is no task to route a
+result back into. `fn_oauth_token_request` now only builds the exchange
+request and queues it, without ever touching `oauth_client_secret`; a new
+`fn_claim_oauth` (worker-only) resolves the secret and merges it into the
+request body it hands back over the RPC socket — never written to
+`oauth_calls.request_body` — the identical claim-time-only shape
+`fn_claim_outbound` already uses for an LLM provider's `api_key` (item 13).
+A new `fn_complete_oauth` (worker-only) parses the token endpoint's
+response, stores `access_token`/`refresh_token` encrypted into
+`llm_secrets`, and fences a belated result the same way
+`fn_complete_outbound`/`fn_complete_sql` already do (a row only completes
+from `in_flight`; a watchdog-reclaimed `lost` row's result is discarded, not
+recorded). `fn_watchdog` gained a fourth reclaim loop, for `oauth_calls`
+stuck `in_flight` past a worker crash between claim and complete — the
+same technique item 6 already named as owed for the two `outbound_calls`/
+`sql_calls` loops, applied here from the start rather than added later.
+
+`fn_oauth_store_tokens` is not merely re-revoked from `operator` the way
+item 20 left it — it is gone. Its storage logic moved inside
+`fn_complete_oauth`, and nothing outside the runtime worker ever needs to
+call it, so there is no public entry point left to leak through in the
+first place. `fn_oauth_start`/`fn_oauth_token_request` are back under the
+ordinary blanket grant to `operator`, safely now: both return only a
+redirect URL / a queued `call_id`, nothing secret, the same reasoning that
+already lets `fn_claim_outbound`/`fn_complete_outbound` sit under that same
+blanket grant despite resolving a real credential internally — ownership,
+not the caller's own grants, is what actually runs a `SECURITY DEFINER`
+function's body.
+
+On the Rust side, `perform_http` gained a third branch alongside its
+existing `tool` (GET) and `llm` (JSON POST) ones: `oauth` sends a standard
+`application/x-www-form-urlencoded` submission (`ureq`'s `send_form`, RFC
+6749 4.1.3 — a token endpoint does not speak JSON on the request side, only
+the response). OAuth jobs run on the same HTTP thread pool as every other
+outbound call, tagged with which queue they came from
+(`OutboundQueue::Outbound`/`::Oauth`) so the harvest step in the main loop
+routes each result to `fn_complete_outbound` or `fn_complete_oauth`
+correctly — the two queues share infrastructure but are otherwise unrelated
+tables with unrelated completion semantics.
+
+Reachable from the dashboard: a `kind='oauth'` provider's editor in
+Settings gained Authorization URL / Token URL / Client ID / Client secret
+fields and a "Connect via OAuth" button (`providers.oauth_start`, a new
+`dashboard_rpc` action alongside `providers.oauth_callback`), which does a
+real full-page redirect to the provider's login screen; the provider's own
+redirect back to the dashboard's URL (`?code=&state=`) is picked up by a
+boot-time handler that completes the flow (`providers.oauth_callback`) and
+returns to Settings. Neither RPC action, nor the redirect itself, ever
+carries a secret — the callback's own return value is `{ok, queued,
+call_id, provider_id}`.
+
+**Verified live**, the same standard as items 12–23: rebuilt against local
+PostgreSQL 16.15 (rustc 1.98, since pgrx 0.19.2 needs rustc ≥1.96 — this
+session's toolchain started at 1.94 and had to be updated first),
+`fn_selftest` 88/88 (five new cases: queuing never touches the secret table
+and the return value contains no trace of it; claiming injects the secret
+only into the response, never back into the row; a stale completion is
+discarded, not stored; a successful exchange stores both tokens encrypted;
+a response missing `access_token` is recorded as an error rather than
+silently doing nothing), `tests/smoke.sql`, and a new section in
+`tests/e2e_mock.sql` that adds a mock OAuth token endpoint
+(`/mock/oauth/token`, gated by `ALLGRES_ENABLE_MOCK` exactly like the
+existing `/mock/chat/completions`) and drives the real background worker
+through it end to end: `fn_claim_oauth` → `perform_http`'s `send_form`
+branch → the mock endpoint (which itself refuses the exchange unless the
+real client secret arrived, and echoes the exchanged code back into the
+access token, so a correct token landing in `llm_secrets` proves both the
+code and the claim-time-injected secret actually made it over the wire) →
+`fn_complete_oauth` → `llm_secrets`, decrypted and checked, then every
+column of `oauth_calls` searched for the secret and both tokens (zero
+matches) — the same "search every column" proof item 13 used live for the
+identical class of leak. Also driven through the real HTTP path, not just
+SQL: `curl` against `/api/v1/rpc` for `providers.oauth_start` and
+`providers.oauth_callback`, and a headless-browser (Playwright/Chromium)
+screenshot of the Settings provider editor confirming the new fields and
+the Connect button render and the "connected" status reflects a stored
+token. A real `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from a real
+0.2.0 install (seeded with an agent beforehand, on a cluster with every
+`allgres_*`/`argo_*` role and schema removed first — see item 19's own
+account of the leftover-role trap this exact check has fallen into
+before) confirms `oauth_calls` exists post-upgrade, `fn_oauth_store_tokens`
+does not, and `fn_selftest` stays 88/88. `scripts/backup_drill.sh` (item
+18) re-run end to end, both the physical (PITR) and logical (`pg_dump`)
+paths, confirms the new `pg_extension_config_dump` registration for
+`oauth_calls` doesn't break either.
+
+`oauth_calls` is registered for `pg_extension_config_dump`, unconditionally,
+the same as `outbound_calls`/`sql_calls` — unlike `oauth_states` (still
+deliberately excluded: short-lived, in-progress flow state) it is a real
+audit trail worth keeping, and unlike `llm_secrets` it never holds a
+plaintext secret or token to begin with: there is no `response_body` column
+on it at all, only a status code and, on failure, the provider's own error
+text.
+
+**Deliberately not built**: token *refresh* — an expired `access_token` has
+to be reconnected from Settings by hand; nothing calls a provider's
+`refresh_token` grant automatically, though `llm_secrets.expires_at` is
+recorded and available for that later. `oauth_scope` has no operator setter
+(`fn_set_provider` never gained one) — it can only be seeded directly,
+same limitation the schema already had before this pass, just not removed
+by it either. No confirmation dialog before "Connect via OAuth" navigates
+away from the dashboard, beyond the browser's own — same caveat items 11
+and 17 already name for `sessions.cancel` and a proposal rollback. No
+per-operator identity attached to who connected a provider, for the reason
+item 10 gives throughout: no accounts system yet.

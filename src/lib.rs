@@ -537,6 +537,24 @@ fn dispatch_and_claim(limit: usize) -> Value {
     })
 }
 
+/// Claims queued OAuth token-exchange rows for the HTTP pool -- the client
+/// secret is already resolved and merged into each call's body by
+/// fn_claim_oauth itself (claim-time credential injection, the same shape as
+/// dispatch_and_claim's fn_claim_outbound), so this is a plain claim with no
+/// separate secret-fetch step here.
+fn claim_oauth_jobs(limit: i32) -> Value {
+    BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            return json!({ "count": 0, "calls": [] });
+        }
+        Spi::get_one_with_args::<JsonB>("SELECT allgres_public.fn_claim_oauth($1)", &[limit.into()])
+            .ok()
+            .flatten()
+            .map(|j| j.0)
+            .unwrap_or_else(|| json!({ "count": 0, "calls": [] }))
+    })
+}
+
 fn submit_http_result(call_id: &str, status: i32, body: &str) {
     // Postgres text cannot hold NUL; this is sanitisation, not escaping.
     let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
@@ -557,6 +575,30 @@ fn submit_http_result(call_id: &str, status: i32, body: &str) {
             &[call_id.into(), status.into(), body.as_str().into()],
         ) {
             pgrx::warning!("Allgres: fn_complete_outbound failed for call {}: {}", call_id, e);
+        }
+    });
+}
+
+/// Same completion shape as submit_http_result, for an OAuth token-exchange
+/// call instead. fn_complete_oauth has no task_id to fall back on if the
+/// privilege drop fails, so the same reasoning applies: leave the row
+/// 'in_flight' and let fn_watchdog reclaim it as 'lost' rather than
+/// recording under the bootstrap superuser.
+fn submit_oauth_result(call_id: &str, status: i32, body: &str) {
+    let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
+    BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            pgrx::warning!(
+                "Allgres: skipping fn_complete_oauth for call {} -- privilege drop failed",
+                call_id
+            );
+            return;
+        }
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_complete_oauth($1::uuid, $2, $3)",
+            &[call_id.into(), status.into(), body.as_str().into()],
+        ) {
+            pgrx::warning!("Allgres: fn_complete_oauth failed for call {}: {}", call_id, e);
         }
     });
 }
@@ -726,13 +768,27 @@ fn pump_sql() -> usize {
 // Outbound HTTP, on pool threads.  Nothing here may touch Postgres.
 // ---------------------------------------------------------------------------
 
+/// Which SQL-side queue a job came from, so the harvest step in the main
+/// loop knows whether to complete it via fn_complete_outbound or
+/// fn_complete_oauth -- both queues share this one HTTP thread pool, but
+/// they are unrelated tables with unrelated completion semantics (one is
+/// tied to a task_id and fn_submit_result, the other to an OAuth provider
+/// and no task at all).
+#[derive(Clone, Copy, PartialEq)]
+enum OutboundQueue {
+    Outbound,
+    Oauth,
+}
+
 struct OutboundJob {
     call_id: String,
+    queue: OutboundQueue,
     call: Value,
 }
 
 struct OutboundResult {
     call_id: String,
+    queue: OutboundQueue,
     status: i32,
     body: String,
 }
@@ -852,6 +908,33 @@ fn perform_http(call: &Value) -> (i32, String) {
             }
         }
         req.call()
+    } else if kind == "oauth" {
+        // An OAuth token endpoint expects a standard form submission, not
+        // JSON (RFC 6749 4.1.3). send_form sets its own content-type header
+        // (application/x-www-form-urlencoded) and percent-encodes every
+        // field, including client_secret -- fn_claim_oauth merged it into
+        // `body` at claim time, so it exists only in this one process's
+        // memory for this one request.
+        let mut req = agent.post(url);
+        if let Some(h) = headers {
+            for (k, v) in h {
+                if k.eq_ignore_ascii_case("content-type") {
+                    continue;
+                }
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+        let form: Vec<(String, String)> = body
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        req.send_form(form)
     } else {
         let mut req = agent.post(url);
         if let Some(h) = headers {
@@ -895,7 +978,7 @@ fn spawn_http_pool(threads: usize) -> (Sender<OutboundJob>, Receiver<OutboundRes
                 let Ok(job) = job else { return };
                 let (status, body) = perform_http(&job.call);
                 if out
-                    .send(OutboundResult { call_id: job.call_id, status, body })
+                    .send(OutboundResult { call_id: job.call_id, queue: job.queue, status, body })
                     .is_err()
                 {
                     return;
@@ -990,7 +1073,10 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
             match results.try_recv() {
                 Ok(r) => {
                     in_flight = in_flight.saturating_sub(1);
-                    submit_http_result(&r.call_id, r.status, &r.body);
+                    match r.queue {
+                        OutboundQueue::Outbound => submit_http_result(&r.call_id, r.status, &r.body),
+                        OutboundQueue::Oauth => submit_oauth_result(&r.call_id, r.status, &r.body),
+                    }
                 }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
@@ -1012,7 +1098,34 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
                     if !valid_uuid(id) {
                         continue;
                     }
-                    let job = OutboundJob { call_id: id.to_string(), call: call.clone() };
+                    let job = OutboundJob { call_id: id.to_string(), queue: OutboundQueue::Outbound, call: call.clone() };
+                    if jobs.send(job).is_err() {
+                        break;
+                    }
+                    in_flight += 1;
+                    queued += 1;
+                }
+            }
+        }
+
+        // 3b. OAuth token exchanges, on the same pool: an operator-initiated
+        // dashboard action rather than an agent turn, so it is claimed
+        // separately from dispatch_and_claim (fn_claim_oauth, not
+        // fn_claim_outbound) but shares the same HTTP threads and the same
+        // capacity budget.
+        if ready && in_flight < capacity {
+            let claimed = claim_oauth_jobs((capacity - in_flight) as i32);
+            if let Some(calls) = claimed.get("calls").and_then(Value::as_array) {
+                for call in calls {
+                    let Some(id) = call.get("call_id").and_then(Value::as_str) else { continue };
+                    if !valid_uuid(id) {
+                        continue;
+                    }
+                    let mut call = call.clone();
+                    if let Some(obj) = call.as_object_mut() {
+                        obj.insert("kind".to_string(), json!("oauth"));
+                    }
+                    let job = OutboundJob { call_id: id.to_string(), queue: OutboundQueue::Oauth, call };
                     if jobs.send(job).is_err() {
                         break;
                     }
@@ -1097,6 +1210,47 @@ fn content_length(data: &[u8], header_end: usize) -> usize {
         }
     }
     0
+}
+
+/// Decodes one application/x-www-form-urlencoded body into a map -- only
+/// used by the /mock/oauth/token test double above, to read back what
+/// send_form actually put on the wire.
+fn parse_form_body(body: &str) -> HashMap<String, String> {
+    fn decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                b'%' if i + 2 < bytes.len() => {
+                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                    match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                        Some(b) => {
+                            out.push(b);
+                            i += 3;
+                        }
+                        None => {
+                            out.push(bytes[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    body.split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (decode(k), decode(v)))
+        .collect()
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<HttpRequest> {
@@ -1526,6 +1680,35 @@ fn handle_web_connection(mut s: TcpStream, cfg: &WebConfig) {
                 },
                 "finish_reason": "stop"
             }]
+        })
+        .to_string();
+        respond_json(&mut s, "200 OK", &body);
+        return;
+    }
+
+    // A mock OAuth token endpoint, gated the same way as /mock/chat/completions:
+    // lets tests/e2e_mock.sql drive the real fn_claim_oauth -> perform_http
+    // (send_form) -> fn_complete_oauth path through the actual background
+    // worker, without a real external OAuth provider. Echoes the exchanged
+    // `code` and `client_secret` back into the response so the test can prove
+    // both actually arrived here -- not just that a request was sent.
+    if path == "/mock/oauth/token" {
+        if !cfg.mock_enabled {
+            respond_json(&mut s, "404 Not Found", "{\"ok\":false,\"error\":\"not_found\"}");
+            return;
+        }
+        let form = parse_form_body(&r.body);
+        let code = form.get("code").cloned().unwrap_or_default();
+        let secret = form.get("client_secret").cloned().unwrap_or_default();
+        if code.is_empty() || secret != "allgres-mock-oauth-secret" {
+            respond_json(&mut s, "401 Unauthorized", "{\"error\":\"invalid_client\"}");
+            return;
+        }
+        let body = json!({
+            "access_token": format!("allgres-mock-access-{code}"),
+            "refresh_token": "allgres-mock-refresh",
+            "expires_in": 3600,
+            "token_type": "bearer"
         })
         .to_string();
         respond_json(&mut s, "200 OK", &body);

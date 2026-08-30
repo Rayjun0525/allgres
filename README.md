@@ -50,6 +50,12 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   and a logical (`pg_dump`) backup/restore round-trip real data, including
   per-agent role identity. See [Upgrades](#upgrades) and [Backup and
   restore](#backup-and-restore).
+- **OAuth token exchange** — an operator connects a `kind='oauth'` provider
+  from Settings; the authorization-code exchange is queued and performed by
+  the runtime worker itself, the same claim-time-credential-injection shape
+  that already keeps an LLM provider's api_key out of any table (see
+  [Secrets at rest](#secrets-at-rest)) — never returned to the dashboard or
+  written anywhere in plaintext.
 
 Not yet built:
 
@@ -57,7 +63,9 @@ Not yet built:
   native install and `docker-compose` exist today.
 - Per-operator identity/accounts — the dashboard has one shared token, not
   user accounts, so "who approved this" is unanswerable by design.
-- OAuth token exchange, secret key rotation.
+- Secret key rotation, and a token *refresh* flow (an expired OAuth access
+  token has to be reconnected from Settings; nothing calls `refresh_token`
+  automatically yet).
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
@@ -173,8 +181,8 @@ Layered, strongest first:
 
 ## Known limitations
 
-Outstanding gaps — the unverified Docker/PG17 build, the untested upgrade path
-and OAuth flow, secret key rotation, and more — are tracked in
+Outstanding gaps — the unverified Docker/PG17 build, secret key rotation, no
+automatic OAuth token refresh, and more — are tracked in
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
 
 `allgres_public.fn_selftest()` exercises the validate/queue/claim/complete state
@@ -283,6 +291,19 @@ never written back to a row. The key exists only in that one response and
 then in the worker's memory for the HTTP request it is used for — never in
 WAL, a physical backup, a PITR archive, a replica, or a plain `SELECT` on
 `outbound_calls`.
+
+OAuth's token exchange follows the identical shape, in its own queue table
+(`allgres_private.oauth_calls`) rather than `outbound_calls`, since it has no
+`task_id` to attach to — connecting a provider is an operator dashboard
+action, not an agent turn. `fn_oauth_token_request` (reachable as
+`providers.oauth_callback`) builds the token request and queues it without
+ever touching the provider's decrypted `oauth_client_secret`; only
+`fn_claim_oauth`, called by the runtime worker, resolves it and merges it
+into the response handed back over the RPC socket. The resulting
+`access_token`/`refresh_token` are encrypted straight into `llm_secrets` by
+`fn_complete_oauth`, which runs entirely inside the worker — the dashboard
+never sees the callback's authorization `code`, the client secret, or the
+issued tokens; it only ever polls `has_secret`.
 
 ### Privileges
 
@@ -411,7 +432,7 @@ bypass of the dashboard token.
 | `ALLGRES_ALLOW_INSECURE_HTTP` | unset | Permit a public bind with no token |
 | `ALLGRES_SOCKET_DIR` | `$PGDATA/allgres` | RPC socket directory |
 | `ALLGRES_SECRET_KEY` | empty | Encrypts provider secrets at rest |
-| `ALLGRES_ENABLE_MOCK` | unset | Serve `/mock/chat/completions` (tests only) |
+| `ALLGRES_ENABLE_MOCK` | unset | Serve `/mock/chat/completions` and `/mock/oauth/token` (tests only) |
 | `ALLGRES_DROP_PRIVILEGES` | `1` | Runtime worker drops to the `worker` role |
 
 ## Extension installation

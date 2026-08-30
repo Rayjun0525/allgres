@@ -270,6 +270,19 @@ DROP FUNCTION IF EXISTS allgres_public.fn_claim_outbound(int);
 -- looks like from inside a SECURITY DEFINER function's own body).
 DROP FUNCTION IF EXISTS allgres_private.agent_may_read(text);
 
+-- OAuth token exchange used to be built and handed straight back to its
+-- caller (fn_oauth_token_request), with a separate fn_oauth_store_tokens an
+-- operator called afterward with whatever access/refresh token their own
+-- browser-side code obtained -- which is exactly how a decrypted client
+-- secret reached `operator` in the first place (see KNOWN_ISSUES, "a
+-- second-round external review of items 18 and 19"). Both functions are
+-- replaced by a queued exchange the runtime worker performs itself
+-- (fn_claim_oauth/fn_complete_oauth, see "9. Operator API"): fn_oauth_token_request
+-- keeps its name and signature but now only queues, and fn_oauth_store_tokens
+-- has no replacement at all -- its storage logic moved inside
+-- fn_complete_oauth, and nothing outside the worker needs to call it anymore.
+DROP FUNCTION IF EXISTS allgres_public.fn_oauth_store_tokens(text, text, text, int);
+
 -- ---------------------------------------------------------------------------
 -- 2. Schemas, tables, indexes, triggers.
 -- ---------------------------------------------------------------------------
@@ -673,6 +686,39 @@ CREATE INDEX IF NOT EXISTS outbound_task_idx
   ON allgres_private.outbound_calls (task_id, status);
 CREATE INDEX IF NOT EXISTS outbound_inflight_idx
   ON allgres_private.outbound_calls (updated_at)
+  WHERE status = 'in_flight';
+
+-- OAuth token exchange, queued the same way as outbound_calls/sql_calls:
+-- queued -> in_flight -> harvested/lost, claimed by the runtime worker and
+-- run on the same HTTP thread pool. Unlike outbound_calls this has no
+-- task_id -- the exchange is an operator-initiated dashboard action, not an
+-- agent turn -- so fn_complete_oauth stores the resulting tokens directly
+-- instead of routing through fn_submit_result. request_body never holds the
+-- client_secret: fn_oauth_token_request queues everything else, and
+-- fn_claim_oauth resolves and merges the decrypted secret in at claim time,
+-- the same credential-at-claim-time shape fn_claim_outbound already uses for
+-- an LLM provider's api_key (see KNOWN_ISSUES, "provider credentials in
+-- plaintext").
+CREATE TABLE IF NOT EXISTS allgres_private.oauth_calls (
+  call_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id      uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
+  state            text NOT NULL,
+  url              text NOT NULL,
+  request_headers  jsonb NOT NULL DEFAULT '{}'::jsonb,
+  request_body     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  allow_private    boolean NOT NULL DEFAULT false,
+  status           text NOT NULL CHECK (status IN ('queued', 'in_flight', 'harvested', 'lost')),
+  response_status  int,
+  error            text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS oauth_calls_ready_idx
+  ON allgres_private.oauth_calls (created_at)
+  WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS oauth_calls_inflight_idx
+  ON allgres_private.oauth_calls (updated_at)
   WHERE status = 'in_flight';
 
 -- Agent SQL is validated here (fn_validate_sql) but executed by the runtime
@@ -1340,6 +1386,22 @@ SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
   SELECT allgres_private.decrypt_secret(api_key)
+  FROM allgres_private.llm_secrets
+  WHERE provider_id = p_provider_id
+$fn$;
+
+-- Same shape as provider_secret, for the OAuth client secret instead of the
+-- api_key column. Used only by fn_claim_oauth, at claim time -- never at
+-- queue time (fn_oauth_token_request), which is what keeps it out of
+-- oauth_calls.request_body.
+CREATE OR REPLACE FUNCTION allgres_private.oauth_client_secret(p_provider_id uuid)
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  SELECT allgres_private.decrypt_secret(oauth_client_secret)
   FROM allgres_private.llm_secrets
   WHERE provider_id = p_provider_id
 $fn$;
@@ -2882,6 +2944,26 @@ BEGIN
     n := n + 1;
   END LOOP;
 
+  -- Same reclaim, for an OAuth token exchange the worker never came back
+  -- from (a crash between fn_claim_oauth and fn_complete_oauth). No task to
+  -- notify -- oauth_calls has no task_id -- so this only marks the row
+  -- 'lost'; the operator sees the failure next time they look at the
+  -- provider (has_secret stays false) and has to restart the flow, since the
+  -- authorization code fn_oauth_token_request already consumed cannot be
+  -- redeemed a second time regardless of what this reclaim does.
+  FOR r IN
+    SELECT call_id
+    FROM allgres_private.oauth_calls
+    WHERE status = 'in_flight'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE allgres_private.oauth_calls
+    SET status = 'lost', error = 'timeout', updated_at = now()
+    WHERE call_id = r.call_id;
+    n := n + 1;
+  END LOOP;
+
   -- Same self-healing shape again, on human timescales: an await_human that
   -- nobody ever answers before its expires_at (set by fn_submit_result, 24h
   -- default) gets auto-rejected instead of holding the task open forever.
@@ -2971,6 +3053,7 @@ DECLARE
   c jsonb;
   w jsonb;
   s jsonb;
+  o jsonb;
 BEGIN
   -- Does not perform HTTP or run sandboxed SQL.  Caller claims queued rows
   -- AFTER this commits.
@@ -2978,7 +3061,8 @@ BEGIN
   d := allgres_public.fn_dispatch_tasks();
   c := allgres_public.fn_claim_outbound(4, p_fallback_key);
   s := allgres_public.fn_claim_sql(4);
-  RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s);
+  o := allgres_public.fn_claim_oauth(4);
+  RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s, 'claim_oauth', o);
 END;
 $fn$;
 
@@ -3492,8 +3576,19 @@ BEGIN
 END;
 $fn$;
 
--- OAuth token exchange is queued like an LLM call: SQL builds the request, HTTP
--- runs after commit, SQL stores the tokens.
+-- OAuth token exchange is queued the same way an agent's LLM call is: this
+-- function only builds the request and inserts a queued oauth_calls row --
+-- it never touches the client secret, so it has nothing to hand back to its
+-- caller that fn_oauth_token_request's old version used to leak (see
+-- KNOWN_ISSUES, "a second-round external review of items 18 and 19":
+-- `operator`'s existing blanket grant on allgres_public reached this
+-- function, breaking the same "the dashboard never returns a secret" rule
+-- provider_secret() being revoked from `operator` exists to enforce). The
+-- runtime worker's HTTP pool claims the row (fn_claim_oauth), performs the
+-- exchange, and fn_complete_oauth stores whatever comes back -- the same
+-- claim/complete shape as fn_claim_outbound/fn_complete_outbound, just
+-- without a task_id, since this is an operator dashboard action rather than
+-- an agent turn.
 CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_token_request(
   p_state text,
   p_code text,
@@ -3506,8 +3601,8 @@ AS $fn$
 DECLARE
   v_pid uuid;
   v allgres_private.llm_providers%ROWTYPE;
-  v_secret text;
   v_reason text;
+  v_call uuid;
 BEGIN
   SELECT provider_id INTO v_pid FROM allgres_private.oauth_states WHERE state = p_state;
   IF v_pid IS NULL THEN
@@ -3523,55 +3618,158 @@ BEGIN
     RAISE EXCEPTION 'oauth token url rejected: %', v_reason USING ERRCODE = 'P0001';
   END IF;
 
-  SELECT allgres_private.decrypt_secret(oauth_client_secret) INTO v_secret
-  FROM allgres_private.llm_secrets WHERE provider_id = v_pid;
+  -- A state is single-use from here: whether the exchange below succeeds or
+  -- fails, the authorization code has been (or is about to be) presented to
+  -- the provider, and a provider-issued code cannot be redeemed twice.
+  -- Deleting it now, rather than at completion, also means a duplicate
+  -- fn_oauth_token_request call for the same state (a doubled dashboard
+  -- click, say) queues at most one exchange, not two.
+  DELETE FROM allgres_private.oauth_states WHERE state = p_state;
 
-  RETURN jsonb_build_object(
-    'ok', true,
-    'url', v.oauth_token_url,
-    'headers', jsonb_build_object('content-type', 'application/x-www-form-urlencoded'),
-    'body', jsonb_build_object(
+  INSERT INTO allgres_private.oauth_calls (
+    provider_id, state, url, request_headers, request_body, allow_private, status
+  ) VALUES (
+    v_pid, p_state, v.oauth_token_url,
+    jsonb_build_object('content-type', 'application/x-www-form-urlencoded',
+                        'accept', 'application/json'),
+    jsonb_build_object(
       'grant_type', 'authorization_code',
       'code', p_code,
       'redirect_uri', p_redirect,
-      'client_id', v.oauth_client_id,
-      'client_secret', COALESCE(v_secret, '')
+      'client_id', v.oauth_client_id
     ),
-    'state', p_state
-  );
+    v.allow_private_network,
+    'queued'
+  )
+  RETURNING call_id INTO v_call;
+
+  RETURN jsonb_build_object('ok', true, 'queued', true, 'call_id', v_call, 'provider_id', v_pid);
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_store_tokens(
-  p_state text,
-  p_access text,
-  p_refresh text,
-  p_expires_in int
+-- Claims queued OAuth token-exchange rows for the runtime worker's HTTP pool.
+-- Same claim shape as fn_claim_outbound: the client secret is resolved and
+-- merged into the response's body right here, never written back to
+-- oauth_calls.request_body, and exists after this only in the return value
+-- and then in the worker's memory for the one HTTP request it is used for.
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_oauth(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+  v_secret text;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT call_id, provider_id, url, request_headers, request_body, allow_private
+    FROM allgres_private.oauth_calls
+    WHERE status = 'queued'
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE allgres_private.oauth_calls
+    SET status = 'in_flight', updated_at = now()
+    WHERE call_id = r.call_id;
+
+    v_secret := allgres_private.oauth_client_secret(r.provider_id);
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'call_id', r.call_id,
+      'url', r.url,
+      'headers', r.request_headers,
+      'body', r.request_body || jsonb_build_object('client_secret', COALESCE(v_secret, '')),
+      'allow_private', r.allow_private
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'calls', v_out);
+END;
+$fn$;
+
+-- Fencing identical to fn_complete_outbound/fn_complete_sql: a row only ever
+-- completes from 'in_flight'.  On success, stores the access/refresh token
+-- the same way the old public fn_oauth_store_tokens used to -- that function
+-- is gone; nothing needs to call it directly anymore, which closes the
+-- surface entirely rather than leaving it revoked-but-present.
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_oauth(
+  p_call_id uuid,
+  p_status int,
+  p_body text
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = allgres_private, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
-  v_pid uuid;
+  c allgres_private.oauth_calls%ROWTYPE;
+  v_parsed jsonb;
+  v_access text;
+  v_refresh text;
+  v_expires_in int;
 BEGIN
-  SELECT provider_id INTO v_pid FROM allgres_private.oauth_states WHERE state = p_state;
-  IF v_pid IS NULL THEN
-    RAISE EXCEPTION 'unknown oauth state' USING ERRCODE = 'P0001';
+  PERFORM set_config('statement_timeout', '2000', true);
+
+  SELECT * INTO c
+  FROM allgres_private.oauth_calls
+  WHERE call_id = p_call_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_complete_oauth: not found' USING ERRCODE = 'P0001';
   END IF;
+
+  IF c.status <> 'in_flight' THEN
+    RETURN jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status);
+  END IF;
+
+  IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+    UPDATE allgres_private.oauth_calls
+    SET status = 'harvested', response_status = p_status,
+        error = left(COALESCE(p_body, ''), 2000), updated_at = now()
+    WHERE call_id = p_call_id;
+    RETURN jsonb_build_object('action', 'error', 'status', p_status);
+  END IF;
+
+  BEGIN
+    v_parsed := p_body::jsonb;
+  EXCEPTION WHEN others THEN
+    v_parsed := NULL;
+  END;
+
+  v_access := NULLIF(v_parsed->>'access_token', '');
+  v_refresh := NULLIF(v_parsed->>'refresh_token', '');
+  v_expires_in := NULLIF(v_parsed->>'expires_in', '')::int;
+
+  IF v_access IS NULL THEN
+    UPDATE allgres_private.oauth_calls
+    SET status = 'harvested', response_status = p_status,
+        error = 'token endpoint response had no access_token', updated_at = now()
+    WHERE call_id = p_call_id;
+    RETURN jsonb_build_object('action', 'error', 'reason', 'no_access_token');
+  END IF;
+
   INSERT INTO allgres_private.llm_secrets (provider_id, access_token, refresh_token, expires_at)
   VALUES (
-    v_pid,
-    allgres_private.encrypt_secret(p_access),
-    allgres_private.encrypt_secret(p_refresh),
-    CASE WHEN p_expires_in IS NULL THEN NULL ELSE now() + make_interval(secs => p_expires_in) END
+    c.provider_id,
+    allgres_private.encrypt_secret(v_access),
+    allgres_private.encrypt_secret(v_refresh),
+    CASE WHEN v_expires_in IS NULL THEN NULL ELSE now() + make_interval(secs => v_expires_in) END
   )
   ON CONFLICT (provider_id) DO UPDATE SET
     access_token = EXCLUDED.access_token,
     refresh_token = COALESCE(EXCLUDED.refresh_token, allgres_private.llm_secrets.refresh_token),
     expires_at = EXCLUDED.expires_at;
-  DELETE FROM allgres_private.oauth_states WHERE state = p_state;
-  RETURN jsonb_build_object('ok', true, 'provider_id', v_pid);
+
+  UPDATE allgres_private.oauth_calls
+  SET status = 'harvested', response_status = p_status, updated_at = now()
+  WHERE call_id = p_call_id;
+
+  RETURN jsonb_build_object('action', 'stored', 'provider_id', c.provider_id);
 END;
 $fn$;
 
@@ -3861,7 +4059,14 @@ $seed$;
 -- KNOWN_ISSUES, "SQL sandbox function check" -- nothing beyond the seed
 -- can exist there today), and the latter holds only short-lived
 -- in-progress OAuth flow state that is stale within minutes regardless of
--- backup.
+-- backup. `oauth_calls` *is* registered, unconditionally, the same as
+-- outbound_calls/sql_calls: unlike oauth_states it is an audit trail of
+-- exchange attempts an operator may want to keep, and unlike llm_secrets it
+-- never holds a plaintext secret or token to begin with (fn_claim_oauth
+-- injects the client secret only into its in-memory response to the
+-- worker; fn_complete_oauth never writes a response body back into this
+-- table -- there is no response_body column on it at all, only a status
+-- code and, on failure, the provider's error text).
 -- ---------------------------------------------------------------------------
 
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agents',
@@ -3887,6 +4092,7 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.change_proposals', '
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.outbound_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_calls', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
@@ -3926,6 +4132,10 @@ DECLARE
   v_prompt_before text;
   v_deleg_a uuid;
   v_deleg_b uuid;
+  v_provider uuid;
+  v_state text;
+  v_call2 uuid;
+  detail_bool boolean;
 BEGIN
   SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM allgres_private.policies WHERE agent_id = v_agent;
@@ -4772,6 +4982,103 @@ BEGIN
   END;
   v := v || jsonb_build_array(jsonb_build_object('name', 'llm_provider_fails_closed_not_substituted', 'ok', ok));
 
+  -- 26. OAuth token exchange, queued rather than handed back to the caller
+  --     (see KNOWN_ISSUES.md, "a second-round external review of items 18
+  --     and 19": fn_oauth_token_request used to decrypt the client secret
+  --     and return the built request directly). A fixed provider name, like
+  --     provision_agent_role_is_idempotent's fixed test agent, so repeated
+  --     fn_selftest calls don't accumulate garbage rows.
+  INSERT INTO allgres_private.llm_providers (name, kind, base_url, is_enabled, allow_private_network,
+    oauth_auth_url, oauth_token_url, oauth_client_id)
+  VALUES ('selftest_oauth', 'oauth', 'https://selftest.invalid/oauth', true, false,
+    'https://selftest.invalid/oauth/authorize', 'https://selftest.invalid/oauth/token', 'selftest-client-id')
+  ON CONFLICT (name) DO UPDATE SET
+    oauth_auth_url = EXCLUDED.oauth_auth_url,
+    oauth_token_url = EXCLUDED.oauth_token_url,
+    oauth_client_id = EXCLUDED.oauth_client_id
+  RETURNING provider_id INTO v_provider;
+  PERFORM allgres_public.fn_set_provider(v_provider, NULL, NULL, NULL, NULL, NULL, NULL, 'selftest-secret-value');
+  DELETE FROM allgres_private.oauth_calls WHERE provider_id = v_provider;
+  DELETE FROM allgres_private.oauth_states WHERE provider_id = v_provider;
+
+  -- 26a. fn_oauth_token_request queues instead of leaking: the client secret
+  --      appears nowhere in its own return value, nor in the queued row's
+  --      request_body -- only fn_claim_oauth (worker-only) ever sees it.
+  v_state := (allgres_public.fn_oauth_start(v_provider, 'https://dashboard.local/callback')->>'state');
+  sub := allgres_public.fn_oauth_token_request(v_state, 'selftest-code', 'https://dashboard.local/callback');
+  v_call := (sub->>'call_id')::uuid;
+  ok := (sub->>'queued')::boolean IS TRUE AND v_call IS NOT NULL
+    AND NOT (sub::text LIKE '%selftest-secret-value%');
+  SELECT NOT (request_body::text LIKE '%selftest-secret-value%') AND NOT (request_body ? 'client_secret')
+    INTO detail_bool FROM allgres_private.oauth_calls WHERE call_id = v_call;
+  ok := ok AND COALESCE(detail_bool, false);
+  -- Single-use: the state is consumed at queue time, not at completion.
+  ok := ok AND NOT EXISTS (SELECT 1 FROM allgres_private.oauth_states WHERE state = v_state);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'oauth_token_request_queues_without_leaking_secret', 'ok', ok));
+
+  -- 26b. fn_claim_oauth injects the decrypted secret only into the response
+  --      it hands the worker -- never back into oauth_calls.request_body,
+  --      the same claim-time-only shape fn_claim_outbound already uses for
+  --      an LLM provider's api_key (KNOWN_ISSUES.md, item 13).
+  spec := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO sub
+  FROM jsonb_array_elements(spec->'calls') AS t(elem)
+  WHERE (elem->>'call_id')::uuid = v_call;
+  ok := sub IS NOT NULL AND sub->'body'->>'client_secret' = 'selftest-secret-value';
+  SELECT NOT (request_body::text LIKE '%selftest-secret-value%') AND status = 'in_flight'
+    INTO detail_bool FROM allgres_private.oauth_calls WHERE call_id = v_call;
+  ok := ok AND COALESCE(detail_bool, false);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'claim_oauth_injects_secret_only_into_response', 'ok', ok));
+
+  -- 26c. Fencing: identical reasoning to complete_sql_fences_stale_result --
+  --      a belated result for a call fn_watchdog already reclaimed as 'lost'
+  --      must be discarded, not stored, or a zombie worker's response could
+  --      overwrite whatever a second, later attempt actually produced.
+  UPDATE allgres_private.oauth_calls SET status = 'lost', updated_at = now() WHERE call_id = v_call;
+  comp := allgres_public.fn_complete_oauth(v_call, 200,
+    '{"access_token":"should-not-be-stored","refresh_token":"nope","expires_in":3600}');
+  ok := comp->>'action' = 'stale';
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.llm_secrets
+    WHERE provider_id = v_provider AND access_token IS NOT NULL
+      AND allgres_private.decrypt_secret(access_token) = 'should-not-be-stored'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_oauth_fences_stale_result', 'ok', ok));
+
+  -- 26d. A second, real flow: fn_complete_oauth stores what comes back,
+  --      encrypted, the same way the old public fn_oauth_store_tokens used
+  --      to -- that function is gone; this is the only path left to it.
+  v_state := (allgres_public.fn_oauth_start(v_provider, 'https://dashboard.local/callback')->>'state');
+  sub := allgres_public.fn_oauth_token_request(v_state, 'selftest-code-2', 'https://dashboard.local/callback');
+  v_call2 := (sub->>'call_id')::uuid;
+  PERFORM allgres_public.fn_claim_oauth(10);
+  comp := allgres_public.fn_complete_oauth(v_call2, 200,
+    '{"access_token":"selftest-access-tok","refresh_token":"selftest-refresh-tok","expires_in":3600}');
+  ok := comp->>'action' = 'stored';
+  ok := ok AND (
+    SELECT allgres_private.decrypt_secret(access_token) = 'selftest-access-tok'
+       AND allgres_private.decrypt_secret(refresh_token) = 'selftest-refresh-tok'
+       AND expires_at IS NOT NULL
+    FROM allgres_private.llm_secrets WHERE provider_id = v_provider
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_oauth_stores_tokens_on_success', 'ok', ok));
+
+  -- 26e. A token endpoint response with no access_token is an error, not a
+  --      silent no-op -- fn_complete_oauth must not leave the row 'in_flight'
+  --      forever waiting for a result that already arrived and was unusable.
+  v_state := (allgres_public.fn_oauth_start(v_provider, 'https://dashboard.local/callback')->>'state');
+  sub := allgres_public.fn_oauth_token_request(v_state, 'selftest-code-3', 'https://dashboard.local/callback');
+  v_call2 := (sub->>'call_id')::uuid;
+  PERFORM allgres_public.fn_claim_oauth(10);
+  comp := allgres_public.fn_complete_oauth(v_call2, 200, '{"error":"access_denied"}');
+  ok := comp->>'action' = 'error' AND comp->>'reason' = 'no_access_token';
+  SELECT status = 'harvested' INTO detail_bool FROM allgres_private.oauth_calls WHERE call_id = v_call2;
+  ok := ok AND COALESCE(detail_bool, false);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_oauth_requires_access_token', 'ok', ok));
+
+  DELETE FROM allgres_private.oauth_calls WHERE provider_id = v_provider;
+  DELETE FROM allgres_private.oauth_states WHERE provider_id = v_provider;
+
   PERFORM allgres_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -4985,6 +5292,8 @@ REVOKE ALL ON FUNCTION allgres_public.fn_claim_outbound(int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_complete_outbound(uuid, int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_claim_sql(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_claim_oauth(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_watchdog(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_selftest() FROM PUBLIC;
 
@@ -5003,6 +5312,8 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_outbound(int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_outbound(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_sql(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_oauth(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
 
@@ -5034,26 +5345,30 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres_public TO operator;
 
 -- The dashboard never returns a secret, only whether one is set (see
 -- README, "Secrets at rest") -- provider_secret() is revoked from operator
--- two lines below for exactly that reason. fn_oauth_token_request breaks
--- the same rule: it hands the decrypted OAuth client_secret straight back
--- in its return value, to whoever calls it. Nothing calls any of the
--- three OAuth functions today -- the token exchange HTTP call itself was
--- never implemented (see KNOWN_ISSUES.md, "Untested control-plane
--- paths") -- so the blanket grant above would otherwise be the only thing
--- standing between operator and a decrypted secret for a feature that
--- does not work yet. Carved out until OAuth is actually finished with a
--- real design for this (the outbound-queue pattern that already fixed the
--- same class of leak for LLM provider keys -- see KNOWN_ISSUES.md, item
--- 13 -- injecting the secret only into the runtime worker's own response
--- at claim time, never back into a table or a caller's result, is the
--- template), not before.
-REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_start(uuid, text) FROM operator;
-REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_token_request(text, text, text) FROM operator;
-REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_store_tokens(text, text, text, int) FROM operator;
+-- two lines below for exactly that reason. fn_oauth_token_request used to
+-- break that rule outright: it decrypted the OAuth client_secret and handed
+-- the built HTTP request straight back to its caller, which the blanket
+-- grant above would have handed to `operator` the moment anything wired it
+-- into dashboard_rpc (see KNOWN_ISSUES.md, "a second-round external review
+-- of items 18 and 19", for the equivalent leak this review round actually
+-- found and fixed). It is fixed now the same way item 13 already fixed the
+-- identical class of leak for an LLM provider's api_key: the secret is
+-- resolved and merged in only at claim time (fn_claim_oauth), inside the
+-- runtime worker's own response, never returned by anything `operator` can
+-- call. fn_oauth_start/fn_oauth_token_request stay under the blanket grant
+-- above -- both now return only a redirect URL / a queued call_id, nothing
+-- secret -- the same way fn_claim_outbound/fn_complete_outbound stay under
+-- it despite resolving the LLM credential internally: ownership, not the
+-- caller's own grants, is what runs their body (see the blanket-grant
+-- comment above). fn_oauth_store_tokens is gone outright -- its storage
+-- logic moved inside fn_complete_oauth, worker-only, with no public entry
+-- point left to revoke from operator in the first place.
 
 REVOKE EXECUTE ON FUNCTION allgres_private.fn_validate_sql(uuid, text) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM worker;
+REVOKE EXECUTE ON FUNCTION allgres_private.oauth_client_secret(uuid) FROM operator;
+REVOKE EXECUTE ON FUNCTION allgres_private.oauth_client_secret(uuid) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.decrypt_secret(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION allgres_private.encrypt_secret(text) FROM PUBLIC;
 
@@ -5451,6 +5766,10 @@ BEGIN
             'base_url', p.base_url,
             'is_enabled', p.is_enabled,
             'allow_private_network', p.allow_private_network,
+            'oauth_auth_url', p.oauth_auth_url,
+            'oauth_token_url', p.oauth_token_url,
+            'oauth_client_id', p.oauth_client_id,
+            'oauth_scope', p.oauth_scope,
             'has_secret', EXISTS (
               SELECT 1 FROM allgres_private.llm_secrets s
               WHERE s.provider_id = p.provider_id AND (
@@ -5472,12 +5791,33 @@ BEGIN
         CASE WHEN p_request ? 'is_enabled' THEN (p_request->>'is_enabled')::boolean ELSE NULL END,
         CASE WHEN p_request ? 'allow_private_network'
              THEN (p_request->>'allow_private_network')::boolean ELSE NULL END,
-        NULL, NULL, NULL, NULL
+        NULLIF(p_request->>'oauth_auth_url',''),
+        NULLIF(p_request->>'oauth_token_url',''),
+        NULLIF(p_request->>'oauth_client_id',''),
+        NULLIF(p_request->>'oauth_client_secret','')
       );
       IF NULLIF(p_request->>'api_key','') IS NOT NULL THEN
         PERFORM allgres_public.fn_set_provider_secret(v_id, p_request->>'api_key');
       END IF;
       RETURN jsonb_build_object('ok', true, 'provider_id', v_id);
+
+    -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
+    -- fn_oauth_start only ever returns a redirect_url and a state, neither
+    -- of which is secret, so this is safe for operator to call directly.
+    WHEN 'providers.oauth_start' THEN
+      v_id := (p_request->>'provider_id')::uuid;
+      RETURN allgres_public.fn_oauth_start(v_id, p_request->>'redirect');
+
+    -- Completes the flow: queues the token exchange (fn_oauth_token_request)
+    -- rather than performing it inline, so the operator-facing return value
+    -- is only {ok, queued, call_id, provider_id} -- never a token or the
+    -- client secret. The runtime worker's HTTP pool picks the row up and
+    -- fn_complete_oauth stores whatever comes back; settings.get's
+    -- has_secret is how the dashboard finds out it landed.
+    WHEN 'providers.oauth_callback' THEN
+      RETURN allgres_public.fn_oauth_token_request(
+        p_request->>'state', p_request->>'code', p_request->>'redirect'
+      );
 
     WHEN 'events' THEN
       RETURN jsonb_build_object(

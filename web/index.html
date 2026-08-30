@@ -183,7 +183,19 @@ async function settings(){
   $('#setTok').onclick=askToken;$('#clrTok').onclick=()=>{setTok('');location.reload()};
   $('#runSelftest').onclick=async()=>{try{$('#selftestOut').textContent='running…';const r=await api('/api/v1/selftest',{method:'POST'});$('#selftestOut').textContent=`passed ${r.passed}, failed ${r.failed}`+(r.failed?': '+(r.cases||[]).filter(c=>!c.ok).map(c=>c.name).join(', '):'')}catch(e){$('#selftestOut').textContent=e.message}}
 }
-function providerModal(p){$('#modal').classList.remove('hidden');$('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>${esc(p.name)}</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div><div class="field"><label>Base URL</label><input class="input" id="pUrl" value="${esc(p.base_url)}"></div><div class="field"><label>API key (leave blank to keep existing)</label><input type="password" class="input" id="pKey" autocomplete="new-password"></div><div class="field"><label><input type="checkbox" id="pEnabled" ${p.is_enabled?'checked':''}> Enabled</label></div><div class="field"><label><input type="checkbox" id="pPrivate" ${p.allow_private_network?'checked':''}> Allow loopback / private-network endpoint</label><div class="muted" style="font-size:12px">Needed for a local Ollama or an in-cluster gateway. Leaving this off is what stops this endpoint from being pointed at an internal address.</div></div><button class="btn primary" id="saveP">Save</button></div>`;$('#closeM').onclick=closeModal;$('#saveP').onclick=async()=>{try{await api('/api/v1/settings/provider',{method:'POST',body:JSON.stringify({provider_id:p.provider_id,base_url:$('#pUrl').value,api_key:$('#pKey').value,is_enabled:$('#pEnabled').checked,allow_private_network:$('#pPrivate').checked})});closeModal();toast('Provider saved');settings()}catch(e){toast(e.message)}}}
+function providerModal(p){
+  const isOauth=p.kind==='oauth';
+  const oauthFields=isOauth?`<div class="field"><label>Authorization URL</label><input class="input" id="pAuthUrl" value="${esc(p.oauth_auth_url||'')}"></div><div class="field"><label>Token URL</label><input class="input" id="pTokenUrl" value="${esc(p.oauth_token_url||'')}"></div><div class="field"><label>Client ID</label><input class="input" id="pClientId" value="${esc(p.oauth_client_id||'')}"></div><div class="field"><label>Client secret (leave blank to keep existing)</label><input type="password" class="input" id="pClientSecret" autocomplete="new-password"></div>`:'';
+  const connectRow=isOauth?`<div class="row" style="margin:14px 0"><button class="btn" id="connectOauth">Connect via OAuth</button><span class="spacer"></span><span class="muted" style="font-size:12px">${p.has_secret?'A token is stored for this provider.':'Not connected yet.'}</span></div>`:'';
+  $('#modal').classList.remove('hidden');$('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>${esc(p.name)}</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div><div class="field"><label>Base URL</label><input class="input" id="pUrl" value="${esc(p.base_url)}"></div>${isOauth?'':'<div class="field"><label>API key (leave blank to keep existing)</label><input type="password" class="input" id="pKey" autocomplete="new-password"></div>'}${oauthFields}<div class="field"><label><input type="checkbox" id="pEnabled" ${p.is_enabled?'checked':''}> Enabled</label></div><div class="field"><label><input type="checkbox" id="pPrivate" ${p.allow_private_network?'checked':''}> Allow loopback / private-network endpoint</label><div class="muted" style="font-size:12px">Needed for a local Ollama or an in-cluster gateway. Leaving this off is what stops this endpoint from being pointed at an internal address.</div></div>${connectRow}<button class="btn primary" id="saveP">Save</button></div>`;
+  $('#closeM').onclick=closeModal;
+  $('#saveP').onclick=async()=>{try{const body={provider_id:p.provider_id,base_url:$('#pUrl').value,is_enabled:$('#pEnabled').checked,allow_private_network:$('#pPrivate').checked};if(isOauth){body.oauth_auth_url=$('#pAuthUrl').value;body.oauth_token_url=$('#pTokenUrl').value;body.oauth_client_id=$('#pClientId').value;body.oauth_client_secret=$('#pClientSecret').value}else{body.api_key=$('#pKey').value}await api('/api/v1/settings/provider',{method:'POST',body:JSON.stringify(body)});closeModal();toast('Provider saved');settings()}catch(e){toast(e.message)}};
+  // Full-page redirect to the provider's own login page, same as any other
+  // OAuth "Connect" button -- the provider redirects back to this same
+  // dashboard URL with ?code=&state=, which the boot-time handler below
+  // (oauthCallbackOnLoad) picks up and completes via providers.oauth_callback.
+  if(isOauth)$('#connectOauth').onclick=async()=>{try{const redirect=location.origin+location.pathname;const r=await rpc('providers.oauth_start',{provider_id:p.provider_id,redirect});if(r.redirect_url)location.href=r.redirect_url}catch(e){toast(e.message)}};
+}
 // The event stream authenticates with a short-lived, single-use ticket
 // (POST /api/v1/events/ticket, gated by the real bearer token) instead of
 // carrying the durable dashboard token in the URL -- EventSource cannot set
@@ -210,5 +222,25 @@ async function startEvents(){
   es.addEventListener('snapshot',e=>{try{const d=JSON.parse(e.data);$('#health').textContent='workers online';const live=$('#live');if(live&&d.tasks){live.innerHTML=d.tasks.slice(0,8).map(t=>`<div class="row" style="padding:5px 0"><span>${esc(t.agent)}</span><span>${status(t.status)}</span><span class="mono muted">step ${esc(t.step_count)}</span></div>`).join('')||'No activity'} }catch{}});
   es.onerror=()=>{$('#health').textContent='reconnecting';es.close();esRetryTimer=setTimeout(startEvents,1500)};
 }
-nav();loadPage();startEvents();
+// If the page just loaded from a provider's OAuth redirect (?code=&state=),
+// complete the flow before anything else renders. The redirect_uri
+// registered with the provider is this dashboard's own URL, so this is the
+// only place a code/state pair can arrive -- there is no separate callback
+// route. providers.oauth_callback only ever queues the exchange (see
+// KNOWN_ISSUES.md, "a second-round external review of items 18 and 19"), so
+// nothing secret ever reaches this page: the runtime worker performs the
+// real token exchange in the background and settings.get's has_secret is
+// how a later Settings load finds out it landed.
+async function oauthCallbackOnLoad(){
+  const qs=new URLSearchParams(location.search);
+  const oauthCode=qs.get('code'), oauthState=qs.get('state');
+  if(!oauthCode||!oauthState)return;
+  history.replaceState({}, '', location.pathname);
+  try{
+    await rpc('providers.oauth_callback',{code:oauthCode,state:oauthState,redirect:location.origin+location.pathname});
+    toast('OAuth exchange queued -- check back in a moment for the connected status.');
+  }catch(e){toast('OAuth callback failed: '+e.message)}
+  state.page='Settings';
+}
+oauthCallbackOnLoad().finally(()=>{nav();loadPage();startEvents()});
 </script></body></html>
