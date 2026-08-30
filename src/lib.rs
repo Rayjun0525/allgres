@@ -1664,10 +1664,23 @@ fn handle_web_connection(mut s: TcpStream, cfg: &WebConfig) {
         return;
     }
 
-    if path == "/mock/chat/completions" {
+    if path == "/mock/chat/completions" || path == "/mock/slow/chat/completions" {
         if !cfg.mock_enabled {
             respond_json(&mut s, "404 Not Found", "{\"ok\":false,\"error\":\"not_found\"}");
             return;
+        }
+        // The /mock/slow variant exists only for scripts/fault_injection_drill.sh:
+        // a deliberately slow response gives that drill a genuine multi-second
+        // window in which a real outbound_calls row is in_flight on a real HTTP
+        // pool thread, wide enough to reliably SIGKILL the worker mid-request
+        // before this ever replies (see KNOWN_ISSUES.md item 6/26 -- proving a
+        // worker crash between claim and complete is recovered from needs an
+        // actual in-flight call to kill, not a synthetic 'in_flight' row).
+        // Comfortably under HTTP_TIMEOUT (45s) so an unkilled request here still
+        // completes normally -- used again by that same drill's automatic-retry
+        // phase, which lets this one actually finish.
+        if path == "/mock/slow/chat/completions" {
+            std::thread::sleep(Duration::from_secs(15));
         }
         let body = json!({
             "id": "allgres-mock",

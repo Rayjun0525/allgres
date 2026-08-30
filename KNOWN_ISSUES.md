@@ -95,16 +95,14 @@ No test covers these; they are wired up but unexercised:
 - ~~the OAuth flow~~ — fixed, see item 24: the token exchange HTTP call is
   now actually performed, by the runtime worker, and covered by both
   `fn_selftest` and a real `tests/e2e_mock.sql` round trip.
-- the `delegate` action end to end (child task creation is covered by unit-level
-  assertions only);
-- `fn_watchdog` reclaiming a genuinely stuck **in-flight** call, for either
-  `outbound_calls` or `sql_calls` (a runtime worker crash between claim and
-  complete). `fn_watchdog` now has four reclaim loops total; the other two
-  (pending-approval expiry, `max_turn_seconds` — see item 11) got selftest
-  coverage in the same pass that added them, using the same technique this
-  pair would need (mark a row in the relevant state, backdate its timestamp,
-  call `fn_watchdog`, assert the reclaim) — nothing stops writing the same
-  tests here, it just hasn't been done yet.
+- ~~the `delegate` action end to end~~ — fixed by item 23: `delegate_depth_
+  exceeded_rejected`, `delegate_cycle_rejected`, `delegate_session_task_
+  limit_rejected`, and `delegate_succeeds_within_budget` now cover it in
+  `fn_selftest`.
+- ~~`fn_watchdog` reclaiming a genuinely stuck **in-flight** call~~ — fixed,
+  see item 26: `scripts/fault_injection_drill.sh` actually kills the real
+  worker mid-call, for both `outbound_calls` and `sql_calls`, and proves the
+  real, unattended recovery cycle, not a synthetic 'lost' row.
 
 `await_human` / `fn_decide_approval` themselves are no longer on this list —
 see item 10. Neither is task/session cancellation, permission and allowlist
@@ -1689,3 +1687,129 @@ memory, beyond the browser's own, the same caveat item 11 already names for
 the truth about a `subject_id` — it is free text an agent or operator
 chooses to write, not tied to any real accounts system, because there isn't
 one yet (item 10).
+
+## 26. A genuine fault-injection drill: killing the real worker mid-call, not simulating it
+
+Item 6 named this from the start and every pass since kept deferring it:
+`fn_watchdog` reclaiming a call stuck `in_flight` because the runtime worker
+crashed between claim and complete had selftest coverage only in the
+*synthetic* sense — `complete_sql_fences_stale_result`/
+`complete_outbound_fences_stale_result` and the pair added for OAuth (item
+24) all prove the fencing logic is correct by `UPDATE ...SET status =
+'lost'` and then calling the complete function directly. That proves the
+*state machine* is correct. It proves nothing about whether a real crash of
+the real worker process, at the real point where it is genuinely blocked on
+a genuinely long-running call, actually gets noticed and recovered from by
+the real, periodic `fn_watchdog` pass running unattended in a process that
+had to restart itself first. Those are different claims, and only one of
+them had ever been checked live.
+
+**What this is**: `scripts/fault_injection_drill.sh`, a new runnable,
+re-runnable drill in the same family as `scripts/backup_drill.sh` (item
+18) — not a `fn_selftest` case, because what it tests cannot be expressed
+as one: it needs a real OS-level `kill -9` against a real backend PID,
+which no SQL function can do to itself. Two phases, one for each queue item
+6 named:
+
+- **Phase 1, `sql_calls`.** A real agent, a real session, a real
+  `execute_sql` action (`SELECT count(*) FROM generate_series(1,
+  200000000) g` — an allowlisted, legitimately slow query, not
+  `pg_sleep()`, which the sandbox denies) submitted through
+  `fn_submit_result` exactly as the runtime worker would after a real LLM
+  turn. The drill polls until the real worker's real `pump_sql()` claims it
+  (`sql_calls.status = 'in_flight'`), reads the real worker's PID out of
+  `pg_stat_activity` (`backend_type = 'allgres runtime'`), and sends it a
+  real `SIGKILL` while the query is genuinely executing on that worker's
+  SPI thread.
+- **Phase 2, `outbound_calls`.** The same shape, for a real LLM/HTTP call
+  instead: a new mock endpoint, `/mock/slow/chat/completions` (`src/lib.rs`,
+  gated by `ALLGRES_ENABLE_MOCK` exactly like the existing
+  `/mock/chat/completions`), sleeps 15 seconds — comfortably under
+  `HTTP_TIMEOUT` (45s) — before replying, giving a real window in which a
+  real `outbound_calls` row is genuinely `in_flight` on a real HTTP pool
+  thread inside the worker process. Same kill, same recovery check.
+
+**What killing the worker actually does, confirmed live, not assumed**:
+PostgreSQL treats an unexpected exit of *any* backend attached to shared
+memory — a background worker with `enable_spi_access()` (`src/lib.rs`)
+included — exactly like any other backend crash: it tears down every other
+connection and replays crash recovery for the whole instance. This is
+standard PostgreSQL behavior, not something specific to Allgres or this
+drill, and the drill's own header says so explicitly: it kills and restarts
+the *entire* instance it is pointed at, on purpose, and must never be run
+against a cluster serving real traffic. The `allgres runtime` worker
+relaunches itself once recovery finishes, with no operator action, via the
+`set_restart_time` already configured in its `BackgroundWorkerBuilder`
+(`src/lib.rs`) — nothing new added for this drill, just verified live for
+the first time.
+
+After the kill, the drill:
+
+1. confirms the log actually shows a crash (`terminated by signal` /
+   `crash of another server process`) followed by `database system is
+   ready to accept connections` — refusing to pass if recovery merely
+   *looked* clean without an actual crash being logged;
+2. confirms the row is still `in_flight` immediately after recovery — it
+   was committed by `fn_claim_sql`/`fn_claim_outbound` in its own
+   transaction *before* the slow call ever started running in a separate
+   one, so a crash mid-call cannot roll the claim back;
+3. waits — up to 130s, no shortened threshold — for the row to reach
+   `'lost'` **on its own**, checking only what the real, restarted worker's
+   own periodic `fn_watchdog` pass did, never calling `fn_watchdog`
+   directly itself. The real threshold is `2 × HTTP_TIMEOUT` = 90s
+   (`dispatch_and_claim`, `src/lib.rs`), not a drill-only fast path, so
+   this genuinely waits as long as a real crash would before recovery
+   starts;
+4. confirms the timeout is visible in the task's own `execution_logs`, not
+   silently swallowed;
+5. then does **nothing further by hand** — no manual resubmission — and
+   instead waits for the real, unattended `fn_dispatch_tasks` (also running
+   inside the same real restarted worker) to redispatch the task on its own
+   and reach `'completed'`.
+
+**A real design mistake in the drill itself, caught by the drill failing on
+its first live run**: the first version left the throwaway agent on its
+seed default LLM provider. The moment `fn_watchdog` logged the timeout, the
+real `fn_dispatch_tasks` — which advances *any* `'running'` task with
+nothing pending, unconditionally, on its own schedule — immediately queued
+a real LLM call against that real (unreachable, from here) provider, which
+failed on a real TLS error twice and exhausted `max_retries` (2) before the
+script's own polling loop ever got to check anything: `status='failed'`
+where `'running'` was expected. Not a bug in `fn_watchdog` or the reclaim
+path — both had already worked correctly by that point, confirmed by the
+row correctly reaching `'lost'` — but a real gap in the drill's own design:
+it had implicitly assumed the task would sit still between the reclaim and
+whatever the script did next, when the real production pump loop never
+sits still for anyone. Fixed by pointing the agent at the same mock
+provider `tests/e2e_mock.sql` already uses (phase 1) and the new
+`/mock/slow` one (phase 2) *before* the crash, so the automatic redispatch
+that was always going to happen either way now succeeds instead of racing
+a real network call to nowhere. This makes the drill prove the *whole* real
+cycle — claim → crash → recovery → reclaim → automatic redispatch →
+completion — rather than only the reclaim step in isolation, which was the
+more valuable claim to prove regardless.
+
+**Verified live, both phases, end to end, twice** (once before and once
+after adding the `/mock/slow` endpoint required a rebuild): `cargo build`/
+`cargo test` (30/30) clean, `fn_selftest` clean before and after each run,
+`tests/smoke.sql`/`tests/e2e_mock.sql` unaffected. `scripts/
+fault_injection_drill.sh` itself passing both phases is the primary
+evidence — a `SIGKILL` against a live, genuinely-in-flight backend, a real
+crash logged, real recovery, real unattended reclaim after the real
+production timeout, and real unattended completion afterward, for both
+queues item 6 named.
+
+**Deliberately not covered**: `oauth_calls` (item 24) is not exercised by
+this drill — its own reclaim loop is identical in shape to the two tested
+here and was already added defensively when that item shipped, but a
+genuine crash-mid-exchange test would need a real, unconsumed authorization
+code to retry with, which a mock OAuth provider cannot supply after the
+fact (the code is single-use by design, see item 24's own account of why
+the state row is deleted at queue time, not completion time) — a real
+retry after that kind of crash is a fresh operator-initiated "Connect"
+click in production, not something this drill can simulate. Also not
+covered: a crash of the `allgres web` worker (dashboard HTTP listener)
+mid-request — that worker holds no durable claim a watchdog would need to
+reclaim, so there is no analogous state to test recovery of; a dropped
+in-flight dashboard request simply fails and the browser retries, which is
+already how any ordinary HTTP client behaves against any server restart.

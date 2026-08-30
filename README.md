@@ -74,10 +74,8 @@ Not yet built:
 - Secret key rotation, and a token *refresh* flow (an expired OAuth access
   token has to be reconnected from Settings; nothing calls `refresh_token`
   automatically yet).
-- Semantic memory search (an embedding column and vector similarity) — recall
-  is importance/recency ranking only in this slice; and no fault-injection
-  test yet for `fn_watchdog` reclaiming a worker that crashes mid-call (see
-  KNOWN_ISSUES, "Untested control-plane paths").
+- Semantic memory search (an embedding column and vector similarity) —
+  recall is importance/recency ranking only in this slice.
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
@@ -585,6 +583,16 @@ cargo pgrx test --features pg17   # Rust unit tests (request parsing, auth, pars
 ./scripts/smoke.sh                # container smoke, end-to-end, and security checks
 psql -c "SELECT allgres_public.fn_selftest()"
 ```
+
+`scripts/fault_injection_drill.sh` is a separate, runnable drill (bare-metal,
+like `scripts/backup_drill.sh`) that sends a real `SIGKILL` to the real
+`allgres runtime` worker while a real sandboxed-SQL call and a real LLM/HTTP
+call are genuinely in flight, and proves the whole claim → crash → recovery
+→ `fn_watchdog` reclaim → automatic retry → completion cycle happens on its
+own — not a `fn_selftest` case, since that would need a SQL function to kill
+its own OS process. It kills and restarts the entire instance it is pointed
+at, on purpose; never run it against anything serving real traffic. See
+KNOWN_ISSUES.md, item 26.
 
 ## License
 
