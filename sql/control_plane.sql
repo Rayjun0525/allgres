@@ -1128,6 +1128,55 @@ AS
   WHERE agent_id IS NOT DISTINCT FROM allgres_private.current_agent_id()
     AND allgres_private.agent_may_read('allgres_public.v_sales', allgres_private.current_agent_id());
 
+-- Read-only diagnostic views for a maintenance/auditor agent (README,
+-- "Maintenance agents"). Same permission-gated shape as v_sales/
+-- v_my_tasks, but with no agent_id ownership column to filter rows by --
+-- these describe the system as a whole, not any one agent's own data, so
+-- agent_may_read alone decides visibility: an agent without the grant sees
+-- zero rows (a bare SELECT with no FROM clause and a false WHERE returns
+-- none, the same as any other filtered query), an agent with it sees the
+-- same picture every other agent holding the grant would -- there is
+-- nothing per-agent to scope further.
+CREATE OR REPLACE VIEW allgres_public.v_system_health
+  WITH (security_barrier = true)
+AS
+  SELECT
+    -- Same caveat as the dashboard's own Workers panel (KNOWN_ISSUES.md,
+    -- item 5): `allgres web` deliberately has no database connection, so a
+    -- background worker without one never appears in pg_stat_activity at
+    -- all -- this reads as "1 worker online" even when both are healthy,
+    -- not a sign the web worker is down.
+    (SELECT count(*) FROM pg_stat_activity WHERE backend_type IN ('allgres runtime', 'allgres web')) AS workers_online,
+    (SELECT count(*) FROM allgres_private.outbound_calls WHERE status = 'queued') AS outbound_queued,
+    (SELECT count(*) FROM allgres_private.outbound_calls WHERE status = 'in_flight') AS outbound_in_flight,
+    (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'queued') AS sql_queued,
+    (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'in_flight') AS sql_in_flight,
+    (SELECT count(*) FROM allgres_private.oauth_calls WHERE status = 'queued') AS oauth_queued,
+    (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued', 'running', 'waiting_human')) AS running_tasks,
+    (SELECT count(*) FROM allgres_private.tasks WHERE status = 'failed' AND updated_at > now() - interval '24 hours') AS failed_tasks_24h,
+    (SELECT count(*) FROM allgres_private.human_approvals WHERE status = 'pending') AS pending_approvals,
+    (SELECT count(*) FROM allgres_private.agent_memories WHERE expires_at IS NOT NULL AND expires_at < now()) AS expired_memories_pending
+  WHERE allgres_private.agent_may_read('allgres_public.v_system_health', allgres_private.current_agent_id());
+
+-- One row per (agent, resource) grant -- the full permission matrix a
+-- security-auditor agent needs to spot an anomaly (an inactive agent still
+-- holding grants, an unusually broad http_host, a permission nobody has
+-- used).  Nothing here is secret: names, resource types and refs, and
+-- when a grant was made -- never a credential.
+CREATE OR REPLACE VIEW allgres_public.v_permission_audit
+  WITH (security_barrier = true)
+AS
+  SELECT
+    a.agent_id,
+    a.name AS agent_name,
+    a.is_active AS agent_is_active,
+    p.resource_type,
+    p.resource_ref,
+    p.granted_at
+  FROM allgres_private.permissions p
+  JOIN allgres_private.agents a USING (agent_id)
+  WHERE allgres_private.agent_may_read('allgres_public.v_permission_audit', allgres_private.current_agent_id());
+
 -- ---------------------------------------------------------------------------
 -- 4. Outbound URL / host guards.
 --
@@ -4203,7 +4252,8 @@ VALUES
 ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
-VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks')
+VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks'),
+       ('allgres_public.v_system_health'), ('allgres_public.v_permission_audit')
 ON CONFLICT DO NOTHING;
 
 DO $seed$
@@ -4264,6 +4314,61 @@ $prompt$,
 END
 $seed$;
 
+-- A first, deliberately narrow maintenance/auditor agent (README,
+-- "Maintenance agents"): read-only, no mutation surface at all in this
+-- slice -- not even propose_change is part of its seeded prompt. It reads
+-- v_system_health/v_permission_audit, reports what it finds as its own
+-- final_answer (visible in the Sessions thread view like any other run),
+-- and remembers anything worth comparing against next time so trends are
+-- visible across runs, not just a single snapshot -- the same `remember`
+-- action any other agent has, no special case needed. There is no
+-- scheduler that runs this automatically; an operator (or an external cron
+-- hitting POST /api/v1/run) triggers it, the same as any other agent.
+DO $seed$
+DECLARE
+  v_agent uuid;
+BEGIN
+  SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'health_monitor';
+
+  IF v_agent IS NULL THEN
+    INSERT INTO allgres_private.agents (name) VALUES ('health_monitor') RETURNING agent_id INTO v_agent;
+
+    UPDATE allgres_private.policies
+    SET system_prompt = $prompt$You are Allgres's own health and security monitor. Reply with one JSON object only. No markdown, no prose.
+
+Allowed:
+{"action":"final_answer","answer":"..."}
+{"action":"execute_sql","sql":"SELECT ..."}
+{"action":"remember","content":"...","memory_type":"episodic","importance":0.0-1.0,"subject_id":"system_health"}
+
+You can read exactly two views: allgres_public.v_system_health (worker
+counts, queue backlogs, pending approvals, recent failures) and
+allgres_public.v_permission_audit (every agent's permission grants). You
+cannot change anything -- no propose_change, no delegate, no tools. Your
+job is to look, compare against what you remembered last time (it is
+already in your own context below, if you have run before), and report:
+what changed, anything that looks wrong (a queue backlog that never drains,
+an inactive agent that still holds grants, a spike in failed tasks), and
+whether it is worth an operator's attention. Remember anything worth
+comparing against next run, then give your final_answer as a short summary
+a human would actually want to read.
+$prompt$,
+        max_steps = 6,
+        max_retries = 2,
+        updated_at = now()
+    WHERE agent_id = v_agent;
+  END IF;
+
+  INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+  SELECT v_agent, x.resource_type, x.resource_ref
+  FROM (VALUES
+    ('view', 'allgres_public.v_system_health'),
+    ('view', 'allgres_public.v_permission_audit')
+  ) AS x(resource_type, resource_ref)
+  ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
+END
+$seed$;
+
 -- ---------------------------------------------------------------------------
 -- 10b. Extension configuration tables -- which of this extension's own
 --      tables `pg_dump` includes data for, and on what terms.
@@ -4284,7 +4389,8 @@ $seed$;
 --
 -- Tables with no seed rows at all dump unconditionally. The tables section
 -- 10 above seeds (llm_providers, sql_sandbox_allowlist, and
--- agents/policies/permissions/demo_sales for the built-in 'analyst' agent)
+-- agents/policies/permissions for the built-in 'analyst' and
+-- 'health_monitor' agents, plus demo_sales for 'analyst' alone)
 -- exclude exactly those seeded rows: the extension script recreates them
 -- fresh on every install, and dumping them too would try to INSERT a
 -- second copy on top and fail on the same UNIQUE constraint that makes
@@ -4309,17 +4415,17 @@ $seed$;
 -- ---------------------------------------------------------------------------
 
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agents',
-  $cfgdump$WHERE name <> 'analyst'$cfgdump$);
+  $cfgdump$WHERE name NOT IN ('analyst', 'health_monitor')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.policies',
-  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor'))$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.permissions',
-  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor'))$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.demo_sales',
   $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_providers',
   $cfgdump$WHERE name NOT IN ('xai', 'openai', 'anthropic', 'ollama', 'openai_compat')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_sandbox_allowlist',
-  $cfgdump$WHERE resource_ref NOT IN ('allgres_public.v_sales', 'allgres_public.v_my_tasks')$cfgdump$);
+  $cfgdump$WHERE resource_ref NOT IN ('allgres_public.v_sales', 'allgres_public.v_my_tasks', 'allgres_public.v_system_health', 'allgres_public.v_permission_audit')$cfgdump$);
 
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.policy_history', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.projects', '');
@@ -5435,6 +5541,30 @@ BEGIN
   v := v || jsonb_build_array(jsonb_build_object('name', 'fn_remember_and_fn_forget_round_trip', 'ok', ok));
 
   DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+
+  -- 28. The seeded maintenance/auditor agent (README, "Maintenance
+  --     agents") can read v_system_health/v_permission_audit; a plain
+  --     agent with no grant for either sees zero rows from both -- the
+  --     same enforcement views_enforce_permission already proved for
+  --     v_sales, now for the system-wide views instead of a per-agent-
+  --     owned one (no agent_id column to filter by; agent_may_read alone
+  --     gates the whole row set).
+  SELECT agent_id INTO v_prov_agent FROM allgres_private.agents WHERE name = 'health_monitor';
+  ok := v_prov_agent IS NOT NULL;
+
+  PERFORM set_config('allgres.agent_id', v_prov_agent::text, true);
+  SELECT count(*) INTO n_logs FROM allgres_public.v_system_health;
+  ok := ok AND n_logs = 1;
+  SELECT count(*) INTO n_logs FROM allgres_public.v_permission_audit;
+  ok := ok AND n_logs > 0;
+
+  PERFORM set_config('allgres.agent_id', v_agent::text, true);
+  SELECT count(*) INTO n_logs FROM allgres_public.v_system_health;
+  ok := ok AND n_logs = 0;
+  SELECT count(*) INTO n_logs FROM allgres_public.v_permission_audit;
+  ok := ok AND n_logs = 0;
+  PERFORM set_config('allgres.agent_id', '', true);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'maintenance_views_enforce_permission', 'ok', ok));
 
   PERFORM allgres_private.selftest_cleanup();
 

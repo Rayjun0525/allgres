@@ -1813,3 +1813,90 @@ mid-request — that worker holds no durable claim a watchdog would need to
 reclaim, so there is no analogous state to test recovery of; a dropped
 in-flight dashboard request simply fails and the browser retries, which is
 already how any ordinary HTTP client behaves against any server restart.
+
+## 27. Maintenance/auditor agents, slice one: two diagnostic views and a read-only seeded agent
+
+A second-round review's proposal (the same one this file's later items have
+been working through) argued for a layer of system-facing agents above the
+user-facing ones — a health agent, a security/policy auditor, a memory
+curator, a performance advisor — each reading operational state and either
+reporting a finding or, for anything that needs to actually change, routing
+through a proposal an operator decides, never mutating directly. This is a
+first, deliberately narrow slice of that, the same framing items 15 and 25
+already used: does the core mechanism work — an ordinary agent reading real
+operational signals through the existing permission-gated view mechanism,
+with genuinely no path to mutate anything — before building a curation UI,
+a scheduler, or a proposal-routed remediation flow on top of it.
+
+**What was built**: two new views, `allgres_public.v_system_health` (worker
+presence, per-queue backlog counts for `outbound_calls`/`sql_calls`/
+`oauth_calls`, running/failed task counts, pending approvals, unswept
+expired memories) and `allgres_public.v_permission_audit` (every agent's
+`(resource_type, resource_ref, granted_at)` grants, joined to the agent's
+name and `is_active`) — no new table, no new action, no new trust boundary.
+Both are system-wide rather than per-agent-owned data, so neither needed
+the `agent_id IS NOT DISTINCT FROM current_agent_id()` row filter
+`v_sales`/`v_my_tasks` use; `agent_may_read` alone gates the whole row set,
+the same function and the same two-layer check (allowlist ∩ permission)
+every sandboxed view already goes through — a maintenance agent's read
+access is exactly as revocable, and exactly as auditable, as any other
+agent's `execute_sql` permission, nothing bespoke.
+
+A seeded agent, `health_monitor`, ships with both views granted and nothing
+else: no `v_sales`, no tools, no `delegate`, and — deliberately, matching
+how conservative this slice chose to be — no `propose_change` in its own
+seeded prompt either, even though the action exists and would work if
+added. It uses only what every agent already has: `execute_sql` against
+the two new views, `remember` to persist a finding for comparison against
+its next run (a nice fit with item 25's own memory feature — a maintenance
+agent's whole "compare against last time" behavior is just ordinary recall,
+no special case), and `final_answer` to report what it found, in the same
+Sessions thread view any other agent's run already surfaces. There is no
+scheduler; an operator (or an external `cron` job hitting
+`POST /api/v1/run`, no different from automating any other agent) decides
+when it runs.
+
+**Verified live**, the same standard as items 12–26: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 95/95 (one new case,
+`maintenance_views_enforce_permission`: `health_monitor` sees both views
+populated, `analyst` — granted neither — sees zero rows from both,
+mirroring `views_enforce_permission`'s own technique for `v_sales`).
+`tests/smoke.sql`/`tests/e2e_mock.sql` unaffected (no Rust change in this
+pass). A real `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from a real
+0.2.0 install (on a fully cleaned cluster, per item 19's own account of the
+leftover-role trap) confirms both views and the seeded agent exist
+post-upgrade and `fn_selftest` stays 95/95. `scripts/backup_drill.sh`
+(item 18) re-run end to end, both physical and logical paths, confirms the
+`sql_sandbox_allowlist`/`agents`/`policies`/`permissions` seed-exclusion
+filters (now naming `health_monitor` alongside `analyst`) don't collide on
+restore. Also driven through the real pipeline, not just `fn_selftest`:
+`health_monitor` pointed at the same mock LLM provider
+`tests/e2e_mock.sql` uses and run through a real session via the real
+background worker end to end, reaching `'completed'`; a headless-browser
+(Playwright/Chromium) pass confirming it renders correctly in the Agents
+page.
+
+`v_system_health`'s `workers_online` count carries the same caveat item 5
+already names for the dashboard's own Workers panel: `allgres web` has no
+database connection and so never appears in `pg_stat_activity` at all —
+confirmed live (`workers_online` read `1` with both workers actually
+healthy) rather than assumed from the existing item 5 text, and now noted
+directly in the view's own comment so a future reader of *this* view
+doesn't have to rediscover it.
+
+**Deliberately not built**: the scheduler that would make a maintenance
+agent actually "maintain" anything unattended — this slice only proves an
+agent *can* read and report; making that happen automatically needs either
+a `pg_cron` dependency or a new recurring-task primitive in the runtime
+worker, either a materially bigger and separately-considered change than
+this one; any way for a maintenance agent to act on a finding beyond
+reporting it — `propose_change` is available to any agent already, but
+`health_monitor`'s own seeded prompt doesn't use it, on purpose, so a real
+recommendation still requires an operator to read the session and decide,
+not an auto-applied policy; the other roles the review proposed (a policy
+auditor beyond raw permission grants, a memory curator, a performance
+advisor) — `v_permission_audit` gives a security/policy auditor its raw
+material but nothing analyzes it yet, and a memory curator is really just
+an agent with `memories.list`-equivalent read access plus a prompt, not
+attempted here; and no operator identity attached to who triggered a
+maintenance run, for the reason item 10 gives throughout.

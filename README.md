@@ -64,6 +64,11 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   its policy and permission bounds already are. An operator can also seed or
   remove a memory directly from the new Memories page. See
   [Memory](#memory).
+- **Maintenance agents** — an ordinary agent can be pointed at two new
+  system-wide, permission-gated diagnostic views (worker/queue health,
+  every agent's permission grants) and asked to report what it finds; a
+  seeded example, `health_monitor`, ships read-only with both. See
+  [Maintenance agents](#maintenance-agents).
 
 Not yet built:
 
@@ -232,6 +237,41 @@ already injected automatically; and row-level security on
 `SECURITY DEFINER` function's own `agent_id` parameter rather than Postgres
 RLS (see "Per-agent roles" below for the one place RLS is actually used
 today).
+
+## Maintenance agents
+
+An agent can be a system-facing operator instead of a user-facing one: read
+`allgres_public.v_system_health` (worker presence, queue backlogs, pending
+approvals, failures in the last 24h, expired-but-unswept memories) and
+`allgres_public.v_permission_audit` (every agent's permission grants), form
+an opinion, and report it — the same `execute_sql`/`final_answer`/`remember`
+actions any other agent has, no special agent "kind" or new action type
+needed. Both views are system-wide, not per-agent data, so there is nothing
+to row-scope: `agent_may_read` alone decides whether an agent sees them at
+all — zero rows without the grant, the full picture with it.
+
+A seeded example, `health_monitor`, ships with both views granted and
+nothing else — no `execute_sql` access to any business-data view, no
+`delegate`, no tools, and deliberately no `propose_change` in its prompt
+either: this first slice is read-and-report only, more conservative than a
+maintenance agent strictly needs to be, on purpose. It compares against
+what it `remember`ed on its last run (already sitting in its own context,
+the same recall every other agent gets) and gives a short human-readable
+summary as its `final_answer` — visible in the Sessions thread view like
+any other run.
+
+There is no scheduler: nothing runs `health_monitor` automatically. An
+operator triggers it from the Run page, or an external `cron` job hits
+`POST /api/v1/run` the same way any other automation would. Deliberately
+not built: an internal recurring-task primitive (a `pg_cron` dependency or
+a new scheduling loop in the runtime worker); a way for a maintenance agent
+to *act* on what it finds — even `propose_change` isn't wired into its
+seeded prompt, so a real finding still requires an operator to read the
+session and decide, the same review-before-apply shape self-modification
+already uses; and any auditor beyond the two views above (a memory curator,
+a performance advisor) — the review that proposed this pattern named
+several; this ships the two with the clearest, most immediately useful
+read surface already in place.
 
 ## Known limitations
 
