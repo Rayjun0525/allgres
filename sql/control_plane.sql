@@ -609,6 +609,30 @@ CREATE INDEX IF NOT EXISTS agent_memories_expiry_idx
   ON allgres_private.agent_memories (expires_at)
   WHERE expires_at IS NOT NULL;
 
+-- A lightweight audit trail (README, "Operator audit log"), deliberately
+-- not a real accounts system: the dashboard has one shared bearer token
+-- (see "Exposure" in the README's Security model), not per-operator
+-- credentials, so there is no authenticated identity to attach here.
+-- operator_name is self-reported -- text the browser sends alongside every
+-- request, the same way the dashboard token itself is (sessionStorage, per
+-- browser tab) -- and dashboard_rpc writes one row per consequential
+-- action in the same transaction as the mutation itself, so a row only
+-- ever exists for something that actually committed. This answers "who
+-- claimed responsibility for this," not "who was authenticated to do it" --
+-- anyone holding the one shared token can type any name, or none. See
+-- KNOWN_ISSUES.md, item 10, for what a real accounts system would need
+-- instead, and item 28 for why this lighter version was built first.
+CREATE TABLE IF NOT EXISTS allgres_private.audit_log (
+  audit_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  operator_name text,
+  action        text NOT NULL,
+  details       jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS audit_log_created_idx
+  ON allgres_private.audit_log (created_at DESC);
+
 CREATE TABLE IF NOT EXISTS allgres_private.human_approvals (
   approval_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
@@ -882,6 +906,24 @@ DROP TRIGGER IF EXISTS execution_logs_no_update ON allgres_private.execution_log
 CREATE TRIGGER execution_logs_no_update
   BEFORE UPDATE OR DELETE ON allgres_private.execution_logs
   FOR EACH ROW EXECUTE FUNCTION allgres_private.forbid_log_mutation();
+
+-- An audit trail that can be edited or deleted isn't one -- append-only,
+-- the same enforcement (trigger + REVOKE, not just convention) execution_logs
+-- already has, for the same reason.
+CREATE OR REPLACE FUNCTION allgres_private.forbid_audit_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  RAISE EXCEPTION 'audit_log is append-only'
+    USING ERRCODE = 'P0001';
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS audit_log_no_update ON allgres_private.audit_log;
+CREATE TRIGGER audit_log_no_update
+  BEFORE UPDATE OR DELETE ON allgres_private.audit_log
+  FOR EACH ROW EXECUTE FUNCTION allgres_private.forbid_audit_mutation();
 
 CREATE OR REPLACE FUNCTION allgres_private.ensure_policy()
 RETURNS trigger
@@ -4439,6 +4481,7 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.outbound_calls', '')
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agent_memories', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.audit_log', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
@@ -5566,6 +5609,50 @@ BEGIN
   PERFORM set_config('allgres.agent_id', '', true);
   v := v || jsonb_build_array(jsonb_build_object('name', 'maintenance_views_enforce_permission', 'ok', ok));
 
+  -- 29. Operator audit log (README, "Operator audit log"): a consequential
+  --     dashboard_rpc action writes exactly one row, with the self-
+  --     reported operator_name and (for an action carrying one) no
+  --     credential anywhere in it; a read-only action writes none; the
+  --     table refuses UPDATE/DELETE even from the function's own owner,
+  --     not just from operator (see audit_log_no_update's own comment for
+  --     why a REVOKE alone would not have been enough).
+  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'allowlist.remove', 'ref', 'selftest_audit_marker'));
+  sub := allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'allowlist.add', 'ref', 'selftest_audit_marker', 'operator_name', 'selftest_operator'
+  ));
+  ok := (sub->>'ok')::boolean IS TRUE;
+  SELECT operator_name = 'selftest_operator' AND details = jsonb_build_object('ref', 'selftest_audit_marker')
+  INTO detail_bool
+  FROM allgres_private.audit_log
+  WHERE action = 'allowlist.add' AND details->>'ref' = 'selftest_audit_marker'
+  ORDER BY created_at DESC LIMIT 1;
+  ok := ok AND COALESCE(detail_bool, false);
+  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'allowlist.remove', 'ref', 'selftest_audit_marker'));
+
+  SELECT count(*) INTO n_logs FROM allgres_private.audit_log;
+  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'overview'));
+  SELECT count(*) INTO v_gen FROM allgres_private.audit_log;
+  ok := ok AND v_gen = n_logs;
+
+  sub := allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'provider.update', 'provider_id', v_provider,
+    'api_key', 'selftest-should-not-leak-into-audit-log', 'operator_name', 'selftest_operator'
+  ));
+  SELECT NOT (details::text LIKE '%selftest-should-not-leak%') INTO detail_bool
+  FROM allgres_private.audit_log WHERE action = 'provider.update' ORDER BY created_at DESC LIMIT 1;
+  ok := ok AND COALESCE(detail_bool, false);
+  PERFORM allgres_public.fn_set_provider(v_provider, NULL, NULL, NULL, NULL, NULL, NULL, 'selftest-secret-value');
+
+  BEGIN
+    UPDATE allgres_private.audit_log SET operator_name = 'tampered'
+    WHERE audit_id = (SELECT audit_id FROM allgres_private.audit_log ORDER BY created_at DESC LIMIT 1);
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := ok AND SQLERRM LIKE '%append-only%';
+  END;
+
+  v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
+
   PERFORM allgres_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -5762,6 +5849,13 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA allgres_private
 
 -- Logs are append-only even for operator (the trigger enforces it too).
 REVOKE UPDATE, DELETE ON allgres_private.execution_logs FROM operator;
+-- REVOKE from operator is real defense in depth here the same way it is
+-- for execution_logs; a REVOKE against allgres_owner itself would not be
+-- (a table owner's DML rights on their own table cannot be revoked by
+-- ACL in PostgreSQL at all -- only the audit_log_no_update trigger above
+-- actually stops that path, and it applies regardless of who issues the
+-- UPDATE/DELETE, ownership included).
+REVOKE UPDATE, DELETE ON allgres_private.audit_log FROM operator;
 
 REVOKE ALL ON allgres_private.llm_secrets FROM PUBLIC;
 REVOKE ALL ON allgres_private.llm_secrets FROM operator;
@@ -5954,6 +6048,34 @@ DECLARE
   v_action text := COALESCE(p_request->>'action', '');
   v_id uuid;
 BEGIN
+  -- One audit_log row per consequential action, written here rather than
+  -- scattered across each branch below, so no future action can be added
+  -- to the audited set without also being wired in -- and so it lands in
+  -- the same transaction as the mutation itself: if the branch below
+  -- raises, PL/pgSQL's implicit savepoint at this BEGIN block rolls this
+  -- insert back right along with it, so a row only ever exists for
+  -- something that actually committed. operator_name is whatever the
+  -- browser sent (self-reported, see the audit_log table's own comment);
+  -- details is the request minus 'action'/'operator_name' and anything
+  -- that could carry a secret (an API key, an OAuth client secret, an
+  -- authorization code or state) -- generic by design, so a new audited
+  -- action needs no bespoke mapping here, only its name added to the list.
+  IF v_action = ANY (ARRAY[
+    'agents.create', 'agents.update', 'policy.rollback', 'proposals.decide',
+    'permissions.grant', 'permissions.revoke', 'allowlist.add', 'allowlist.remove',
+    'projects.create', 'projects.update', 'sessions.cancel',
+    'memories.create', 'memories.remove', 'provider.update',
+    'providers.oauth_callback', 'approvals.decide'
+  ]) THEN
+    INSERT INTO allgres_private.audit_log (operator_name, action, details)
+    VALUES (
+      NULLIF(btrim(COALESCE(p_request->>'operator_name', '')), ''),
+      v_action,
+      (p_request - 'action' - 'operator_name')
+        - ARRAY['api_key', 'oauth_client_secret', 'code', 'state']::text[]
+    );
+  END IF;
+
   CASE v_action
     WHEN 'overview' THEN
       RETURN jsonb_build_object(
@@ -6271,6 +6393,17 @@ BEGIN
 
     WHEN 'memories.remove' THEN
       RETURN allgres_public.fn_forget((p_request->>'memory_id')::uuid);
+
+    WHEN 'audit.list' THEN
+      RETURN jsonb_build_object('ok', true, 'entries', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
+        FROM (
+          SELECT audit_id, operator_name, action, details, created_at
+          FROM allgres_private.audit_log
+          ORDER BY created_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
+        ) q
+      ), '[]'::jsonb));
 
     WHEN 'settings.get' THEN
       RETURN jsonb_build_object(

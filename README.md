@@ -37,7 +37,7 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   can be rolled back later. See [Self-modification](#self-modification).
 - **Dashboard** — a single static HTML file (no build step) covering
   Overview, Agents, Projects, Run, Sessions, Approvals, Proposals, Tasks,
-  Memories, Logs, and Settings, all reachable through one generic
+  Memories, Logs, Audit Log, and Settings, all reachable through one generic
   `/api/v1/rpc` route.
 - **Dashboard auth hardening** — a per-IP rate limit on `/api/v1/*` (a
   tighter, separate cap on failed-auth responses specifically), and the
@@ -69,13 +69,23 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   every agent's permission grants) and asked to report what it finds; a
   seeded example, `health_monitor`, ships read-only with both. See
   [Maintenance agents](#maintenance-agents).
+- **Operator audit log** — a self-reported operator name, sent with every
+  dashboard request, recorded append-only against every consequential
+  action (a permission grant, a decided approval or proposal, a policy
+  rollback, a cancelled session, and more). Answers "who claimed
+  responsibility for this," not "who was authorized" — see [Operator audit
+  log](#operator-audit-log) for exactly what that distinction means and
+  doesn't.
 
 Not yet built:
 
 - Helm charts, Kubernetes manifests, and CNPG dynamic loading — only a
   native install and `docker-compose` exist today.
-- Per-operator identity/accounts — the dashboard has one shared token, not
-  user accounts, so "who approved this" is unanswerable by design.
+- Real per-operator identity/accounts — the dashboard still has one shared
+  token, not user accounts; the audit log records a self-reported name
+  alongside consequential actions, but that name is not authenticated, so
+  "who was actually authorized to do this" stays unanswerable by design,
+  only "who claimed it" is now on record.
 - Secret key rotation, and a token *refresh* flow (an expired OAuth access
   token has to be reconnected from Settings; nothing calls `refresh_token`
   automatically yet).
@@ -272,6 +282,37 @@ already uses; and any auditor beyond the two views above (a memory curator,
 a performance advisor) — the review that proposed this pattern named
 several; this ships the two with the clearest, most immediately useful
 read surface already in place.
+
+## Operator audit log
+
+The dashboard has one shared bearer token (see [Exposure](#exposure)), not
+per-operator accounts, so there is no authenticated identity to attach an
+audit trail to. `allgres_private.audit_log` is a lighter answer to the same
+question — "who did this" — built on a self-reported label instead of a
+real login: the browser sends whatever name is set in Settings
+(`sessionStorage`, per browser tab, the same way the dashboard token itself
+is) alongside every request, and `dashboard_rpc` writes one append-only row
+— `operator_name`, `action`, a `details` object (the request minus the
+action itself and anything that could carry a secret: an API key, an OAuth
+client secret, an authorization code or state) — for each consequential
+action: creating or editing an agent, granting or revoking a permission,
+deciding an approval or a proposal, rolling back a policy, cancelling a
+session, editing the SQL sandbox allowlist or a project, updating a
+provider, connecting an OAuth provider, or writing/removing a memory.
+
+**This is not access control and does not claim to be.** Anyone holding
+the one shared token can type any name in Settings, or leave it blank —
+`audit_log` answers "who claimed responsibility for this," not "who was
+authorized to do it." The row itself is trustworthy (append-only,
+enforced by a trigger that applies even to the table's own owner, not
+just `REVOKE`), but the name inside it is exactly as reliable as the
+person typing it chooses to be. A real answer needs per-operator accounts
+— see [Known limitations](#known-limitations) and KNOWN_ISSUES.md, item
+10 — which this is not, and does not try to shortcut.
+
+Browsable from the new **Audit Log** dashboard page (`audit.list`), newest
+first, with the same self-reported-not-authentication banner repeated
+there.
 
 ## Known limitations
 

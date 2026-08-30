@@ -1900,3 +1900,94 @@ material but nothing analyzes it yet, and a memory curator is really just
 an agent with `memories.list`-equivalent read access plus a prompt, not
 attempted here; and no operator identity attached to who triggered a
 maintenance run, for the reason item 10 gives throughout.
+
+## 28. A lightweight operator audit log — self-reported, not authenticated, and explicit about the difference
+
+Item 10 has said throughout this file that "who approved this" is
+unanswerable by design, because the dashboard has one shared bearer token,
+not per-operator accounts. That remains true — a real fix needs a real
+authentication model, a materially heavier and riskier change than
+anything else in this pass, and was explicitly scoped out in favor of this
+lighter version: not an accounts system, an audit trail built on a
+self-reported label instead of a real login. It answers a narrower, still
+useful question — "who claimed responsibility for this" — and is explicit,
+everywhere it appears, that it does not answer the harder one.
+
+**What was built**: `allgres_private.audit_log` (`operator_name`, `action`,
+`details` jsonb, `created_at`), append-only the same way `execution_logs`
+already is — a `BEFORE UPDATE OR DELETE` trigger, not just a `REVOKE`.
+`dashboard_rpc` writes one row per consequential action — `agents.create`/
+`agents.update`, `policy.rollback`, `proposals.decide`, `permissions.grant`/
+`revoke`, `allowlist.add`/`remove`, `projects.create`/`update`,
+`sessions.cancel`, `memories.create`/`remove`, `provider.update`,
+`providers.oauth_callback`, `approvals.decide` — in the same transaction as
+the mutation itself, before the action's own `CASE` branch runs: if that
+branch later raises, PL/pgSQL's implicit savepoint at `dashboard_rpc`'s own
+`BEGIN` rolls the audit insert back right along with it, so a row only ever
+exists for something that actually committed, never a failed attempt.
+`operator_name` is whatever the browser sent, unauthenticated; `details` is
+the request minus `action`/`operator_name` and a fixed list of fields that
+could carry a secret (`api_key`, `oauth_client_secret`, `code`, `state`) —
+generic by construction, so a newly audited action needs only its name
+added to the list, no bespoke field mapping.
+
+Deliberately not a REVOKE against the table's own owner: a PostgreSQL table
+owner's DML rights on their own table cannot be revoked by ACL at all — only
+the trigger actually stops that path, and it applies regardless of who
+issues the UPDATE/DELETE, ownership included. (The file's `audit_log`
+section says this explicitly, so a future reader does not have to
+rediscover it by trying a `REVOKE ... FROM allgres_owner` that would
+silently do nothing.)
+
+The dashboard sends `operator_name` from `sessionStorage` (`opName()`),
+the same per-tab storage the dashboard token itself already uses, on every
+call through the generic `rpc()` helper; three legacy named routes that
+bypass it (`agents.create`, `agents.update`, `provider.update`) were
+patched individually to include it in their own request bodies. A new
+**Audit Log** page lists entries newest-first (`audit.list`), with a
+banner repeating the same "self-reported, not authentication" framing the
+README's own "Operator audit log" section leads with — the point where
+this is easiest to misread as real access control is exactly the page
+someone would open to check who did something, so the caveat lives there
+too, not only in documentation nobody reading the dashboard would see.
+
+**Verified live**, the same standard as items 12–27: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 96/96 (one new case,
+`audit_log_records_consequential_actions_only`: a consequential action
+writes exactly one row with the correct `operator_name` and `details`; a
+read-only action (`overview`) writes none; a request carrying an `api_key`
+never leaks it into `audit_log.details`; and `UPDATE`/`DELETE` against the
+table both raise, confirmed by catching the actual exception rather than
+assuming the trigger fires). Also driven through the real HTTP path, not
+just `fn_selftest`: `curl` against `/api/v1/rpc` for `allowlist.add`/
+`allowlist.remove` with an `operator_name`, confirmed to land correctly and
+with secrets stripped from a `provider.update` call carrying a real
+`api_key`; a headless-browser (Playwright/Chromium) pass setting an
+operator name from Settings, performing an audited action, and reading it
+back correctly labeled on the new Audit Log page.
+
+**A real side effect from the browser test itself, caught and fixed before
+being called done**: the first Playwright pass clicked the first `.remove`
+button on the allowlist panel to undo its own test entry, but the panel had
+re-rendered in a different order and it actually removed
+`allgres_public.v_my_tasks` — a real, seeded, load-bearing allowlist entry,
+not a leftover from the test. The audit log itself is what caught it (the
+row correctly read `allowlist.remove` / `v_my_tasks`, proving the log was
+accurate about something the *test* got wrong, not a bug in `dashboard_rpc`
+or the trigger) — confirmed by checking `sql_sandbox_allowlist` directly
+afterward and finding the row genuinely gone. Restored by hand
+(re-`INSERT`ing `v_my_tasks`) before re-running `fn_selftest`, which passed
+clean afterward — a case of a test's own imprecision producing a real,
+correctly-recorded consequence, not a false pass.
+
+**Deliberately not built**: real per-operator authentication — this is the
+whole point of choosing the lighter version item 10 keeps deferring;
+anything that reads `audit_log` as proof of who was *authorized*, rather
+than who *claimed* an action, would be a misuse of what this actually is,
+which is why every surface it appears on (the table's own comment, the
+README section, the dashboard page) repeats the same caveat rather than
+stating it once and trusting it to travel; audit coverage for read-only
+actions (`*.list`, `settings.get`) — deliberately excluded, since the
+question this answers is "who changed something," not "who looked"; and
+any UI affordance to filter or search the Audit Log page beyond a flat,
+newest-first list of the most recent 300 entries.
