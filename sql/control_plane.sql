@@ -571,6 +571,44 @@ CREATE INDEX IF NOT EXISTS execution_logs_task_idx
 CREATE INDEX IF NOT EXISTS execution_logs_created_idx
   ON allgres_private.execution_logs (created_at DESC);
 
+-- Long-term agent memory, slice one: structured storage plus recency/
+-- importance retrieval, deliberately no embedding column or vector search
+-- in this pass -- narrow, the same shape item 15 used for per-agent roles
+-- ("does the core mechanism work at all, end to end, verified live, before
+-- any of the rest is built on top of it"). execution_logs is the verbatim,
+-- append-only transcript of one task; this is the opposite: a bounded,
+-- curated, cross-session store an agent writes to on purpose (the
+-- `remember` action) and that fn_next_step reads back into every future
+-- turn's context, for that agent only -- see "7. Agent state machine".
+-- subject_id is free text (there is no user-accounts system to key it to
+-- yet, see KNOWN_ISSUES item 10), for an agent to tag who or what a memory
+-- is about if it chooses to; nothing enforces its shape or reads it as
+-- identity today.
+CREATE TABLE IF NOT EXISTS allgres_private.agent_memories (
+  memory_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id          uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  subject_id        text,
+  memory_type       text NOT NULL CHECK (memory_type IN
+                      ('semantic', 'episodic', 'preference', 'instruction', 'relationship', 'working')),
+  content           text NOT NULL,
+  importance        real NOT NULL DEFAULT 0.5 CHECK (importance BETWEEN 0 AND 1),
+  confidence        real NOT NULL DEFAULT 1.0 CHECK (confidence BETWEEN 0 AND 1),
+  source_session_id uuid REFERENCES allgres_private.sessions(session_id) ON DELETE SET NULL,
+  source_task_id    uuid REFERENCES allgres_private.tasks(task_id) ON DELETE SET NULL,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  last_accessed_at  timestamptz,
+  expires_at        timestamptz,
+  metadata          jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- What fn_next_step's retrieval query actually uses: one agent's own rows,
+-- ranked by importance then recency, live rows only.
+CREATE INDEX IF NOT EXISTS agent_memories_recall_idx
+  ON allgres_private.agent_memories (agent_id, importance DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS agent_memories_expiry_idx
+  ON allgres_private.agent_memories (expires_at)
+  WHERE expires_at IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS allgres_private.human_approvals (
   approval_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
@@ -1700,6 +1738,95 @@ $fn$;
 -- 7. Agent state machine.  Short transactions only; never waits on HTTP.
 -- ---------------------------------------------------------------------------
 
+-- Shared by the agent's own `remember` action (fn_submit_result) and the
+-- operator-authored path (fn_remember / dashboard_rpc's memories.create):
+-- same validation, same fixed 500-per-agent eviction, same insert. Returns
+-- {ok:false, error:...} rather than raising, since the two callers handle a
+-- rejected write differently (one logs an 'error' turn and continues the
+-- task; the other just reports failure to the dashboard) -- this function
+-- only decides whether the write is well-formed, not what happens next.
+-- p_importance/p_expires_in_days are text, not real/int: casting either at
+-- a call site (`(p_request->>'importance')::real`) throws immediately on a
+-- malformed value, before this function's own defensive handling ever runs
+-- -- an agent-controlled string has to be parsed *inside* the guarded block
+-- that decides what to do when it doesn't parse, not before it.
+CREATE OR REPLACE FUNCTION allgres_private.write_memory(
+  p_agent_id uuid,
+  p_content text,
+  p_memory_type text,
+  p_importance text,
+  p_subject_id text,
+  p_expires_in_days text,
+  p_source_session_id uuid DEFAULT NULL,
+  p_source_task_id uuid DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_content text;
+  v_type text;
+  v_importance real;
+  v_expires timestamptz;
+  v_memory uuid;
+BEGIN
+  v_content := btrim(COALESCE(p_content, ''));
+  IF v_content = '' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'empty_content');
+  END IF;
+
+  v_type := COALESCE(NULLIF(p_memory_type, ''), 'semantic');
+  IF v_type NOT IN ('semantic', 'episodic', 'preference', 'instruction', 'relationship', 'working') THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'invalid_memory_type', 'memory_type', v_type);
+  END IF;
+
+  -- Malformed importance falls back to the default rather than rejecting
+  -- the whole write -- it is a ranking hint, not a correctness constraint.
+  BEGIN
+    v_importance := LEAST(1.0, GREATEST(0.0, COALESCE(NULLIF(p_importance, '')::real, 0.5)));
+  EXCEPTION WHEN others THEN
+    v_importance := 0.5;
+  END;
+
+  v_expires := NULL;
+  IF NULLIF(p_expires_in_days, '') IS NOT NULL THEN
+    BEGIN
+      v_expires := now() + make_interval(days => GREATEST(0, p_expires_in_days::int));
+    EXCEPTION WHEN others THEN
+      v_expires := NULL;
+    END;
+  END IF;
+
+  INSERT INTO allgres_private.agent_memories (
+    agent_id, subject_id, memory_type, content, importance,
+    source_session_id, source_task_id, expires_at
+  ) VALUES (
+    p_agent_id, NULLIF(btrim(COALESCE(p_subject_id, '')), ''), v_type,
+    left(v_content, 4000), v_importance, p_source_session_id, p_source_task_id, v_expires
+  ) RETURNING memory_id INTO v_memory;
+
+  -- Bounded working set: keeps the 500 most important (then most recent)
+  -- rows and evicts the rest, rather than let the table (and every future
+  -- prompt's memory block) grow without limit. Ordering DESC and OFFSET-ing
+  -- past the keepers is deliberate: ORDER BY ... ASC OFFSET 500 would skip
+  -- the 500 *least* important rows and delete everything after them --
+  -- i.e. the important ones -- which is exactly backwards. 500 is a fixed
+  -- constant for this slice, not an operator-configurable policy field --
+  -- see item 25's own README note for the same kind of deliberate
+  -- simplification.
+  DELETE FROM allgres_private.agent_memories
+  WHERE memory_id IN (
+    SELECT memory_id FROM allgres_private.agent_memories
+    WHERE agent_id = p_agent_id
+    ORDER BY importance DESC, created_at DESC
+    OFFSET 500
+  );
+
+  RETURN jsonb_build_object('ok', true, 'memory_id', v_memory, 'memory_type', v_type);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_next_step(p_task_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1717,6 +1844,8 @@ DECLARE
   v_tools jsonb;
   v_input_text text;
   v_cfg jsonb;
+  v_memories jsonb;
+  v_memory_ids uuid[];
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -1789,6 +1918,36 @@ BEGIN
   FROM allgres_private.permissions
   WHERE agent_id = t.agent_id AND resource_type = 'tool';
 
+  -- Recalled every turn, the same way system_prompt and the view/tool bounds
+  -- are: an agent's own memories, live ones only, ranked by importance then
+  -- recency, capped at 15 rows and 500 chars each so one prompt can never be
+  -- dominated by this block. Scoped strictly to this agent_id -- there is no
+  -- cross-agent read here, unlike delegate, which is explicit and audited.
+  -- last_accessed_at is touched for exactly the rows recalled, not on
+  -- write, so it reflects "last time this actually reached a prompt," not
+  -- "last time it was mentioned."
+  WITH recalled AS (
+    SELECT memory_id, memory_type, content, importance
+    FROM allgres_private.agent_memories
+    WHERE agent_id = t.agent_id
+      AND (expires_at IS NULL OR expires_at > now())
+    ORDER BY importance DESC, created_at DESC
+    LIMIT 15
+  )
+  SELECT
+    COALESCE(jsonb_agg(jsonb_build_object(
+      'type', memory_type, 'content', left(content, 500)
+    ) ORDER BY importance DESC), '[]'::jsonb),
+    COALESCE(array_agg(memory_id), ARRAY[]::uuid[])
+  INTO v_memories, v_memory_ids
+  FROM recalled;
+
+  IF array_length(v_memory_ids, 1) > 0 THEN
+    UPDATE allgres_private.agent_memories
+    SET last_accessed_at = now()
+    WHERE memory_id = ANY(v_memory_ids);
+  END IF;
+
   -- Bounds come from the database, not from worker code, so revoking a
   -- permission takes effect on the very next step.
   v_messages := v_messages || jsonb_build_array(
@@ -1800,11 +1959,18 @@ BEGIN
       || v_views::text
       || E'\ntools: '
       || v_tools::text
-      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_human | propose_change.'
+      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_human | propose_change | remember.'
       || E'\nFor numeric questions, execute_sql first. Do not invent keys.'
       || E'\npropose_change: {"action":"propose_change","changes":{"system_prompt":"..."},"reason":"..."}'
       || E' -- only system_prompt and llm_config.model/temperature/max_tokens may be proposed;'
       || E' an operator decides it later, it does not change your policy right now.'
+      || E'\nremember: {"action":"remember","content":"...","memory_type":"semantic|episodic|preference|instruction|relationship|working","importance":0.0-1.0,"subject_id":"...","expires_in_days":N}'
+      || E' -- saves something worth recalling in a future session; memory_type and importance default to'
+      || E' semantic/0.5 if omitted, expires_in_days is optional and unset means it never expires on its own.'
+      || E' Use it when you learn a durable fact, preference, or instruction, not for routine intermediate results.'
+      || CASE WHEN v_memories = '[]'::jsonb THEN ''
+              ELSE E'\n\n# memory (your own past recollections, most important first)\n' || v_memories::text
+         END
     )
   );
 
@@ -1896,6 +2062,7 @@ DECLARE
   v_changes jsonb;
   v_ok boolean;
   v_proposal uuid;
+  v_mem_result jsonb;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -1984,7 +2151,7 @@ BEGIN
 
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
-    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change'
+    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change', 'remember'
   ) THEN
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
@@ -2289,6 +2456,39 @@ BEGIN
     );
     UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
+  END IF;
+
+  -- No queue, no claim/complete: unlike execute_sql/call_tool this never
+  -- leaves PostgreSQL, so it can be a plain synchronous write, the same
+  -- shape as propose_change's INSERT. It also needs no resource-permission
+  -- check the way execute_sql (a view) or delegate (a target agent) do --
+  -- an agent can only ever write to its own memory, which cannot expand its
+  -- privileges or touch anything another agent owns.
+  IF v_action = 'remember' THEN
+    v_mem_result := allgres_private.write_memory(
+      t.agent_id,
+      v_parsed->>'content',
+      v_parsed->>'memory_type',
+      v_parsed->>'importance',
+      v_parsed->>'subject_id',
+      v_parsed->>'expires_in_days',
+      t.session_id, p_task_id
+    );
+    IF NOT COALESCE((v_mem_result->>'ok')::boolean, false) THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'remember_' || (v_mem_result->>'error'), 'payload', v_parsed)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    PERFORM allgres_private.append_log(
+      p_task_id, t.step_count + 1, 'assistant',
+      jsonb_build_object('remembered', v_mem_result->>'memory_id', 'memory_type', v_mem_result->>'memory_type')
+    );
+    UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'continue', 'memory_id', v_mem_result->>'memory_id');
   END IF;
 
   IF v_action = 'await_human' THEN
@@ -2888,6 +3088,7 @@ DECLARE
   n int := 0;
   v_step int;
   v_session uuid;
+  v_mem_gc int;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
   FOR r IN
@@ -3034,7 +3235,16 @@ BEGIN
     n := n + 1;
   END LOOP;
 
-  RETURN jsonb_build_object('lost', n);
+  -- Garbage collection, not reclaim: an expired memory is already filtered
+  -- out of fn_next_step's own recall query (WHERE expires_at IS NULL OR
+  -- expires_at > now()), so nothing is broken by leaving a stale row sitting
+  -- there -- this just keeps the table (and the 500-per-agent cap in
+  -- fn_submit_result's `remember` handler) from accumulating dead weight
+  -- indefinitely.
+  DELETE FROM allgres_private.agent_memories WHERE expires_at IS NOT NULL AND expires_at < now();
+  GET DIAGNOSTICS v_mem_gc = ROW_COUNT;
+
+  RETURN jsonb_build_object('lost', n, 'memories_expired', v_mem_gc);
 END;
 $fn$;
 
@@ -3919,6 +4129,39 @@ AS $fn$
   RETURNING jsonb_build_object('ok', true);
 $fn$;
 
+-- Operator-authored counterpart to the agent's own `remember` action
+-- (fn_submit_result) -- same validation and eviction, via write_memory,
+-- just with no session/task to attribute it to. Lets an operator seed an
+-- agent's memory directly (a standing preference, a correction to
+-- something the agent got wrong) rather than only ever waiting for the
+-- agent to write it itself.
+CREATE OR REPLACE FUNCTION allgres_public.fn_remember(
+  p_agent_id uuid,
+  p_content text,
+  p_memory_type text DEFAULT 'semantic',
+  p_importance text DEFAULT NULL,
+  p_subject_id text DEFAULT NULL,
+  p_expires_in_days text DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  SELECT allgres_private.write_memory(
+    p_agent_id, p_content, p_memory_type, p_importance, p_subject_id, p_expires_in_days
+  );
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_forget(p_memory_id uuid)
+RETURNS jsonb
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  DELETE FROM allgres_private.agent_memories WHERE memory_id = p_memory_id
+  RETURNING jsonb_build_object('ok', true, 'memory_id', memory_id);
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_private.selftest_cleanup()
 RETURNS void
 LANGUAGE plpgsql
@@ -4089,6 +4332,7 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.outbound_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_calls', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.agent_memories', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
@@ -4132,6 +4376,11 @@ DECLARE
   v_state text;
   v_call2 uuid;
   detail_bool boolean;
+  v_mem_result jsonb;
+  v_mem_count int;
+  v_low_mem uuid;
+  v_high_mem uuid;
+  v_mem_gc int;
 BEGIN
   SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM allgres_private.policies WHERE agent_id = v_agent;
@@ -5075,6 +5324,118 @@ BEGIN
   DELETE FROM allgres_private.oauth_calls WHERE provider_id = v_provider;
   DELETE FROM allgres_private.oauth_states WHERE provider_id = v_provider;
 
+  -- 27. Long-term agent memory (item 25). Starts from a clean slate for the
+  --     analyst agent so the recall test below can assert on content, not
+  --     just presence.
+  DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+
+  -- 27a. `remember` rejects malformed input without failing the task.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest remember_reject')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"remember"}',
+    'parsed', jsonb_build_object('action', 'remember', 'content', '')
+  ));
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'continue' AND detail = 'running' AND sub->>'memory_id' IS NULL;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"remember"}',
+    'parsed', jsonb_build_object('action', 'remember', 'content', 'x', 'memory_type', 'not_a_real_type')
+  ));
+  ok := ok AND sub->>'action' = 'continue' AND sub->>'memory_id' IS NULL;
+  SELECT count(*) INTO v_mem_count FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+  ok := ok AND v_mem_count = 0;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'remember_rejects_malformed_input', 'ok', ok));
+
+  -- 27b. A well-formed `remember` writes a row and is recalled into a later
+  --      task's own fn_next_step context -- the actual point of this
+  --      feature, not just that a row got written (see item 12's own
+  --      standing question: "does the test check the write, or the read?").
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"remember"}',
+    'parsed', jsonb_build_object(
+      'action', 'remember', 'content', 'selftest marker: the sky is teal',
+      'memory_type', 'semantic', 'importance', 0.9
+    )
+  ));
+  ok := sub->>'action' = 'continue' AND sub->>'memory_id' IS NOT NULL;
+
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest remember_recall')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid2 FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  spec := allgres_public.fn_next_step(v_tid2);
+  ok := ok AND (spec->'messages'->0->>'content') LIKE '%selftest marker: the sky is teal%';
+  ok := ok AND (spec->'messages'->0->>'content') LIKE '%remember%';
+  SELECT last_accessed_at IS NOT NULL INTO detail_bool
+  FROM allgres_private.agent_memories WHERE agent_id = v_agent AND content LIKE 'selftest marker%';
+  ok := ok AND COALESCE(detail_bool, false);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'remember_writes_and_is_recalled', 'ok', ok));
+
+  -- 27c. Recall is scoped to the querying agent only -- selftest_delegate_b's
+  --      own fn_next_step must never see selftest_delegate_a's memory, the
+  --      same isolation property provision_agent_role_is_idempotent already
+  --      proved for the SQL sandbox (v_my_tasks), now for this instead.
+  DELETE FROM allgres_private.agent_memories WHERE agent_id IN (v_deleg_a, v_deleg_b);
+  v_mem_result := allgres_private.write_memory(
+    v_deleg_a, 'selftest marker: agent A secret preference', 'preference', '1.0', NULL, NULL
+  );
+  v_sid := (allgres_public.fn_create_session(v_deleg_b, 'selftest recall_scoping')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') NOT LIKE '%agent A secret preference%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'memory_recall_scoped_to_agent', 'ok', ok));
+  DELETE FROM allgres_private.agent_memories WHERE agent_id IN (v_deleg_a, v_deleg_b);
+
+  -- 27d. The fixed 500-per-agent cap evicts the least important (then
+  --      oldest) rows rather than growing without bound.
+  DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+  v_mem_result := allgres_private.write_memory(v_agent, 'selftest low importance marker', 'working', '0.0', NULL, NULL);
+  v_low_mem := (v_mem_result->>'memory_id')::uuid;
+  FOR n_logs IN 1..499 LOOP
+    PERFORM allgres_private.write_memory(v_agent, 'selftest filler ' || n_logs, 'working', '0.4', NULL, NULL);
+  END LOOP;
+  v_mem_result := allgres_private.write_memory(v_agent, 'selftest high importance marker', 'working', '1.0', NULL, NULL);
+  v_high_mem := (v_mem_result->>'memory_id')::uuid;
+  SELECT count(*) INTO v_mem_count FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+  ok := v_mem_count = 500;
+  ok := ok AND NOT EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_low_mem);
+  ok := ok AND EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_high_mem);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'memory_cap_evicts_least_important', 'ok', ok));
+  DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+
+  -- 27e. fn_watchdog garbage-collects an expired memory -- filtered out of
+  --      recall already (see fn_next_step), this just stops the row itself
+  --      from sitting there forever.
+  v_mem_result := allgres_private.write_memory(v_agent, 'selftest expired marker', 'working', '0.5', NULL, '1');
+  UPDATE allgres_private.agent_memories SET expires_at = now() - interval '1 minute'
+  WHERE memory_id = (v_mem_result->>'memory_id')::uuid;
+  spec := allgres_public.fn_watchdog();
+  ok := COALESCE((spec->>'memories_expired')::int, 0) >= 1;
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = (v_mem_result->>'memory_id')::uuid
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_expires_stale_memory', 'ok', ok));
+
+  -- 27f. The operator path (fn_remember/fn_forget, dashboard_rpc's
+  --      memories.create/.remove) is the same write_memory underneath, with
+  --      no session/task to attribute it to.
+  sub := allgres_public.fn_remember(v_agent, 'selftest operator-authored memory', 'instruction', '0.7', 'operator', NULL);
+  ok := (sub->>'ok')::boolean IS TRUE AND sub->>'memory_id' IS NOT NULL;
+  ok := ok AND EXISTS (
+    SELECT 1 FROM allgres_private.agent_memories
+    WHERE memory_id = (sub->>'memory_id')::uuid AND source_session_id IS NULL AND source_task_id IS NULL
+  );
+  comp := allgres_public.fn_forget((sub->>'memory_id')::uuid);
+  ok := ok AND (comp->>'ok')::boolean IS TRUE;
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = (sub->>'memory_id')::uuid
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_remember_and_fn_forget_round_trip', 'ok', ok));
+
+  DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+
   PERFORM allgres_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -5749,6 +6110,37 @@ BEGIN
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 150), 1), 1000)
         ) q
       ), '[]'::jsonb));
+
+    -- Optional agent_id filter, the same shape tasks.list's own optional
+    -- limit uses: present -> scoped, absent -> every agent's memories.
+    WHEN 'memories.list' THEN
+      RETURN jsonb_build_object('ok', true, 'memories', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.importance DESC, q.created_at DESC)
+        FROM (
+          SELECT m.memory_id, m.agent_id, a.name AS agent, m.subject_id, m.memory_type,
+                 m.content, m.importance, m.confidence, m.source_session_id,
+                 m.created_at, m.last_accessed_at, m.expires_at
+          FROM allgres_private.agent_memories m
+          JOIN allgres_private.agents a USING (agent_id)
+          WHERE NULLIF(p_request->>'agent_id', '') IS NULL
+             OR m.agent_id = (p_request->>'agent_id')::uuid
+          ORDER BY m.importance DESC, m.created_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
+        ) q
+      ), '[]'::jsonb));
+
+    WHEN 'memories.create' THEN
+      RETURN allgres_public.fn_remember(
+        (p_request->>'agent_id')::uuid,
+        p_request->>'content',
+        NULLIF(p_request->>'memory_type', ''),
+        p_request->>'importance',
+        p_request->>'subject_id',
+        p_request->>'expires_in_days'
+      );
+
+    WHEN 'memories.remove' THEN
+      RETURN allgres_public.fn_forget((p_request->>'memory_id')::uuid);
 
     WHEN 'settings.get' THEN
       RETURN jsonb_build_object(

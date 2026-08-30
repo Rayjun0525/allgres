@@ -1565,3 +1565,127 @@ away from the dashboard, beyond the browser's own — same caveat items 11
 and 17 already name for `sessions.cancel` and a proposal rollback. No
 per-operator identity attached to who connected a provider, for the reason
 item 10 gives throughout: no accounts system yet.
+
+## 25. Long-term agent memory, slice one
+
+Before this pass, Allgres had no cross-session memory at all: `execution_logs`
+is the verbatim, append-only transcript of one task, replayed into that
+task's own next `call_llm`, and nothing else. An agent that learned
+something in session 1 had no way to carry it into session 2 — a real gap
+for anything meant to act like a *personal* agent rather than a one-shot
+tool. This is a first, deliberately narrow slice, the same framing item 15
+used for per-agent PostgreSQL roles: does the core mechanism — an agent
+writing something durable, and getting it back automatically on a later
+turn — work at all, end to end, verified live, before building retrieval
+ranking, embeddings, or a curation UI on top of it.
+
+**What was built**: a new table, `allgres_private.agent_memories`
+(`memory_id`, `agent_id`, `subject_id`, `memory_type` — `semantic`/
+`episodic`/`preference`/`instruction`/`relationship`/`working` —, `content`,
+`importance`, `confidence`, `source_session_id`/`source_task_id`,
+`created_at`, `last_accessed_at`, `expires_at`, `metadata`), and a new agent
+action, `remember`, alongside `final_answer`/`execute_sql`/`call_tool`/
+`delegate`/`await_human`/`propose_change`. Unlike `execute_sql`/`call_tool`
+this needed no queue: it never leaves PostgreSQL, so `fn_submit_result`
+writes the row synchronously, the same shape `propose_change`'s own `INSERT`
+already uses. It also needed no resource-permission check the way
+`execute_sql` (a view) or `delegate` (a target agent) do — an agent can only
+ever write to its own memory, which cannot expand its privileges or touch
+anything another agent owns, the same reasoning `await_human`/
+`propose_change` already skip a permission grant for.
+
+`fn_next_step` reads a bounded set of that agent's own memories back on
+every turn — live ones only (`expires_at IS NULL OR expires_at > now()`),
+ranked by importance then recency, capped at 15 rows and 500 characters
+each — into a new `# memory` block in the same system message that already
+carries the policy prompt and the view/tool bounds. `last_accessed_at` is
+touched for exactly the rows actually recalled, not on write, so it reflects
+"last time this reached a prompt," not "last time it was mentioned." Recall
+is strictly scoped to `agent_id`, with no cross-agent read at all — verified
+live (below), not just asserted.
+
+Both the agent's own write path (`fn_submit_result`'s `remember` handler)
+and a new operator-authored one (`fn_remember`/`fn_forget`, exposed as
+`dashboard_rpc`'s `memories.create`/`memories.remove`, and a new Memories
+dashboard page) share one private function, `allgres_private.write_memory`
+— same validation, same fixed eviction, same insert, so the two paths
+cannot drift. It returns `{ok:false, error:...}` rather than raising,
+since the two callers handle a rejected write differently (one logs an
+`'error'`-role turn and continues the task; the other just reports failure
+to the dashboard).
+
+A fixed cap, 500 rows per agent, evicts the least important — then oldest —
+memories past that count on every write, rather than let the table (and
+every future prompt's memory block) grow without bound; this is a constant
+in `write_memory`, not an operator-configurable policy field, the same kind
+of deliberate simplification item 24 made for the OAuth queue's claim
+limit. `fn_watchdog` gained a fifth loop that garbage-collects any row past
+its `expires_in_days` — not a correctness fix (an expired row is already
+excluded from `fn_next_step`'s own recall query regardless of whether it
+has been swept), just hygiene, the same self-healing shape every other
+`fn_watchdog` loop already has.
+
+**A real bug caught while writing the test for it, before it shipped**: the
+first version of the 500-row eviction query ordered
+`importance ASC, created_at ASC` and deleted everything past
+`OFFSET 500` — which skips the 500 *least* important rows and deletes
+whatever comes after them in that ascending order, i.e. the *most*
+important ones. Exactly backwards: it would have evicted an agent's most
+valuable memories and kept the least valuable 500. Caught by writing
+`memory_cap_evicts_least_important` (insert one low-importance marker, 499
+filler rows, one high-importance marker, assert the low one is gone and the
+high one survives) before assuming the query was correct — the same
+standing question item 12 already named ("does the test check the write, or
+the read?") applied here to the query's own direction, not just whether it
+ran. Fixed by ordering `DESC` instead, so the OFFSET skips the *keepers*.
+
+**Verified live**, the same standard as items 12–24: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 94/94 (six new cases: malformed `remember`
+input — empty content, an unknown `memory_type` — is rejected without
+failing the task or writing a row; a well-formed `remember` writes a row
+*and* is recalled, verbatim, into a separate later task's own
+`fn_next_step` output, not just present in the table;
+`selftest_delegate_b`'s own `fn_next_step` never sees
+`selftest_delegate_a`'s memory; the 500-cap eviction test described above;
+`fn_watchdog` sweeping an expired row and reporting it in
+`memories_expired`; and `fn_remember`/`fn_forget` round-tripping a
+write and delete with no `source_session_id`/`source_task_id`, the
+operator-authored path). `tests/smoke.sql` and `tests/e2e_mock.sql` both
+still green (this slice touches no Rust code and no outbound path, so
+neither needed a new section). Also checked directly against a live
+session, not just `fn_selftest`'s own calls: `memories.create` over a real
+`curl` against `/api/v1/rpc`, a fresh `fn_next_step` call for that same
+agent confirmed to contain the exact memory content, `memories.remove` over
+the same route, and a headless-browser (Playwright/Chromium) round trip
+through the new Memories page (fill the form, Save, see the row; click
+Forget, see the empty state) with the underlying table checked directly
+before and after. A real `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from a
+real 0.2.0 install (seeded with an agent beforehand, on a fully cleaned
+cluster — see item 19's own account of the leftover-role trap this check
+keeps falling into) confirms `agent_memories`, `fn_remember`, and
+`fn_forget` all exist post-upgrade and `fn_selftest` stays 94/94.
+`scripts/backup_drill.sh` (item 18) re-run end to end, both the physical
+(PITR) and logical (`pg_dump`) paths, confirms the new
+`pg_extension_config_dump` registration for `agent_memories` doesn't break
+either.
+
+`agent_memories` is registered for `pg_extension_config_dump`,
+unconditionally — real agent/operator state worth keeping, the same
+treatment `execution_logs`/`sessions`/`tasks` already get.
+
+**Deliberately not built**, the same "narrow slice, revisit later" shape
+item 15 used: semantic (embedding/vector) search — recall is
+importance/recency ranking over structured rows only, no `pgvector`
+dependency added; an explicit `recall` action for an agent to query beyond
+what `fn_next_step` already injects automatically; row-level security on
+`agent_memories` (gated by `write_memory`'s own `agent_id` parameter and
+`fn_next_step`'s own `WHERE agent_id = ...`, the same `SECURITY DEFINER`
+pattern nearly every other table in this project uses — `v_sales`/
+`v_my_tasks` remain the one place real Postgres RLS is used, per item 15);
+an operator-configurable per-agent memory cap (the 500-row limit is a fixed
+constant); a confirmation step before an operator's "Forget" deletes a
+memory, beyond the browser's own, the same caveat item 11 already names for
+`sessions.cancel`; and no identity for *who* (operator or agent) is telling
+the truth about a `subject_id` — it is free text an agent or operator
+chooses to write, not tied to any real accounts system, because there isn't
+one yet (item 10).

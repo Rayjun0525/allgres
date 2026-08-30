@@ -37,7 +37,8 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   can be rolled back later. See [Self-modification](#self-modification).
 - **Dashboard** — a single static HTML file (no build step) covering
   Overview, Agents, Projects, Run, Sessions, Approvals, Proposals, Tasks,
-  Logs, and Settings, all reachable through one generic `/api/v1/rpc` route.
+  Memories, Logs, and Settings, all reachable through one generic
+  `/api/v1/rpc` route.
 - **Dashboard auth hardening** — a per-IP rate limit on `/api/v1/*` (a
   tighter, separate cap on failed-auth responses specifically), and the
   event stream authenticates with a short-lived single-use ticket instead
@@ -56,6 +57,13 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   that already keeps an LLM provider's api_key out of any table (see
   [Secrets at rest](#secrets-at-rest)) — never returned to the dashboard or
   written anywhere in plaintext.
+- **Long-term agent memory** — an agent can `remember` something worth
+  recalling in a future session (a fact, a preference, an instruction);
+  `fn_next_step` reads a bounded set of that agent's own memories, ranked by
+  importance then recency, back into every turn's own prompt, the same way
+  its policy and permission bounds already are. An operator can also seed or
+  remove a memory directly from the new Memories page. See
+  [Memory](#memory).
 
 Not yet built:
 
@@ -66,6 +74,10 @@ Not yet built:
 - Secret key rotation, and a token *refresh* flow (an expired OAuth access
   token has to be reconnected from Settings; nothing calls `refresh_token`
   automatically yet).
+- Semantic memory search (an embedding column and vector similarity) — recall
+  is importance/recency ranking only in this slice; and no fault-injection
+  test yet for `fn_watchdog` reclaiming a worker that crashes mid-call (see
+  KNOWN_ISSUES, "Untested control-plane paths").
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
@@ -178,6 +190,50 @@ Layered, strongest first:
    `SELECT ... INTO` and data-modifying CTEs, which are `SelectStmt` nodes);
 7. every relation named must be schema-qualified, outside the reserved schemas,
    and present in the allowlist ∩ that agent's permissions.
+
+## Memory
+
+An agent can emit `{"action":"remember","content":"...","memory_type":
+"semantic|episodic|preference|instruction|relationship|working",
+"importance":0.0-1.0,"subject_id":"...","expires_in_days":N}` alongside its
+other actions. `content` and a valid `memory_type` are the only required
+fields; `memory_type` and `importance` default to `semantic`/`0.5`,
+`subject_id` is free text (there is no user-accounts system yet — see
+[Security model](#security-model) — so it can't be tied to a real identity,
+only tagged by the agent), and `expires_in_days` is optional.
+
+Every future turn, `fn_next_step` reads that agent's own memories back —
+live ones only, ranked by importance then recency, capped at 15 rows and 500
+characters each — into a `# memory` block in the same system message that
+already carries its policy and permission bounds. Recall is strictly scoped
+to `agent_id`: nothing an agent remembers is ever visible to another agent's
+own prompt, delegation included. A memory does not need any resource
+permission the way `execute_sql` (a view) or `delegate` (a target agent) do
+— an agent can only ever write to its own memory, which cannot expand its
+privileges or touch anything another agent owns, the same reasoning that
+already lets `propose_change`/`await_human` skip a permission grant.
+
+A fixed cap (500 rows per agent) evicts the least important, then oldest,
+memories on write, so an agent cannot grow its own prompt context — or the
+table — without bound; there is no operator-configurable policy field for
+this in the current slice. `fn_watchdog` separately garbage-collects any row
+past its `expires_in_days`, though an expired row is already excluded from
+recall regardless of whether it has been swept yet.
+
+An operator can also seed or remove a memory directly from the **Memories**
+dashboard page (`fn_remember`/`fn_forget`, exposed as `memories.create`/
+`memories.remove`) — useful for correcting something an agent got wrong, or
+telling it something once rather than waiting for it to learn the fact
+itself.
+
+Deliberately not in this slice: semantic (embedding/vector) search — recall
+is importance/recency ranking over structured rows only, no `pgvector`
+dependency; an explicit `recall` action for an agent to query beyond what is
+already injected automatically; and row-level security on
+`agent_memories` — like most of this project's tables, it is gated by a
+`SECURITY DEFINER` function's own `agent_id` parameter rather than Postgres
+RLS (see "Per-agent roles" below for the one place RLS is actually used
+today).
 
 ## Known limitations
 
@@ -503,7 +559,8 @@ extension does that a generic `pg_dump` would otherwise miss silently:
   every table holding real operator/agent state via
   `pg_extension_config_dump()` (agents, sessions, tasks, policies and their
   history, permissions, projects, execution logs, human approvals, change
-  proposals, provider secrets, and the outbound/SQL call queues), so a plain
+  proposals, provider secrets, agent memories, and the outbound/SQL/OAuth
+  call queues), so a plain
   `pg_dump` now actually includes this extension's data — it silently did
   not, before KNOWN_ISSUES.md item 18. Restoring it needs
   `pg_restore --schema-only` first (creates the extension and its own seed
