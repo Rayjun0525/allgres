@@ -57,7 +57,13 @@ function nav(){const n=$('#nav');const list=pagesForRole();n.innerHTML=list.map(
 function renderWhoami(){const el=$('#whoami');if(!el)return;el.textContent=state.me?`${state.me.username} (${state.me.role})`:''}
 function status(s){return `<span class="status s-${esc(s)}">${esc(s)}</span>`}
 function fmtContent(c){return typeof c==='string'?c:JSON.stringify(c)}
-async function loadPage(){ $('#pageTitle').textContent=state.page; try{
+async function loadPage(){
+  // Chat/Messenger poll for an async reply on a setInterval; leaving the
+  // page must stop it, or it keeps firing against DOM elements (#chatThread/
+  // #msgFeed) that no longer exist once another page has rendered.
+  if(chatPollTimer){clearInterval(chatPollTimer);chatPollTimer=null}
+  if(msgPollTimer){clearInterval(msgPollTimer);msgPollTimer=null}
+  $('#pageTitle').textContent=state.page; try{
   if(state.page==='Overview')await overview();
   if(state.page==='Agents')await agents();
   if(state.page==='Projects')await projectsPage();
@@ -317,10 +323,15 @@ async function chatPage(){
   await renderChatThread();
 }
 async function renderChatThread(){
+  // A stray poll tick (loadPage clears the timer, but a call already in
+  // flight can still land after navigating away) must not throw on a
+  // #chatThread that no longer exists.
+  if(!$('#chatThread'))return;
   if(!state.chatAgentId){$('#chatThread').innerHTML='<div class="muted">No agent assigned yet -- ask an admin.</div>';return}
   try{ const h=await rpc('chat.history',{agent_id:state.chatAgentId});
+    if(!$('#chatThread'))return;
     $('#chatThread').innerHTML=(h.messages||[]).map(m=>msgBubble(m)).join('')||'<div class="muted">Say hello.</div>';
-  }catch(e){$('#chatThread').innerHTML=`<div class="muted">${esc(e.message)}</div>`}
+  }catch(e){if($('#chatThread'))$('#chatThread').innerHTML=`<div class="muted">${esc(e.message)}</div>`}
 }
 let chatPollTimer=null;
 async function sendChat(){
@@ -348,6 +359,9 @@ async function messengerPage(){
 }
 async function renderMessengerFeed(){
   const d=await rpc('messenger.list',{limit:200});
+  // Same stray-poll-tick guard as renderChatThread: a call already in
+  // flight can still land after navigating away from Messenger.
+  if(!$('#msgFeed'))return;
   const replyLine=m=>{
     if(!m.mentioned_agent)return '';
     const body=m.reply_status==='completed'?esc(m.reply||''):m.reply_status==='failed'?'(agent failed to respond)':'(waiting for reply…)';
