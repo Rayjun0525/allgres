@@ -6,7 +6,7 @@ Allgres is a PostgreSQL-native agent control plane. It packages the PL/pgSQL
 state machine, a Rust/pgrx native runtime worker, outbound HTTP/HTTPS, and an
 embedded browser control panel into one PostgreSQL extension.
 
-Version 0.4.0. This is an MVP: read [Security model](#security-model) before
+Version 0.5.0. This is an MVP: read [Security model](#security-model) before
 putting it anywhere that matters.
 
 ## Status
@@ -373,6 +373,45 @@ still reachable by anyone holding that one token, same as every version
 before this — login adds a second, narrower identity layer for chat/
 messenger/my-model specifically, not a retrofit of the first one (that
 remains KNOWN_ISSUES.md, item 10).
+
+## System agents
+
+Beyond the two demo/maintenance agents above, five built-in agents operate
+the platform itself, seeded under one shared parent (`system_root`) so a
+grant or a framing sentence added to the root reaches all five without
+being restated per agent: `session_compactor` (job seeded, auto-trigger
+not yet wired — see KNOWN_ISSUES item 31), `orchestrator` (same, for
+multi-`@mention` Messenger routing), `creator`, `fixer`, and
+`self_improve`. `agent_id`/`name`/`system_prompt` inheritance is real —
+`allgres_private.agent_has_permission`/`agent_effective_prompt` walk
+`parent_agent_id` so a child sees its own grants plus everything the root
+was granted, and its own prompt appended after the root's shared framing.
+Every one of the five is `is_system = true`: editing its policy or
+permissions from the Agents page now requires an admin session
+(`require_admin_for_system_agent`) — an ordinary, non-system agent is
+completely unaffected by this check.
+
+`creator`, `fixer`, and `self_improve` can each take one real,
+consequential action, gated by a per-agent `autonomy_level` an admin sets
+from the Agents page (`agents.set_autonomy`): `admin_approval` (default)
+queues it for a human to accept or reject; `auto`/`self_approve` apply it
+immediately.
+
+- **creator** proposes a brand-new agent (`create_agent`); approval calls
+  the same `fn_create_agent` the Agents page itself uses.
+- **fixer** reads the same two read-only views `health_monitor` does
+  (`v_system_health`, `v_permission_audit`) and, instead of only
+  reporting, proposes a concrete remediation (`propose_fix`: revoke a
+  permission, or deactivate an agent) into a new Fixes queue.
+- **self_improve** is the one agent allowed to `propose_change` against an
+  *other* agent's policy (every other agent's `propose_change` stays
+  self-only) — aimed at cost/efficiency, not behavior.
+
+Approvals, Proposals, and the new Fixes queue are no longer admin-only
+inboxes: a regular user sees and may decide the ones whose target is one
+of their own assigned agents (`allgres_private.visible_agent_ids`); an
+admin still sees everything. Both inboxes also filter out
+`fn_selftest`'s own fixtures, the same as Sessions/Tasks already did.
 
 ## Known limitations
 

@@ -2221,3 +2221,138 @@ shared-token `dashboard_rpc` surface by role -- that remains the same
 single shared secret it always was, now with a second, narrower,
 per-user identity layer sitting alongside it for chat/messenger/my-model
 specifically.
+
+## 31. A system agent family: one root, five children, per-agent autonomy levels, and three new consequential actions
+
+A follow-up requested directly: built-in agents that operate the platform
+itself rather than a user's workload -- summarizing a long session,
+routing a multi-mention Messenger message, helping create new agents,
+proposing a fix for what `health_monitor` finds, and tuning another
+agent's cost -- structured as one inheritance hierarchy, with an
+admin-configurable dial on how much of each one's own consequential
+actions run unattended. This item is the backend half of that request;
+the SQL-side inbox (Approvals/Proposals plus a new Fixes queue) is real
+and role-scoped, but Overview's cluster monitoring, the Chat page's
+General/Messenger/Project mode switch, nav consolidation, and i18n/theme
+remain a follow-up pass, tracked separately.
+
+**Hierarchy.** `allgres_private.agents` gains `is_system boolean`,
+`parent_agent_id uuid` (self-referencing), and `autonomy_level text` in
+`('auto', 'self_approve', 'admin_approval')`, default `admin_approval`.
+One `system_root` agent carries no operational job of its own; five
+children -- `session_compactor`, `orchestrator`, `creator`, `fixer`,
+`self_improve` -- hang off it with `parent_agent_id = system_root`.
+`allgres_private.agent_has_permission`/`agent_permission_refs` replace
+every direct `SELECT ... FROM allgres_private.permissions WHERE agent_id =
+...` check in the file (`call_tool`'s tool/http_host grants, `delegate`'s
+target-agent grant, `execute_sql`'s view grant via `agent_may_read` and
+`fn_validate_sql`) with a recursive walk up `parent_agent_id` -- a grant on
+`system_root` reaches every child without being restated five times, and
+is invisible to every non-system agent, confirmed live (`selftest_agent`,
+an ordinary agent, does not see a permission granted only to
+`system_root`). `allgres_private.agent_effective_prompt` does the same for
+`system_prompt` text -- a child's own prompt is appended after its
+ancestors', root-first -- and `fn_next_step`'s "bounds" text (what an
+agent is told it may do) now reads from `agent_permission_refs` rather
+than the agent's own direct grants, so a system agent's displayed
+capabilities match what `agent_has_permission` will actually let it do.
+`allgres_private.require_admin_for_system_agent(token, agent_id)` is a
+no-op for an ordinary agent (the pre-existing shared-token-only surface,
+completely unaffected) and requires an admin session the moment the
+target `is_system` -- wired into `agents.update`, `policy.rollback`, and
+`permissions.grant`/`.revoke`, the first real narrowing of that
+shared-token surface by role since item 30 explicitly deferred it.
+`fn_set_agent_autonomy` (RPC: `agents.set_autonomy`, always admin-only,
+regardless of target) is the dial's own setter.
+
+**The three new actions**, each gated to exactly the one agent whose job
+it is (checked by name, since only that one agent is ever seeded with the
+matching prompt) and each respecting its own `autonomy_level`:
+`admin_approval` queues a request in the existing (or, for `propose_fix`,
+new) inbox for a human to accept or reject; `auto` or `self_approve` apply
+immediately, no human step in the path at all -- the nuance between those
+two is left to the agent's own prompt (an agent at `self_approve` is told
+it may still choose `await_human` itself when unsure, rather than the
+platform forcing an escalation on every call).
+
+- `create_agent` (`creator` only): `{"action":"create_agent","name":
+  "...","system_prompt":"..."}`. Queued as a new `change_proposals.kind =
+  'create_agent'` row (that table's existing `agent_id`/`base_generation`/
+  `target_agent_id` columns are meaningless for this kind -- there is no
+  existing policy to go stale); `fn_decide_proposal` calls
+  `fn_create_agent` on approval, same as if an admin had typed it into the
+  Agents page.
+- `propose_fix` (`fixer` only): `{"action":"propose_fix","fix_kind":
+  "revoke_permission"|"deactivate_agent","target_agent_id":"...","detail":
+  {...}}`. A new table, `allgres_private.fix_proposals`, shaped like
+  `change_proposals` but for a fix's payload rather than a policy edit;
+  `allgres_private.apply_fix` (shared by `fn_decide_fix` and the
+  `auto`/`self_approve` immediate path) is the one place that turns a
+  `fix_kind` into a real `fn_revoke_permission`/`fn_set_agent_active`
+  call. `fixer` is seeded with the same two read-only views
+  `health_monitor` already watches (`v_system_health`,
+  `v_permission_audit`) -- it can look at exactly what `health_monitor`
+  looks at, never anything more, and proposes rather than silently acts
+  by default.
+- Cross-agent `propose_change` (`self_improve` only): the existing
+  `propose_change` action, extended with an optional `target_agent_id` --
+  every other agent's `propose_change` is rejected outright
+  (`propose_change_cross_agent_not_permitted`) the moment it names one,
+  preserving item-whatever's original "an agent may only ever propose
+  a change to itself" invariant for everyone except this one agent.
+  `change_proposals.target_agent_id` records who it actually targets;
+  `base_generation` is read from *that* agent's policy, not
+  `self_improve`'s own, so the staleness check protects the right row;
+  `fn_decide_proposal` writes to `COALESCE(target_agent_id, agent_id)` on
+  approval. Confirmed live: an approved cross-agent proposal changed the
+  target's `system_prompt` and left `self_improve`'s own untouched.
+
+**Approvals, Proposals, and the new Fixes queue, opened to regular
+users.** `allgres_private.visible_agent_ids(token)` returns `NULL`
+(unrestricted -- no session, i.e. the original shared-token-only caller,
+or an admin) or a regular user's own `user_agent_assignments` list.
+`approvals.list`/`.decide`, `proposals.list`/`.decide`, and the new
+`fixes.list`/`.decide` all scope by it: a regular user sees and may decide
+only the rows whose underlying agent (a `propose_change`'s
+`COALESCE(target_agent_id, agent_id)`, a fix's `target_agent_id`) is one
+of their own assigned agents; `create_agent` proposals have no existing
+target to scope by and stay admin-only. Both inboxes also gained a
+`reason NOT LIKE 'selftest%'` filter, closing the same "fn_selftest
+fixtures visible as if real" gap item 29 fixed for Sessions/Tasks --
+confirmed live, `fixes.list` and `proposals.list` are empty of selftest
+rows immediately after a `fn_selftest` run.
+
+**Verified live**: `fn_selftest` grew from 105 to 129 cases (root-and-five
+seeded correctly under one parent; a `system_root` grant reaching every
+child and no unrelated agent; a child's effective prompt containing the
+root's framing text ahead of its own; `is_system` edits rejected without
+an admin session and unaffected for an ordinary agent; a bad
+`autonomy_level` rejected with a clear error; `create_agent` queuing then
+actually creating the agent on approval, rejected outright from any other
+agent, and applying immediately under `autonomy_level = 'auto'`;
+`propose_fix` queuing then applying a deactivation on approval;
+`self_improve`'s cross-agent proposal landing on the target's own
+generation and policy, and rejected from every other agent;
+`visible_agent_ids` scoping a regular user to their assigned agents and
+widening the moment one is assigned) -- all passing, and idempotent
+across repeated runs (checked twice back to back). `tests/smoke.sql`
+passes end to end, including a live `dashboard_rpc` round trip for
+`agents.set_autonomy`/`fixes.list`/`proposals.list`. The whole 0.4.0 ->
+0.5.0 upgrade path was exercised for real: an extension created at
+`'0.4.0'`, a real operator edit made to the seeded `analyst` agent's
+`system_prompt`, `ALTER EXTENSION allgres UPDATE TO '0.5.0'` run against
+it, and both the operator's edit and every new system agent/column
+confirmed present afterward.
+
+**Deliberately not built in this pass**: `session_compactor`'s actual
+trigger (summarizing a session automatically once it grows long -- today
+it is seeded with a prompt describing that job, but nothing calls it yet)
+and `orchestrator`'s multi-mention routing in Messenger (same -- seeded,
+not wired to a real multi-`@mention` code path); the Overview page's
+Postgres-version-plus-cluster-monitoring redesign; the Chat page's three
+mode buttons (General/Messenger/Project) replacing today's separate Chat/
+Messenger pages, and the matching extension of `allgres_private.projects`
+with an `agent_id` and preset prompt; folding Sessions/Tasks/Logs/Events
+into Audit and Users into Settings; and language (en/ko) and dark/light
+theme switches in Settings. All tracked as the immediate next pass on
+this same branch.
