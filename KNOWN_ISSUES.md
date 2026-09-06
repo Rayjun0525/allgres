@@ -1991,3 +1991,124 @@ actions (`*.list`, `settings.get`) — deliberately excluded, since the
 question this answers is "who changed something," not "who looked"; and
 any UI affordance to filter or search the Audit Log page beyond a flat,
 newest-first list of the most recent 300 entries.
+
+## 29. Four real product gaps found by actually using the installed dashboard: a fake default model, no way to add a provider, no chat, and selftest fixtures showing up as if they were real work
+
+Everything through item 28 was found by code review or external review of
+the diff. This batch is different: it came from someone actually installing
+Allgres end to end (Rocky Linux 9, PostgreSQL 18) and using the dashboard,
+which surfaced four things no amount of reading the SQL would have caught.
+
+**A fresh install looked like a provider had already been picked and
+authenticated when nothing had.** `allgres_private.ensure_policy()` — the
+trigger that gives every newly created agent a starting policy row — set
+`llm_config` to `{"provider":"xai","model":"grok-4.5",...}` unconditionally.
+The seeded `analyst` demo agent's own policy did the same in its one-time
+seed block. Neither of these is a credential leak (no `xai` API key or
+OAuth token is ever seeded), but the visible effect was exactly what got
+reported: every agent, seeded or freshly created, showed a real-looking
+model selection despite OAuth never having been run. Both now leave
+`llm_config` at `{}`, matching what `health_monitor`'s seed already did.
+That alone wasn't enough: `allgres_private.build_llm_http` still defaulted
+an *empty* `llm_config` to `provider: 'xai', model: 'grok-4.5'` before
+resolving it against `llm_providers` — meaning an agent with nothing
+configured at all would still build a real request pointed at xai's actual
+endpoint. It now raises a clear "no llm_config.provider/model configured"
+error instead, the same fail-closed shape item 23 already gave a
+*misconfigured* provider name; only a real, explicit choice ever reaches an
+endpoint.
+
+**There was no way to add an LLM provider — only edit one of the five
+seeded ones.** `fn_set_provider` only ever `UPDATE`s a row that already
+exists; nothing in this file could `INSERT` a new one, so an operator who
+wanted anything beyond xai/openai/anthropic/ollama/openai_compat had no
+path but editing the database by hand. `fn_create_provider(name, kind,
+base_url, api_key, allow_private_network)` is the missing counterpart —
+same endpoint/SSRF validation `fn_set_provider` already applies on edit,
+applied at creation time too — wired into `dashboard_rpc` as
+`provider.create` and into the audited-action list next to
+`provider.update`. The Settings page gained an "Add provider" form for it.
+The agent editor's Provider field was a free-text `<input>` with no
+base_url or api_key fields at all — the exact complaint, "there's no way to
+configure a model by URL, no API key field, nothing." It is now a `<select>`
+populated from currently-enabled providers (an agent can no longer be
+pointed at a provider name that was just typed and might not exist); Model
+stays free text, since one provider can host many model names.
+
+**There was no way to have a conversation.** `fn_create_session` builds
+exactly one task and that task runs once; there was no function to send a
+follow-up in the same session, only "start an entirely new session that
+remembers nothing." Before adding one, this needed an answer to a real
+design question: delegated child tasks (`fn_submit_result`'s `delegate`
+branch) share their parent's `session_id`, so a naive "pull every task in
+this session's logs" would blend a user-facing conversation with whatever
+sub-agent delegation happened to occur inside it. The fix distinguishes
+root-level tasks (`parent_task_id IS NULL` — a user-facing turn) from
+delegated ones (`parent_task_id IS NOT NULL` — a sub-agent's own isolated
+turn): `fn_next_step`'s message assembly now pulls every root-level task's
+log in the session, ordered by `created_at` across tasks instead of
+`step_number` within one, when the task being run is itself root-level;
+a delegated task stays scoped to only its own log, exactly as before.
+`fn_continue_session(session_id, message)` creates a new root-level task in
+an existing session (fresh `step_count`/`max_steps` budget per turn,
+deliberately, so an exhausted earlier turn can't block a later one),
+appends the message as a `user` log entry, and reopens the session
+(`status = 'open'`, `completed_at = NULL`) if it had already finished —
+rejecting a second message outright while an earlier turn in the same
+session is still `queued`/`running`/`waiting_human`, rather than racing
+`fn_next_step`'s own read of the session's task list. Wired into
+`dashboard_rpc` as `sessions.continue`.
+
+**Sessions created by running `fn_selftest` were permanently visible in the
+dashboard, indistinguishable from real work.** `selftest_cleanup()`
+existed, but only ever `UPDATE`d matching rows to a terminal status
+(`failed`/`cancelled`) — it never removed them, so every past
+`fn_selftest` run left real, permanent rows behind. The obvious fix —
+make it actually `DELETE` — does not work: `execution_logs` has a
+`BEFORE UPDATE OR DELETE` trigger (`forbid_log_mutation`) making it
+genuinely append-only, rejecting `DELETE` the same as `UPDATE`, for
+*anyone*, including this function's own owner — confirmed by trying it and
+watching PostgreSQL reject it live (`ERROR: execution_logs are
+append-only`), not by reading the trigger and assuming. Deleting
+`sql_calls`/`tasks`/`sessions` instead and leaving the now-orphaned
+`execution_logs` rows behind would either violate the `tasks`/`sessions`
+foreign key (nothing here cascades) or leave a log with no task to belong
+to. So selftest fixtures are still never deleted — `selftest_cleanup` only
+terminates anything an interrupted run left non-terminal, now called
+defensively at the *start* of `fn_selftest` too, not just the end — and
+every operator-facing listing (`overview`'s counts and `recent_tasks`,
+`sessions.list`, `tasks.list`, `logs.list`, the SSE `events` snapshot)
+filters out `goal LIKE 'selftest%'` instead. The dashboard never shows them;
+the database still has an honest, immutable record of every test run.
+
+**Verified live**, the same standard as items 12–28: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 104/104 (8 new cases: the fail-closed
+provider/model checks, a fresh agent's `llm_config` starting empty,
+`fn_create_provider`'s success/bad-kind/SSRF-rejection paths, both ends of
+`fn_continue_session` — rejecting a second message mid-turn and reopening a
+finished session with context intact — and `selftest_cleanup` actually
+being invisible to `tasks.list`/`sessions.list`/`events` rather than gone).
+`tests/smoke.sql` and `tests/e2e_mock.sql` both pass. Beyond the SQL-only
+suite: driven through the real async runtime worker end to end against the
+`allgres_mock` provider `tests/e2e_mock.sql` already sets up — one session
+run to completion, then `fn_continue_session` called against it directly,
+confirmed to flip the session back to `open`, dispatch a genuinely new
+task, and — read back from `execution_logs` across both root tasks,
+ordered by `created_at` — carry both turns' `user`/`assistant` messages in
+one continuous, correctly ordered thread. (One real environment trap found
+along the way, not a bug in this diff: the runtime worker connects to
+whichever database `ALLGRES_DATABASE` names, `postgres` by default, not
+whatever database `psql` happens to be pointed at — testing against a
+different database than the workers' own left tasks permanently `queued`
+with no error logged anywhere, since `extension_is_installed()` correctly
+reported `false` for a database that never had the extension created in
+it. Worth naming here since it is exactly the kind of silent, misleading
+non-failure someone else debugging this project could burn real time on.)
+
+**Deliberately not built in this pass**: the two chat *modes* (a Slack-style
+`@agent_name` channel where an unaddressed message posts without triggering
+a reply, versus a plain 1:1 conversation) and the real accounts/login system
+with admin/user roles and per-user agent assignment that the dashboard UI
+for `fn_continue_session` will sit on top of — both underway as a follow-up
+to this same round of feedback, tracked separately rather than folded into
+this entry after the fact.

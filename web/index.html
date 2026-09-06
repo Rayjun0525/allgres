@@ -70,12 +70,23 @@ async function agents(){const d=await api('/api/v1/agents');state.agents=d.agent
 async function agentModal(a){
   const isNew=!a;
   const opts=isNew?null:await rpc('permissions.options').catch(()=>null);
+  const providers=isNew?[]:(await api('/api/v1/settings').catch(()=>({providers:[]}))).providers||[];
+  const curProvider=a?.llm_config?.provider||'';
+  // Only providers actually configured (added or edited in Settings) and
+  // enabled show up here -- an agent can no longer be pointed at a
+  // provider name that was just typed and might not exist. If the agent's
+  // stored provider was since disabled or removed, it's kept as an extra
+  // option so the field doesn't silently show something else.
+  const providerOpts=providers.filter(p=>p.is_enabled||p.name===curProvider);
+  const providerSelect=providerOpts.length
+    ?`<select class="select" id="aProvider">${!curProvider?'<option value="">— select —</option>':''}${providerOpts.map(p=>`<option value="${esc(p.name)}" ${p.name===curProvider?'selected':''}>${esc(p.name)} (${esc(p.kind)})</option>`).join('')}</select>`
+    :`<select class="select" id="aProvider" disabled><option value="">No provider configured yet -- add one in Settings</option></select>`;
   $('#modal').classList.remove('hidden');
   $('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>${isNew?'Create agent':'Edit agent'}</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div>
 <div class="field"><label>Name</label><input class="input" id="aName" value="${esc(a?.name||'')}"></div>
 <div class="field"><label>System prompt</label><textarea class="textarea" id="aPrompt">${esc(a?.system_prompt||'')}</textarea></div>
-${isNew?'':`<div class="grid2"><div class="field"><label>Provider</label><input class="input" id="aProvider" value="${esc(a?.llm_config?.provider||'')}"></div><div class="field"><label>Model</label><input class="input" id="aModel" value="${esc(a?.llm_config?.model||'')}"></div></div>
-<div class="muted" style="font-size:12px;margin:-4px 0 8px">The endpoint URL comes from the provider in Settings; an agent cannot override it.</div>
+${isNew?'':`<div class="grid2"><div class="field"><label>Provider</label>${providerSelect}</div><div class="field"><label>Model</label><input class="input" id="aModel" value="${esc(a?.llm_config?.model||'')}" placeholder="e.g. gpt-4o, claude-sonnet-5, llama3"></div></div>
+<div class="muted" style="font-size:12px;margin:-4px 0 8px">The endpoint URL and API key come from the provider chosen above (see Settings); an agent cannot override them. ${!providerOpts.length?'No provider is configured yet, so this agent cannot run until one is added.':''}</div>
 <div class="grid2"><div class="field"><label>Max steps</label><input type="number" class="input" id="aSteps" value="${esc(a.max_steps||20)}"></div><div class="field"><label>Max retries</label><input type="number" class="input" id="aRetries" value="${esc(a.max_retries||2)}"></div></div>
 <div class="grid2"><div class="field"><label>Max concurrent tasks</label><input type="number" class="input" id="aConcurrent" value="${esc(a.max_concurrent_tasks||4)}"></div><div class="field"><label>Max turn seconds (blank = uncapped)</label><input type="number" class="input" id="aTurnSecs" value="${a.max_turn_seconds??''}"></div></div>
 <div class="grid2"><div class="field"><label>Max delegation depth</label><input type="number" class="input" id="aDelegDepth" value="${esc(a.max_delegation_depth??5)}"></div><div class="field"><label>Max session tasks</label><input type="number" class="input" id="aSessTasks" value="${esc(a.max_session_tasks??100)}"></div></div>
@@ -208,8 +219,9 @@ async function logs(){const d=await api('/api/v1/logs');state.logs=d.logs||[];$(
 async function settings(){
   const d=await api('/api/v1/settings');state.settings=d;
   const al=await rpc('allowlist.list').catch(()=>({allowlist:[]}));
-  $('#view').innerHTML=`${secretBanner(d.secret_storage)}<div class="panel"><h3>LLM providers</h3><table class="table"><thead><tr><th>Name</th><th>Kind</th><th>Base URL</th><th>Secret</th><th>Private net</th><th>Status</th><th></th></tr></thead><tbody>${(d.providers||[]).map(p=>`<tr><td><b>${esc(p.name)}</b></td><td>${esc(p.kind)}</td><td class="mono">${esc(p.base_url)}</td><td>${p.has_secret?'configured':'—'}</td><td>${p.allow_private_network?'allowed':'blocked'}</td><td>${p.is_enabled?status('running'):status('disabled')}</td><td><button class="btn editProvider" data-id="${esc(p.provider_id)}">Edit</button></td></tr>`).join('')}</tbody></table></div><div class="panel"><h3>SQL sandbox allowlist</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Views an agent's <code>execute_sql</code> action may read from, in addition to that agent holding a matching view permission -- both are required. See README, "The SQL sandbox".</div><div id="allowList">${(al.allowlist||[]).map(r=>`<div class="row" style="padding:4px 0"><span class="mono" style="font-size:12px">${esc(r)}</span><span class="spacer"></span><button class="btn danger small removeAllow" data-ref="${esc(r)}">Remove</button></div>`).join('')||'<div class="muted" style="font-size:12px">Empty.</div>'}</div><div class="row" style="margin-top:10px"><input class="input" id="allowRef" placeholder="allgres_public.v_name"><button class="btn" id="addAllow">Add</button></div></div><div class="panel"><h3>Dashboard access</h3><div class="muted" style="font-size:13px;margin-bottom:10px">${tok()?'A token is set for this browser tab.':'No token set for this browser tab. If the server requires one, requests will return 401.'}</div><div class="row"><button class="btn" id="setTok">Set token</button><button class="btn" id="clrTok">Clear token</button><span class="spacer"></span><button class="btn" id="runSelftest">Run selftest</button></div><div id="selftestOut" class="mono muted" style="margin-top:12px"></div><div class="muted" style="font-size:13px;margin:16px 0 10px;border-top:1px solid var(--line);padding-top:14px">${opName()?`Audit log entries you make will be labeled "${esc(opName())}".`:'No name set -- audit log entries will show as unlabeled. This is self-reported, not authentication: anyone with the token can type any name.'}</div><div class="row"><button class="btn" id="setOpName">${opName()?'Change my name':'Set my name'}</button></div></div>`;
+  $('#view').innerHTML=`${secretBanner(d.secret_storage)}<div class="panel"><h3>LLM providers</h3><table class="table"><thead><tr><th>Name</th><th>Kind</th><th>Base URL</th><th>Secret</th><th>Private net</th><th>Status</th><th></th></tr></thead><tbody>${(d.providers||[]).map(p=>`<tr><td><b>${esc(p.name)}</b></td><td>${esc(p.kind)}</td><td class="mono">${esc(p.base_url)}</td><td>${p.has_secret?'configured':'—'}</td><td>${p.allow_private_network?'allowed':'blocked'}</td><td>${p.is_enabled?status('running'):status('disabled')}</td><td><button class="btn editProvider" data-id="${esc(p.provider_id)}">Edit</button></td></tr>`).join('')}</tbody></table><div class="row" style="margin-top:12px"><button class="btn primary" id="newProvider">Add provider</button></div></div><div class="panel"><h3>SQL sandbox allowlist</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Views an agent's <code>execute_sql</code> action may read from, in addition to that agent holding a matching view permission -- both are required. See README, "The SQL sandbox".</div><div id="allowList">${(al.allowlist||[]).map(r=>`<div class="row" style="padding:4px 0"><span class="mono" style="font-size:12px">${esc(r)}</span><span class="spacer"></span><button class="btn danger small removeAllow" data-ref="${esc(r)}">Remove</button></div>`).join('')||'<div class="muted" style="font-size:12px">Empty.</div>'}</div><div class="row" style="margin-top:10px"><input class="input" id="allowRef" placeholder="allgres_public.v_name"><button class="btn" id="addAllow">Add</button></div></div><div class="panel"><h3>Dashboard access</h3><div class="muted" style="font-size:13px;margin-bottom:10px">${tok()?'A token is set for this browser tab.':'No token set for this browser tab. If the server requires one, requests will return 401.'}</div><div class="row"><button class="btn" id="setTok">Set token</button><button class="btn" id="clrTok">Clear token</button><span class="spacer"></span><button class="btn" id="runSelftest">Run selftest</button></div><div id="selftestOut" class="mono muted" style="margin-top:12px"></div><div class="muted" style="font-size:13px;margin:16px 0 10px;border-top:1px solid var(--line);padding-top:14px">${opName()?`Audit log entries you make will be labeled "${esc(opName())}".`:'No name set -- audit log entries will show as unlabeled. This is self-reported, not authentication: anyone with the token can type any name.'}</div><div class="row"><button class="btn" id="setOpName">${opName()?'Change my name':'Set my name'}</button></div></div>`;
   document.querySelectorAll('.editProvider').forEach(b=>b.onclick=()=>providerModal(d.providers.find(p=>p.provider_id===b.dataset.id)));
+  $('#newProvider').onclick=newProviderModal;
   document.querySelectorAll('.removeAllow').forEach(b=>b.onclick=async()=>{try{await rpc('allowlist.remove',{ref:b.dataset.ref});toast('Removed');settings()}catch(e){toast(e.message)}});
   $('#addAllow').onclick=async()=>{try{await rpc('allowlist.add',{ref:$('#allowRef').value});toast('Added');settings()}catch(e){toast(e.message)}};
   $('#setTok').onclick=askToken;$('#clrTok').onclick=()=>{setTok('');location.reload()};
@@ -228,6 +240,26 @@ function providerModal(p){
   // dashboard URL with ?code=&state=, which the boot-time handler below
   // (oauthCallbackOnLoad) picks up and completes via providers.oauth_callback.
   if(isOauth)$('#connectOauth').onclick=async()=>{try{const redirect=location.origin+location.pathname;const r=await rpc('providers.oauth_start',{provider_id:p.provider_id,redirect});if(r.redirect_url)location.href=r.redirect_url}catch(e){toast(e.message)}};
+}
+// Adds a brand new provider row -- until fn_create_provider existed, the
+// only providers that could ever exist were the fixed seeded list (xai,
+// openai, anthropic, ollama, openai_compat); an operator who wanted to
+// point at anything else had no way to add it.
+function newProviderModal(){
+  $('#modal').classList.remove('hidden');$('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>Add provider</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div><div class="field"><label>Name</label><input class="input" id="npName" placeholder="e.g. my-openai-compat-endpoint"></div><div class="field"><label>Kind</label><select class="input" id="npKind"><option value="openai_compat">openai_compat</option><option value="anthropic">anthropic</option><option value="oauth">oauth</option></select></div><div class="field"><label>Base URL</label><input class="input" id="npUrl" placeholder="https://..."></div><div class="field"><label>API key (optional here for a non-OAuth provider; can also be set later)</label><input type="password" class="input" id="npKey" autocomplete="new-password"></div><div class="field"><label><input type="checkbox" id="npPrivate"> Allow loopback / private-network endpoint</label><div class="muted" style="font-size:12px">Needed for a local Ollama or an in-cluster gateway. Leaving this off is what stops this endpoint from being pointed at an internal address.</div></div><button class="btn primary" id="saveNewP">Add provider</button></div>`;
+  $('#closeM').onclick=closeModal;
+  $('#saveNewP').onclick=async()=>{
+    try{
+      await rpc('provider.create',{
+        name:$('#npName').value,
+        kind:$('#npKind').value,
+        base_url:$('#npUrl').value,
+        api_key:$('#npKey').value,
+        allow_private_network:$('#npPrivate').checked
+      });
+      closeModal();toast('Provider added');settings()
+    }catch(e){toast(e.message)}
+  };
 }
 // The event stream authenticates with a short-lived, single-use ticket
 // (POST /api/v1/events/ticket, gated by the real bearer token) instead of

@@ -6,7 +6,7 @@ Allgres is a PostgreSQL-native agent control plane. It packages the PL/pgSQL
 state machine, a Rust/pgrx native runtime worker, outbound HTTP/HTTPS, and an
 embedded browser control panel into one PostgreSQL extension.
 
-Version 0.3.0. This is an MVP: read [Security model](#security-model) before
+Version 0.4.0. This is an MVP: read [Security model](#security-model) before
 putting it anywhere that matters.
 
 ## Status
@@ -313,6 +313,46 @@ person typing it chooses to be. A real answer needs per-operator accounts
 Browsable from the new **Audit Log** dashboard page (`audit.list`), newest
 first, with the same self-reported-not-authentication banner repeated
 there.
+
+## Model configuration and conversations
+
+A fresh agent's `llm_config` starts empty — `{}` — whether it was just
+created or is the seeded `analyst` demo agent. Nothing runs until an
+operator explicitly picks a provider and model; there is no fallback
+provider or model name baked in anywhere, so an agent with nothing
+configured fails closed with a clear error (`agent has no llm_config.provider
+configured`) instead of quietly reaching a real endpoint.
+
+Providers are managed from **Settings**: `provider.create`
+(`fn_create_provider`) adds a new one (name, kind, base URL, an optional API
+key, and whether it may point at a loopback/private-network address) — not
+just the five seeded ones (`xai`, `openai`, `anthropic`, `ollama`,
+`openai_compat`) — and `provider.update` (`fn_set_provider`) edits an
+existing one, including OAuth fields and connecting via the OAuth flow (see
+above). In the agent editor, Provider is a dropdown populated from
+currently-enabled providers, not a free-text field an agent could be
+pointed at a nonexistent name with; Model stays free text, since one
+provider can host many model names.
+
+A session is no longer a single one-shot exchange. `fn_continue_session`
+adds a follow-up message to an existing session — a new task in the same
+session, sharing its `agent_id` — and `fn_next_step` assembles the full
+conversation for it: every root-level task's log in that session, in
+chronological order, not just the one task currently running. A delegated
+sub-agent task (`parent_task_id` set — see `delegate` in the SQL sandbox
+section above) stays scoped to only its own log, so a sub-agent's turn
+never sees the parent conversation, or a sibling delegate's, just because
+they share a `session_id`. A session that already finished is reopened
+(`status` back to `open`) by a new message, the same way a chat thread
+resumes when someone replies to it; sending a second message while an
+earlier turn in the same session is still in flight is rejected outright
+rather than racing it. Wired into `dashboard_rpc` as `sessions.continue`.
+
+**Deliberately not built yet**: a Slack-style channel where an unaddressed
+message posts without triggering any agent and an `@agent_name` mention
+routes it to that agent, and the real accounts/login system (admin vs.
+regular-user roles, per-user agent assignment) this conversational UI is
+meant to sit behind — see KNOWN_ISSUES.md, item 29.
 
 ## Known limitations
 
