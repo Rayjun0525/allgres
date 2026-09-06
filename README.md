@@ -379,10 +379,13 @@ remains KNOWN_ISSUES.md, item 10).
 Beyond the two demo/maintenance agents above, five built-in agents operate
 the platform itself, seeded under one shared parent (`system_root`) so a
 grant or a framing sentence added to the root reaches all five without
-being restated per agent: `session_compactor` (job seeded, auto-trigger
-not yet wired — see KNOWN_ISSUES item 31), `orchestrator` (same, for
-multi-`@mention` Messenger routing), `creator`, `fixer`, and
-`self_improve`. `agent_id`/`name`/`system_prompt` inheritance is real —
+being restated per agent: `session_compactor` (summarizes a session's
+older turns once its log passes a threshold — `allgres_private.
+maybe_trigger_compaction`, called on every `fn_next_step`), `orchestrator`
+(records an advisory opinion on response order whenever a Messenger post
+`@mentions` more than one agent — delivery itself is still text order; see
+KNOWN_ISSUES item 31 for what "advisory" means here), `creator`, `fixer`,
+and `self_improve`. `agent_id`/`name`/`system_prompt` inheritance is real —
 `allgres_private.agent_has_permission`/`agent_effective_prompt` walk
 `parent_agent_id` so a child sees its own grants plus everything the root
 was granted, and its own prompt appended after the root's shared framing.
@@ -412,6 +415,52 @@ inboxes: a regular user sees and may decide the ones whose target is one
 of their own assigned agents (`allgres_private.visible_agent_ids`); an
 admin still sees everything. Both inboxes also filter out
 `fn_selftest`'s own fixtures, the same as Sessions/Tasks already did.
+
+An admin can also grant/revoke a user's access to one agent directly from
+the Agents page's own edit modal (`assignments.toggle`/`.for_agent`), not
+only from Settings' Users section — the reverse direction of the same
+`user_agent_assignments` table, one pair at a time rather than replacing a
+user's whole list.
+
+## Chat: General, Messenger, and Project modes
+
+The Chat page is one page with three mode buttons, not three separate nav
+entries: **General** (a plain, continuing 1:1 conversation — unchanged from
+before), **Messenger** (the Slack-style shared channel — unchanged, now
+also delivering to every agent a post `@mentions`, in text order, when more
+than one is addressed), and **Project** — a project (Settings/Projects,
+admin-managed) may be bound to one agent with a `preset_prompt` appended
+after that agent's own system prompt (`fn_next_step`), giving it a focused,
+reusable context (e.g. "only ever answer about the Seoul region") without
+touching the agent's own policy. Project mode has its own continuing
+session per (user, project) pair (`user_project_chat_sessions`,
+`fn_project_chat_send`/`fn_project_chat_history`) — deliberately separate
+from that same agent's General-mode conversation, so a project's preset
+context never leaks into a plain chat with the same agent or vice versa.
+
+## Overview: cluster monitoring
+
+Overview also reports PostgreSQL's own version and this database's
+`pg_stat_activity` session counts (active/idle/idle-in-transaction), plus
+host-level CPU load and memory — the one thing SQL cannot see on its own,
+read from `/proc/loadavg`/`/proc/meminfo` by a new native function,
+`allgres.native_host_stats()` (Linux-only by design, the same reasoning as
+`analyze_sql`'s use of PostgreSQL's own parser: the most direct interface
+available, not the most portable one — it degrades to `null` sections
+rather than an error if `/proc` is unavailable).
+
+## Navigation, language, and theme
+
+Sessions/Tasks/Logs and the audit trail are one **Audit** page with four
+tabs now, not four separate nav entries; Users is a section of **Settings**
+rather than its own page; Approvals/Proposals/Fixes are three tabs of one
+**Approvals** page, open to regular users too (see "System agents" above).
+Settings also has a language switch (English/한국어) and a dark/light theme
+switch — both a plain per-browser `localStorage` preference with nothing
+server-side to configure. The language switch covers navigation, page
+chrome, and common actions/empty-states, not every field label in every
+modal, and never data that came from the database itself (an agent's own
+name, a log's own content) — see KNOWN_ISSUES item 31 for the exact scope.
 
 ## Known limitations
 

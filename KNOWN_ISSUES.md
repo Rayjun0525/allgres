@@ -2356,3 +2356,152 @@ with an `agent_id` and preset prompt; folding Sessions/Tasks/Logs/Events
 into Audit and Users into Settings; and language (en/ko) and dark/light
 theme switches in Settings. All tracked as the immediate next pass on
 this same branch.
+
+## 32. The rest of item 31's own list, plus a real extension-tooling gap it exposed
+
+The immediate follow-up item 31 named: `session_compactor`'s actual
+trigger, `orchestrator`'s multi-mention routing, Overview's cluster
+monitoring, the Chat page's three-mode switch and Project mode, nav
+consolidation, and language/theme switches. All built and verified live
+in this pass; a genuine bug in `scripts/gen-upgrade.sh` itself (not in any
+SQL logic) was also found and fixed along the way -- see "Verified live"
+below for how it surfaced.
+
+**session_compactor, actually triggered.** `allgres_private.
+maybe_trigger_compaction(session_id, task_ids)`, called from
+`fn_next_step` on every root-level step: counts this session's own
+not-yet-summarized logs (everything after `sessions.compacted_before`, or
+all of them the first time -- counting every row ever written would stay
+past threshold forever, since raw logs are append-only and never
+deleted), and past 60 queues a real background task for `session_compactor`
+carrying the oldest of them (everything but the most recent 10) plus
+whatever it summarized last time, so a second compaction folds both into
+one updated summary instead of silently dropping the first one. Nothing
+sets `compacted_before` except `session_compactor`'s own `remember`
+landing (`fn_submit_result`) -- the trigger itself never does -- so a turn
+can never see neither the raw logs nor a finished summary; worst case, a
+few extra turns while compaction is still in flight. Once set,
+`fn_next_step` excludes logs older than the cutoff and prepends the latest
+summary as a system message instead. Confirmed live end to end with
+explicit, distinct `created_at` timestamps 1 second apart: 70 synthetic
+turns in one session, `fn_next_step` correctly triggering a compaction
+task, simulating that task's own `remember` + `final_answer`, and a
+following turn on the original session showing the summary and the most
+recent turns but not the compacted-away ones. (First attempt used a tight
+PL/pgSQL loop with the implicit `now()`, which is frozen for the whole
+transaction -- every row got the *same* timestamp, so the cutoff logic
+had nothing to compare against and silently kept everything. The fix
+belongs to the test, not the product: real turns, each its own
+transaction with real elapsed time between them, never collide like this.)
+
+**orchestrator, actually exercised -- advisory only.** `fn_messenger_post`
+now extracts every distinct `@mention` in text order (not just the
+first), validates and delivers to each via `fn_chat_send` the same way a
+single mention always did, and records the full ordered list
+(`channel_messages.mentioned_agent_ids`, `messenger.list`'s new
+`mentioned_agents` array). When more than one agent is mentioned,
+`allgres_private.queue_orchestrator_opinion` also fires a real task for
+`orchestrator` carrying the message and each candidate's own prompt, so it
+is genuinely exercised against real messages rather than sitting
+permanently idle -- but its opinion is not yet what decides delivery
+order; that stays text order for now. A real reordering-before-delivery
+pass needs the async completion hook this doesn't build (orchestrator's
+task completes on its own schedule, well after `fn_messenger_post` has
+already returned) and is tracked as further work, not silently dropped.
+
+**Project mode.** `allgres_private.projects` gains `agent_id`/
+`preset_prompt`; `fn_next_step` appends `preset_prompt` after the bound
+agent's own effective prompt when the session belongs to that project.
+`allgres_private.user_project_chat_sessions` +
+`fn_project_chat_send`/`fn_project_chat_history` mirror the General-mode
+chat surface exactly, keyed by project instead of by agent and
+deliberately its own table/session rather than reusing that agent's
+General-mode one -- a project's preset context must never leak into a
+plain chat with the same agent, or the other way around.
+`allgres_private.require_project_access` is `require_agent_access` plus
+"the project is active and bound to an agent at all" -- a regular user
+needs the same assignment a Project's agent would require in General
+mode; there is no separate project-level allow-list. Confirmed live: a
+project bound to `analyst` with a haiku-only preset, chatted with through
+`fn_project_chat_send`, and `fn_next_step`'s system message contained the
+preset text.
+
+**Overview's cluster monitoring.** A new native function,
+`allgres.native_host_stats()` (Linux-only by design -- `/proc/loadavg`/
+`/proc/meminfo`, the most direct interface available, degrading to `null`
+sections rather than an error if unavailable, the same reasoning
+`analyze_sql` already used for PostgreSQL's own parser instead of a
+hand-rolled one), plus `current_setting('server_version')` and a
+`pg_stat_activity` count scoped to `current_database()`, all folded into
+the existing `overview` RPC action rather than a new one.
+
+**Nav consolidation, language, and theme -- all in `web/index.html`.**
+Sessions/Tasks/Logs/the audit trail become one **Audit** page with four
+tabs; Users becomes a section of **Settings**; Approvals/Proposals/the new
+Fixes queue become three tabs of one **Approvals** page (open to regular
+users, per item 31); Chat/Messenger/Project become three mode buttons of
+one **Chat** page. `assignments.toggle`/`.for_agent` (admin-only, added
+alongside this) let an admin grant/revoke one user's access to one agent
+directly from the Agents page's edit modal -- the reverse direction of
+`assignments.set`/`.list`, which stay built for the Users page's own
+per-user checkbox list and would otherwise require reading a user's whole
+assignment list just to flip one entry. Language (English/한국어) and
+theme (dark/light) are both a plain `localStorage` preference, no
+server-side state at all; language covers navigation, page chrome, and
+common actions/empty-states -- not every field label in every modal, and
+never data from the database itself (an agent's own name, a log's own
+content), which was never translatable content to begin with.
+
+**A real bug in `scripts/gen-upgrade.sh` itself, caught by actually
+running the upgrade.** `sql/control_plane.sql` is hand-written SQL only
+(tables, PL/pgSQL) -- a native function declared in `src/lib.rs` via
+`#[pg_extern]` (`native_host_stats` above) is not in it at all; pgrx
+generates that function's own `CREATE FUNCTION ... LANGUAGE c` statement
+and splices it into the *fresh-install* file only
+(`allgres--<version>.sql`). `gen-upgrade.sh` had always just dumped
+`control_plane.sql` verbatim, which was never wrong before because every
+native function already existed since 0.1.0 -- `native_host_stats` is the
+first one ever added mid-project. Caught live: `ALTER EXTENSION allgres
+UPDATE TO '0.5.0'` against a real 0.4.0 database left `overview` failing
+with `function allgres.native_host_stats() does not exist` despite every
+fresh install passing, because `fn_next_step`/`fn_selftest` (hand-written
+SQL) upgraded correctly while the native function they call did not.
+Fixed in the script itself, not by hand-patching the generated file (which
+its own header says not to edit): it now extracts every native
+(`LANGUAGE c`) function declaration from the fresh-install file it just
+built, rewrites each as `CREATE OR REPLACE FUNCTION` (idempotent against a
+target that already has an older, or for one that predates this fix, no
+version of it), and prepends them before the `control_plane.sql` dump --
+so any future native function added mid-project is included automatically,
+not by remembering to hand-patch an upgrade script again. A second,
+smaller version of the identical rule (CREATE OR REPLACE cannot land a
+grown parameter list, see this file's own "Drop objects whose signature...
+changed" section) applied to `fn_create_project` gaining
+`agent_id`/`preset_prompt` -- without an explicit
+`DROP FUNCTION IF EXISTS fn_create_project(text, text)`, an upgrade would
+leave both the old 2-arg and new 4-arg overloads installed side by side,
+and a single-argument call (`fn_selftest`'s own project fixture) becomes
+ambiguous between them.
+
+**Verified live**: `fn_selftest` grew from 129 to 140 cases (all of the
+above, plus `assignments.toggle`/`.for_agent`), passing and idempotent
+across repeated runs on a fresh install. The corrected `0.4.0 -> 0.5.0`
+upgrade was re-verified for real end to end after the `gen-upgrade.sh`
+fix: a real 0.4.0 database, a real operator edit to `analyst`'s
+`system_prompt`, `ALTER EXTENSION ... UPDATE TO '0.5.0'`, and both the
+edit and `overview`'s new fields (which had failed before the fix)
+confirmed working afterward, with `fn_selftest` at 140/140 on the upgraded
+database too -- not just on a fresh install, which is exactly the gap that
+let the `native_host_stats` bug through the first time. `tests/smoke.sql`
+passes. Beyond the SQL suite: a full headless-Chromium (Playwright) pass
+against the real running dashboard -- admin's consolidated 9-page nav;
+Agents showing every system agent's `autonomy_level` inline and the
+edit modal's autonomy selector plus its new "Assigned users" button and
+modal; Approvals' three tabs (Approvals/Proposals/Fixes); Projects showing
+a project's bound chat agent; Chat's three mode buttons each actually
+sending and receiving a reply (General, an `@mention` in Messenger, and a
+Project-mode message with its preset applied); Settings showing the
+embedded Users section and switching the whole nav to 한국어 and the page
+to light theme live; Audit's four tabs; and a regular user's restricted
+three-item nav still reaching the Approvals page scoped to their own
+assignments -- zero console errors across the whole pass.
