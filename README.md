@@ -348,11 +348,31 @@ resumes when someone replies to it; sending a second message while an
 earlier turn in the same session is still in flight is rejected outright
 rather than racing it. Wired into `dashboard_rpc` as `sessions.continue`.
 
-**Deliberately not built yet**: a Slack-style channel where an unaddressed
-message posts without triggering any agent and an `@agent_name` mention
-routes it to that agent, and the real accounts/login system (admin vs.
-regular-user roles, per-user agent assignment) this conversational UI is
-meant to sit behind — see KNOWN_ISSUES.md, item 29.
+A real login gates the dashboard on top of the token above, not instead of
+it: the token still decides whether a browser reaches the HTTP surface at
+all, login decides who, having reached it, is using it. An **admin**
+account sees every existing page plus **Users** (create an account,
+activate/deactivate it, change its role, and manage which agents it can
+reach), **Chat**, and **Messenger**. A **user** account sees only three
+pages: **Chat** (a plain, continuing 1:1 conversation with one of their
+assigned agents at a time — `fn_chat_send`/`fn_chat_history`, one ongoing
+session per (user, agent) pair, resumed via `fn_continue_session` above),
+**Messenger** (a Slack-style shared channel — a plain post is just stored;
+a post containing `@agent_name` additionally routes that message to the
+agent the same way Chat would, sharing the same conversation rather than
+starting a second, divergent one — `fn_messenger_post`/`messenger.list`),
+and **My Agents** (their assigned agents, each with an inline Provider/
+Model editor — `fn_set_my_model` — never the full agent editor's
+prompt/budget/permission fields). Which agents a regular user can reach at
+all is an explicit allow-list (`allgres_private.user_agent_assignments`,
+managed by an admin from the Users page), not everything minus a
+block-list. See KNOWN_ISSUES.md, item 30, for what this deliberately does
+not change: the pre-existing shared-token `dashboard_rpc` surface (agent
+CRUD, permissions, providers, the SQL sandbox allowlist) is untouched and
+still reachable by anyone holding that one token, same as every version
+before this — login adds a second, narrower identity layer for chat/
+messenger/my-model specifically, not a retrofit of the first one (that
+remains KNOWN_ISSUES.md, item 10).
 
 ## Known limitations
 

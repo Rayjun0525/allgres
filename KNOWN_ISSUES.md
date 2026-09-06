@@ -2111,4 +2111,113 @@ a reply, versus a plain 1:1 conversation) and the real accounts/login system
 with admin/user roles and per-user agent assignment that the dashboard UI
 for `fn_continue_session` will sit on top of — both underway as a follow-up
 to this same round of feedback, tracked separately rather than folded into
-this entry after the fact.
+this entry after the fact. See item 30.
+
+## 30. Real accounts (admin/user roles, per-user agent assignment) and the two chat modes item 29 deferred
+
+A follow-up to item 29's own "deliberately not built in this pass" note,
+from the same round of feedback: a real username/password login distinct
+from the dashboard's one shared bearer token, admin vs. regular-user roles,
+an explicit per-user agent assignment list, and two ways to talk to an
+agent from the dashboard -- a plain 1:1 chat and a Slack-style channel
+where addressing a message with `@agent_name` is what routes it to that
+agent, everything else just posts.
+
+**Accounts.** `allgres_private.users` (username, a pgcrypto bcrypt
+`password_hash`, `role` in `('admin','user')`) and `allgres_private.
+web_sessions` (a bearer token distinct from the dashboard's own, resolved
+server-side by `allgres_private.session_user` rather than trusted at face
+value). Unlike provider-secret encryption, which degrades to plaintext
+storage with a loud warning when pgcrypto is missing (see "Secrets at
+rest"), a password hash has no safe degraded mode: `fn_create_user`/
+`fn_login` raise `pgcrypto is required` and refuse outright rather than
+ever hashing or comparing a password in plaintext -- confirmed live by
+temporarily uninstalling pgcrypto and watching both calls fail closed, then
+reinstalling and confirming they work. A failed login (wrong username or
+wrong password) is intentionally indistinguishable from the caller's
+side -- the same error message, plus a fixed `pg_sleep(0.2)` on the
+unknown-username path so it cannot be timed apart from a
+wrong-password one.
+
+**Roles.** `allgres_private.require_admin(token)` gates the new admin-only
+actions (`users.create`, `users.list`, `users.set_active`, `users.
+set_role`, `assignments.set`, `assignments.list`). `allgres_private.
+require_agent_access(token, agent_id)` is the one check every chat/
+messenger/model-config action for a specific agent goes through: an admin
+reaches any active agent with no assignment row needed at all; a regular
+user only one explicitly listed in `allgres_private.
+user_agent_assignments` (item 29's "explicit allowed set" pattern, not
+"everything visible unless removed"). Neither of these touches the
+dashboard's own shared token or `operator_name` -- a `session_token` in the
+request body identifies the logged-in user instead, alongside the existing
+mechanisms rather than replacing them. This is deliberately narrower than
+a full rewrite of the security model: the existing shared-token-gated
+`dashboard_rpc` surface (agent CRUD, permissions, providers, the SQL
+sandbox allowlist, and so on) is unchanged and still reachable by anyone
+holding that one token, same as before every item through 29. Real
+per-operator authorization for *that* surface remains the deferred item
+KNOWN_ISSUES.md, item 10, has always described -- this adds a second,
+separate identity layer for the new conversational surface specifically,
+not a retrofit of the first one.
+
+**Simple chat.** `allgres_private.user_agent_chat_sessions` maps one
+(user, agent) pair to one continuing session -- created via
+`fn_create_session` on the first message, resumed via `fn_continue_session`
+(item 29) on every one after, never a fresh, contextless session per
+message. `fn_chat_send`/`fn_chat_history` are the two calls the Chat page
+uses; `chat.send`/`chat.history` in `dashboard_rpc`.
+
+**Messenger.** `allgres_private.channel_messages` is a flat, append-style
+feed: every plain post is just stored (`mentioned_agent_id`/`session_id`
+both `NULL`); a post containing `@agent_name` additionally resolves that
+agent (through the same `require_agent_access` a direct `chat.send` would
+apply) and routes the *same* message through `fn_chat_send` -- so
+mentioning an agent in the channel and messaging it from the 1:1 Chat page
+share one conversation per (user, agent), not two divergent histories,
+confirmed live: a `chat.send` message and a later `@mention` in the
+channel landed in the same `session_id`, and the channel mention correctly
+picked up the earlier turn's context. `messenger.list` joins each
+mentioned row back to `allgres_private.sessions` for `status`/
+`final_answer` rather than duplicating the agent's reply into
+`channel_messages` itself -- the reply lives in exactly one place.
+
+**Dashboard.** A login screen gates the whole app -- on top of, not instead
+of, the existing dashboard-token prompt: that token still decides whether
+a browser reaches the HTTP surface at all, this decides who, having
+reached it, is using it. Nav is now role-scoped: an admin keeps every
+existing page, plus new **Users** (create an account, activate/deactivate,
+change role, manage one user's agent assignments), **Chat**, and
+**Messenger** pages; a regular user sees only **Chat**, **Messenger**, and
+**My Agents** -- their assigned agents, each with an inline Provider
+(dropdown of configured providers, the same as the operator-facing agent
+editor -- see item 29) / Model editor wired to `fn_set_my_model`, never the
+full `agents.update` surface (no prompt, budgets, or permissions).
+
+**Verified live**, the same standard as items 12–29: `fn_selftest` 113/113
+(9 new cases -- fail-closed without pgcrypto, wrong-password rejection, a
+correct login, `require_agent_access` admin-bypass vs. assigned-only-user,
+a plain messenger post carrying no mention, an unassigned `@mention`
+rejected, `fn_set_my_model` updating only an assigned agent and rejecting
+an unassigned one, and `fn_logout` invalidating a token idempotently), all
+using a throwaway agent created and torn down within the test, never the
+real seeded `analyst`/`health_monitor` fixtures. `tests/smoke.sql` and
+`tests/e2e_mock.sql` both still pass. Beyond the SQL suite: driven through
+an actual headless-Chromium (Playwright) pass against the real dashboard --
+the login gate blocking the app until signed in; an admin's full nav
+(including the three new pages) versus a freshly created regular user's
+three-item nav; creating a user and assigning an agent from the Users
+page; sending a chat message and reading it back on the Chat page; posting
+a plain message and an `@analyst` mention on the Messenger page and
+watching the mention's reply (`"Allgres mock runtime OK"`, from
+`tests/e2e_mock.sql`'s own mock provider) appear inline; and a regular
+user's My Agents page correctly listing only their one assigned agent
+with a provider dropdown.
+
+**Deliberately not built**: any UI affordance to search/paginate the
+Users or Messenger pages beyond a flat list (matching the Audit Log
+page's own accepted limitation, item 28); typing-indicator or read-receipt
+niceties for the messenger; and, as above, gating the pre-existing
+shared-token `dashboard_rpc` surface by role -- that remains the same
+single shared secret it always was, now with a second, narrower,
+per-user identity layer sitting alongside it for chat/messenger/my-model
+specifically.

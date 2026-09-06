@@ -637,6 +637,76 @@ CREATE TABLE IF NOT EXISTS allgres_private.audit_log (
 CREATE INDEX IF NOT EXISTS audit_log_created_idx
   ON allgres_private.audit_log (created_at DESC);
 
+-- Real per-operator accounts (KNOWN_ISSUES.md, item 10 -- what item 28's
+-- lighter audit log kept deferring): a username/password login, distinct
+-- from the dashboard's one shared bearer token, so the conversational
+-- (chat/messenger) surface can tell an admin apart from a regular user and
+-- scope what each one can reach. password_hash is a pgcrypto bcrypt hash
+-- (see fn_create_user/fn_login) -- never handled or compared in plaintext
+-- past the one call that sets or checks it.
+CREATE TABLE IF NOT EXISTS allgres_private.users (
+  user_id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  username      text NOT NULL UNIQUE,
+  password_hash text NOT NULL,
+  role          text NOT NULL CHECK (role IN ('admin', 'user')),
+  is_active     boolean NOT NULL DEFAULT true,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- A bearer token distinct from the dashboard's own shared one: this one
+-- identifies a single logged-in user, carried by the browser the same way
+-- (sessionStorage, sent back on every chat/messenger/account call) but
+-- resolved server-side to a real row instead of trusted at face value.
+CREATE TABLE IF NOT EXISTS allgres_private.web_sessions (
+  session_token text PRIMARY KEY,
+  user_id       uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  expires_at    timestamptz NOT NULL,
+  last_seen_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS web_sessions_user_idx ON allgres_private.web_sessions (user_id);
+CREATE INDEX IF NOT EXISTS web_sessions_expiry_idx ON allgres_private.web_sessions (expires_at);
+
+-- Which agents a regular user may see or talk to at all -- an admin needs
+-- no row here (see require_agent_access); this table only ever narrows a
+-- regular user's reach, never widens an admin's.
+CREATE TABLE IF NOT EXISTS allgres_private.user_agent_assignments (
+  user_id    uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  agent_id   uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, agent_id)
+);
+
+-- One continuing session per (user, agent) pair for the simple 1:1 chat
+-- page, and the same pair's session for a messenger @mention (see
+-- messenger.post): "chat with this agent" is one ongoing conversation per
+-- user, not a new session every message. Deliberately separate from
+-- fn_create_session's ordinary sessions table -- this is only the pointer
+-- to which session a user's chat with an agent currently lives in.
+CREATE TABLE IF NOT EXISTS allgres_private.user_agent_chat_sessions (
+  user_id    uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  agent_id   uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES allgres_private.sessions(session_id),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, agent_id)
+);
+
+-- The Slack-style messenger channel: every plain post, and every message
+-- that addressed an agent with "@agent_name". mentioned_agent_id/session_id
+-- are set only for the latter; messenger.list joins session_id back to
+-- allgres_private.sessions to show the agent's reply once that session
+-- completes, rather than duplicating the answer into this table itself.
+CREATE TABLE IF NOT EXISTS allgres_private.channel_messages (
+  message_id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  author_user_id    uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  content            text NOT NULL,
+  mentioned_agent_id uuid REFERENCES allgres_private.agents(agent_id),
+  session_id         uuid REFERENCES allgres_private.sessions(session_id),
+  created_at         timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS channel_messages_created_idx
+  ON allgres_private.channel_messages (created_at DESC);
+
 CREATE TABLE IF NOT EXISTS allgres_private.human_approvals (
   approval_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
@@ -4428,6 +4498,346 @@ END;
 $fn$;
 
 -- ---------------------------------------------------------------------------
+-- 9b. Accounts, roles, and the chat/messenger surface built on them.
+--     Real login (username/password, pgcrypto bcrypt hashes), distinct from
+--     the dashboard's one shared bearer token -- see the users/web_sessions
+--     table comments above for why this exists alongside, not instead of,
+--     the lighter audit log item 28 already built.
+-- ---------------------------------------------------------------------------
+
+-- Every password operation here requires pgcrypto -- unlike provider secret
+-- encryption (allgres_private.encrypt_secret), which degrades to plaintext
+-- with a loud warning when pgcrypto is missing, a password hash has no safe
+-- degraded mode: fail closed instead, the same way encrypt_secret already
+-- fails closed when a secret *key* is configured but pgcrypto is not.
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_user(
+  p_username text,
+  p_password text,
+  p_role text DEFAULT 'user'
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_ns text := allgres_private.pgcrypto_schema();
+  v_hash text;
+  v_id uuid;
+  v_username text := btrim(COALESCE(p_username, ''));
+BEGIN
+  IF v_ns IS NULL THEN
+    RAISE EXCEPTION 'pgcrypto is required for the accounts system but is not installed'
+      USING ERRCODE = 'P0001';
+  END IF;
+  IF v_username = '' THEN
+    RAISE EXCEPTION 'username required' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_role NOT IN ('admin', 'user') THEN
+    RAISE EXCEPTION 'invalid role: %', p_role USING ERRCODE = 'P0001';
+  END IF;
+  IF length(COALESCE(p_password, '')) < 8 THEN
+    RAISE EXCEPTION 'password must be at least 8 characters' USING ERRCODE = 'P0001';
+  END IF;
+
+  EXECUTE format('SELECT %I.crypt($1, %I.gen_salt(''bf''))', v_ns, v_ns)
+    INTO v_hash USING p_password;
+
+  INSERT INTO allgres_private.users (username, password_hash, role)
+  VALUES (v_username, v_hash, p_role)
+  RETURNING user_id INTO v_id;
+
+  RETURN jsonb_build_object('ok', true, 'user_id', v_id, 'username', v_username, 'role', p_role);
+END;
+$fn$;
+
+-- A failed login (unknown username or wrong password) is indistinguishable
+-- from the caller's side -- same error message, and a fixed pg_sleep so a
+-- valid-username-wrong-password attempt does not visibly resolve faster
+-- than an unknown-username one.
+CREATE OR REPLACE FUNCTION allgres_public.fn_login(p_username text, p_password text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_ns text := allgres_private.pgcrypto_schema();
+  u allgres_private.users%ROWTYPE;
+  v_ok boolean;
+  v_token text;
+BEGIN
+  IF v_ns IS NULL THEN
+    RAISE EXCEPTION 'pgcrypto is required for login but is not installed' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT * INTO u FROM allgres_private.users
+  WHERE username = btrim(COALESCE(p_username, '')) AND is_active;
+
+  IF NOT FOUND THEN
+    PERFORM pg_sleep(0.2);
+    RAISE EXCEPTION 'invalid username or password' USING ERRCODE = 'P0001';
+  END IF;
+
+  EXECUTE format('SELECT %I.crypt($1, $2) = $2', v_ns)
+    INTO v_ok USING COALESCE(p_password, ''), u.password_hash;
+
+  IF NOT v_ok THEN
+    RAISE EXCEPTION 'invalid username or password' USING ERRCODE = 'P0001';
+  END IF;
+
+  EXECUTE format('SELECT encode(%I.gen_random_bytes(32), ''hex'')', v_ns) INTO v_token;
+
+  INSERT INTO allgres_private.web_sessions (session_token, user_id, expires_at)
+  VALUES (v_token, u.user_id, now() + interval '7 days');
+
+  RETURN jsonb_build_object(
+    'ok', true, 'session_token', v_token,
+    'user_id', u.user_id, 'username', u.username, 'role', u.role
+  );
+END;
+$fn$;
+
+-- Idempotent: logging out a token that is already gone (expired, or logged
+-- out from another tab) is not an error.
+CREATE OR REPLACE FUNCTION allgres_public.fn_logout(p_session_token text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.web_sessions WHERE session_token = p_session_token;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- Resolves a bearer token to the user it belongs to, or a NULL row if the
+-- token is missing, unknown, expired, or the account was deactivated since
+-- the token was issued. Touches last_seen_at only on a hit, so a wall of
+-- invalid tokens can never generate write traffic.
+CREATE OR REPLACE FUNCTION allgres_private.session_user(p_token text)
+RETURNS allgres_private.users
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+BEGIN
+  IF p_token IS NULL OR p_token = '' THEN
+    RETURN NULL;
+  END IF;
+  SELECT us.* INTO u
+  FROM allgres_private.web_sessions ws
+  JOIN allgres_private.users us ON us.user_id = ws.user_id
+  WHERE ws.session_token = p_token AND ws.expires_at > now() AND us.is_active;
+  IF FOUND THEN
+    UPDATE allgres_private.web_sessions SET last_seen_at = now() WHERE session_token = p_token;
+    RETURN u;
+  END IF;
+  RETURN NULL;
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_private.require_admin(p_token text)
+RETURNS allgres_private.users
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+BEGIN
+  u := allgres_private.session_user(p_token);
+  IF u.user_id IS NULL THEN
+    RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+  END IF;
+  IF u.role <> 'admin' THEN
+    RAISE EXCEPTION 'admin role required' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN u;
+END;
+$fn$;
+
+-- The one check every chat/messenger/model-config action for a specific
+-- agent goes through: an admin may reach any active agent; a regular user
+-- only one explicitly assigned via user_agent_assignments (item 29's
+-- "explicit allowed set", not "everything visible by default").
+CREATE OR REPLACE FUNCTION allgres_private.require_agent_access(p_token text, p_agent_id uuid)
+RETURNS allgres_private.users
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+BEGIN
+  u := allgres_private.session_user(p_token);
+  IF u.user_id IS NULL THEN
+    RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_active) THEN
+    RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+  IF u.role <> 'admin' AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.user_agent_assignments
+    WHERE user_id = u.user_id AND agent_id = p_agent_id
+  ) THEN
+    RAISE EXCEPTION 'agent not assigned to this user' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN u;
+END;
+$fn$;
+
+-- The simple 1:1 chat surface: one continuing session per (user, agent)
+-- pair (user_agent_chat_sessions), created on first message and continued
+-- (fn_continue_session) on every one after -- never a fresh, contextless
+-- session per message.
+CREATE OR REPLACE FUNCTION allgres_public.fn_chat_send(
+  p_session_token text,
+  p_agent_id uuid,
+  p_message text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+  v_sid uuid;
+  v_created jsonb;
+BEGIN
+  u := allgres_private.require_agent_access(p_session_token, p_agent_id);
+  IF btrim(COALESCE(p_message, '')) = '' THEN
+    RAISE EXCEPTION 'message required' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT session_id INTO v_sid
+  FROM allgres_private.user_agent_chat_sessions
+  WHERE user_id = u.user_id AND agent_id = p_agent_id;
+
+  IF v_sid IS NULL THEN
+    v_created := allgres_public.fn_create_session(p_agent_id, btrim(p_message));
+    v_sid := (v_created->>'session_id')::uuid;
+    INSERT INTO allgres_private.user_agent_chat_sessions (user_id, agent_id, session_id)
+    VALUES (u.user_id, p_agent_id, v_sid);
+    RETURN jsonb_build_object('ok', true, 'session_id', v_sid, 'task_id', v_created->>'task_id');
+  END IF;
+
+  v_created := allgres_public.fn_continue_session(v_sid, btrim(p_message));
+  UPDATE allgres_private.user_agent_chat_sessions SET updated_at = now()
+  WHERE user_id = u.user_id AND agent_id = p_agent_id;
+  RETURN v_created;
+END;
+$fn$;
+
+-- The full thread for a user's ongoing chat with one agent -- same
+-- session-wide, root-tasks-only stitching fn_next_step itself now uses,
+-- read back for display rather than to build a prompt.
+CREATE OR REPLACE FUNCTION allgres_public.fn_chat_history(p_session_token text, p_agent_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+  v_sid uuid;
+BEGIN
+  u := allgres_private.require_agent_access(p_session_token, p_agent_id);
+
+  SELECT session_id INTO v_sid
+  FROM allgres_private.user_agent_chat_sessions
+  WHERE user_id = u.user_id AND agent_id = p_agent_id;
+
+  IF v_sid IS NULL THEN
+    RETURN jsonb_build_object('ok', true, 'session_id', NULL, 'status', NULL, 'messages', '[]'::jsonb);
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'session_id', v_sid,
+    'status', (SELECT status FROM allgres_private.sessions WHERE session_id = v_sid),
+    'messages', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'role', l.role, 'content', allgres_private.log_content_text(l.content), 'created_at', l.created_at
+      ) ORDER BY l.created_at)
+      FROM allgres_private.execution_logs l
+      JOIN allgres_private.tasks t USING (task_id)
+      WHERE t.session_id = v_sid AND t.parent_task_id IS NULL
+        AND l.role IN ('user', 'assistant', 'operator')
+    ), '[]'::jsonb)
+  );
+END;
+$fn$;
+
+-- The Slack-style messenger: a plain post is just stored; a post containing
+-- "@agent_name" additionally resolves that agent (subject to the same
+-- require_agent_access an unaddressed regular user could not bypass) and
+-- routes the *same* message through fn_chat_send, so mentioning an agent in
+-- the channel and messaging it in the 1:1 chat page share one conversation
+-- per (user, agent) -- not two divergent histories.
+CREATE OR REPLACE FUNCTION allgres_public.fn_messenger_post(p_session_token text, p_text text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+  v_text text := btrim(COALESCE(p_text, ''));
+  v_mention text;
+  v_agent_id uuid;
+  v_sid uuid;
+  v_mid uuid;
+BEGIN
+  u := allgres_private.session_user(p_session_token);
+  IF u.user_id IS NULL THEN
+    RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_text = '' THEN
+    RAISE EXCEPTION 'message required' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_mention := substring(v_text FROM '@([A-Za-z0-9_-]+)');
+  IF v_mention IS NOT NULL THEN
+    SELECT agent_id INTO v_agent_id FROM allgres_private.agents WHERE name = v_mention;
+    IF v_agent_id IS NULL THEN
+      RAISE EXCEPTION 'no such agent: %', v_mention USING ERRCODE = 'P0001';
+    END IF;
+    -- Validates access the same way chat.send would; a plain post (no
+    -- mention, v_agent_id NULL) skips this entirely -- posting to the
+    -- channel itself is not agent-gated, only addressing one is.
+    PERFORM allgres_private.require_agent_access(p_session_token, v_agent_id);
+    v_sid := (allgres_public.fn_chat_send(p_session_token, v_agent_id, v_text)->>'session_id')::uuid;
+  END IF;
+
+  INSERT INTO allgres_private.channel_messages (author_user_id, content, mentioned_agent_id, session_id)
+  VALUES (u.user_id, v_text, v_agent_id, v_sid)
+  RETURNING message_id INTO v_mid;
+
+  RETURN jsonb_build_object('ok', true, 'message_id', v_mid, 'mentioned_agent_id', v_agent_id, 'session_id', v_sid);
+END;
+$fn$;
+
+-- Regular users can only reach this narrow slice of an agent's policy --
+-- llm_config, through fn_set_policy the same way the operator-facing agent
+-- editor already does -- never max_steps/permissions/prompt, which stay
+-- admin-only via the existing agents.update surface.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_my_model(
+  p_session_token text,
+  p_agent_id uuid,
+  p_provider text,
+  p_model text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+BEGIN
+  PERFORM allgres_private.require_agent_access(p_session_token, p_agent_id);
+  RETURN allgres_public.fn_set_policy(
+    p_agent_id, NULL, NULL, NULL,
+    jsonb_build_object('provider', p_provider, 'model', p_model)
+  );
+END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
 -- 10. Seed data.  Create-only: replaying this file must not clobber an
 --     operator's edited prompt, provider list, or policy.
 -- ---------------------------------------------------------------------------
@@ -4685,6 +5095,9 @@ DECLARE
   v_high_mem uuid;
   v_mem_gc int;
   v_new_agent uuid;
+  v_admin_tok text;
+  v_user_tok text;
+  v_acct_agent uuid;
 BEGIN
   -- Clear out any leftover fixtures from an interrupted prior run before
   -- creating new ones, so a crash mid-selftest can't leave stale rows
@@ -5906,6 +6319,121 @@ BEGIN
   WHERE task_id = v_tid2;
   PERFORM allgres_private.maybe_complete_session(v_sid);
 
+  -- 31. Real accounts (item 29's follow-up to item 28's lighter audit log):
+  --     pgcrypto-backed login, role gating (require_admin/
+  --     require_agent_access), and the chat/messenger surface built on
+  --     them. A fresh agent of its own, never the real 'analyst' fixture --
+  --     fn_set_my_model below actually mutates llm_config, and fn_selftest
+  --     must never leave a real seeded agent's policy different from how
+  --     it found it.
+  DELETE FROM allgres_private.web_sessions WHERE user_id IN (
+    SELECT user_id FROM allgres_private.users WHERE username IN ('selftest_admin', 'selftest_user')
+  );
+  DELETE FROM allgres_private.users WHERE username IN ('selftest_admin', 'selftest_user');
+  SELECT agent_id INTO v_acct_agent FROM allgres_private.agents WHERE name = 'selftest_accounts_agent';
+  IF v_acct_agent IS NULL THEN
+    v_acct_agent := (allgres_public.fn_create_agent('selftest_accounts_agent')->>'agent_id')::uuid;
+  END IF;
+
+  IF allgres_private.pgcrypto_schema() IS NULL THEN
+    -- Accounts have no degraded mode, unlike secret encryption: fail
+    -- closed and loudly instead of ever hashing or comparing a password
+    -- in plaintext.
+    BEGIN
+      PERFORM allgres_public.fn_create_user('selftest_no_pgcrypto', 'irrelevant123', 'admin');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%pgcrypto is required%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'accounts_fail_closed_without_pgcrypto', 'ok', ok));
+  ELSE
+    PERFORM allgres_public.fn_create_user('selftest_admin', 'selftest-admin-pw1', 'admin');
+    PERFORM allgres_public.fn_create_user('selftest_user', 'selftest-user-pw1', 'user');
+
+    BEGIN
+      PERFORM allgres_public.fn_login('selftest_admin', 'wrong-password');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%invalid username or password%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_login_rejects_wrong_password', 'ok', ok));
+
+    comp := allgres_public.fn_login('selftest_admin', 'selftest-admin-pw1');
+    v_admin_tok := comp->>'session_token';
+    ok := (comp->>'ok')::boolean AND v_admin_tok IS NOT NULL AND (comp->>'role') = 'admin';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_login_succeeds_with_correct_password', 'ok', ok));
+
+    comp := allgres_public.fn_login('selftest_user', 'selftest-user-pw1');
+    v_user_tok := comp->>'session_token';
+
+    -- An admin reaches any active agent with no assignment row at all; a
+    -- regular user is rejected from the same agent until explicitly
+    -- assigned, then allowed.
+    BEGIN
+      PERFORM allgres_private.require_agent_access(v_user_tok, v_acct_agent);
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%not assigned%';
+    END;
+    ok := ok AND (allgres_private.require_agent_access(v_admin_tok, v_acct_agent)).user_id IS NOT NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'require_agent_access_admin_bypasses_assignment', 'ok', ok));
+
+    INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+    VALUES ((SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'), v_acct_agent);
+    ok := (allgres_private.require_agent_access(v_user_tok, v_acct_agent)).user_id IS NOT NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'require_agent_access_allows_assigned_user', 'ok', ok));
+
+    -- fn_messenger_post: a plain post carries no mentioned_agent_id/
+    -- session_id; an @mention of an agent the user cannot reach is
+    -- rejected the same way chat.send would reject it directly.
+    comp := allgres_public.fn_messenger_post(v_user_tok, 'just a plain selftest channel message');
+    ok := (comp->>'mentioned_agent_id') IS NULL AND (comp->>'session_id') IS NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'messenger_plain_post_has_no_mention', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_public.fn_messenger_post(v_user_tok, '@health_monitor selftest not assigned');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%not assigned%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'messenger_mention_of_unassigned_agent_rejected', 'ok', ok));
+
+    -- fn_set_my_model: the one thing a regular user may change on their
+    -- assigned agent's policy -- never max_steps/permissions/prompt, which
+    -- stay behind the operator-only agents.update surface.
+    comp := allgres_public.fn_set_my_model(v_user_tok, v_acct_agent, 'selftest_placeholder_provider', 'some-model');
+    ok := (comp->>'ok')::boolean
+      AND (SELECT llm_config FROM allgres_private.policies WHERE agent_id = v_acct_agent)
+        = jsonb_build_object('provider', 'selftest_placeholder_provider', 'model', 'some-model');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_my_model_updates_assigned_agent', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_public.fn_set_my_model(
+        v_user_tok, (SELECT agent_id FROM allgres_private.agents WHERE name = 'health_monitor'), 'x', 'y'
+      );
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%not assigned%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_my_model_rejects_unassigned_agent', 'ok', ok));
+
+    -- fn_logout is idempotent, and a logged-out token no longer resolves.
+    PERFORM allgres_public.fn_logout(v_user_tok);
+    ok := allgres_private.session_user(v_user_tok) IS NULL;
+    PERFORM allgres_public.fn_logout(v_user_tok);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_logout_invalidates_token_and_is_idempotent', 'ok', ok));
+
+    PERFORM allgres_public.fn_logout(v_admin_tok);
+  END IF;
+
+  DELETE FROM allgres_private.web_sessions WHERE user_id IN (
+    SELECT user_id FROM allgres_private.users WHERE username IN ('selftest_admin', 'selftest_user')
+  );
+  DELETE FROM allgres_private.user_agent_assignments WHERE agent_id = v_acct_agent;
+  DELETE FROM allgres_private.users WHERE username IN ('selftest_admin', 'selftest_user');
+  DELETE FROM allgres_private.policies WHERE agent_id = v_acct_agent;
+  DELETE FROM allgres_private.agents WHERE agent_id = v_acct_agent;
+
   -- selftest_cleanup cannot delete these rows outright -- execution_logs'
   -- append-only trigger rejects DELETE the same as UPDATE, for anyone -- so
   -- an operator must never see them a different way: every operator-facing
@@ -6319,6 +6847,7 @@ AS $fn$
 DECLARE
   v_action text := COALESCE(p_request->>'action', '');
   v_id uuid;
+  v_user allgres_private.users%ROWTYPE;
 BEGIN
   -- One audit_log row per consequential action, written here rather than
   -- scattered across each branch below, so no future action can be added
@@ -6337,14 +6866,15 @@ BEGIN
     'permissions.grant', 'permissions.revoke', 'allowlist.add', 'allowlist.remove',
     'projects.create', 'projects.update', 'sessions.cancel',
     'memories.create', 'memories.remove', 'provider.update', 'provider.create',
-    'providers.oauth_callback', 'approvals.decide'
+    'providers.oauth_callback', 'approvals.decide',
+    'users.create', 'users.set_active', 'users.set_role', 'assignments.set'
   ]) THEN
     INSERT INTO allgres_private.audit_log (operator_name, action, details)
     VALUES (
       NULLIF(btrim(COALESCE(p_request->>'operator_name', '')), ''),
       v_action,
       (p_request - 'action' - 'operator_name')
-        - ARRAY['api_key', 'oauth_client_secret', 'code', 'state']::text[]
+        - ARRAY['api_key', 'oauth_client_secret', 'code', 'state', 'password', 'session_token']::text[]
     );
   END IF;
 
@@ -6585,6 +7115,143 @@ BEGIN
         (p_request->>'session_id')::uuid,
         p_request->>'message'
       );
+
+    -- ---------------------------------------------------------------------
+    -- Accounts, roles, and the chat/messenger surface (see the
+    -- users/web_sessions table comments and require_admin/
+    -- require_agent_access). None of these touch operator_name/the
+    -- dashboard's own shared bearer token -- a session_token in the request
+    -- body identifies the logged-in user instead, resolved server-side by
+    -- allgres_private.session_user rather than trusted at face value.
+    -- ---------------------------------------------------------------------
+
+    WHEN 'auth.login' THEN
+      RETURN allgres_public.fn_login(p_request->>'username', p_request->>'password');
+
+    WHEN 'auth.logout' THEN
+      RETURN allgres_public.fn_logout(p_request->>'session_token');
+
+    WHEN 'auth.me' THEN
+      v_user := allgres_private.session_user(p_request->>'session_token');
+      IF v_user.user_id IS NULL THEN
+        RETURN jsonb_build_object('ok', true, 'logged_in', false);
+      END IF;
+      RETURN jsonb_build_object(
+        'ok', true, 'logged_in', true,
+        'user_id', v_user.user_id, 'username', v_user.username, 'role', v_user.role
+      );
+
+    WHEN 'users.create' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      RETURN allgres_public.fn_create_user(
+        p_request->>'username', p_request->>'password',
+        COALESCE(NULLIF(p_request->>'role', ''), 'user')
+      );
+
+    WHEN 'users.list' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'users', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'user_id', user_id, 'username', username, 'role', role,
+          'is_active', is_active, 'created_at', created_at
+        ) ORDER BY created_at)
+        FROM allgres_private.users
+      ), '[]'::jsonb));
+
+    WHEN 'users.set_active' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      UPDATE allgres_private.users SET is_active = (p_request->>'is_active')::boolean
+      WHERE user_id = (p_request->>'user_id')::uuid;
+      RETURN jsonb_build_object('ok', true);
+
+    WHEN 'users.set_role' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      IF p_request->>'role' NOT IN ('admin', 'user') THEN
+        RAISE EXCEPTION 'invalid role: %', p_request->>'role' USING ERRCODE = 'P0001';
+      END IF;
+      UPDATE allgres_private.users SET role = p_request->>'role'
+      WHERE user_id = (p_request->>'user_id')::uuid;
+      RETURN jsonb_build_object('ok', true);
+
+    -- Replaces the full assignment set for one user with the given
+    -- agent_ids array -- simpler and less error-prone from the UI than
+    -- incremental add/remove calls for what is always edited as one list.
+    WHEN 'assignments.set' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      v_id := (p_request->>'user_id')::uuid;
+      DELETE FROM allgres_private.user_agent_assignments WHERE user_id = v_id;
+      INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+      SELECT v_id, (a)::uuid FROM jsonb_array_elements_text(COALESCE(p_request->'agent_ids', '[]'::jsonb)) a;
+      RETURN jsonb_build_object('ok', true);
+
+    WHEN 'assignments.list' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'agent_ids', COALESCE((
+        SELECT jsonb_agg(agent_id) FROM allgres_private.user_agent_assignments
+        WHERE user_id = (p_request->>'user_id')::uuid
+      ), '[]'::jsonb));
+
+    -- The agents a logged-in user may see at all: every active agent for an
+    -- admin, only explicitly assigned ones for a regular user.
+    WHEN 'agents.mine' THEN
+      v_user := allgres_private.session_user(p_request->>'session_token');
+      IF v_user.user_id IS NULL THEN
+        RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'agents', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'agent_id', a.agent_id, 'name', a.name,
+          'provider', p.llm_config->>'provider', 'model', p.llm_config->>'model'
+        ) ORDER BY a.name)
+        FROM allgres_private.agents a
+        JOIN allgres_private.policies p USING (agent_id)
+        WHERE a.is_active AND (
+          v_user.role = 'admin'
+          OR EXISTS (
+            SELECT 1 FROM allgres_private.user_agent_assignments x
+            WHERE x.user_id = v_user.user_id AND x.agent_id = a.agent_id
+          )
+        )
+      ), '[]'::jsonb));
+
+    WHEN 'agents.set_my_model' THEN
+      RETURN allgres_public.fn_set_my_model(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid,
+        NULLIF(p_request->>'provider', ''), NULLIF(p_request->>'model', '')
+      );
+
+    WHEN 'chat.send' THEN
+      RETURN allgres_public.fn_chat_send(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid, p_request->>'message'
+      );
+
+    WHEN 'chat.history' THEN
+      RETURN allgres_public.fn_chat_history(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid
+      );
+
+    WHEN 'messenger.post' THEN
+      RETURN allgres_public.fn_messenger_post(p_request->>'session_token', p_request->>'text');
+
+    WHEN 'messenger.list' THEN
+      v_user := allgres_private.session_user(p_request->>'session_token');
+      IF v_user.user_id IS NULL THEN
+        RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'messages', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at)
+        FROM (
+          SELECT m.message_id, m.content, m.created_at,
+                 au.username AS author, ag.name AS mentioned_agent,
+                 s.status AS reply_status, s.final_answer AS reply
+          FROM allgres_private.channel_messages m
+          JOIN allgres_private.users au ON au.user_id = m.author_user_id
+          LEFT JOIN allgres_private.agents ag ON ag.agent_id = m.mentioned_agent_id
+          LEFT JOIN allgres_private.sessions s ON s.session_id = m.session_id
+          ORDER BY m.created_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
+        ) q
+      ), '[]'::jsonb));
 
     WHEN 'sessions.list' THEN
       RETURN jsonb_build_object('ok', true, 'sessions', COALESCE((
