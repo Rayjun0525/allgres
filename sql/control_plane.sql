@@ -266,6 +266,19 @@ DROP FUNCTION IF EXISTS allgres_public.fn_claim_outbound(int);
 -- looks like from inside a SECURITY DEFINER function's own body).
 DROP FUNCTION IF EXISTS allgres_private.agent_may_read(text);
 
+-- OAuth token exchange used to be built and handed straight back to its
+-- caller (fn_oauth_token_request), with a separate fn_oauth_store_tokens an
+-- operator called afterward with whatever access/refresh token their own
+-- browser-side code obtained -- which is exactly how a decrypted client
+-- secret reached `operator` in the first place (see KNOWN_ISSUES, "a
+-- second-round external review of items 18 and 19"). Both functions are
+-- replaced by a queued exchange the runtime worker performs itself
+-- (fn_claim_oauth/fn_complete_oauth, see "9. Operator API"): fn_oauth_token_request
+-- keeps its name and signature but now only queues, and fn_oauth_store_tokens
+-- has no replacement at all -- its storage logic moved inside
+-- fn_complete_oauth, and nothing outside the worker needs to call it anymore.
+DROP FUNCTION IF EXISTS allgres_public.fn_oauth_store_tokens(text, text, text, int);
+
 -- ---------------------------------------------------------------------------
 -- 2. Schemas, tables, indexes, triggers.
 -- ---------------------------------------------------------------------------
@@ -558,6 +571,68 @@ CREATE INDEX IF NOT EXISTS execution_logs_task_idx
 CREATE INDEX IF NOT EXISTS execution_logs_created_idx
   ON allgres_private.execution_logs (created_at DESC);
 
+-- Long-term agent memory, slice one: structured storage plus recency/
+-- importance retrieval, deliberately no embedding column or vector search
+-- in this pass -- narrow, the same shape item 15 used for per-agent roles
+-- ("does the core mechanism work at all, end to end, verified live, before
+-- any of the rest is built on top of it"). execution_logs is the verbatim,
+-- append-only transcript of one task; this is the opposite: a bounded,
+-- curated, cross-session store an agent writes to on purpose (the
+-- `remember` action) and that fn_next_step reads back into every future
+-- turn's context, for that agent only -- see "7. Agent state machine".
+-- subject_id is free text (there is no user-accounts system to key it to
+-- yet, see KNOWN_ISSUES item 10), for an agent to tag who or what a memory
+-- is about if it chooses to; nothing enforces its shape or reads it as
+-- identity today.
+CREATE TABLE IF NOT EXISTS allgres_private.agent_memories (
+  memory_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id          uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  subject_id        text,
+  memory_type       text NOT NULL CHECK (memory_type IN
+                      ('semantic', 'episodic', 'preference', 'instruction', 'relationship', 'working')),
+  content           text NOT NULL,
+  importance        real NOT NULL DEFAULT 0.5 CHECK (importance BETWEEN 0 AND 1),
+  confidence        real NOT NULL DEFAULT 1.0 CHECK (confidence BETWEEN 0 AND 1),
+  source_session_id uuid REFERENCES allgres_private.sessions(session_id) ON DELETE SET NULL,
+  source_task_id    uuid REFERENCES allgres_private.tasks(task_id) ON DELETE SET NULL,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  last_accessed_at  timestamptz,
+  expires_at        timestamptz,
+  metadata          jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- What fn_next_step's retrieval query actually uses: one agent's own rows,
+-- ranked by importance then recency, live rows only.
+CREATE INDEX IF NOT EXISTS agent_memories_recall_idx
+  ON allgres_private.agent_memories (agent_id, importance DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS agent_memories_expiry_idx
+  ON allgres_private.agent_memories (expires_at)
+  WHERE expires_at IS NOT NULL;
+
+-- A lightweight audit trail (README, "Operator audit log"), deliberately
+-- not a real accounts system: the dashboard has one shared bearer token
+-- (see "Exposure" in the README's Security model), not per-operator
+-- credentials, so there is no authenticated identity to attach here.
+-- operator_name is self-reported -- text the browser sends alongside every
+-- request, the same way the dashboard token itself is (sessionStorage, per
+-- browser tab) -- and dashboard_rpc writes one row per consequential
+-- action in the same transaction as the mutation itself, so a row only
+-- ever exists for something that actually committed. This answers "who
+-- claimed responsibility for this," not "who was authenticated to do it" --
+-- anyone holding the one shared token can type any name, or none. See
+-- KNOWN_ISSUES.md, item 10, for what a real accounts system would need
+-- instead, and item 28 for why this lighter version was built first.
+CREATE TABLE IF NOT EXISTS allgres_private.audit_log (
+  audit_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  operator_name text,
+  action        text NOT NULL,
+  details       jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS audit_log_created_idx
+  ON allgres_private.audit_log (created_at DESC);
+
 CREATE TABLE IF NOT EXISTS allgres_private.human_approvals (
   approval_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
@@ -669,6 +744,39 @@ CREATE INDEX IF NOT EXISTS outbound_task_idx
   ON allgres_private.outbound_calls (task_id, status);
 CREATE INDEX IF NOT EXISTS outbound_inflight_idx
   ON allgres_private.outbound_calls (updated_at)
+  WHERE status = 'in_flight';
+
+-- OAuth token exchange, queued the same way as outbound_calls/sql_calls:
+-- queued -> in_flight -> harvested/lost, claimed by the runtime worker and
+-- run on the same HTTP thread pool. Unlike outbound_calls this has no
+-- task_id -- the exchange is an operator-initiated dashboard action, not an
+-- agent turn -- so fn_complete_oauth stores the resulting tokens directly
+-- instead of routing through fn_submit_result. request_body never holds the
+-- client_secret: fn_oauth_token_request queues everything else, and
+-- fn_claim_oauth resolves and merges the decrypted secret in at claim time,
+-- the same credential-at-claim-time shape fn_claim_outbound already uses for
+-- an LLM provider's api_key (see KNOWN_ISSUES, "provider credentials in
+-- plaintext").
+CREATE TABLE IF NOT EXISTS allgres_private.oauth_calls (
+  call_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id      uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
+  state            text NOT NULL,
+  url              text NOT NULL,
+  request_headers  jsonb NOT NULL DEFAULT '{}'::jsonb,
+  request_body     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  allow_private    boolean NOT NULL DEFAULT false,
+  status           text NOT NULL CHECK (status IN ('queued', 'in_flight', 'harvested', 'lost')),
+  response_status  int,
+  error            text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS oauth_calls_ready_idx
+  ON allgres_private.oauth_calls (created_at)
+  WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS oauth_calls_inflight_idx
+  ON allgres_private.oauth_calls (updated_at)
   WHERE status = 'in_flight';
 
 -- Agent SQL is validated here (fn_validate_sql) but executed by the runtime
@@ -798,6 +906,24 @@ DROP TRIGGER IF EXISTS execution_logs_no_update ON allgres_private.execution_log
 CREATE TRIGGER execution_logs_no_update
   BEFORE UPDATE OR DELETE ON allgres_private.execution_logs
   FOR EACH ROW EXECUTE FUNCTION allgres_private.forbid_log_mutation();
+
+-- An audit trail that can be edited or deleted isn't one -- append-only,
+-- the same enforcement (trigger + REVOKE, not just convention) execution_logs
+-- already has, for the same reason.
+CREATE OR REPLACE FUNCTION allgres_private.forbid_audit_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  RAISE EXCEPTION 'audit_log is append-only'
+    USING ERRCODE = 'P0001';
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS audit_log_no_update ON allgres_private.audit_log;
+CREATE TRIGGER audit_log_no_update
+  BEFORE UPDATE OR DELETE ON allgres_private.audit_log
+  FOR EACH ROW EXECUTE FUNCTION allgres_private.forbid_audit_mutation();
 
 CREATE OR REPLACE FUNCTION allgres_private.ensure_policy()
 RETURNS trigger
@@ -1043,6 +1169,55 @@ AS
   FROM allgres_private.demo_sales
   WHERE agent_id IS NOT DISTINCT FROM allgres_private.current_agent_id()
     AND allgres_private.agent_may_read('allgres_public.v_sales', allgres_private.current_agent_id());
+
+-- Read-only diagnostic views for a maintenance/auditor agent (README,
+-- "Maintenance agents"). Same permission-gated shape as v_sales/
+-- v_my_tasks, but with no agent_id ownership column to filter rows by --
+-- these describe the system as a whole, not any one agent's own data, so
+-- agent_may_read alone decides visibility: an agent without the grant sees
+-- zero rows (a bare SELECT with no FROM clause and a false WHERE returns
+-- none, the same as any other filtered query), an agent with it sees the
+-- same picture every other agent holding the grant would -- there is
+-- nothing per-agent to scope further.
+CREATE OR REPLACE VIEW allgres_public.v_system_health
+  WITH (security_barrier = true)
+AS
+  SELECT
+    -- Same caveat as the dashboard's own Workers panel (KNOWN_ISSUES.md,
+    -- item 5): `allgres web` deliberately has no database connection, so a
+    -- background worker without one never appears in pg_stat_activity at
+    -- all -- this reads as "1 worker online" even when both are healthy,
+    -- not a sign the web worker is down.
+    (SELECT count(*) FROM pg_stat_activity WHERE backend_type IN ('allgres runtime', 'allgres web')) AS workers_online,
+    (SELECT count(*) FROM allgres_private.outbound_calls WHERE status = 'queued') AS outbound_queued,
+    (SELECT count(*) FROM allgres_private.outbound_calls WHERE status = 'in_flight') AS outbound_in_flight,
+    (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'queued') AS sql_queued,
+    (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'in_flight') AS sql_in_flight,
+    (SELECT count(*) FROM allgres_private.oauth_calls WHERE status = 'queued') AS oauth_queued,
+    (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued', 'running', 'waiting_human')) AS running_tasks,
+    (SELECT count(*) FROM allgres_private.tasks WHERE status = 'failed' AND updated_at > now() - interval '24 hours') AS failed_tasks_24h,
+    (SELECT count(*) FROM allgres_private.human_approvals WHERE status = 'pending') AS pending_approvals,
+    (SELECT count(*) FROM allgres_private.agent_memories WHERE expires_at IS NOT NULL AND expires_at < now()) AS expired_memories_pending
+  WHERE allgres_private.agent_may_read('allgres_public.v_system_health', allgres_private.current_agent_id());
+
+-- One row per (agent, resource) grant -- the full permission matrix a
+-- security-auditor agent needs to spot an anomaly (an inactive agent still
+-- holding grants, an unusually broad http_host, a permission nobody has
+-- used).  Nothing here is secret: names, resource types and refs, and
+-- when a grant was made -- never a credential.
+CREATE OR REPLACE VIEW allgres_public.v_permission_audit
+  WITH (security_barrier = true)
+AS
+  SELECT
+    a.agent_id,
+    a.name AS agent_name,
+    a.is_active AS agent_is_active,
+    p.resource_type,
+    p.resource_ref,
+    p.granted_at
+  FROM allgres_private.permissions p
+  JOIN allgres_private.agents a USING (agent_id)
+  WHERE allgres_private.agent_may_read('allgres_public.v_permission_audit', allgres_private.current_agent_id());
 
 -- ---------------------------------------------------------------------------
 -- 4. Outbound URL / host guards.
@@ -1336,6 +1511,22 @@ SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
   SELECT allgres_private.decrypt_secret(api_key)
+  FROM allgres_private.llm_secrets
+  WHERE provider_id = p_provider_id
+$fn$;
+
+-- Same shape as provider_secret, for the OAuth client secret instead of the
+-- api_key column. Used only by fn_claim_oauth, at claim time -- never at
+-- queue time (fn_oauth_token_request), which is what keeps it out of
+-- oauth_calls.request_body.
+CREATE OR REPLACE FUNCTION allgres_private.oauth_client_secret(p_provider_id uuid)
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  SELECT allgres_private.decrypt_secret(oauth_client_secret)
   FROM allgres_private.llm_secrets
   WHERE provider_id = p_provider_id
 $fn$;
@@ -1638,6 +1829,95 @@ $fn$;
 -- 7. Agent state machine.  Short transactions only; never waits on HTTP.
 -- ---------------------------------------------------------------------------
 
+-- Shared by the agent's own `remember` action (fn_submit_result) and the
+-- operator-authored path (fn_remember / dashboard_rpc's memories.create):
+-- same validation, same fixed 500-per-agent eviction, same insert. Returns
+-- {ok:false, error:...} rather than raising, since the two callers handle a
+-- rejected write differently (one logs an 'error' turn and continues the
+-- task; the other just reports failure to the dashboard) -- this function
+-- only decides whether the write is well-formed, not what happens next.
+-- p_importance/p_expires_in_days are text, not real/int: casting either at
+-- a call site (`(p_request->>'importance')::real`) throws immediately on a
+-- malformed value, before this function's own defensive handling ever runs
+-- -- an agent-controlled string has to be parsed *inside* the guarded block
+-- that decides what to do when it doesn't parse, not before it.
+CREATE OR REPLACE FUNCTION allgres_private.write_memory(
+  p_agent_id uuid,
+  p_content text,
+  p_memory_type text,
+  p_importance text,
+  p_subject_id text,
+  p_expires_in_days text,
+  p_source_session_id uuid DEFAULT NULL,
+  p_source_task_id uuid DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_content text;
+  v_type text;
+  v_importance real;
+  v_expires timestamptz;
+  v_memory uuid;
+BEGIN
+  v_content := btrim(COALESCE(p_content, ''));
+  IF v_content = '' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'empty_content');
+  END IF;
+
+  v_type := COALESCE(NULLIF(p_memory_type, ''), 'semantic');
+  IF v_type NOT IN ('semantic', 'episodic', 'preference', 'instruction', 'relationship', 'working') THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'invalid_memory_type', 'memory_type', v_type);
+  END IF;
+
+  -- Malformed importance falls back to the default rather than rejecting
+  -- the whole write -- it is a ranking hint, not a correctness constraint.
+  BEGIN
+    v_importance := LEAST(1.0, GREATEST(0.0, COALESCE(NULLIF(p_importance, '')::real, 0.5)));
+  EXCEPTION WHEN others THEN
+    v_importance := 0.5;
+  END;
+
+  v_expires := NULL;
+  IF NULLIF(p_expires_in_days, '') IS NOT NULL THEN
+    BEGIN
+      v_expires := now() + make_interval(days => GREATEST(0, p_expires_in_days::int));
+    EXCEPTION WHEN others THEN
+      v_expires := NULL;
+    END;
+  END IF;
+
+  INSERT INTO allgres_private.agent_memories (
+    agent_id, subject_id, memory_type, content, importance,
+    source_session_id, source_task_id, expires_at
+  ) VALUES (
+    p_agent_id, NULLIF(btrim(COALESCE(p_subject_id, '')), ''), v_type,
+    left(v_content, 4000), v_importance, p_source_session_id, p_source_task_id, v_expires
+  ) RETURNING memory_id INTO v_memory;
+
+  -- Bounded working set: keeps the 500 most important (then most recent)
+  -- rows and evicts the rest, rather than let the table (and every future
+  -- prompt's memory block) grow without limit. Ordering DESC and OFFSET-ing
+  -- past the keepers is deliberate: ORDER BY ... ASC OFFSET 500 would skip
+  -- the 500 *least* important rows and delete everything after them --
+  -- i.e. the important ones -- which is exactly backwards. 500 is a fixed
+  -- constant for this slice, not an operator-configurable policy field --
+  -- see item 25's own README note for the same kind of deliberate
+  -- simplification.
+  DELETE FROM allgres_private.agent_memories
+  WHERE memory_id IN (
+    SELECT memory_id FROM allgres_private.agent_memories
+    WHERE agent_id = p_agent_id
+    ORDER BY importance DESC, created_at DESC
+    OFFSET 500
+  );
+
+  RETURN jsonb_build_object('ok', true, 'memory_id', v_memory, 'memory_type', v_type);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_next_step(p_task_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1655,6 +1935,8 @@ DECLARE
   v_tools jsonb;
   v_input_text text;
   v_cfg jsonb;
+  v_memories jsonb;
+  v_memory_ids uuid[];
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -1727,6 +2009,36 @@ BEGIN
   FROM allgres_private.permissions
   WHERE agent_id = t.agent_id AND resource_type = 'tool';
 
+  -- Recalled every turn, the same way system_prompt and the view/tool bounds
+  -- are: an agent's own memories, live ones only, ranked by importance then
+  -- recency, capped at 15 rows and 500 chars each so one prompt can never be
+  -- dominated by this block. Scoped strictly to this agent_id -- there is no
+  -- cross-agent read here, unlike delegate, which is explicit and audited.
+  -- last_accessed_at is touched for exactly the rows recalled, not on
+  -- write, so it reflects "last time this actually reached a prompt," not
+  -- "last time it was mentioned."
+  WITH recalled AS (
+    SELECT memory_id, memory_type, content, importance
+    FROM allgres_private.agent_memories
+    WHERE agent_id = t.agent_id
+      AND (expires_at IS NULL OR expires_at > now())
+    ORDER BY importance DESC, created_at DESC
+    LIMIT 15
+  )
+  SELECT
+    COALESCE(jsonb_agg(jsonb_build_object(
+      'type', memory_type, 'content', left(content, 500)
+    ) ORDER BY importance DESC), '[]'::jsonb),
+    COALESCE(array_agg(memory_id), ARRAY[]::uuid[])
+  INTO v_memories, v_memory_ids
+  FROM recalled;
+
+  IF array_length(v_memory_ids, 1) > 0 THEN
+    UPDATE allgres_private.agent_memories
+    SET last_accessed_at = now()
+    WHERE memory_id = ANY(v_memory_ids);
+  END IF;
+
   -- Bounds come from the database, not from worker code, so revoking a
   -- permission takes effect on the very next step.
   v_messages := v_messages || jsonb_build_array(
@@ -1738,11 +2050,18 @@ BEGIN
       || v_views::text
       || E'\ntools: '
       || v_tools::text
-      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_human | propose_change.'
+      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_human | propose_change | remember.'
       || E'\nFor numeric questions, execute_sql first. Do not invent keys.'
       || E'\npropose_change: {"action":"propose_change","changes":{"system_prompt":"..."},"reason":"..."}'
       || E' -- only system_prompt and llm_config.model/temperature/max_tokens may be proposed;'
       || E' an operator decides it later, it does not change your policy right now.'
+      || E'\nremember: {"action":"remember","content":"...","memory_type":"semantic|episodic|preference|instruction|relationship|working","importance":0.0-1.0,"subject_id":"...","expires_in_days":N}'
+      || E' -- saves something worth recalling in a future session; memory_type and importance default to'
+      || E' semantic/0.5 if omitted, expires_in_days is optional and unset means it never expires on its own.'
+      || E' Use it when you learn a durable fact, preference, or instruction, not for routine intermediate results.'
+      || CASE WHEN v_memories = '[]'::jsonb THEN ''
+              ELSE E'\n\n# memory (your own past recollections, most important first)\n' || v_memories::text
+         END
     )
   );
 
@@ -1834,6 +2153,7 @@ DECLARE
   v_changes jsonb;
   v_ok boolean;
   v_proposal uuid;
+  v_mem_result jsonb;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -1922,7 +2242,7 @@ BEGIN
 
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
-    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change'
+    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change', 'remember'
   ) THEN
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
@@ -2227,6 +2547,39 @@ BEGIN
     );
     UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
+  END IF;
+
+  -- No queue, no claim/complete: unlike execute_sql/call_tool this never
+  -- leaves PostgreSQL, so it can be a plain synchronous write, the same
+  -- shape as propose_change's INSERT. It also needs no resource-permission
+  -- check the way execute_sql (a view) or delegate (a target agent) do --
+  -- an agent can only ever write to its own memory, which cannot expand its
+  -- privileges or touch anything another agent owns.
+  IF v_action = 'remember' THEN
+    v_mem_result := allgres_private.write_memory(
+      t.agent_id,
+      v_parsed->>'content',
+      v_parsed->>'memory_type',
+      v_parsed->>'importance',
+      v_parsed->>'subject_id',
+      v_parsed->>'expires_in_days',
+      t.session_id, p_task_id
+    );
+    IF NOT COALESCE((v_mem_result->>'ok')::boolean, false) THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'remember_' || (v_mem_result->>'error'), 'payload', v_parsed)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    PERFORM allgres_private.append_log(
+      p_task_id, t.step_count + 1, 'assistant',
+      jsonb_build_object('remembered', v_mem_result->>'memory_id', 'memory_type', v_mem_result->>'memory_type')
+    );
+    UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'continue', 'memory_id', v_mem_result->>'memory_id');
   END IF;
 
   IF v_action = 'await_human' THEN
@@ -2826,6 +3179,7 @@ DECLARE
   n int := 0;
   v_step int;
   v_session uuid;
+  v_mem_gc int;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
   FOR r IN
@@ -2875,6 +3229,26 @@ BEGIN
         RAISE WARNING 'fn_watchdog: fn_submit_result failed for task % after sql timeout: %', r.task_id, SQLERRM;
       END;
     END IF;
+    n := n + 1;
+  END LOOP;
+
+  -- Same reclaim, for an OAuth token exchange the worker never came back
+  -- from (a crash between fn_claim_oauth and fn_complete_oauth). No task to
+  -- notify -- oauth_calls has no task_id -- so this only marks the row
+  -- 'lost'; the operator sees the failure next time they look at the
+  -- provider (has_secret stays false) and has to restart the flow, since the
+  -- authorization code fn_oauth_token_request already consumed cannot be
+  -- redeemed a second time regardless of what this reclaim does.
+  FOR r IN
+    SELECT call_id
+    FROM allgres_private.oauth_calls
+    WHERE status = 'in_flight'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE allgres_private.oauth_calls
+    SET status = 'lost', error = 'timeout', updated_at = now()
+    WHERE call_id = r.call_id;
     n := n + 1;
   END LOOP;
 
@@ -2952,7 +3326,16 @@ BEGIN
     n := n + 1;
   END LOOP;
 
-  RETURN jsonb_build_object('lost', n);
+  -- Garbage collection, not reclaim: an expired memory is already filtered
+  -- out of fn_next_step's own recall query (WHERE expires_at IS NULL OR
+  -- expires_at > now()), so nothing is broken by leaving a stale row sitting
+  -- there -- this just keeps the table (and the 500-per-agent cap in
+  -- fn_submit_result's `remember` handler) from accumulating dead weight
+  -- indefinitely.
+  DELETE FROM allgres_private.agent_memories WHERE expires_at IS NOT NULL AND expires_at < now();
+  GET DIAGNOSTICS v_mem_gc = ROW_COUNT;
+
+  RETURN jsonb_build_object('lost', n, 'memories_expired', v_mem_gc);
 END;
 $fn$;
 
@@ -2967,6 +3350,7 @@ DECLARE
   c jsonb;
   w jsonb;
   s jsonb;
+  o jsonb;
 BEGIN
   -- Does not perform HTTP or run sandboxed SQL.  Caller claims queued rows
   -- AFTER this commits.
@@ -2974,7 +3358,8 @@ BEGIN
   d := allgres_public.fn_dispatch_tasks();
   c := allgres_public.fn_claim_outbound(4, p_fallback_key);
   s := allgres_public.fn_claim_sql(4);
-  RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s);
+  o := allgres_public.fn_claim_oauth(4);
+  RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s, 'claim_oauth', o);
 END;
 $fn$;
 
@@ -3488,8 +3873,19 @@ BEGIN
 END;
 $fn$;
 
--- OAuth token exchange is queued like an LLM call: SQL builds the request, HTTP
--- runs after commit, SQL stores the tokens.
+-- OAuth token exchange is queued the same way an agent's LLM call is: this
+-- function only builds the request and inserts a queued oauth_calls row --
+-- it never touches the client secret, so it has nothing to hand back to its
+-- caller that fn_oauth_token_request's old version used to leak (see
+-- KNOWN_ISSUES, "a second-round external review of items 18 and 19":
+-- `operator`'s existing blanket grant on allgres_public reached this
+-- function, breaking the same "the dashboard never returns a secret" rule
+-- provider_secret() being revoked from `operator` exists to enforce). The
+-- runtime worker's HTTP pool claims the row (fn_claim_oauth), performs the
+-- exchange, and fn_complete_oauth stores whatever comes back -- the same
+-- claim/complete shape as fn_claim_outbound/fn_complete_outbound, just
+-- without a task_id, since this is an operator dashboard action rather than
+-- an agent turn.
 CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_token_request(
   p_state text,
   p_code text,
@@ -3502,8 +3898,8 @@ AS $fn$
 DECLARE
   v_pid uuid;
   v allgres_private.llm_providers%ROWTYPE;
-  v_secret text;
   v_reason text;
+  v_call uuid;
 BEGIN
   SELECT provider_id INTO v_pid FROM allgres_private.oauth_states WHERE state = p_state;
   IF v_pid IS NULL THEN
@@ -3519,55 +3915,158 @@ BEGIN
     RAISE EXCEPTION 'oauth token url rejected: %', v_reason USING ERRCODE = 'P0001';
   END IF;
 
-  SELECT allgres_private.decrypt_secret(oauth_client_secret) INTO v_secret
-  FROM allgres_private.llm_secrets WHERE provider_id = v_pid;
+  -- A state is single-use from here: whether the exchange below succeeds or
+  -- fails, the authorization code has been (or is about to be) presented to
+  -- the provider, and a provider-issued code cannot be redeemed twice.
+  -- Deleting it now, rather than at completion, also means a duplicate
+  -- fn_oauth_token_request call for the same state (a doubled dashboard
+  -- click, say) queues at most one exchange, not two.
+  DELETE FROM allgres_private.oauth_states WHERE state = p_state;
 
-  RETURN jsonb_build_object(
-    'ok', true,
-    'url', v.oauth_token_url,
-    'headers', jsonb_build_object('content-type', 'application/x-www-form-urlencoded'),
-    'body', jsonb_build_object(
+  INSERT INTO allgres_private.oauth_calls (
+    provider_id, state, url, request_headers, request_body, allow_private, status
+  ) VALUES (
+    v_pid, p_state, v.oauth_token_url,
+    jsonb_build_object('content-type', 'application/x-www-form-urlencoded',
+                        'accept', 'application/json'),
+    jsonb_build_object(
       'grant_type', 'authorization_code',
       'code', p_code,
       'redirect_uri', p_redirect,
-      'client_id', v.oauth_client_id,
-      'client_secret', COALESCE(v_secret, '')
+      'client_id', v.oauth_client_id
     ),
-    'state', p_state
-  );
+    v.allow_private_network,
+    'queued'
+  )
+  RETURNING call_id INTO v_call;
+
+  RETURN jsonb_build_object('ok', true, 'queued', true, 'call_id', v_call, 'provider_id', v_pid);
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_store_tokens(
-  p_state text,
-  p_access text,
-  p_refresh text,
-  p_expires_in int
+-- Claims queued OAuth token-exchange rows for the runtime worker's HTTP pool.
+-- Same claim shape as fn_claim_outbound: the client secret is resolved and
+-- merged into the response's body right here, never written back to
+-- oauth_calls.request_body, and exists after this only in the return value
+-- and then in the worker's memory for the one HTTP request it is used for.
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_oauth(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+  v_secret text;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT call_id, provider_id, url, request_headers, request_body, allow_private
+    FROM allgres_private.oauth_calls
+    WHERE status = 'queued'
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE allgres_private.oauth_calls
+    SET status = 'in_flight', updated_at = now()
+    WHERE call_id = r.call_id;
+
+    v_secret := allgres_private.oauth_client_secret(r.provider_id);
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'call_id', r.call_id,
+      'url', r.url,
+      'headers', r.request_headers,
+      'body', r.request_body || jsonb_build_object('client_secret', COALESCE(v_secret, '')),
+      'allow_private', r.allow_private
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'calls', v_out);
+END;
+$fn$;
+
+-- Fencing identical to fn_complete_outbound/fn_complete_sql: a row only ever
+-- completes from 'in_flight'.  On success, stores the access/refresh token
+-- the same way the old public fn_oauth_store_tokens used to -- that function
+-- is gone; nothing needs to call it directly anymore, which closes the
+-- surface entirely rather than leaving it revoked-but-present.
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_oauth(
+  p_call_id uuid,
+  p_status int,
+  p_body text
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = allgres_private, pg_temp
+SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
-  v_pid uuid;
+  c allgres_private.oauth_calls%ROWTYPE;
+  v_parsed jsonb;
+  v_access text;
+  v_refresh text;
+  v_expires_in int;
 BEGIN
-  SELECT provider_id INTO v_pid FROM allgres_private.oauth_states WHERE state = p_state;
-  IF v_pid IS NULL THEN
-    RAISE EXCEPTION 'unknown oauth state' USING ERRCODE = 'P0001';
+  PERFORM set_config('statement_timeout', '2000', true);
+
+  SELECT * INTO c
+  FROM allgres_private.oauth_calls
+  WHERE call_id = p_call_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_complete_oauth: not found' USING ERRCODE = 'P0001';
   END IF;
+
+  IF c.status <> 'in_flight' THEN
+    RETURN jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status);
+  END IF;
+
+  IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+    UPDATE allgres_private.oauth_calls
+    SET status = 'harvested', response_status = p_status,
+        error = left(COALESCE(p_body, ''), 2000), updated_at = now()
+    WHERE call_id = p_call_id;
+    RETURN jsonb_build_object('action', 'error', 'status', p_status);
+  END IF;
+
+  BEGIN
+    v_parsed := p_body::jsonb;
+  EXCEPTION WHEN others THEN
+    v_parsed := NULL;
+  END;
+
+  v_access := NULLIF(v_parsed->>'access_token', '');
+  v_refresh := NULLIF(v_parsed->>'refresh_token', '');
+  v_expires_in := NULLIF(v_parsed->>'expires_in', '')::int;
+
+  IF v_access IS NULL THEN
+    UPDATE allgres_private.oauth_calls
+    SET status = 'harvested', response_status = p_status,
+        error = 'token endpoint response had no access_token', updated_at = now()
+    WHERE call_id = p_call_id;
+    RETURN jsonb_build_object('action', 'error', 'reason', 'no_access_token');
+  END IF;
+
   INSERT INTO allgres_private.llm_secrets (provider_id, access_token, refresh_token, expires_at)
   VALUES (
-    v_pid,
-    allgres_private.encrypt_secret(p_access),
-    allgres_private.encrypt_secret(p_refresh),
-    CASE WHEN p_expires_in IS NULL THEN NULL ELSE now() + make_interval(secs => p_expires_in) END
+    c.provider_id,
+    allgres_private.encrypt_secret(v_access),
+    allgres_private.encrypt_secret(v_refresh),
+    CASE WHEN v_expires_in IS NULL THEN NULL ELSE now() + make_interval(secs => v_expires_in) END
   )
   ON CONFLICT (provider_id) DO UPDATE SET
     access_token = EXCLUDED.access_token,
     refresh_token = COALESCE(EXCLUDED.refresh_token, allgres_private.llm_secrets.refresh_token),
     expires_at = EXCLUDED.expires_at;
-  DELETE FROM allgres_private.oauth_states WHERE state = p_state;
-  RETURN jsonb_build_object('ok', true, 'provider_id', v_pid);
+
+  UPDATE allgres_private.oauth_calls
+  SET status = 'harvested', response_status = p_status, updated_at = now()
+  WHERE call_id = p_call_id;
+
+  RETURN jsonb_build_object('action', 'stored', 'provider_id', c.provider_id);
 END;
 $fn$;
 
@@ -3721,6 +4220,39 @@ AS $fn$
   RETURNING jsonb_build_object('ok', true);
 $fn$;
 
+-- Operator-authored counterpart to the agent's own `remember` action
+-- (fn_submit_result) -- same validation and eviction, via write_memory,
+-- just with no session/task to attribute it to. Lets an operator seed an
+-- agent's memory directly (a standing preference, a correction to
+-- something the agent got wrong) rather than only ever waiting for the
+-- agent to write it itself.
+CREATE OR REPLACE FUNCTION allgres_public.fn_remember(
+  p_agent_id uuid,
+  p_content text,
+  p_memory_type text DEFAULT 'semantic',
+  p_importance text DEFAULT NULL,
+  p_subject_id text DEFAULT NULL,
+  p_expires_in_days text DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  SELECT allgres_private.write_memory(
+    p_agent_id, p_content, p_memory_type, p_importance, p_subject_id, p_expires_in_days
+  );
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_forget(p_memory_id uuid)
+RETURNS jsonb
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  DELETE FROM allgres_private.agent_memories WHERE memory_id = p_memory_id
+  RETURNING jsonb_build_object('ok', true, 'memory_id', memory_id);
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_private.selftest_cleanup()
 RETURNS void
 LANGUAGE plpgsql
@@ -3762,7 +4294,8 @@ VALUES
 ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
-VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks')
+VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks'),
+       ('allgres_public.v_system_health'), ('allgres_public.v_permission_audit')
 ON CONFLICT DO NOTHING;
 
 DO $seed$
@@ -3823,6 +4356,61 @@ $prompt$,
 END
 $seed$;
 
+-- A first, deliberately narrow maintenance/auditor agent (README,
+-- "Maintenance agents"): read-only, no mutation surface at all in this
+-- slice -- not even propose_change is part of its seeded prompt. It reads
+-- v_system_health/v_permission_audit, reports what it finds as its own
+-- final_answer (visible in the Sessions thread view like any other run),
+-- and remembers anything worth comparing against next time so trends are
+-- visible across runs, not just a single snapshot -- the same `remember`
+-- action any other agent has, no special case needed. There is no
+-- scheduler that runs this automatically; an operator (or an external cron
+-- hitting POST /api/v1/run) triggers it, the same as any other agent.
+DO $seed$
+DECLARE
+  v_agent uuid;
+BEGIN
+  SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'health_monitor';
+
+  IF v_agent IS NULL THEN
+    INSERT INTO allgres_private.agents (name) VALUES ('health_monitor') RETURNING agent_id INTO v_agent;
+
+    UPDATE allgres_private.policies
+    SET system_prompt = $prompt$You are Allgres's own health and security monitor. Reply with one JSON object only. No markdown, no prose.
+
+Allowed:
+{"action":"final_answer","answer":"..."}
+{"action":"execute_sql","sql":"SELECT ..."}
+{"action":"remember","content":"...","memory_type":"episodic","importance":0.0-1.0,"subject_id":"system_health"}
+
+You can read exactly two views: allgres_public.v_system_health (worker
+counts, queue backlogs, pending approvals, recent failures) and
+allgres_public.v_permission_audit (every agent's permission grants). You
+cannot change anything -- no propose_change, no delegate, no tools. Your
+job is to look, compare against what you remembered last time (it is
+already in your own context below, if you have run before), and report:
+what changed, anything that looks wrong (a queue backlog that never drains,
+an inactive agent that still holds grants, a spike in failed tasks), and
+whether it is worth an operator's attention. Remember anything worth
+comparing against next run, then give your final_answer as a short summary
+a human would actually want to read.
+$prompt$,
+        max_steps = 6,
+        max_retries = 2,
+        updated_at = now()
+    WHERE agent_id = v_agent;
+  END IF;
+
+  INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+  SELECT v_agent, x.resource_type, x.resource_ref
+  FROM (VALUES
+    ('view', 'allgres_public.v_system_health'),
+    ('view', 'allgres_public.v_permission_audit')
+  ) AS x(resource_type, resource_ref)
+  ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
+END
+$seed$;
+
 -- ---------------------------------------------------------------------------
 -- 10b. Extension configuration tables -- which of this extension's own
 --      tables `pg_dump` includes data for, and on what terms.
@@ -3843,7 +4431,8 @@ $seed$;
 --
 -- Tables with no seed rows at all dump unconditionally. The tables section
 -- 10 above seeds (llm_providers, sql_sandbox_allowlist, and
--- agents/policies/permissions/demo_sales for the built-in 'analyst' agent)
+-- agents/policies/permissions for the built-in 'analyst' and
+-- 'health_monitor' agents, plus demo_sales for 'analyst' alone)
 -- exclude exactly those seeded rows: the extension script recreates them
 -- fresh on every install, and dumping them too would try to INSERT a
 -- second copy on top and fail on the same UNIQUE constraint that makes
@@ -3857,21 +4446,28 @@ $seed$;
 -- KNOWN_ISSUES, "SQL sandbox function check" -- nothing beyond the seed
 -- can exist there today), and the latter holds only short-lived
 -- in-progress OAuth flow state that is stale within minutes regardless of
--- backup.
+-- backup. `oauth_calls` *is* registered, unconditionally, the same as
+-- outbound_calls/sql_calls: unlike oauth_states it is an audit trail of
+-- exchange attempts an operator may want to keep, and unlike llm_secrets it
+-- never holds a plaintext secret or token to begin with (fn_claim_oauth
+-- injects the client secret only into its in-memory response to the
+-- worker; fn_complete_oauth never writes a response body back into this
+-- table -- there is no response_body column on it at all, only a status
+-- code and, on failure, the provider's error text).
 -- ---------------------------------------------------------------------------
 
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agents',
-  $cfgdump$WHERE name <> 'analyst'$cfgdump$);
+  $cfgdump$WHERE name NOT IN ('analyst', 'health_monitor')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.policies',
-  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor'))$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.permissions',
-  $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor'))$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.demo_sales',
   $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_providers',
   $cfgdump$WHERE name NOT IN ('xai', 'openai', 'anthropic', 'ollama', 'openai_compat')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_sandbox_allowlist',
-  $cfgdump$WHERE resource_ref NOT IN ('allgres_public.v_sales', 'allgres_public.v_my_tasks')$cfgdump$);
+  $cfgdump$WHERE resource_ref NOT IN ('allgres_public.v_sales', 'allgres_public.v_my_tasks', 'allgres_public.v_system_health', 'allgres_public.v_permission_audit')$cfgdump$);
 
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.policy_history', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.projects', '');
@@ -3883,6 +4479,9 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.change_proposals', '
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.outbound_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_calls', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.agent_memories', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.audit_log', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
@@ -3922,6 +4521,15 @@ DECLARE
   v_prompt_before text;
   v_deleg_a uuid;
   v_deleg_b uuid;
+  v_provider uuid;
+  v_state text;
+  v_call2 uuid;
+  detail_bool boolean;
+  v_mem_result jsonb;
+  v_mem_count int;
+  v_low_mem uuid;
+  v_high_mem uuid;
+  v_mem_gc int;
 BEGIN
   SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM allgres_private.policies WHERE agent_id = v_agent;
@@ -4768,6 +5376,283 @@ BEGIN
   END;
   v := v || jsonb_build_array(jsonb_build_object('name', 'llm_provider_fails_closed_not_substituted', 'ok', ok));
 
+  -- 26. OAuth token exchange, queued rather than handed back to the caller
+  --     (see KNOWN_ISSUES.md, "a second-round external review of items 18
+  --     and 19": fn_oauth_token_request used to decrypt the client secret
+  --     and return the built request directly). A fixed provider name, like
+  --     provision_agent_role_is_idempotent's fixed test agent, so repeated
+  --     fn_selftest calls don't accumulate garbage rows.
+  INSERT INTO allgres_private.llm_providers (name, kind, base_url, is_enabled, allow_private_network,
+    oauth_auth_url, oauth_token_url, oauth_client_id)
+  VALUES ('selftest_oauth', 'oauth', 'https://selftest.invalid/oauth', true, false,
+    'https://selftest.invalid/oauth/authorize', 'https://selftest.invalid/oauth/token', 'selftest-client-id')
+  ON CONFLICT (name) DO UPDATE SET
+    oauth_auth_url = EXCLUDED.oauth_auth_url,
+    oauth_token_url = EXCLUDED.oauth_token_url,
+    oauth_client_id = EXCLUDED.oauth_client_id
+  RETURNING provider_id INTO v_provider;
+  PERFORM allgres_public.fn_set_provider(v_provider, NULL, NULL, NULL, NULL, NULL, NULL, 'selftest-secret-value');
+  DELETE FROM allgres_private.oauth_calls WHERE provider_id = v_provider;
+  DELETE FROM allgres_private.oauth_states WHERE provider_id = v_provider;
+
+  -- 26a. fn_oauth_token_request queues instead of leaking: the client secret
+  --      appears nowhere in its own return value, nor in the queued row's
+  --      request_body -- only fn_claim_oauth (worker-only) ever sees it.
+  v_state := (allgres_public.fn_oauth_start(v_provider, 'https://dashboard.local/callback')->>'state');
+  sub := allgres_public.fn_oauth_token_request(v_state, 'selftest-code', 'https://dashboard.local/callback');
+  v_call := (sub->>'call_id')::uuid;
+  ok := (sub->>'queued')::boolean IS TRUE AND v_call IS NOT NULL
+    AND NOT (sub::text LIKE '%selftest-secret-value%');
+  SELECT NOT (request_body::text LIKE '%selftest-secret-value%') AND NOT (request_body ? 'client_secret')
+    INTO detail_bool FROM allgres_private.oauth_calls WHERE call_id = v_call;
+  ok := ok AND COALESCE(detail_bool, false);
+  -- Single-use: the state is consumed at queue time, not at completion.
+  ok := ok AND NOT EXISTS (SELECT 1 FROM allgres_private.oauth_states WHERE state = v_state);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'oauth_token_request_queues_without_leaking_secret', 'ok', ok));
+
+  -- 26b. fn_claim_oauth injects the decrypted secret only into the response
+  --      it hands the worker -- never back into oauth_calls.request_body,
+  --      the same claim-time-only shape fn_claim_outbound already uses for
+  --      an LLM provider's api_key (KNOWN_ISSUES.md, item 13).
+  spec := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO sub
+  FROM jsonb_array_elements(spec->'calls') AS t(elem)
+  WHERE (elem->>'call_id')::uuid = v_call;
+  ok := sub IS NOT NULL AND sub->'body'->>'client_secret' = 'selftest-secret-value';
+  SELECT NOT (request_body::text LIKE '%selftest-secret-value%') AND status = 'in_flight'
+    INTO detail_bool FROM allgres_private.oauth_calls WHERE call_id = v_call;
+  ok := ok AND COALESCE(detail_bool, false);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'claim_oauth_injects_secret_only_into_response', 'ok', ok));
+
+  -- 26c. Fencing: identical reasoning to complete_sql_fences_stale_result --
+  --      a belated result for a call fn_watchdog already reclaimed as 'lost'
+  --      must be discarded, not stored, or a zombie worker's response could
+  --      overwrite whatever a second, later attempt actually produced.
+  UPDATE allgres_private.oauth_calls SET status = 'lost', updated_at = now() WHERE call_id = v_call;
+  comp := allgres_public.fn_complete_oauth(v_call, 200,
+    '{"access_token":"should-not-be-stored","refresh_token":"nope","expires_in":3600}');
+  ok := comp->>'action' = 'stale';
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.llm_secrets
+    WHERE provider_id = v_provider AND access_token IS NOT NULL
+      AND allgres_private.decrypt_secret(access_token) = 'should-not-be-stored'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_oauth_fences_stale_result', 'ok', ok));
+
+  -- 26d. A second, real flow: fn_complete_oauth stores what comes back,
+  --      encrypted, the same way the old public fn_oauth_store_tokens used
+  --      to -- that function is gone; this is the only path left to it.
+  v_state := (allgres_public.fn_oauth_start(v_provider, 'https://dashboard.local/callback')->>'state');
+  sub := allgres_public.fn_oauth_token_request(v_state, 'selftest-code-2', 'https://dashboard.local/callback');
+  v_call2 := (sub->>'call_id')::uuid;
+  PERFORM allgres_public.fn_claim_oauth(10);
+  comp := allgres_public.fn_complete_oauth(v_call2, 200,
+    '{"access_token":"selftest-access-tok","refresh_token":"selftest-refresh-tok","expires_in":3600}');
+  ok := comp->>'action' = 'stored';
+  ok := ok AND (
+    SELECT allgres_private.decrypt_secret(access_token) = 'selftest-access-tok'
+       AND allgres_private.decrypt_secret(refresh_token) = 'selftest-refresh-tok'
+       AND expires_at IS NOT NULL
+    FROM allgres_private.llm_secrets WHERE provider_id = v_provider
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_oauth_stores_tokens_on_success', 'ok', ok));
+
+  -- 26e. A token endpoint response with no access_token is an error, not a
+  --      silent no-op -- fn_complete_oauth must not leave the row 'in_flight'
+  --      forever waiting for a result that already arrived and was unusable.
+  v_state := (allgres_public.fn_oauth_start(v_provider, 'https://dashboard.local/callback')->>'state');
+  sub := allgres_public.fn_oauth_token_request(v_state, 'selftest-code-3', 'https://dashboard.local/callback');
+  v_call2 := (sub->>'call_id')::uuid;
+  PERFORM allgres_public.fn_claim_oauth(10);
+  comp := allgres_public.fn_complete_oauth(v_call2, 200, '{"error":"access_denied"}');
+  ok := comp->>'action' = 'error' AND comp->>'reason' = 'no_access_token';
+  SELECT status = 'harvested' INTO detail_bool FROM allgres_private.oauth_calls WHERE call_id = v_call2;
+  ok := ok AND COALESCE(detail_bool, false);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'complete_oauth_requires_access_token', 'ok', ok));
+
+  DELETE FROM allgres_private.oauth_calls WHERE provider_id = v_provider;
+  DELETE FROM allgres_private.oauth_states WHERE provider_id = v_provider;
+
+  -- 27. Long-term agent memory (item 25). Starts from a clean slate for the
+  --     analyst agent so the recall test below can assert on content, not
+  --     just presence.
+  DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+
+  -- 27a. `remember` rejects malformed input without failing the task.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest remember_reject')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"remember"}',
+    'parsed', jsonb_build_object('action', 'remember', 'content', '')
+  ));
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'continue' AND detail = 'running' AND sub->>'memory_id' IS NULL;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"remember"}',
+    'parsed', jsonb_build_object('action', 'remember', 'content', 'x', 'memory_type', 'not_a_real_type')
+  ));
+  ok := ok AND sub->>'action' = 'continue' AND sub->>'memory_id' IS NULL;
+  SELECT count(*) INTO v_mem_count FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+  ok := ok AND v_mem_count = 0;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'remember_rejects_malformed_input', 'ok', ok));
+
+  -- 27b. A well-formed `remember` writes a row and is recalled into a later
+  --      task's own fn_next_step context -- the actual point of this
+  --      feature, not just that a row got written (see item 12's own
+  --      standing question: "does the test check the write, or the read?").
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"remember"}',
+    'parsed', jsonb_build_object(
+      'action', 'remember', 'content', 'selftest marker: the sky is teal',
+      'memory_type', 'semantic', 'importance', 0.9
+    )
+  ));
+  ok := sub->>'action' = 'continue' AND sub->>'memory_id' IS NOT NULL;
+
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest remember_recall')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid2 FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  spec := allgres_public.fn_next_step(v_tid2);
+  ok := ok AND (spec->'messages'->0->>'content') LIKE '%selftest marker: the sky is teal%';
+  ok := ok AND (spec->'messages'->0->>'content') LIKE '%remember%';
+  SELECT last_accessed_at IS NOT NULL INTO detail_bool
+  FROM allgres_private.agent_memories WHERE agent_id = v_agent AND content LIKE 'selftest marker%';
+  ok := ok AND COALESCE(detail_bool, false);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'remember_writes_and_is_recalled', 'ok', ok));
+
+  -- 27c. Recall is scoped to the querying agent only -- selftest_delegate_b's
+  --      own fn_next_step must never see selftest_delegate_a's memory, the
+  --      same isolation property provision_agent_role_is_idempotent already
+  --      proved for the SQL sandbox (v_my_tasks), now for this instead.
+  DELETE FROM allgres_private.agent_memories WHERE agent_id IN (v_deleg_a, v_deleg_b);
+  v_mem_result := allgres_private.write_memory(
+    v_deleg_a, 'selftest marker: agent A secret preference', 'preference', '1.0', NULL, NULL
+  );
+  v_sid := (allgres_public.fn_create_session(v_deleg_b, 'selftest recall_scoping')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') NOT LIKE '%agent A secret preference%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'memory_recall_scoped_to_agent', 'ok', ok));
+  DELETE FROM allgres_private.agent_memories WHERE agent_id IN (v_deleg_a, v_deleg_b);
+
+  -- 27d. The fixed 500-per-agent cap evicts the least important (then
+  --      oldest) rows rather than growing without bound.
+  DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+  v_mem_result := allgres_private.write_memory(v_agent, 'selftest low importance marker', 'working', '0.0', NULL, NULL);
+  v_low_mem := (v_mem_result->>'memory_id')::uuid;
+  FOR n_logs IN 1..499 LOOP
+    PERFORM allgres_private.write_memory(v_agent, 'selftest filler ' || n_logs, 'working', '0.4', NULL, NULL);
+  END LOOP;
+  v_mem_result := allgres_private.write_memory(v_agent, 'selftest high importance marker', 'working', '1.0', NULL, NULL);
+  v_high_mem := (v_mem_result->>'memory_id')::uuid;
+  SELECT count(*) INTO v_mem_count FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+  ok := v_mem_count = 500;
+  ok := ok AND NOT EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_low_mem);
+  ok := ok AND EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_high_mem);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'memory_cap_evicts_least_important', 'ok', ok));
+  DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+
+  -- 27e. fn_watchdog garbage-collects an expired memory -- filtered out of
+  --      recall already (see fn_next_step), this just stops the row itself
+  --      from sitting there forever.
+  v_mem_result := allgres_private.write_memory(v_agent, 'selftest expired marker', 'working', '0.5', NULL, '1');
+  UPDATE allgres_private.agent_memories SET expires_at = now() - interval '1 minute'
+  WHERE memory_id = (v_mem_result->>'memory_id')::uuid;
+  spec := allgres_public.fn_watchdog();
+  ok := COALESCE((spec->>'memories_expired')::int, 0) >= 1;
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = (v_mem_result->>'memory_id')::uuid
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_expires_stale_memory', 'ok', ok));
+
+  -- 27f. The operator path (fn_remember/fn_forget, dashboard_rpc's
+  --      memories.create/.remove) is the same write_memory underneath, with
+  --      no session/task to attribute it to.
+  sub := allgres_public.fn_remember(v_agent, 'selftest operator-authored memory', 'instruction', '0.7', 'operator', NULL);
+  ok := (sub->>'ok')::boolean IS TRUE AND sub->>'memory_id' IS NOT NULL;
+  ok := ok AND EXISTS (
+    SELECT 1 FROM allgres_private.agent_memories
+    WHERE memory_id = (sub->>'memory_id')::uuid AND source_session_id IS NULL AND source_task_id IS NULL
+  );
+  comp := allgres_public.fn_forget((sub->>'memory_id')::uuid);
+  ok := ok AND (comp->>'ok')::boolean IS TRUE;
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = (sub->>'memory_id')::uuid
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_remember_and_fn_forget_round_trip', 'ok', ok));
+
+  DELETE FROM allgres_private.agent_memories WHERE agent_id = v_agent;
+
+  -- 28. The seeded maintenance/auditor agent (README, "Maintenance
+  --     agents") can read v_system_health/v_permission_audit; a plain
+  --     agent with no grant for either sees zero rows from both -- the
+  --     same enforcement views_enforce_permission already proved for
+  --     v_sales, now for the system-wide views instead of a per-agent-
+  --     owned one (no agent_id column to filter by; agent_may_read alone
+  --     gates the whole row set).
+  SELECT agent_id INTO v_prov_agent FROM allgres_private.agents WHERE name = 'health_monitor';
+  ok := v_prov_agent IS NOT NULL;
+
+  PERFORM set_config('allgres.agent_id', v_prov_agent::text, true);
+  SELECT count(*) INTO n_logs FROM allgres_public.v_system_health;
+  ok := ok AND n_logs = 1;
+  SELECT count(*) INTO n_logs FROM allgres_public.v_permission_audit;
+  ok := ok AND n_logs > 0;
+
+  PERFORM set_config('allgres.agent_id', v_agent::text, true);
+  SELECT count(*) INTO n_logs FROM allgres_public.v_system_health;
+  ok := ok AND n_logs = 0;
+  SELECT count(*) INTO n_logs FROM allgres_public.v_permission_audit;
+  ok := ok AND n_logs = 0;
+  PERFORM set_config('allgres.agent_id', '', true);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'maintenance_views_enforce_permission', 'ok', ok));
+
+  -- 29. Operator audit log (README, "Operator audit log"): a consequential
+  --     dashboard_rpc action writes exactly one row, with the self-
+  --     reported operator_name and (for an action carrying one) no
+  --     credential anywhere in it; a read-only action writes none; the
+  --     table refuses UPDATE/DELETE even from the function's own owner,
+  --     not just from operator (see audit_log_no_update's own comment for
+  --     why a REVOKE alone would not have been enough).
+  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'allowlist.remove', 'ref', 'selftest_audit_marker'));
+  sub := allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'allowlist.add', 'ref', 'selftest_audit_marker', 'operator_name', 'selftest_operator'
+  ));
+  ok := (sub->>'ok')::boolean IS TRUE;
+  SELECT operator_name = 'selftest_operator' AND details = jsonb_build_object('ref', 'selftest_audit_marker')
+  INTO detail_bool
+  FROM allgres_private.audit_log
+  WHERE action = 'allowlist.add' AND details->>'ref' = 'selftest_audit_marker'
+  ORDER BY created_at DESC LIMIT 1;
+  ok := ok AND COALESCE(detail_bool, false);
+  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'allowlist.remove', 'ref', 'selftest_audit_marker'));
+
+  SELECT count(*) INTO n_logs FROM allgres_private.audit_log;
+  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'overview'));
+  SELECT count(*) INTO v_gen FROM allgres_private.audit_log;
+  ok := ok AND v_gen = n_logs;
+
+  sub := allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'provider.update', 'provider_id', v_provider,
+    'api_key', 'selftest-should-not-leak-into-audit-log', 'operator_name', 'selftest_operator'
+  ));
+  SELECT NOT (details::text LIKE '%selftest-should-not-leak%') INTO detail_bool
+  FROM allgres_private.audit_log WHERE action = 'provider.update' ORDER BY created_at DESC LIMIT 1;
+  ok := ok AND COALESCE(detail_bool, false);
+  PERFORM allgres_public.fn_set_provider(v_provider, NULL, NULL, NULL, NULL, NULL, NULL, 'selftest-secret-value');
+
+  BEGIN
+    UPDATE allgres_private.audit_log SET operator_name = 'tampered'
+    WHERE audit_id = (SELECT audit_id FROM allgres_private.audit_log ORDER BY created_at DESC LIMIT 1);
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := ok AND SQLERRM LIKE '%append-only%';
+  END;
+
+  v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
+
   PERFORM allgres_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -4964,6 +5849,13 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA allgres_private
 
 -- Logs are append-only even for operator (the trigger enforces it too).
 REVOKE UPDATE, DELETE ON allgres_private.execution_logs FROM operator;
+-- REVOKE from operator is real defense in depth here the same way it is
+-- for execution_logs; a REVOKE against allgres_owner itself would not be
+-- (a table owner's DML rights on their own table cannot be revoked by
+-- ACL in PostgreSQL at all -- only the audit_log_no_update trigger above
+-- actually stops that path, and it applies regardless of who issues the
+-- UPDATE/DELETE, ownership included).
+REVOKE UPDATE, DELETE ON allgres_private.audit_log FROM operator;
 
 REVOKE ALL ON allgres_private.llm_secrets FROM PUBLIC;
 REVOKE ALL ON allgres_private.llm_secrets FROM operator;
@@ -4981,6 +5873,8 @@ REVOKE ALL ON FUNCTION allgres_public.fn_claim_outbound(int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_complete_outbound(uuid, int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_claim_sql(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_claim_oauth(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_watchdog(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_selftest() FROM PUBLIC;
 
@@ -4999,6 +5893,8 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_outbound(int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_outbound(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_sql(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_oauth(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
 
@@ -5030,26 +5926,30 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres_public TO operator;
 
 -- The dashboard never returns a secret, only whether one is set (see
 -- README, "Secrets at rest") -- provider_secret() is revoked from operator
--- two lines below for exactly that reason. fn_oauth_token_request breaks
--- the same rule: it hands the decrypted OAuth client_secret straight back
--- in its return value, to whoever calls it. Nothing calls any of the
--- three OAuth functions today -- the token exchange HTTP call itself was
--- never implemented (see KNOWN_ISSUES.md, "Untested control-plane
--- paths") -- so the blanket grant above would otherwise be the only thing
--- standing between operator and a decrypted secret for a feature that
--- does not work yet. Carved out until OAuth is actually finished with a
--- real design for this (the outbound-queue pattern that already fixed the
--- same class of leak for LLM provider keys -- see KNOWN_ISSUES.md, item
--- 13 -- injecting the secret only into the runtime worker's own response
--- at claim time, never back into a table or a caller's result, is the
--- template), not before.
-REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_start(uuid, text) FROM operator;
-REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_token_request(text, text, text) FROM operator;
-REVOKE EXECUTE ON FUNCTION allgres_public.fn_oauth_store_tokens(text, text, text, int) FROM operator;
+-- two lines below for exactly that reason. fn_oauth_token_request used to
+-- break that rule outright: it decrypted the OAuth client_secret and handed
+-- the built HTTP request straight back to its caller, which the blanket
+-- grant above would have handed to `operator` the moment anything wired it
+-- into dashboard_rpc (see KNOWN_ISSUES.md, "a second-round external review
+-- of items 18 and 19", for the equivalent leak this review round actually
+-- found and fixed). It is fixed now the same way item 13 already fixed the
+-- identical class of leak for an LLM provider's api_key: the secret is
+-- resolved and merged in only at claim time (fn_claim_oauth), inside the
+-- runtime worker's own response, never returned by anything `operator` can
+-- call. fn_oauth_start/fn_oauth_token_request stay under the blanket grant
+-- above -- both now return only a redirect URL / a queued call_id, nothing
+-- secret -- the same way fn_claim_outbound/fn_complete_outbound stay under
+-- it despite resolving the LLM credential internally: ownership, not the
+-- caller's own grants, is what runs their body (see the blanket-grant
+-- comment above). fn_oauth_store_tokens is gone outright -- its storage
+-- logic moved inside fn_complete_oauth, worker-only, with no public entry
+-- point left to revoke from operator in the first place.
 
 REVOKE EXECUTE ON FUNCTION allgres_private.fn_validate_sql(uuid, text) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM worker;
+REVOKE EXECUTE ON FUNCTION allgres_private.oauth_client_secret(uuid) FROM operator;
+REVOKE EXECUTE ON FUNCTION allgres_private.oauth_client_secret(uuid) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.decrypt_secret(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION allgres_private.encrypt_secret(text) FROM PUBLIC;
 
@@ -5148,6 +6048,34 @@ DECLARE
   v_action text := COALESCE(p_request->>'action', '');
   v_id uuid;
 BEGIN
+  -- One audit_log row per consequential action, written here rather than
+  -- scattered across each branch below, so no future action can be added
+  -- to the audited set without also being wired in -- and so it lands in
+  -- the same transaction as the mutation itself: if the branch below
+  -- raises, PL/pgSQL's implicit savepoint at this BEGIN block rolls this
+  -- insert back right along with it, so a row only ever exists for
+  -- something that actually committed. operator_name is whatever the
+  -- browser sent (self-reported, see the audit_log table's own comment);
+  -- details is the request minus 'action'/'operator_name' and anything
+  -- that could carry a secret (an API key, an OAuth client secret, an
+  -- authorization code or state) -- generic by design, so a new audited
+  -- action needs no bespoke mapping here, only its name added to the list.
+  IF v_action = ANY (ARRAY[
+    'agents.create', 'agents.update', 'policy.rollback', 'proposals.decide',
+    'permissions.grant', 'permissions.revoke', 'allowlist.add', 'allowlist.remove',
+    'projects.create', 'projects.update', 'sessions.cancel',
+    'memories.create', 'memories.remove', 'provider.update',
+    'providers.oauth_callback', 'approvals.decide'
+  ]) THEN
+    INSERT INTO allgres_private.audit_log (operator_name, action, details)
+    VALUES (
+      NULLIF(btrim(COALESCE(p_request->>'operator_name', '')), ''),
+      v_action,
+      (p_request - 'action' - 'operator_name')
+        - ARRAY['api_key', 'oauth_client_secret', 'code', 'state']::text[]
+    );
+  END IF;
+
   CASE v_action
     WHEN 'overview' THEN
       RETURN jsonb_build_object(
@@ -5435,6 +6363,48 @@ BEGIN
         ) q
       ), '[]'::jsonb));
 
+    -- Optional agent_id filter, the same shape tasks.list's own optional
+    -- limit uses: present -> scoped, absent -> every agent's memories.
+    WHEN 'memories.list' THEN
+      RETURN jsonb_build_object('ok', true, 'memories', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.importance DESC, q.created_at DESC)
+        FROM (
+          SELECT m.memory_id, m.agent_id, a.name AS agent, m.subject_id, m.memory_type,
+                 m.content, m.importance, m.confidence, m.source_session_id,
+                 m.created_at, m.last_accessed_at, m.expires_at
+          FROM allgres_private.agent_memories m
+          JOIN allgres_private.agents a USING (agent_id)
+          WHERE NULLIF(p_request->>'agent_id', '') IS NULL
+             OR m.agent_id = (p_request->>'agent_id')::uuid
+          ORDER BY m.importance DESC, m.created_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
+        ) q
+      ), '[]'::jsonb));
+
+    WHEN 'memories.create' THEN
+      RETURN allgres_public.fn_remember(
+        (p_request->>'agent_id')::uuid,
+        p_request->>'content',
+        NULLIF(p_request->>'memory_type', ''),
+        p_request->>'importance',
+        p_request->>'subject_id',
+        p_request->>'expires_in_days'
+      );
+
+    WHEN 'memories.remove' THEN
+      RETURN allgres_public.fn_forget((p_request->>'memory_id')::uuid);
+
+    WHEN 'audit.list' THEN
+      RETURN jsonb_build_object('ok', true, 'entries', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
+        FROM (
+          SELECT audit_id, operator_name, action, details, created_at
+          FROM allgres_private.audit_log
+          ORDER BY created_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
+        ) q
+      ), '[]'::jsonb));
+
     WHEN 'settings.get' THEN
       RETURN jsonb_build_object(
         'ok', true,
@@ -5447,6 +6417,10 @@ BEGIN
             'base_url', p.base_url,
             'is_enabled', p.is_enabled,
             'allow_private_network', p.allow_private_network,
+            'oauth_auth_url', p.oauth_auth_url,
+            'oauth_token_url', p.oauth_token_url,
+            'oauth_client_id', p.oauth_client_id,
+            'oauth_scope', p.oauth_scope,
             'has_secret', EXISTS (
               SELECT 1 FROM allgres_private.llm_secrets s
               WHERE s.provider_id = p.provider_id AND (
@@ -5468,12 +6442,33 @@ BEGIN
         CASE WHEN p_request ? 'is_enabled' THEN (p_request->>'is_enabled')::boolean ELSE NULL END,
         CASE WHEN p_request ? 'allow_private_network'
              THEN (p_request->>'allow_private_network')::boolean ELSE NULL END,
-        NULL, NULL, NULL, NULL
+        NULLIF(p_request->>'oauth_auth_url',''),
+        NULLIF(p_request->>'oauth_token_url',''),
+        NULLIF(p_request->>'oauth_client_id',''),
+        NULLIF(p_request->>'oauth_client_secret','')
       );
       IF NULLIF(p_request->>'api_key','') IS NOT NULL THEN
         PERFORM allgres_public.fn_set_provider_secret(v_id, p_request->>'api_key');
       END IF;
       RETURN jsonb_build_object('ok', true, 'provider_id', v_id);
+
+    -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
+    -- fn_oauth_start only ever returns a redirect_url and a state, neither
+    -- of which is secret, so this is safe for operator to call directly.
+    WHEN 'providers.oauth_start' THEN
+      v_id := (p_request->>'provider_id')::uuid;
+      RETURN allgres_public.fn_oauth_start(v_id, p_request->>'redirect');
+
+    -- Completes the flow: queues the token exchange (fn_oauth_token_request)
+    -- rather than performing it inline, so the operator-facing return value
+    -- is only {ok, queued, call_id, provider_id} -- never a token or the
+    -- client secret. The runtime worker's HTTP pool picks the row up and
+    -- fn_complete_oauth stores whatever comes back; settings.get's
+    -- has_secret is how the dashboard finds out it landed.
+    WHEN 'providers.oauth_callback' THEN
+      RETURN allgres_public.fn_oauth_token_request(
+        p_request->>'state', p_request->>'code', p_request->>'redirect'
+      );
 
     WHEN 'events' THEN
       RETURN jsonb_build_object(

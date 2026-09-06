@@ -37,7 +37,8 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   can be rolled back later. See [Self-modification](#self-modification).
 - **Dashboard** — a single static HTML file (no build step) covering
   Overview, Agents, Projects, Run, Sessions, Approvals, Proposals, Tasks,
-  Logs, and Settings, all reachable through one generic `/api/v1/rpc` route.
+  Memories, Logs, Audit Log, and Settings, all reachable through one generic
+  `/api/v1/rpc` route.
 - **Dashboard auth hardening** — a per-IP rate limit on `/api/v1/*` (a
   tighter, separate cap on failed-auth responses specifically), and the
   event stream authenticates with a short-lived single-use ticket instead
@@ -50,14 +51,46 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   and a logical (`pg_dump`) backup/restore round-trip real data, including
   per-agent role identity. See [Upgrades](#upgrades) and [Backup and
   restore](#backup-and-restore).
+- **OAuth token exchange** — an operator connects a `kind='oauth'` provider
+  from Settings; the authorization-code exchange is queued and performed by
+  the runtime worker itself, the same claim-time-credential-injection shape
+  that already keeps an LLM provider's api_key out of any table (see
+  [Secrets at rest](#secrets-at-rest)) — never returned to the dashboard or
+  written anywhere in plaintext.
+- **Long-term agent memory** — an agent can `remember` something worth
+  recalling in a future session (a fact, a preference, an instruction);
+  `fn_next_step` reads a bounded set of that agent's own memories, ranked by
+  importance then recency, back into every turn's own prompt, the same way
+  its policy and permission bounds already are. An operator can also seed or
+  remove a memory directly from the new Memories page. See
+  [Memory](#memory).
+- **Maintenance agents** — an ordinary agent can be pointed at two new
+  system-wide, permission-gated diagnostic views (worker/queue health,
+  every agent's permission grants) and asked to report what it finds; a
+  seeded example, `health_monitor`, ships read-only with both. See
+  [Maintenance agents](#maintenance-agents).
+- **Operator audit log** — a self-reported operator name, sent with every
+  dashboard request, recorded append-only against every consequential
+  action (a permission grant, a decided approval or proposal, a policy
+  rollback, a cancelled session, and more). Answers "who claimed
+  responsibility for this," not "who was authorized" — see [Operator audit
+  log](#operator-audit-log) for exactly what that distinction means and
+  doesn't.
 
 Not yet built:
 
 - Helm charts, Kubernetes manifests, and CNPG dynamic loading — only a
   native install and `docker-compose` exist today.
-- Per-operator identity/accounts — the dashboard has one shared token, not
-  user accounts, so "who approved this" is unanswerable by design.
-- OAuth token exchange, secret key rotation.
+- Real per-operator identity/accounts — the dashboard still has one shared
+  token, not user accounts; the audit log records a self-reported name
+  alongside consequential actions, but that name is not authenticated, so
+  "who was actually authorized to do this" stays unanswerable by design,
+  only "who claimed it" is now on record.
+- Secret key rotation, and a token *refresh* flow (an expired OAuth access
+  token has to be reconnected from Settings; nothing calls `refresh_token`
+  automatically yet).
+- Semantic memory search (an embedding column and vector similarity) —
+  recall is importance/recency ranking only in this slice.
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
@@ -171,10 +204,120 @@ Layered, strongest first:
 7. every relation named must be schema-qualified, outside the reserved schemas,
    and present in the allowlist ∩ that agent's permissions.
 
+## Memory
+
+An agent can emit `{"action":"remember","content":"...","memory_type":
+"semantic|episodic|preference|instruction|relationship|working",
+"importance":0.0-1.0,"subject_id":"...","expires_in_days":N}` alongside its
+other actions. `content` and a valid `memory_type` are the only required
+fields; `memory_type` and `importance` default to `semantic`/`0.5`,
+`subject_id` is free text (there is no user-accounts system yet — see
+[Security model](#security-model) — so it can't be tied to a real identity,
+only tagged by the agent), and `expires_in_days` is optional.
+
+Every future turn, `fn_next_step` reads that agent's own memories back —
+live ones only, ranked by importance then recency, capped at 15 rows and 500
+characters each — into a `# memory` block in the same system message that
+already carries its policy and permission bounds. Recall is strictly scoped
+to `agent_id`: nothing an agent remembers is ever visible to another agent's
+own prompt, delegation included. A memory does not need any resource
+permission the way `execute_sql` (a view) or `delegate` (a target agent) do
+— an agent can only ever write to its own memory, which cannot expand its
+privileges or touch anything another agent owns, the same reasoning that
+already lets `propose_change`/`await_human` skip a permission grant.
+
+A fixed cap (500 rows per agent) evicts the least important, then oldest,
+memories on write, so an agent cannot grow its own prompt context — or the
+table — without bound; there is no operator-configurable policy field for
+this in the current slice. `fn_watchdog` separately garbage-collects any row
+past its `expires_in_days`, though an expired row is already excluded from
+recall regardless of whether it has been swept yet.
+
+An operator can also seed or remove a memory directly from the **Memories**
+dashboard page (`fn_remember`/`fn_forget`, exposed as `memories.create`/
+`memories.remove`) — useful for correcting something an agent got wrong, or
+telling it something once rather than waiting for it to learn the fact
+itself.
+
+Deliberately not in this slice: semantic (embedding/vector) search — recall
+is importance/recency ranking over structured rows only, no `pgvector`
+dependency; an explicit `recall` action for an agent to query beyond what is
+already injected automatically; and row-level security on
+`agent_memories` — like most of this project's tables, it is gated by a
+`SECURITY DEFINER` function's own `agent_id` parameter rather than Postgres
+RLS (see "Per-agent roles" below for the one place RLS is actually used
+today).
+
+## Maintenance agents
+
+An agent can be a system-facing operator instead of a user-facing one: read
+`allgres_public.v_system_health` (worker presence, queue backlogs, pending
+approvals, failures in the last 24h, expired-but-unswept memories) and
+`allgres_public.v_permission_audit` (every agent's permission grants), form
+an opinion, and report it — the same `execute_sql`/`final_answer`/`remember`
+actions any other agent has, no special agent "kind" or new action type
+needed. Both views are system-wide, not per-agent data, so there is nothing
+to row-scope: `agent_may_read` alone decides whether an agent sees them at
+all — zero rows without the grant, the full picture with it.
+
+A seeded example, `health_monitor`, ships with both views granted and
+nothing else — no `execute_sql` access to any business-data view, no
+`delegate`, no tools, and deliberately no `propose_change` in its prompt
+either: this first slice is read-and-report only, more conservative than a
+maintenance agent strictly needs to be, on purpose. It compares against
+what it `remember`ed on its last run (already sitting in its own context,
+the same recall every other agent gets) and gives a short human-readable
+summary as its `final_answer` — visible in the Sessions thread view like
+any other run.
+
+There is no scheduler: nothing runs `health_monitor` automatically. An
+operator triggers it from the Run page, or an external `cron` job hits
+`POST /api/v1/run` the same way any other automation would. Deliberately
+not built: an internal recurring-task primitive (a `pg_cron` dependency or
+a new scheduling loop in the runtime worker); a way for a maintenance agent
+to *act* on what it finds — even `propose_change` isn't wired into its
+seeded prompt, so a real finding still requires an operator to read the
+session and decide, the same review-before-apply shape self-modification
+already uses; and any auditor beyond the two views above (a memory curator,
+a performance advisor) — the review that proposed this pattern named
+several; this ships the two with the clearest, most immediately useful
+read surface already in place.
+
+## Operator audit log
+
+The dashboard has one shared bearer token (see [Exposure](#exposure)), not
+per-operator accounts, so there is no authenticated identity to attach an
+audit trail to. `allgres_private.audit_log` is a lighter answer to the same
+question — "who did this" — built on a self-reported label instead of a
+real login: the browser sends whatever name is set in Settings
+(`sessionStorage`, per browser tab, the same way the dashboard token itself
+is) alongside every request, and `dashboard_rpc` writes one append-only row
+— `operator_name`, `action`, a `details` object (the request minus the
+action itself and anything that could carry a secret: an API key, an OAuth
+client secret, an authorization code or state) — for each consequential
+action: creating or editing an agent, granting or revoking a permission,
+deciding an approval or a proposal, rolling back a policy, cancelling a
+session, editing the SQL sandbox allowlist or a project, updating a
+provider, connecting an OAuth provider, or writing/removing a memory.
+
+**This is not access control and does not claim to be.** Anyone holding
+the one shared token can type any name in Settings, or leave it blank —
+`audit_log` answers "who claimed responsibility for this," not "who was
+authorized to do it." The row itself is trustworthy (append-only,
+enforced by a trigger that applies even to the table's own owner, not
+just `REVOKE`), but the name inside it is exactly as reliable as the
+person typing it chooses to be. A real answer needs per-operator accounts
+— see [Known limitations](#known-limitations) and KNOWN_ISSUES.md, item
+10 — which this is not, and does not try to shortcut.
+
+Browsable from the new **Audit Log** dashboard page (`audit.list`), newest
+first, with the same self-reported-not-authentication banner repeated
+there.
+
 ## Known limitations
 
-Outstanding gaps — the unverified Docker/PG17 build, the untested upgrade path
-and OAuth flow, secret key rotation, and more — are tracked in
+Outstanding gaps — the unverified Docker/PG17 build, secret key rotation, no
+automatic OAuth token refresh, and more — are tracked in
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
 
 `allgres_public.fn_selftest()` exercises the validate/queue/claim/complete state
@@ -283,6 +426,19 @@ never written back to a row. The key exists only in that one response and
 then in the worker's memory for the HTTP request it is used for — never in
 WAL, a physical backup, a PITR archive, a replica, or a plain `SELECT` on
 `outbound_calls`.
+
+OAuth's token exchange follows the identical shape, in its own queue table
+(`allgres_private.oauth_calls`) rather than `outbound_calls`, since it has no
+`task_id` to attach to — connecting a provider is an operator dashboard
+action, not an agent turn. `fn_oauth_token_request` (reachable as
+`providers.oauth_callback`) builds the token request and queues it without
+ever touching the provider's decrypted `oauth_client_secret`; only
+`fn_claim_oauth`, called by the runtime worker, resolves it and merges it
+into the response handed back over the RPC socket. The resulting
+`access_token`/`refresh_token` are encrypted straight into `llm_secrets` by
+`fn_complete_oauth`, which runs entirely inside the worker — the dashboard
+never sees the callback's authorization `code`, the client secret, or the
+issued tokens; it only ever polls `has_secret`.
 
 ### Privileges
 
@@ -411,7 +567,7 @@ bypass of the dashboard token.
 | `ALLGRES_ALLOW_INSECURE_HTTP` | unset | Permit a public bind with no token |
 | `ALLGRES_SOCKET_DIR` | `$PGDATA/allgres` | RPC socket directory |
 | `ALLGRES_SECRET_KEY` | empty | Encrypts provider secrets at rest |
-| `ALLGRES_ENABLE_MOCK` | unset | Serve `/mock/chat/completions` (tests only) |
+| `ALLGRES_ENABLE_MOCK` | unset | Serve `/mock/chat/completions` and `/mock/oauth/token` (tests only) |
 | `ALLGRES_DROP_PRIVILEGES` | `1` | Runtime worker drops to the `worker` role |
 
 ## Extension installation
@@ -482,7 +638,8 @@ extension does that a generic `pg_dump` would otherwise miss silently:
   every table holding real operator/agent state via
   `pg_extension_config_dump()` (agents, sessions, tasks, policies and their
   history, permissions, projects, execution logs, human approvals, change
-  proposals, provider secrets, and the outbound/SQL call queues), so a plain
+  proposals, provider secrets, agent memories, and the outbound/SQL/OAuth
+  call queues), so a plain
   `pg_dump` now actually includes this extension's data — it silently did
   not, before KNOWN_ISSUES.md item 18. Restoring it needs
   `pg_restore --schema-only` first (creates the extension and its own seed
@@ -507,6 +664,16 @@ cargo pgrx test --features pg17   # Rust unit tests (request parsing, auth, pars
 ./scripts/smoke.sh                # container smoke, end-to-end, and security checks
 psql -c "SELECT allgres_public.fn_selftest()"
 ```
+
+`scripts/fault_injection_drill.sh` is a separate, runnable drill (bare-metal,
+like `scripts/backup_drill.sh`) that sends a real `SIGKILL` to the real
+`allgres runtime` worker while a real sandboxed-SQL call and a real LLM/HTTP
+call are genuinely in flight, and proves the whole claim → crash → recovery
+→ `fn_watchdog` reclaim → automatic retry → completion cycle happens on its
+own — not a `fn_selftest` case, since that would need a SQL function to kill
+its own OS process. It kills and restarts the entire instance it is pointed
+at, on purpose; never run it against anything serving real traffic. See
+KNOWN_ISSUES.md, item 26.
 
 ## License
 

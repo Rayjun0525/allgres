@@ -92,19 +92,17 @@ worker is down while it is serving the page you are looking at.
 
 No test covers these; they are wired up but unexercised:
 
-- the OAuth flow (`fn_oauth_start`, `fn_oauth_token_request`,
-  `fn_oauth_store_tokens`) — including the fact that nothing currently performs
-  the token exchange HTTP call;
-- the `delegate` action end to end (child task creation is covered by unit-level
-  assertions only);
-- `fn_watchdog` reclaiming a genuinely stuck **in-flight** call, for either
-  `outbound_calls` or `sql_calls` (a runtime worker crash between claim and
-  complete). `fn_watchdog` now has four reclaim loops total; the other two
-  (pending-approval expiry, `max_turn_seconds` — see item 11) got selftest
-  coverage in the same pass that added them, using the same technique this
-  pair would need (mark a row in the relevant state, backdate its timestamp,
-  call `fn_watchdog`, assert the reclaim) — nothing stops writing the same
-  tests here, it just hasn't been done yet.
+- ~~the OAuth flow~~ — fixed, see item 24: the token exchange HTTP call is
+  now actually performed, by the runtime worker, and covered by both
+  `fn_selftest` and a real `tests/e2e_mock.sql` round trip.
+- ~~the `delegate` action end to end~~ — fixed by item 23: `delegate_depth_
+  exceeded_rejected`, `delegate_cycle_rejected`, `delegate_session_task_
+  limit_rejected`, and `delegate_succeeds_within_budget` now cover it in
+  `fn_selftest`.
+- ~~`fn_watchdog` reclaiming a genuinely stuck **in-flight** call~~ — fixed,
+  see item 26: `scripts/fault_injection_drill.sh` actually kills the real
+  worker mid-call, for both `outbound_calls` and `sql_calls`, and proves the
+  real, unattended recovery cycle, not a synthetic 'lost' row.
 
 `await_human` / `fn_decide_approval` themselves are no longer on this list —
 see item 10. Neither is task/session cancellation, permission and allowlist
@@ -1079,6 +1077,15 @@ verification, not named by the review at all.
   credential at claim time, inject it only into the runtime worker's own
   response, never write it back anywhere a caller's result or a table
   could expose it) is the template, not attempted here.
+
+  Done in item 24, exactly on that template: `fn_oauth_token_request` no
+  longer returns anything secret, so the explicit revoke-from-operator this
+  bullet describes is gone too — `fn_oauth_start`/`fn_oauth_token_request`
+  are back under the ordinary blanket grant, the same as
+  `fn_claim_outbound`/`fn_complete_outbound` always were despite handling
+  the LLM credential internally (ownership, not the caller's grants, is
+  what actually runs their body — ibid.). `fn_oauth_store_tokens` itself is
+  gone outright rather than merely re-revoked.
 - **`drop_privileges()` failing was logged but not actually fail-closed** —
   confirmed real, though independent analysis found the practical
   severity lower than the review's framing for five of its six call
@@ -1434,3 +1441,553 @@ round trip for the two new operator-configurable fields this added.
   that already seeded the old prompt keeps it — this only changes what a
   fresh install (or a restore onto one) gets from here on, the same
   forward-only shape as the fixed provider ids in item 18.
+
+## 24. OAuth token exchange, actually performed, queued the way item 13 already fixed the same leak once
+
+Item 6 named this from the start: OAuth had three functions
+(`fn_oauth_start`, `fn_oauth_token_request`, `fn_oauth_store_tokens`) and no
+code path that ever performed the token exchange HTTP call. Item 20 found
+`fn_oauth_token_request` was also actively unsafe the moment anything called
+it: it decrypted the provider's `oauth_client_secret` and returned the built
+request straight to its caller, which the blanket
+`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA allgres_public TO operator` (see
+item 20's own account) would have handed to `operator` the instant a
+dashboard action reached it. Both gaps are closed together, since finishing
+the feature and fixing the leak turned out to be the same change.
+
+**What was built**: a new queue, `allgres_private.oauth_calls`, shaped
+exactly like `outbound_calls`/`sql_calls` (`queued -> in_flight ->
+harvested/lost`) but with no `task_id` — connecting a provider is an
+operator dashboard action, not an agent turn, so there is no task to route a
+result back into. `fn_oauth_token_request` now only builds the exchange
+request and queues it, without ever touching `oauth_client_secret`; a new
+`fn_claim_oauth` (worker-only) resolves the secret and merges it into the
+request body it hands back over the RPC socket — never written to
+`oauth_calls.request_body` — the identical claim-time-only shape
+`fn_claim_outbound` already uses for an LLM provider's `api_key` (item 13).
+A new `fn_complete_oauth` (worker-only) parses the token endpoint's
+response, stores `access_token`/`refresh_token` encrypted into
+`llm_secrets`, and fences a belated result the same way
+`fn_complete_outbound`/`fn_complete_sql` already do (a row only completes
+from `in_flight`; a watchdog-reclaimed `lost` row's result is discarded, not
+recorded). `fn_watchdog` gained a fourth reclaim loop, for `oauth_calls`
+stuck `in_flight` past a worker crash between claim and complete — the
+same technique item 6 already named as owed for the two `outbound_calls`/
+`sql_calls` loops, applied here from the start rather than added later.
+
+`fn_oauth_store_tokens` is not merely re-revoked from `operator` the way
+item 20 left it — it is gone. Its storage logic moved inside
+`fn_complete_oauth`, and nothing outside the runtime worker ever needs to
+call it, so there is no public entry point left to leak through in the
+first place. `fn_oauth_start`/`fn_oauth_token_request` are back under the
+ordinary blanket grant to `operator`, safely now: both return only a
+redirect URL / a queued `call_id`, nothing secret, the same reasoning that
+already lets `fn_claim_outbound`/`fn_complete_outbound` sit under that same
+blanket grant despite resolving a real credential internally — ownership,
+not the caller's own grants, is what actually runs a `SECURITY DEFINER`
+function's body.
+
+On the Rust side, `perform_http` gained a third branch alongside its
+existing `tool` (GET) and `llm` (JSON POST) ones: `oauth` sends a standard
+`application/x-www-form-urlencoded` submission (`ureq`'s `send_form`, RFC
+6749 4.1.3 — a token endpoint does not speak JSON on the request side, only
+the response). OAuth jobs run on the same HTTP thread pool as every other
+outbound call, tagged with which queue they came from
+(`OutboundQueue::Outbound`/`::Oauth`) so the harvest step in the main loop
+routes each result to `fn_complete_outbound` or `fn_complete_oauth`
+correctly — the two queues share infrastructure but are otherwise unrelated
+tables with unrelated completion semantics.
+
+Reachable from the dashboard: a `kind='oauth'` provider's editor in
+Settings gained Authorization URL / Token URL / Client ID / Client secret
+fields and a "Connect via OAuth" button (`providers.oauth_start`, a new
+`dashboard_rpc` action alongside `providers.oauth_callback`), which does a
+real full-page redirect to the provider's login screen; the provider's own
+redirect back to the dashboard's URL (`?code=&state=`) is picked up by a
+boot-time handler that completes the flow (`providers.oauth_callback`) and
+returns to Settings. Neither RPC action, nor the redirect itself, ever
+carries a secret — the callback's own return value is `{ok, queued,
+call_id, provider_id}`.
+
+**Verified live**, the same standard as items 12–23: rebuilt against local
+PostgreSQL 16.15 (rustc 1.98, since pgrx 0.19.2 needs rustc ≥1.96 — this
+session's toolchain started at 1.94 and had to be updated first),
+`fn_selftest` 88/88 (five new cases: queuing never touches the secret table
+and the return value contains no trace of it; claiming injects the secret
+only into the response, never back into the row; a stale completion is
+discarded, not stored; a successful exchange stores both tokens encrypted;
+a response missing `access_token` is recorded as an error rather than
+silently doing nothing), `tests/smoke.sql`, and a new section in
+`tests/e2e_mock.sql` that adds a mock OAuth token endpoint
+(`/mock/oauth/token`, gated by `ALLGRES_ENABLE_MOCK` exactly like the
+existing `/mock/chat/completions`) and drives the real background worker
+through it end to end: `fn_claim_oauth` → `perform_http`'s `send_form`
+branch → the mock endpoint (which itself refuses the exchange unless the
+real client secret arrived, and echoes the exchanged code back into the
+access token, so a correct token landing in `llm_secrets` proves both the
+code and the claim-time-injected secret actually made it over the wire) →
+`fn_complete_oauth` → `llm_secrets`, decrypted and checked, then every
+column of `oauth_calls` searched for the secret and both tokens (zero
+matches) — the same "search every column" proof item 13 used live for the
+identical class of leak. Also driven through the real HTTP path, not just
+SQL: `curl` against `/api/v1/rpc` for `providers.oauth_start` and
+`providers.oauth_callback`, and a headless-browser (Playwright/Chromium)
+screenshot of the Settings provider editor confirming the new fields and
+the Connect button render and the "connected" status reflects a stored
+token. A real `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from a real
+0.2.0 install (seeded with an agent beforehand, on a cluster with every
+`allgres_*`/`argo_*` role and schema removed first — see item 19's own
+account of the leftover-role trap this exact check has fallen into
+before) confirms `oauth_calls` exists post-upgrade, `fn_oauth_store_tokens`
+does not, and `fn_selftest` stays 88/88. `scripts/backup_drill.sh` (item
+18) re-run end to end, both the physical (PITR) and logical (`pg_dump`)
+paths, confirms the new `pg_extension_config_dump` registration for
+`oauth_calls` doesn't break either.
+
+`oauth_calls` is registered for `pg_extension_config_dump`, unconditionally,
+the same as `outbound_calls`/`sql_calls` — unlike `oauth_states` (still
+deliberately excluded: short-lived, in-progress flow state) it is a real
+audit trail worth keeping, and unlike `llm_secrets` it never holds a
+plaintext secret or token to begin with: there is no `response_body` column
+on it at all, only a status code and, on failure, the provider's own error
+text.
+
+**Deliberately not built**: token *refresh* — an expired `access_token` has
+to be reconnected from Settings by hand; nothing calls a provider's
+`refresh_token` grant automatically, though `llm_secrets.expires_at` is
+recorded and available for that later. `oauth_scope` has no operator setter
+(`fn_set_provider` never gained one) — it can only be seeded directly,
+same limitation the schema already had before this pass, just not removed
+by it either. No confirmation dialog before "Connect via OAuth" navigates
+away from the dashboard, beyond the browser's own — same caveat items 11
+and 17 already name for `sessions.cancel` and a proposal rollback. No
+per-operator identity attached to who connected a provider, for the reason
+item 10 gives throughout: no accounts system yet.
+
+## 25. Long-term agent memory, slice one
+
+Before this pass, Allgres had no cross-session memory at all: `execution_logs`
+is the verbatim, append-only transcript of one task, replayed into that
+task's own next `call_llm`, and nothing else. An agent that learned
+something in session 1 had no way to carry it into session 2 — a real gap
+for anything meant to act like a *personal* agent rather than a one-shot
+tool. This is a first, deliberately narrow slice, the same framing item 15
+used for per-agent PostgreSQL roles: does the core mechanism — an agent
+writing something durable, and getting it back automatically on a later
+turn — work at all, end to end, verified live, before building retrieval
+ranking, embeddings, or a curation UI on top of it.
+
+**What was built**: a new table, `allgres_private.agent_memories`
+(`memory_id`, `agent_id`, `subject_id`, `memory_type` — `semantic`/
+`episodic`/`preference`/`instruction`/`relationship`/`working` —, `content`,
+`importance`, `confidence`, `source_session_id`/`source_task_id`,
+`created_at`, `last_accessed_at`, `expires_at`, `metadata`), and a new agent
+action, `remember`, alongside `final_answer`/`execute_sql`/`call_tool`/
+`delegate`/`await_human`/`propose_change`. Unlike `execute_sql`/`call_tool`
+this needed no queue: it never leaves PostgreSQL, so `fn_submit_result`
+writes the row synchronously, the same shape `propose_change`'s own `INSERT`
+already uses. It also needed no resource-permission check the way
+`execute_sql` (a view) or `delegate` (a target agent) do — an agent can only
+ever write to its own memory, which cannot expand its privileges or touch
+anything another agent owns, the same reasoning `await_human`/
+`propose_change` already skip a permission grant for.
+
+`fn_next_step` reads a bounded set of that agent's own memories back on
+every turn — live ones only (`expires_at IS NULL OR expires_at > now()`),
+ranked by importance then recency, capped at 15 rows and 500 characters
+each — into a new `# memory` block in the same system message that already
+carries the policy prompt and the view/tool bounds. `last_accessed_at` is
+touched for exactly the rows actually recalled, not on write, so it reflects
+"last time this reached a prompt," not "last time it was mentioned." Recall
+is strictly scoped to `agent_id`, with no cross-agent read at all — verified
+live (below), not just asserted.
+
+Both the agent's own write path (`fn_submit_result`'s `remember` handler)
+and a new operator-authored one (`fn_remember`/`fn_forget`, exposed as
+`dashboard_rpc`'s `memories.create`/`memories.remove`, and a new Memories
+dashboard page) share one private function, `allgres_private.write_memory`
+— same validation, same fixed eviction, same insert, so the two paths
+cannot drift. It returns `{ok:false, error:...}` rather than raising,
+since the two callers handle a rejected write differently (one logs an
+`'error'`-role turn and continues the task; the other just reports failure
+to the dashboard).
+
+A fixed cap, 500 rows per agent, evicts the least important — then oldest —
+memories past that count on every write, rather than let the table (and
+every future prompt's memory block) grow without bound; this is a constant
+in `write_memory`, not an operator-configurable policy field, the same kind
+of deliberate simplification item 24 made for the OAuth queue's claim
+limit. `fn_watchdog` gained a fifth loop that garbage-collects any row past
+its `expires_in_days` — not a correctness fix (an expired row is already
+excluded from `fn_next_step`'s own recall query regardless of whether it
+has been swept), just hygiene, the same self-healing shape every other
+`fn_watchdog` loop already has.
+
+**A real bug caught while writing the test for it, before it shipped**: the
+first version of the 500-row eviction query ordered
+`importance ASC, created_at ASC` and deleted everything past
+`OFFSET 500` — which skips the 500 *least* important rows and deletes
+whatever comes after them in that ascending order, i.e. the *most*
+important ones. Exactly backwards: it would have evicted an agent's most
+valuable memories and kept the least valuable 500. Caught by writing
+`memory_cap_evicts_least_important` (insert one low-importance marker, 499
+filler rows, one high-importance marker, assert the low one is gone and the
+high one survives) before assuming the query was correct — the same
+standing question item 12 already named ("does the test check the write, or
+the read?") applied here to the query's own direction, not just whether it
+ran. Fixed by ordering `DESC` instead, so the OFFSET skips the *keepers*.
+
+**Verified live**, the same standard as items 12–24: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 94/94 (six new cases: malformed `remember`
+input — empty content, an unknown `memory_type` — is rejected without
+failing the task or writing a row; a well-formed `remember` writes a row
+*and* is recalled, verbatim, into a separate later task's own
+`fn_next_step` output, not just present in the table;
+`selftest_delegate_b`'s own `fn_next_step` never sees
+`selftest_delegate_a`'s memory; the 500-cap eviction test described above;
+`fn_watchdog` sweeping an expired row and reporting it in
+`memories_expired`; and `fn_remember`/`fn_forget` round-tripping a
+write and delete with no `source_session_id`/`source_task_id`, the
+operator-authored path). `tests/smoke.sql` and `tests/e2e_mock.sql` both
+still green (this slice touches no Rust code and no outbound path, so
+neither needed a new section). Also checked directly against a live
+session, not just `fn_selftest`'s own calls: `memories.create` over a real
+`curl` against `/api/v1/rpc`, a fresh `fn_next_step` call for that same
+agent confirmed to contain the exact memory content, `memories.remove` over
+the same route, and a headless-browser (Playwright/Chromium) round trip
+through the new Memories page (fill the form, Save, see the row; click
+Forget, see the empty state) with the underlying table checked directly
+before and after. A real `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from a
+real 0.2.0 install (seeded with an agent beforehand, on a fully cleaned
+cluster — see item 19's own account of the leftover-role trap this check
+keeps falling into) confirms `agent_memories`, `fn_remember`, and
+`fn_forget` all exist post-upgrade and `fn_selftest` stays 94/94.
+`scripts/backup_drill.sh` (item 18) re-run end to end, both the physical
+(PITR) and logical (`pg_dump`) paths, confirms the new
+`pg_extension_config_dump` registration for `agent_memories` doesn't break
+either.
+
+`agent_memories` is registered for `pg_extension_config_dump`,
+unconditionally — real agent/operator state worth keeping, the same
+treatment `execution_logs`/`sessions`/`tasks` already get.
+
+**Deliberately not built**, the same "narrow slice, revisit later" shape
+item 15 used: semantic (embedding/vector) search — recall is
+importance/recency ranking over structured rows only, no `pgvector`
+dependency added; an explicit `recall` action for an agent to query beyond
+what `fn_next_step` already injects automatically; row-level security on
+`agent_memories` (gated by `write_memory`'s own `agent_id` parameter and
+`fn_next_step`'s own `WHERE agent_id = ...`, the same `SECURITY DEFINER`
+pattern nearly every other table in this project uses — `v_sales`/
+`v_my_tasks` remain the one place real Postgres RLS is used, per item 15);
+an operator-configurable per-agent memory cap (the 500-row limit is a fixed
+constant); a confirmation step before an operator's "Forget" deletes a
+memory, beyond the browser's own, the same caveat item 11 already names for
+`sessions.cancel`; and no identity for *who* (operator or agent) is telling
+the truth about a `subject_id` — it is free text an agent or operator
+chooses to write, not tied to any real accounts system, because there isn't
+one yet (item 10).
+
+## 26. A genuine fault-injection drill: killing the real worker mid-call, not simulating it
+
+Item 6 named this from the start and every pass since kept deferring it:
+`fn_watchdog` reclaiming a call stuck `in_flight` because the runtime worker
+crashed between claim and complete had selftest coverage only in the
+*synthetic* sense — `complete_sql_fences_stale_result`/
+`complete_outbound_fences_stale_result` and the pair added for OAuth (item
+24) all prove the fencing logic is correct by `UPDATE ...SET status =
+'lost'` and then calling the complete function directly. That proves the
+*state machine* is correct. It proves nothing about whether a real crash of
+the real worker process, at the real point where it is genuinely blocked on
+a genuinely long-running call, actually gets noticed and recovered from by
+the real, periodic `fn_watchdog` pass running unattended in a process that
+had to restart itself first. Those are different claims, and only one of
+them had ever been checked live.
+
+**What this is**: `scripts/fault_injection_drill.sh`, a new runnable,
+re-runnable drill in the same family as `scripts/backup_drill.sh` (item
+18) — not a `fn_selftest` case, because what it tests cannot be expressed
+as one: it needs a real OS-level `kill -9` against a real backend PID,
+which no SQL function can do to itself. Two phases, one for each queue item
+6 named:
+
+- **Phase 1, `sql_calls`.** A real agent, a real session, a real
+  `execute_sql` action (`SELECT count(*) FROM generate_series(1,
+  200000000) g` — an allowlisted, legitimately slow query, not
+  `pg_sleep()`, which the sandbox denies) submitted through
+  `fn_submit_result` exactly as the runtime worker would after a real LLM
+  turn. The drill polls until the real worker's real `pump_sql()` claims it
+  (`sql_calls.status = 'in_flight'`), reads the real worker's PID out of
+  `pg_stat_activity` (`backend_type = 'allgres runtime'`), and sends it a
+  real `SIGKILL` while the query is genuinely executing on that worker's
+  SPI thread.
+- **Phase 2, `outbound_calls`.** The same shape, for a real LLM/HTTP call
+  instead: a new mock endpoint, `/mock/slow/chat/completions` (`src/lib.rs`,
+  gated by `ALLGRES_ENABLE_MOCK` exactly like the existing
+  `/mock/chat/completions`), sleeps 15 seconds — comfortably under
+  `HTTP_TIMEOUT` (45s) — before replying, giving a real window in which a
+  real `outbound_calls` row is genuinely `in_flight` on a real HTTP pool
+  thread inside the worker process. Same kill, same recovery check.
+
+**What killing the worker actually does, confirmed live, not assumed**:
+PostgreSQL treats an unexpected exit of *any* backend attached to shared
+memory — a background worker with `enable_spi_access()` (`src/lib.rs`)
+included — exactly like any other backend crash: it tears down every other
+connection and replays crash recovery for the whole instance. This is
+standard PostgreSQL behavior, not something specific to Allgres or this
+drill, and the drill's own header says so explicitly: it kills and restarts
+the *entire* instance it is pointed at, on purpose, and must never be run
+against a cluster serving real traffic. The `allgres runtime` worker
+relaunches itself once recovery finishes, with no operator action, via the
+`set_restart_time` already configured in its `BackgroundWorkerBuilder`
+(`src/lib.rs`) — nothing new added for this drill, just verified live for
+the first time.
+
+After the kill, the drill:
+
+1. confirms the log actually shows a crash (`terminated by signal` /
+   `crash of another server process`) followed by `database system is
+   ready to accept connections` — refusing to pass if recovery merely
+   *looked* clean without an actual crash being logged;
+2. confirms the row is still `in_flight` immediately after recovery — it
+   was committed by `fn_claim_sql`/`fn_claim_outbound` in its own
+   transaction *before* the slow call ever started running in a separate
+   one, so a crash mid-call cannot roll the claim back;
+3. waits — up to 130s, no shortened threshold — for the row to reach
+   `'lost'` **on its own**, checking only what the real, restarted worker's
+   own periodic `fn_watchdog` pass did, never calling `fn_watchdog`
+   directly itself. The real threshold is `2 × HTTP_TIMEOUT` = 90s
+   (`dispatch_and_claim`, `src/lib.rs`), not a drill-only fast path, so
+   this genuinely waits as long as a real crash would before recovery
+   starts;
+4. confirms the timeout is visible in the task's own `execution_logs`, not
+   silently swallowed;
+5. then does **nothing further by hand** — no manual resubmission — and
+   instead waits for the real, unattended `fn_dispatch_tasks` (also running
+   inside the same real restarted worker) to redispatch the task on its own
+   and reach `'completed'`.
+
+**A real design mistake in the drill itself, caught by the drill failing on
+its first live run**: the first version left the throwaway agent on its
+seed default LLM provider. The moment `fn_watchdog` logged the timeout, the
+real `fn_dispatch_tasks` — which advances *any* `'running'` task with
+nothing pending, unconditionally, on its own schedule — immediately queued
+a real LLM call against that real (unreachable, from here) provider, which
+failed on a real TLS error twice and exhausted `max_retries` (2) before the
+script's own polling loop ever got to check anything: `status='failed'`
+where `'running'` was expected. Not a bug in `fn_watchdog` or the reclaim
+path — both had already worked correctly by that point, confirmed by the
+row correctly reaching `'lost'` — but a real gap in the drill's own design:
+it had implicitly assumed the task would sit still between the reclaim and
+whatever the script did next, when the real production pump loop never
+sits still for anyone. Fixed by pointing the agent at the same mock
+provider `tests/e2e_mock.sql` already uses (phase 1) and the new
+`/mock/slow` one (phase 2) *before* the crash, so the automatic redispatch
+that was always going to happen either way now succeeds instead of racing
+a real network call to nowhere. This makes the drill prove the *whole* real
+cycle — claim → crash → recovery → reclaim → automatic redispatch →
+completion — rather than only the reclaim step in isolation, which was the
+more valuable claim to prove regardless.
+
+**Verified live, both phases, end to end, twice** (once before and once
+after adding the `/mock/slow` endpoint required a rebuild): `cargo build`/
+`cargo test` (30/30) clean, `fn_selftest` clean before and after each run,
+`tests/smoke.sql`/`tests/e2e_mock.sql` unaffected. `scripts/
+fault_injection_drill.sh` itself passing both phases is the primary
+evidence — a `SIGKILL` against a live, genuinely-in-flight backend, a real
+crash logged, real recovery, real unattended reclaim after the real
+production timeout, and real unattended completion afterward, for both
+queues item 6 named.
+
+**Deliberately not covered**: `oauth_calls` (item 24) is not exercised by
+this drill — its own reclaim loop is identical in shape to the two tested
+here and was already added defensively when that item shipped, but a
+genuine crash-mid-exchange test would need a real, unconsumed authorization
+code to retry with, which a mock OAuth provider cannot supply after the
+fact (the code is single-use by design, see item 24's own account of why
+the state row is deleted at queue time, not completion time) — a real
+retry after that kind of crash is a fresh operator-initiated "Connect"
+click in production, not something this drill can simulate. Also not
+covered: a crash of the `allgres web` worker (dashboard HTTP listener)
+mid-request — that worker holds no durable claim a watchdog would need to
+reclaim, so there is no analogous state to test recovery of; a dropped
+in-flight dashboard request simply fails and the browser retries, which is
+already how any ordinary HTTP client behaves against any server restart.
+
+## 27. Maintenance/auditor agents, slice one: two diagnostic views and a read-only seeded agent
+
+A second-round review's proposal (the same one this file's later items have
+been working through) argued for a layer of system-facing agents above the
+user-facing ones — a health agent, a security/policy auditor, a memory
+curator, a performance advisor — each reading operational state and either
+reporting a finding or, for anything that needs to actually change, routing
+through a proposal an operator decides, never mutating directly. This is a
+first, deliberately narrow slice of that, the same framing items 15 and 25
+already used: does the core mechanism work — an ordinary agent reading real
+operational signals through the existing permission-gated view mechanism,
+with genuinely no path to mutate anything — before building a curation UI,
+a scheduler, or a proposal-routed remediation flow on top of it.
+
+**What was built**: two new views, `allgres_public.v_system_health` (worker
+presence, per-queue backlog counts for `outbound_calls`/`sql_calls`/
+`oauth_calls`, running/failed task counts, pending approvals, unswept
+expired memories) and `allgres_public.v_permission_audit` (every agent's
+`(resource_type, resource_ref, granted_at)` grants, joined to the agent's
+name and `is_active`) — no new table, no new action, no new trust boundary.
+Both are system-wide rather than per-agent-owned data, so neither needed
+the `agent_id IS NOT DISTINCT FROM current_agent_id()` row filter
+`v_sales`/`v_my_tasks` use; `agent_may_read` alone gates the whole row set,
+the same function and the same two-layer check (allowlist ∩ permission)
+every sandboxed view already goes through — a maintenance agent's read
+access is exactly as revocable, and exactly as auditable, as any other
+agent's `execute_sql` permission, nothing bespoke.
+
+A seeded agent, `health_monitor`, ships with both views granted and nothing
+else: no `v_sales`, no tools, no `delegate`, and — deliberately, matching
+how conservative this slice chose to be — no `propose_change` in its own
+seeded prompt either, even though the action exists and would work if
+added. It uses only what every agent already has: `execute_sql` against
+the two new views, `remember` to persist a finding for comparison against
+its next run (a nice fit with item 25's own memory feature — a maintenance
+agent's whole "compare against last time" behavior is just ordinary recall,
+no special case), and `final_answer` to report what it found, in the same
+Sessions thread view any other agent's run already surfaces. There is no
+scheduler; an operator (or an external `cron` job hitting
+`POST /api/v1/run`, no different from automating any other agent) decides
+when it runs.
+
+**Verified live**, the same standard as items 12–26: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 95/95 (one new case,
+`maintenance_views_enforce_permission`: `health_monitor` sees both views
+populated, `analyst` — granted neither — sees zero rows from both,
+mirroring `views_enforce_permission`'s own technique for `v_sales`).
+`tests/smoke.sql`/`tests/e2e_mock.sql` unaffected (no Rust change in this
+pass). A real `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from a real
+0.2.0 install (on a fully cleaned cluster, per item 19's own account of the
+leftover-role trap) confirms both views and the seeded agent exist
+post-upgrade and `fn_selftest` stays 95/95. `scripts/backup_drill.sh`
+(item 18) re-run end to end, both physical and logical paths, confirms the
+`sql_sandbox_allowlist`/`agents`/`policies`/`permissions` seed-exclusion
+filters (now naming `health_monitor` alongside `analyst`) don't collide on
+restore. Also driven through the real pipeline, not just `fn_selftest`:
+`health_monitor` pointed at the same mock LLM provider
+`tests/e2e_mock.sql` uses and run through a real session via the real
+background worker end to end, reaching `'completed'`; a headless-browser
+(Playwright/Chromium) pass confirming it renders correctly in the Agents
+page.
+
+`v_system_health`'s `workers_online` count carries the same caveat item 5
+already names for the dashboard's own Workers panel: `allgres web` has no
+database connection and so never appears in `pg_stat_activity` at all —
+confirmed live (`workers_online` read `1` with both workers actually
+healthy) rather than assumed from the existing item 5 text, and now noted
+directly in the view's own comment so a future reader of *this* view
+doesn't have to rediscover it.
+
+**Deliberately not built**: the scheduler that would make a maintenance
+agent actually "maintain" anything unattended — this slice only proves an
+agent *can* read and report; making that happen automatically needs either
+a `pg_cron` dependency or a new recurring-task primitive in the runtime
+worker, either a materially bigger and separately-considered change than
+this one; any way for a maintenance agent to act on a finding beyond
+reporting it — `propose_change` is available to any agent already, but
+`health_monitor`'s own seeded prompt doesn't use it, on purpose, so a real
+recommendation still requires an operator to read the session and decide,
+not an auto-applied policy; the other roles the review proposed (a policy
+auditor beyond raw permission grants, a memory curator, a performance
+advisor) — `v_permission_audit` gives a security/policy auditor its raw
+material but nothing analyzes it yet, and a memory curator is really just
+an agent with `memories.list`-equivalent read access plus a prompt, not
+attempted here; and no operator identity attached to who triggered a
+maintenance run, for the reason item 10 gives throughout.
+
+## 28. A lightweight operator audit log — self-reported, not authenticated, and explicit about the difference
+
+Item 10 has said throughout this file that "who approved this" is
+unanswerable by design, because the dashboard has one shared bearer token,
+not per-operator accounts. That remains true — a real fix needs a real
+authentication model, a materially heavier and riskier change than
+anything else in this pass, and was explicitly scoped out in favor of this
+lighter version: not an accounts system, an audit trail built on a
+self-reported label instead of a real login. It answers a narrower, still
+useful question — "who claimed responsibility for this" — and is explicit,
+everywhere it appears, that it does not answer the harder one.
+
+**What was built**: `allgres_private.audit_log` (`operator_name`, `action`,
+`details` jsonb, `created_at`), append-only the same way `execution_logs`
+already is — a `BEFORE UPDATE OR DELETE` trigger, not just a `REVOKE`.
+`dashboard_rpc` writes one row per consequential action — `agents.create`/
+`agents.update`, `policy.rollback`, `proposals.decide`, `permissions.grant`/
+`revoke`, `allowlist.add`/`remove`, `projects.create`/`update`,
+`sessions.cancel`, `memories.create`/`remove`, `provider.update`,
+`providers.oauth_callback`, `approvals.decide` — in the same transaction as
+the mutation itself, before the action's own `CASE` branch runs: if that
+branch later raises, PL/pgSQL's implicit savepoint at `dashboard_rpc`'s own
+`BEGIN` rolls the audit insert back right along with it, so a row only ever
+exists for something that actually committed, never a failed attempt.
+`operator_name` is whatever the browser sent, unauthenticated; `details` is
+the request minus `action`/`operator_name` and a fixed list of fields that
+could carry a secret (`api_key`, `oauth_client_secret`, `code`, `state`) —
+generic by construction, so a newly audited action needs only its name
+added to the list, no bespoke field mapping.
+
+Deliberately not a REVOKE against the table's own owner: a PostgreSQL table
+owner's DML rights on their own table cannot be revoked by ACL at all — only
+the trigger actually stops that path, and it applies regardless of who
+issues the UPDATE/DELETE, ownership included. (The file's `audit_log`
+section says this explicitly, so a future reader does not have to
+rediscover it by trying a `REVOKE ... FROM allgres_owner` that would
+silently do nothing.)
+
+The dashboard sends `operator_name` from `sessionStorage` (`opName()`),
+the same per-tab storage the dashboard token itself already uses, on every
+call through the generic `rpc()` helper; three legacy named routes that
+bypass it (`agents.create`, `agents.update`, `provider.update`) were
+patched individually to include it in their own request bodies. A new
+**Audit Log** page lists entries newest-first (`audit.list`), with a
+banner repeating the same "self-reported, not authentication" framing the
+README's own "Operator audit log" section leads with — the point where
+this is easiest to misread as real access control is exactly the page
+someone would open to check who did something, so the caveat lives there
+too, not only in documentation nobody reading the dashboard would see.
+
+**Verified live**, the same standard as items 12–27: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 96/96 (one new case,
+`audit_log_records_consequential_actions_only`: a consequential action
+writes exactly one row with the correct `operator_name` and `details`; a
+read-only action (`overview`) writes none; a request carrying an `api_key`
+never leaks it into `audit_log.details`; and `UPDATE`/`DELETE` against the
+table both raise, confirmed by catching the actual exception rather than
+assuming the trigger fires). Also driven through the real HTTP path, not
+just `fn_selftest`: `curl` against `/api/v1/rpc` for `allowlist.add`/
+`allowlist.remove` with an `operator_name`, confirmed to land correctly and
+with secrets stripped from a `provider.update` call carrying a real
+`api_key`; a headless-browser (Playwright/Chromium) pass setting an
+operator name from Settings, performing an audited action, and reading it
+back correctly labeled on the new Audit Log page.
+
+**A real side effect from the browser test itself, caught and fixed before
+being called done**: the first Playwright pass clicked the first `.remove`
+button on the allowlist panel to undo its own test entry, but the panel had
+re-rendered in a different order and it actually removed
+`allgres_public.v_my_tasks` — a real, seeded, load-bearing allowlist entry,
+not a leftover from the test. The audit log itself is what caught it (the
+row correctly read `allowlist.remove` / `v_my_tasks`, proving the log was
+accurate about something the *test* got wrong, not a bug in `dashboard_rpc`
+or the trigger) — confirmed by checking `sql_sandbox_allowlist` directly
+afterward and finding the row genuinely gone. Restored by hand
+(re-`INSERT`ing `v_my_tasks`) before re-running `fn_selftest`, which passed
+clean afterward — a case of a test's own imprecision producing a real,
+correctly-recorded consequence, not a false pass.
+
+**Deliberately not built**: real per-operator authentication — this is the
+whole point of choosing the lighter version item 10 keeps deferring;
+anything that reads `audit_log` as proof of who was *authorized*, rather
+than who *claimed* an action, would be a misuse of what this actually is,
+which is why every surface it appears on (the table's own comment, the
+README section, the dashboard page) repeats the same caveat rather than
+stating it once and trusting it to travel; audit coverage for read-only
+actions (`*.list`, `settings.get`) — deliberately excluded, since the
+question this answers is "who changed something," not "who looked"; and
+any UI affordance to filter or search the Audit Log page beyond a flat,
+newest-first list of the most recent 300 entries.
