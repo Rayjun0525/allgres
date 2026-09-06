@@ -1,4 +1,4 @@
--- Allgres 0.5.0 control plane.
+-- Allgres 0.1.0 control plane.
 --
 -- Internal state lives in the allgres_private/allgres_public schemas and the
 -- allgres_owner role; user-facing native functions are exposed under schema

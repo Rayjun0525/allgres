@@ -20,6 +20,22 @@ Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
 a gap between what the code does and what it should do.
 
+**A note on version numbers**: this project has never had an actual release.
+`Cargo.toml`/`allgres.control` bumped through `0.2.0`–`0.5.0` during
+development (each bump documented, at the time, in the item below it); none
+of those were ever published anywhere, so none of them are a real prior
+version an operator could actually be running. The version has been reset to
+`0.1.0` and its matching `sql/allgres--<from>--<to>.sql` upgrade scripts for
+those never-shipped versions removed — the version number will move again
+only to mark an actual release, not every development milestone. This does
+**not** touch `sql/allgres--0.2.0.sql`, the frozen pre-rename (Argo-named)
+snapshot item 19 describes, or the `ALTER ROLE`/`SCHEMA ... RENAME`
+migration path built for it: that predates this project's own renaming and
+is a separate, real concern from this version-numbering cleanup. Every item
+below keeps whatever version number was live in the codebase at the time it
+was written — read them as a dated development diary, not as claims about
+the current version.
+
 ## 1. ~~Agent SQL does not run as the `sandbox` role~~ — fixed
 
 `fn_execute_sql` validated *and* executed in one `SECURITY DEFINER` call, which

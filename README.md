@@ -6,7 +6,9 @@ Allgres is a PostgreSQL-native agent control plane. It packages the PL/pgSQL
 state machine, a Rust/pgrx native runtime worker, outbound HTTP/HTTPS, and an
 embedded browser control panel into one PostgreSQL extension.
 
-Version 0.5.0. This is an MVP: read [Security model](#security-model) before
+Version 0.1.0 -- pre-release; the version number tracks an actual release,
+not every development milestone (see KNOWN_ISSUES.md's versioning note).
+This is an MVP: read [Security model](#security-model) before
 putting it anywhere that matters.
 
 ## Status
