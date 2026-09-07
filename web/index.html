@@ -161,7 +161,7 @@ function agentConfigFields(a){
 async function agentModal(a){
   const isNew=!a;
   const opts=isNew?null:await rpc('permissions.options').catch(()=>null);
-  const providers=isNew?[]:(await api('/api/v1/settings').catch(()=>({providers:[]}))).providers||[];
+  const providers=(await api('/api/v1/settings').catch(()=>({providers:[]}))).providers||[];
   const curProvider=a?.llm_config?.provider||'';
   // Only providers actually configured (added or edited in Settings) and
   // enabled show up here -- an agent can no longer be pointed at a
@@ -176,9 +176,9 @@ async function agentModal(a){
   $('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>${isNew?'Create agent':'Edit agent'}</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div>
 <div class="field"><label>Name</label><input class="input" id="aName" value="${esc(a?.name||'')}"></div>
 <div class="field"><label>System prompt</label><textarea class="textarea" id="aPrompt">${esc(a?.system_prompt||'')}</textarea></div>
-${isNew?'':`<div class="grid2"><div class="field"><label>Provider</label>${providerSelect}</div><div class="field"><label>Model</label><input class="input" id="aModel" value="${esc(a?.llm_config?.model||'')}" placeholder="e.g. gpt-4o, claude-sonnet-5, llama3"></div></div>
+<div class="grid2"><div class="field"><label>Provider</label>${providerSelect}</div><div class="field"><label>Model</label><input class="input" id="aModel" value="${esc(a?.llm_config?.model||'')}" placeholder="e.g. gpt-4o, claude-sonnet-5, llama3"></div></div>
 <div class="muted" style="font-size:12px;margin:-4px 0 8px">The endpoint URL and API key come from the provider chosen above (see Settings); an agent cannot override them. ${!providerOpts.length?'No provider is configured yet, so this agent cannot run until one is added.':''}</div>
-<div class="grid2"><div class="field"><label>Max steps</label><input type="number" class="input" id="aSteps" value="${esc(a.max_steps||20)}"></div><div class="field"><label>Max retries</label><input type="number" class="input" id="aRetries" value="${esc(a.max_retries||2)}"></div></div>
+${isNew?'':`<div class="grid2"><div class="field"><label>Max steps</label><input type="number" class="input" id="aSteps" value="${esc(a.max_steps||20)}"></div><div class="field"><label>Max retries</label><input type="number" class="input" id="aRetries" value="${esc(a.max_retries||2)}"></div></div>
 <div class="grid2"><div class="field"><label>Max concurrent tasks</label><input type="number" class="input" id="aConcurrent" value="${esc(a.max_concurrent_tasks||4)}"></div><div class="field"><label>Max turn seconds (blank = uncapped)</label><input type="number" class="input" id="aTurnSecs" value="${a.max_turn_seconds??''}"></div></div>
 <div class="grid2"><div class="field"><label>Max delegation depth</label><input type="number" class="input" id="aDelegDepth" value="${esc(a.max_delegation_depth??5)}"></div><div class="field"><label>Max session tasks</label><input type="number" class="input" id="aSessTasks" value="${esc(a.max_session_tasks??100)}"></div></div>
 <div class="field"><label><input type="checkbox" id="aActive" ${a.is_active?'checked':''}> Active</label></div>
@@ -199,7 +199,11 @@ ${agentConfigFields(a)}
     $('#viewProposals').onclick=()=>{state.proposalAgentFilter=a.agent_id;state.page='Approvals';state.approvalsTab='Proposals';closeModal();nav();loadPage()};
     $('#viewAssigned').onclick=()=>assignedUsersModal(a.agent_id);
   }
-  $('#saveA').onclick=async()=>{try{if(isNew){await api('/api/v1/agents',{method:'POST',body:JSON.stringify({name:$('#aName').value,system_prompt:$('#aPrompt').value,operator_name:opName(),session_token:sessTok()})})}else{
+  $('#saveA').onclick=async()=>{try{if(isNew){
+    const r=await api('/api/v1/agents',{method:'POST',body:JSON.stringify({name:$('#aName').value,system_prompt:$('#aPrompt').value,operator_name:opName(),session_token:sessTok()})});
+    const prov=$('#aProvider').value,mdl=$('#aModel').value.trim();
+    if(prov||mdl)await api('/api/v1/agents/'+encodeURIComponent(r.agent_id),{method:'PATCH',body:JSON.stringify({llm_config:{provider:prov,model:mdl},session_token:sessTok(),operator_name:opName()})})
+  }else{
     let agentConfig;
     try{agentConfig=JSON.parse($('#aConfigRaw').value||'{}')}catch(e){toast('Agent config is not valid JSON');return}
     if($('#acCompactionThreshold'))agentConfig.compaction_threshold=$('#acCompactionThreshold').value===''?null:+$('#acCompactionThreshold').value;
