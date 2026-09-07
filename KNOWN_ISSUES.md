@@ -2746,3 +2746,152 @@ without it (confirmed the brute-force path returns the identical ranking,
 same values up to floating-point precision). Semantic recall over
 long-term agent memory (item 25), using this same embedding
 infrastructure, is deliberately left for a follow-up slice.
+
+## 36. Three real gaps found by an outside review of item 35's own commit: a flaky CI mechanism, an unvalidated agent_config, and an embedding-model mix-up
+
+An external review of the merged commit (b539afc) flagged three things
+worth checking against the real code rather than taking on faith. All
+three turned out to be real.
+
+**`docker-smoke` was failing on `main`, not just a stale PR run.** The
+review caught this live: `native-matrix (16/17/18)` all green, but
+`docker-smoke` red on both the merge that landed item 35 and the *previous*
+merge (PR #3) before it -- a pre-existing, recurring failure, not something
+this session's own changes introduced. `scripts/smoke.sh`'s own log showed
+the actual failing line every time: `curl: (23) Failure writing output to
+destination`, immediately after `dashboard stayed responsive under
+outbound load` and before one of the CSP-header assertions. The
+`set -euo pipefail` script piped `curl` straight into `grep -q`/`grep -qv`
+in three places; `-q` makes grep exit the instant it finds (or definitively
+rules out) a match, closing its end of the pipe while curl may still be
+mid-write, so curl gets a broken-pipe write failure (exit 23) for what was
+actually a *successful* assertion -- and `pipefail` turns that broken-pipe
+exit into a script failure regardless of what grep found. This is a
+textbook `curl | grep -q` race, not a size limit or a real HTTP problem:
+confirmed live by fetching the exact same responses with `curl | wc -c`
+(reads to EOF, no early-exiting consumer) against a real running server --
+same bytes, no failure, including the by-now-fairly-large `/api/v1/agents`
+response. Fixed by capturing each response into a shell variable first
+(`body=$(curl ...)`) and grepping the variable via a here-string
+(`grep -q pattern <<<"$body"`) instead of a live pipe -- command
+substitution waits for curl to fully exit before grep ever runs, so there
+is no pipe left to race. All three occurrences in `scripts/smoke.sh` fixed
+the same way; a repo-wide grep confirms no other script has the same
+pattern.
+
+**`agent_config`'s known integer keys had no value validation.** Item 35's
+own `fn_set_agent_config` only ever checked that the whole value was a
+JSON object -- `compaction_threshold: "not_a_number"` or
+`min_mentions_to_route: 0` would both write successfully and only surface
+as a runtime error the next time `maybe_trigger_compaction` or
+`fn_messenger_post` actually cast the value with `::int`, mid-turn, on
+whatever task happened to trigger it next -- exactly the "fails late
+instead of fails fast" gap the review named. Fixed with
+`allgres_private.validate_agent_config`, called from `fn_set_agent_config`
+before the merge: for each of the file's own known integer-typed keys
+present and non-null in the incoming config, it must be a whole number
+within a sane range, or the write is rejected with a friendly error naming
+the key -- the same "friendly rejection instead of a raw error" shape
+`fn_set_agent_autonomy` already has for a bad `autonomy_level`. A key not
+on this list is completely unvalidated and always was -- that is still the
+entire point of `agent_config` being a generic bag rather than one column
+per tunable; only names this file's own readers already cast get checked.
+
+**Embedding-model mix-up: same dimension, different model, ranked as if
+comparable.** `rank_agents_by_embedding` already refused to compare
+embeddings of different *dimension* (item 35), but two different embedding
+models can produce the same dimension while meaning something completely
+different per axis -- switching the configured provider/model would have
+silently started ranking an old embedding against a new query in an
+incomparable vector space, with nothing about the shape of the data to
+catch it. Fixed: `rank_agents_by_embedding` takes a new
+`p_expected_model` parameter and only considers agents whose
+`embedding_model` matches it exactly, in both the pgvector-accelerated and
+brute-force paths. `fn_complete_outbound`'s `'embedding'` branch derives
+the expected model from the *actual* call that was just completed
+(`request_body->>'model'` plus that row's own `provider_id` looked up
+against `llm_providers.name`) rather than re-querying "the" current
+embedding provider, which could have changed between when the query was
+queued and when it completed.
+
+**Verified live**: `fn_selftest` grew from 149 to 153 cases (rejecting a
+non-numeric and an out-of-range known key, confirming the rejected value
+was never persisted, confirming an unknown key stays fully unvalidated,
+and extending the ranking test with a same-dimension-different-model agent
+that must be excluded even though it would otherwise rank first),
+idempotent across repeated runs, on a fresh install both with and without
+pgvector. `tests/e2e_mock.sql`'s real end-to-end round trip (item 35) still
+passes both ways with the model filter in place, confirming the
+provider-name/request-body-model reconstruction actually matches what
+`fn_complete_agent_embedding` stamped onto `agents.embedding_model` in the
+first place. The three fixed `scripts/smoke.sh` assertions were run
+directly against a real live server (not just `bash -n`), each one
+succeeding exactly as it should.
+
+## 37. The same outside review's fourth finding: admin gating across `dashboard_rpc`'s platform-configuration actions was never consistent, just accidentally uniform until item 28 added real accounts
+
+Item 28 layered a real login system (`users`, `session_tokens`, roles) on
+top of a dashboard that had always been governed by one thing: possession
+of the shared bearer token in `Authorization: Bearer ...`. Before item 28,
+"logged in" didn't exist as a concept, so nothing in `dashboard_rpc` needed
+to check it. After item 28, a handful of actions were updated to call
+`require_admin(session_token)` -- but only the ones item 28 itself touched
+directly (`users.*`, `assignments.*`) plus, later, item 32's
+`require_admin_for_system_agent`, which is unconditional the instant its
+target happens to be a system agent, and a no-op otherwise. Nothing ever
+went back and gated the rest of the platform-configuration surface:
+`agents.create`, `agents.update`/`policy.rollback`/`permissions.grant`/
+`permissions.revoke`/`agents.set_autonomy` for an *ordinary* (non-system)
+agent, `provider.create`, `provider.update`, `allowlist.add`,
+`allowlist.remove`, and `providers.oauth_start`/`providers.oauth_callback`.
+Every one of these was reachable by anyone holding the shared dashboard
+token alone, with no relationship to whether that caller was logged in or
+as what role -- confirmed by reading each branch in `dashboard_rpc`
+directly, not inferred. A real gap between the accounts system and the
+admin-only surface that predates it, not a deliberate two-tier design.
+
+The fix cannot be a bare `require_admin` the way
+`require_admin_for_system_agent` already is for a system-agent target:
+that would break the deployment mode this whole accounts system was
+always additive to (see `dashboard_rpc`'s own "Accounts, roles, ..."
+section comment) -- a single-operator install that has never created a
+user account at all, where the shared bearer token alone has always been
+the entire security model and still needs to be enough on its own. Added
+`allgres_private.require_admin_if_accounts_exist(p_token text)`: a no-op
+if `allgres_private.users` has zero rows (accounts never configured --
+preserves the historical single-operator behavior exactly), otherwise it
+delegates to `require_admin`. Checked fresh on every call, not cached, so
+the very next request after the first account is created is already
+covered. Wired into every action named above; `agents.update` and its
+sibling system-agent-target actions keep `require_admin_for_system_agent`
+*alongside* the new gate, not replaced by it -- one call stays
+unconditional the moment the target is a system agent, the other now also
+covers an ordinary agent, but only once accounts exist. `users.*` and
+`assignments.*` were deliberately left untouched: those were already
+correctly strict (`require_admin` has no bootstrap fallback, which is
+right for account management specifically -- the first admin account is
+expected to be bootstrapped via direct SQL, not through the dashboard).
+
+**Deliberately out of scope for this pass**: `run`, `sessions.cancel`, and
+`sessions.continue` still have no session/scoping check at all and can act
+on any `agent_id`/`session_id` regardless of `user_agent_assignments` --
+a separate, arguably larger gap than what this finding named, left for a
+follow-up rather than folded into this fix.
+
+**Verified live**: `fn_selftest` grew from 153 to 160 cases -- a bootstrap
+no-op check (`admin_gate_is_a_noop_before_any_account_exists`, run at the
+one point in the whole suite where `allgres_private.users` is guaranteed
+still empty, confirming `agents.create` still works with no session_token
+at all before any account exists), the `agent_config`-on-ordinary-agent
+case rewritten to reflect that it now needs an admin session once accounts
+exist (its old premise, "no admin needed," stopped being true by design),
+and five representative spot-checks across the newly gated actions
+(`agents.create`, `provider.create`, `allowlist.add`, `permissions.grant`)
+each confirmed rejected without a session and confirmed to actually take
+effect with one. Idempotent across three consecutive runs on the same
+database, on a fresh install both with and without pgcrypto and both with
+and without pgvector. `tests/smoke.sql` and `tests/e2e_mock.sql` still pass
+unchanged -- neither exercises any of the newly gated actions through
+`dashboard_rpc` (the mock providers `e2e_mock.sql` needs are seeded via
+direct `INSERT`, not `provider.create`), confirming this fix didn't need
+to touch either script.

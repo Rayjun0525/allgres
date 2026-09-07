@@ -1338,15 +1338,23 @@ $fn$;
 -- allgres_private.vector_available(), a brute-force
 -- allgres_private.cosine_similarity() scan otherwise -- see the
 -- llm_providers.purpose comment for why both paths have to exist. Excludes
--- the requester itself (searching for a delegate target, not a mirror) and
--- any agent whose embedding has a different dimension than the query's
+-- the requester itself (searching for a delegate target, not a mirror), any
+-- agent whose embedding has a different dimension than the query's
 -- (cosine_similarity already returns NULL for that mismatch in the
 -- brute-force path; the accelerated path filters it explicitly since
--- casting a mismatched-length array to vector(N) would error, not just
--- rank oddly).
+-- casting a mismatched-length array to vector(N) would error, not just rank
+-- oddly), and -- p_expected_model, the "<provider name>:<model>" the query
+-- embedding was itself just generated with (see fn_complete_outbound) --
+-- any agent embedded under a *different* model. Two different embedding
+-- models can produce vectors of the identical dimension while meaning
+-- something completely different per axis; matching dimension alone would
+-- silently rank across two incomparable vector spaces the moment an
+-- operator switches embedding providers/models without an accident this
+-- obvious ever surfacing as an error.
 CREATE OR REPLACE FUNCTION allgres_private.rank_agents_by_embedding(
   p_query_embedding double precision[],
   p_requester_agent_id uuid,
+  p_expected_model text,
   p_limit int DEFAULT 5
 ) RETURNS jsonb
 LANGUAGE plpgsql
@@ -1367,10 +1375,11 @@ BEGIN
       || 'FROM (SELECT agent_id, name, 1 - (embedding::%2$I.vector(%1$s) OPERATOR(%2$I.<=>) $1::%2$I.vector(%1$s)) AS similarity '
       || 'FROM allgres_private.agents '
       || 'WHERE embedding IS NOT NULL AND is_active AND agent_id <> $2 AND array_length(embedding, 1) = %1$s '
+      || 'AND embedding_model = $4 '
       || 'AND allgres_private.agent_has_permission($2, ''agent'', name) '
       || 'ORDER BY embedding::%2$I.vector(%1$s) OPERATOR(%2$I.<=>) $1::%2$I.vector(%1$s) LIMIT $3) s',
       v_dims, allgres_private.vector_schema()
-    ) INTO v_out USING p_query_embedding, p_requester_agent_id, v_n;
+    ) INTO v_out USING p_query_embedding, p_requester_agent_id, v_n, p_expected_model;
   ELSE
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
       'agent_id', agent_id, 'name', name, 'similarity', similarity
@@ -1382,6 +1391,7 @@ BEGIN
       WHERE embedding IS NOT NULL AND is_active
         AND agent_id <> p_requester_agent_id
         AND array_length(embedding, 1) = v_dims
+        AND embedding_model = p_expected_model
         AND allgres_private.agent_has_permission(p_requester_agent_id, 'agent', name)
       ORDER BY allgres_private.cosine_similarity(embedding, p_query_embedding) DESC NULLS LAST
       LIMIT v_n
@@ -4032,6 +4042,7 @@ DECLARE
   v_running boolean;
   v_query_vec double precision[];
   v_requester uuid;
+  v_expected_model text;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -4100,11 +4111,22 @@ BEGIN
         );
       ELSE
         SELECT agent_id INTO v_requester FROM allgres_private.tasks WHERE task_id = c.task_id;
+        -- The same "<provider name>:<model>" string fn_complete_agent_embedding
+        -- stamps onto agents.embedding_model, built from what this very call
+        -- was actually queued with (c.request_body->>'model', the provider it
+        -- was actually sent to) rather than re-deriving "the" current
+        -- embedding provider -- which could have changed between queue time
+        -- and this completion.
+        SELECT p.name || ':' || (c.request_body->>'model') INTO v_expected_model
+        FROM allgres_private.llm_providers p WHERE p.provider_id = c.provider_id;
         v_payload := jsonb_build_object(
           'type', 'tool_result',
           'content', jsonb_build_object(
             'status', p_status,
-            'body', COALESCE(allgres_private.rank_agents_by_embedding(v_query_vec, v_requester, 5), '[]'::jsonb)::text
+            'body', COALESCE(
+              allgres_private.rank_agents_by_embedding(v_query_vec, v_requester, v_expected_model, 5),
+              '[]'::jsonb
+            )::text
           )
         );
       END IF;
@@ -4575,6 +4597,57 @@ BEGIN
 END;
 $fn$;
 
+-- agent_config stays a fully open jsonb bag for any key a future tunable
+-- needs -- see its own column comment, "a new tunable never needs a new
+-- migration" -- but every key a *current* reader actually casts (the three
+-- below, all via (value->>'key')::int) is checked here at set time instead
+-- of only failing later, mid-turn, the moment maybe_trigger_compaction or
+-- fn_messenger_post finally reads a bad one back. An unknown key -- the
+-- whole reason this column is a jsonb bag and not one column per tunable --
+-- is left alone entirely; only names this file's own readers already
+-- depend on get a fail-fast check, and it never blocks the key from being
+-- set to jsonb null (the documented "clear it back to default" signal,
+-- checked before this loop ever sees it as a would-be integer).
+CREATE OR REPLACE FUNCTION allgres_private.validate_agent_config(p_config jsonb)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  r record;
+  v_val jsonb;
+  v_num numeric;
+BEGIN
+  FOR r IN
+    SELECT * FROM (VALUES
+      ('compaction_threshold', 1, 1000000),
+      ('compaction_keep_recent', 0, 1000000),
+      ('min_mentions_to_route', 1, 1000)
+    ) AS t(key, min_val, max_val)
+  LOOP
+    IF NOT (p_config ? r.key) THEN
+      CONTINUE;
+    END IF;
+    v_val := p_config -> r.key;
+    IF jsonb_typeof(v_val) = 'null' THEN
+      CONTINUE;
+    END IF;
+    IF jsonb_typeof(v_val) <> 'number' THEN
+      RAISE EXCEPTION 'agent_config.% must be a number, got %', r.key, jsonb_typeof(v_val)
+        USING ERRCODE = 'P0001';
+    END IF;
+    v_num := v_val::text::numeric;
+    IF v_num <> trunc(v_num) THEN
+      RAISE EXCEPTION 'agent_config.% must be a whole number, got %', r.key, v_num
+        USING ERRCODE = 'P0001';
+    END IF;
+    IF v_num < r.min_val OR v_num > r.max_val THEN
+      RAISE EXCEPTION 'agent_config.% must be between % and %, got %', r.key, r.min_val, r.max_val, v_num
+        USING ERRCODE = 'P0001';
+    END IF;
+  END LOOP;
+END;
+$fn$;
+
 -- agent_config's own setter: a shallow merge (||), the same "only touch
 -- the keys you send" shape fn_set_project_config uses for preset_prompt --
 -- clearing one tunable back to its coded default means sending it as
@@ -4593,6 +4666,7 @@ BEGIN
   IF p_config IS NULL OR jsonb_typeof(p_config) <> 'object' THEN
     RAISE EXCEPTION 'agent_config must be a JSON object' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.validate_agent_config(p_config);
   UPDATE allgres_private.agents
   SET agent_config = jsonb_strip_nulls(agent_config || p_config), updated_at = now()
   WHERE agent_id = p_agent_id
@@ -6034,6 +6108,43 @@ BEGIN
   ) THEN
     PERFORM allgres_private.require_admin(p_token);
   END IF;
+END;
+$fn$;
+
+-- The gate the rest of the platform-configuration surface was missing --
+-- agents.create, agents.update/permissions.grant/permissions.revoke/
+-- policy.rollback for an *ordinary* (non-system) agent, provider.create/
+-- provider.update, allowlist.add/remove, and agents.set_autonomy all either
+-- had no session check at all or (agents.update and friends) one that only
+-- ever fired for a system-agent target, leaving every one of these
+-- reachable by anyone holding the shared dashboard bearer token alone, with
+-- no relationship to whether that caller is logged in, or as what role --
+-- a real gap between the accounts system (item 28) and the admin-only
+-- surface that predates it, not a deliberate two-tier design.
+--
+-- The fix cannot be a bare require_admin the way require_admin_for_system_
+-- agent already is for a system-agent target: that would break the
+-- deployment mode this whole accounts system was always additive to (see
+-- the "Accounts, roles, ..." section comment on dashboard_rpc) -- a
+-- single-operator install that has never created a user account at all,
+-- where the shared bearer token alone has always been the entire security
+-- model and still needs to be enough. So this only starts requiring a
+-- logged-in admin once an operator has actually created at least one
+-- account -- at that point every action gated by this function requires
+-- one, uniformly, regardless of whether its specific target happens to be
+-- a system agent. Before that point (zero rows in allgres_private.users --
+-- checked fresh on every call, not cached, so the very next request after
+-- the first account is created is already covered) this is a no-op, the
+-- same as before this function existed.
+CREATE OR REPLACE FUNCTION allgres_private.require_admin_if_accounts_exist(p_token text)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
+    RETURN;
+  END IF;
+  PERFORM allgres_private.require_admin(p_token);
 END;
 $fn$;
 
@@ -8042,6 +8153,22 @@ BEGIN
 
   v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
 
+  -- item 36's own bootstrap guarantee: require_admin_if_accounts_exist must
+  -- be a true no-op for a deployment that has never created a user account
+  -- at all -- verified here, not assumed, since this is the one point in
+  -- the whole run where allgres_private.users is guaranteed still empty
+  -- (section 31 below is the only place fn_selftest ever creates one, and
+  -- always cleans up after itself before returning).
+  ok := NOT EXISTS (SELECT 1 FROM allgres_private.users);
+  IF ok THEN
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.create',
+      'name', 'selftest_bootstrap_probe_' || extract(epoch from clock_timestamp())::text
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+  END IF;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'admin_gate_is_a_noop_before_any_account_exists', 'ok', ok));
+
   -- 30. fn_continue_session: a session can be resumed with a follow-up
   --     message instead of only ever starting a brand new, contextless one
   --     (dashboard, "no way to chat"). The new turn is a new task, but
@@ -8451,19 +8578,26 @@ BEGIN
 
     -- 33b. agent_config (agent metadata settings, item: "make every such
     -- parameter configurable, not just compaction"): a generic per-agent
-    -- jsonb bag, merged (not replaced) by fn_set_agent_config, admin-gated
-    -- for a system agent target through the same agents.update ->
-    -- require_admin_for_system_agent path as everything else system-agent
-    -- specific, unrestricted for an ordinary one.
-    -- Ordinary (non-system) agent: agents.update with agent_config needs
-    -- no admin session at all, same as every other agents.update field --
-    -- confirms the gate is really about is_system, not agent_config itself.
+    -- jsonb bag, merged (not replaced) by fn_set_agent_config. agents.update
+    -- as a whole is now admin-gated the moment any account exists at all
+    -- (require_admin_if_accounts_exist, item 36's own fix for the gap an
+    -- outside review found), for a system-agent target *and* an ordinary
+    -- one alike -- accounts exist by this point in the run (the 31 section
+    -- above created selftest_admin/selftest_user), so both branches here
+    -- exercise the accounts-configured behavior, not the bootstrap no-op.
     sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'agents.update', 'agent_id', v_sys_target::text,
       'agent_config', jsonb_build_object('probe', 1)
     ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_ordinary_agent_now_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.update', 'agent_id', v_sys_target::text, 'session_token', v_admin_tok,
+      'agent_config', jsonb_build_object('probe', 1)
+    ));
     ok := COALESCE((sub->>'ok')::boolean, false);
-    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_set_on_ordinary_agent_needs_no_admin', 'ok', ok));
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_ordinary_agent_succeeds_with_admin_session', 'ok', ok));
 
     -- dashboard_rpc never raises to its caller (its own outer EXCEPTION
     -- WHEN OTHERS turns everything into {ok:false,...}), so a rejection
@@ -8483,6 +8617,51 @@ BEGIN
       AND (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = jsonb_build_object('probe', 2);
     v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_persists_merged_not_replaced', 'ok', ok));
 
+    -- item 36's own fix, spot-checked on a representative few of the
+    -- platform-configuration actions that used to have no session check at
+    -- all -- the underlying gate (require_admin_if_accounts_exist) is the
+    -- exact same one already proven above for agents.update, so this is
+    -- deliberately not exhaustive over every action it was also added to
+    -- (policy.rollback, permissions.revoke, provider.update, allowlist.
+    -- remove, agents.set_autonomy, providers.oauth_start/oauth_callback).
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'agents.create', 'name', 'selftest_should_not_exist'));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'selftest_should_not_exist');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agents_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.create', 'session_token', v_admin_tok,
+      'name', 'selftest_created_with_admin_' || extract(epoch from clock_timestamp())::text
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agents_create_succeeds_with_admin_session', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'provider.create', 'name', 'selftest_should_not_exist_provider',
+      'kind', 'openai_compat', 'base_url', 'https://example.invalid'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.llm_providers WHERE name = 'selftest_should_not_exist_provider');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'provider_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'allowlist.add', 'ref', 'allgres_public.v_should_not_be_added'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.sql_sandbox_allowlist WHERE resource_ref = 'allgres_public.v_should_not_be_added');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'allowlist_add_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'permissions.grant', 'agent_id', v_sys_target::text, 'type', 'tool', 'ref', 'http_get'
+    ));
+    -- Not also asserting NOT agent_has_permission(...) here: v_sys_target's
+    -- permission state going into this point isn't otherwise pinned down by
+    -- this test, so that clause would risk a false negative against a grant
+    -- some earlier, unrelated case happened to leave in place. The rejection
+    -- itself is what this case is for.
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'permissions_grant_needs_admin_once_accounts_exist', 'ok', ok));
+
     -- Setting a key to JSON null clears it back to the reader's own coded
     -- default rather than leaving a stray {"probe":2} on a real seeded
     -- agent.
@@ -8492,6 +8671,40 @@ BEGIN
     ));
     ok := (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = '{}'::jsonb;
     v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_null_value_clears_the_key', 'ok', ok));
+
+    -- A known-integer key must fail fast at set time on a value fn_next_step
+    -- would otherwise only choke on much later, mid-turn -- a non-numeric
+    -- string, and a numeric value outside its sane range.
+    BEGIN
+      PERFORM allgres_public.fn_set_agent_config(
+        v_creator_id, jsonb_build_object('compaction_threshold', 'not_a_number')
+      );
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%must be a number%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_rejects_non_numeric_known_key', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_public.fn_set_agent_config(
+        v_creator_id, jsonb_build_object('min_mentions_to_route', 0)
+      );
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%must be between%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_rejects_out_of_range_known_key', 'ok', ok));
+
+    -- Neither rejection above left a partial write behind, and an unknown
+    -- key (not one of the file's own known-integer readers) still passes
+    -- through untouched -- the whole point of this staying a generic bag.
+    ok := (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = '{}'::jsonb;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_rejected_value_not_persisted', 'ok', ok));
+
+    PERFORM allgres_public.fn_set_agent_config(v_creator_id, jsonb_build_object('some_future_string_tunable', 'anything goes'));
+    ok := (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = jsonb_build_object('some_future_string_tunable', 'anything goes');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_unknown_key_stays_unvalidated', 'ok', ok));
+    PERFORM allgres_public.fn_set_agent_config(v_creator_id, jsonb_build_object('some_future_string_tunable', NULL));
 
     -- 33c. session_compactor's threshold/keep_recent are read from its own
     -- agent_config, not hardcoded -- a lower threshold set here must
@@ -8714,6 +8927,7 @@ BEGIN
     v_wrongdim uuid;
     v_nopermission uuid;
     v_ranked jsonb;
+    v_wrongmodel uuid;
   BEGIN
     SELECT agent_id INTO v_req FROM allgres_private.agents WHERE name = 'selftest_embed_requester';
     IF v_req IS NULL THEN
@@ -8735,25 +8949,37 @@ BEGIN
     IF v_nopermission IS NULL THEN
       v_nopermission := (allgres_public.fn_create_agent('selftest_embed_nopermission')->>'agent_id')::uuid;
     END IF;
+    -- Same dimension AND same direction as v_near -- would rank first on
+    -- similarity alone -- but embedded under a different model, so must be
+    -- excluded exactly like a dimension mismatch is: two models can agree
+    -- on vector length while meaning something entirely different per axis.
+    SELECT agent_id INTO v_wrongmodel FROM allgres_private.agents WHERE name = 'selftest_embed_wrongmodel';
+    IF v_wrongmodel IS NULL THEN
+      v_wrongmodel := (allgres_public.fn_create_agent('selftest_embed_wrongmodel')->>'agent_id')::uuid;
+    END IF;
 
-    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[] WHERE agent_id = v_near;
-    UPDATE allgres_private.agents SET embedding = ARRAY[0,1,0,0]::double precision[] WHERE agent_id = v_far;
-    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0]::double precision[] WHERE agent_id = v_wrongdim;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE agent_id = v_near;
+    UPDATE allgres_private.agents SET embedding = ARRAY[0,1,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE agent_id = v_far;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE agent_id = v_wrongdim;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-b' WHERE agent_id = v_wrongmodel;
     -- Closer to the query than v_near, but the requester is never granted
     -- 'agent' permission for it -- must still be excluded, the same check
     -- 'delegate' itself enforces.
-    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[] WHERE agent_id = v_nopermission;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE agent_id = v_nopermission;
 
     PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_near');
     PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_far');
     PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_wrongdim');
+    PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_wrongmodel');
 
-    v_ranked := allgres_private.rank_agents_by_embedding(ARRAY[1,0,0,0]::double precision[], v_req, 5);
+    v_ranked := allgres_private.rank_agents_by_embedding(
+      ARRAY[1,0,0,0]::double precision[], v_req, 'selftest_provider:model-a', 5
+    );
     ok := jsonb_array_length(v_ranked) = 2
       AND v_ranked->0->>'name' = 'selftest_embed_near'
       AND (v_ranked->0->>'similarity')::numeric = 1
       AND v_ranked->1->>'name' = 'selftest_embed_far';
-    v := v || jsonb_build_array(jsonb_build_object('name', 'rank_agents_by_embedding_orders_filters_and_excludes_mismatched_dims', 'ok', ok));
+    v := v || jsonb_build_array(jsonb_build_object('name', 'rank_agents_by_embedding_orders_filters_and_excludes_mismatched_dims_and_models', 'ok', ok));
 
     -- search_agents with no purpose='embedding' provider configured (the
     -- default state here) must be a friendly continue, not an exception --
@@ -9309,17 +9535,27 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'agents.set_autonomy' THEN
-      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      -- Relaxed from a bare require_admin: that alone made this the one
+      -- action on the whole platform-configuration surface that could never
+      -- be reached at all in a deployment that has never created a user
+      -- account -- see require_admin_if_accounts_exist's own comment.
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_set_agent_autonomy(
         (p_request->>'agent_id')::uuid, p_request->>'autonomy_level'
       );
 
     WHEN 'agents.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_create_agent(p_request->>'name', p_request->>'system_prompt');
 
     WHEN 'agents.update' THEN
       v_id := (p_request->>'agent_id')::uuid;
+      -- Two gates, deliberately not one: require_admin_for_system_agent is
+      -- unconditional the moment the target is a system agent (it always
+      -- has been); require_admin_if_accounts_exist is what now also covers
+      -- an *ordinary* agent, but only once accounts are actually in use.
       PERFORM allgres_private.require_admin_for_system_agent(p_request->>'session_token', v_id);
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       IF p_request ? 'is_active' THEN
         PERFORM allgres_public.fn_set_agent_active(v_id, (p_request->>'is_active')::boolean);
       END IF;
@@ -9366,6 +9602,7 @@ BEGIN
       PERFORM allgres_private.require_admin_for_system_agent(
         p_request->>'session_token', (p_request->>'agent_id')::uuid
       );
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_rollback_policy(
         (p_request->>'agent_id')::uuid, (p_request->>'generation')::int
       );
@@ -9457,6 +9694,7 @@ BEGIN
       PERFORM allgres_private.require_admin_for_system_agent(
         p_request->>'session_token', (p_request->>'agent_id')::uuid
       );
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_grant_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
@@ -9465,6 +9703,7 @@ BEGIN
       PERFORM allgres_private.require_admin_for_system_agent(
         p_request->>'session_token', (p_request->>'agent_id')::uuid
       );
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_revoke_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
@@ -9495,9 +9734,11 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'allowlist.add' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_allowlist_add(p_request->>'ref');
 
     WHEN 'allowlist.remove' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_allowlist_del(p_request->>'ref');
 
     WHEN 'projects.list' THEN
@@ -9894,6 +10135,7 @@ BEGIN
       );
 
     WHEN 'provider.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'provider_id')::uuid;
       PERFORM allgres_public.fn_set_provider(
         v_id,
@@ -9913,6 +10155,7 @@ BEGIN
       RETURN jsonb_build_object('ok', true, 'provider_id', v_id);
 
     WHEN 'provider.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_create_provider(
         p_request->>'name',
         p_request->>'kind',
@@ -9927,6 +10170,7 @@ BEGIN
     -- fn_oauth_start only ever returns a redirect_url and a state, neither
     -- of which is secret, so this is safe for operator to call directly.
     WHEN 'providers.oauth_start' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'provider_id')::uuid;
       RETURN allgres_public.fn_oauth_start(v_id, p_request->>'redirect');
 
@@ -9937,6 +10181,7 @@ BEGIN
     -- fn_complete_oauth stores whatever comes back; settings.get's
     -- has_secret is how the dashboard finds out it landed.
     WHEN 'providers.oauth_callback' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_oauth_token_request(
         p_request->>'state', p_request->>'code', p_request->>'redirect'
       );

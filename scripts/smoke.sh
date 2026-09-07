@@ -29,7 +29,19 @@ docker compose exec -T allgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 -
 curl -fsS "$BASE/healthz"; echo
 curl -fsS "${HDR[@]}" "$BASE/api/v1/status"; echo
 curl -fsS "${HDR[@]}" "$BASE/api/v1/agents"; echo
-curl -fsS "$BASE/" | grep -q 'Allgres Control Plane'
+# `curl | grep -q` is a real race, not a style nit: -q makes grep exit the
+# instant it finds a match, closing its end of the pipe while curl may still
+# be mid-write -- curl then reports exit 23 ("failure writing output") for a
+# broken pipe that was actually a successful match, and `pipefail` turns
+# that into a script failure regardless of what grep found. Capturing into a
+# variable first (command substitution waits for curl to finish, in full,
+# before grep ever runs) removes the race instead of just tolerating it.
+# The bigger the body -- and /api/v1/agents just above has grown a lot
+# since this script was first written -- the more likely the race resolves
+# the "wrong" way, so this is not something a fresh install would keep
+# getting away with.
+index_body=$(curl -fsS "$BASE/")
+grep -q 'Allgres Control Plane' <<<"$index_body"
 
 # e2e_mock.sql left a dozen tasks queued, so the runtime worker has outbound
 # calls in flight right now.  The dashboard must still answer promptly: that is
@@ -43,8 +55,12 @@ done
 echo "dashboard stayed responsive under outbound load"
 
 # The dashboard HTML must ship a per-response CSP nonce, not the placeholder.
-curl -fsSD- -o/dev/null "$BASE/" | grep -qi "content-security-policy:.*nonce-"
-curl -fsS "$BASE/" | grep -qv '__CSP_NONCE__'
+# Same capture-then-grep fix as above -- these two used to pipe curl
+# straight into grep -q/-qv as well.
+csp_headers=$(curl -fsSD- -o /dev/null "$BASE/")
+grep -qi "content-security-policy:.*nonce-" <<<"$csp_headers"
+index_body=$(curl -fsS "$BASE/")
+grep -qv '__CSP_NONCE__' <<<"$index_body"
 
 # CSRF: an API call without the client header, or with a foreign Origin, fails.
 [[ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/agents")" == "403" ]]
