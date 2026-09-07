@@ -608,6 +608,27 @@ fn claim_oauth_jobs(limit: i32) -> Value {
     })
 }
 
+/// Claims queued agent-identity embedding regeneration rows -- same claim
+/// shape as claim_oauth_jobs, a different table (embedding_calls) with no
+/// task_id, feeding the same HTTP pool. See allgres_private.
+/// queue_agent_embedding's own comment for what this is regenerating and why
+/// it never blocks an agent create/update on failure.
+fn claim_agent_embedding_jobs(limit: i32) -> Value {
+    BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            return json!({ "count": 0, "calls": [] });
+        }
+        Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_claim_agent_embedding($1)",
+            &[limit.into()],
+        )
+        .ok()
+        .flatten()
+        .map(|j| j.0)
+        .unwrap_or_else(|| json!({ "count": 0, "calls": [] }))
+    })
+}
+
 fn submit_http_result(call_id: &str, status: i32, body: &str) {
     // Postgres text cannot hold NUL; this is sanitisation, not escaping.
     let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
@@ -652,6 +673,29 @@ fn submit_oauth_result(call_id: &str, status: i32, body: &str) {
             &[call_id.into(), status.into(), body.as_str().into()],
         ) {
             pgrx::warning!("Allgres: fn_complete_oauth failed for call {}: {}", call_id, e);
+        }
+    });
+}
+
+/// Same completion shape again, for an agent-identity embedding call.
+/// fn_complete_agent_embedding has no task_id to fall back on either, so the
+/// same "leave it in_flight, let fn_watchdog reclaim it as lost" reasoning
+/// applies on a privilege-drop failure.
+fn submit_agent_embedding_result(call_id: &str, status: i32, body: &str) {
+    let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
+    BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            pgrx::warning!(
+                "Allgres: skipping fn_complete_agent_embedding for call {} -- privilege drop failed",
+                call_id
+            );
+            return;
+        }
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_complete_agent_embedding($1::uuid, $2, $3)",
+            &[call_id.into(), status.into(), body.as_str().into()],
+        ) {
+            pgrx::warning!("Allgres: fn_complete_agent_embedding failed for call {}: {}", call_id, e);
         }
     });
 }
@@ -831,6 +875,7 @@ fn pump_sql() -> usize {
 enum OutboundQueue {
     Outbound,
     Oauth,
+    AgentEmbedding,
 }
 
 struct OutboundJob {
@@ -1129,6 +1174,9 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
                     match r.queue {
                         OutboundQueue::Outbound => submit_http_result(&r.call_id, r.status, &r.body),
                         OutboundQueue::Oauth => submit_oauth_result(&r.call_id, r.status, &r.body),
+                        OutboundQueue::AgentEmbedding => {
+                            submit_agent_embedding_result(&r.call_id, r.status, &r.body)
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
@@ -1179,6 +1227,35 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
                         obj.insert("kind".to_string(), json!("oauth"));
                     }
                     let job = OutboundJob { call_id: id.to_string(), queue: OutboundQueue::Oauth, call };
+                    if jobs.send(job).is_err() {
+                        break;
+                    }
+                    in_flight += 1;
+                    queued += 1;
+                }
+            }
+        }
+
+        // 3c. Agent-identity embedding regeneration -- an admin editing an
+        // agent's system_prompt from the dashboard, not an agent turn, so
+        // it is claimed separately (fn_claim_agent_embedding, not
+        // fn_claim_outbound) but shares the same HTTP threads and capacity
+        // budget as everything else here. Optional feature: if no
+        // purpose='embedding' provider is configured, this claims nothing
+        // every tick, which costs one cheap empty SELECT.
+        if ready && in_flight < capacity {
+            let claimed = claim_agent_embedding_jobs((capacity - in_flight) as i32);
+            if let Some(calls) = claimed.get("calls").and_then(Value::as_array) {
+                for call in calls {
+                    let Some(id) = call.get("call_id").and_then(Value::as_str) else { continue };
+                    if !valid_uuid(id) {
+                        continue;
+                    }
+                    let mut call = call.clone();
+                    if let Some(obj) = call.as_object_mut() {
+                        obj.insert("kind".to_string(), json!("embedding"));
+                    }
+                    let job = OutboundJob { call_id: id.to_string(), queue: OutboundQueue::AgentEmbedding, call };
                     if jobs.send(job).is_err() {
                         break;
                     }
@@ -1775,6 +1852,45 @@ fn handle_web_connection(mut s: TcpStream, cfg: &WebConfig) {
             "refresh_token": "allgres-mock-refresh",
             "expires_in": 3600,
             "token_type": "bearer"
+        })
+        .to_string();
+        respond_json(&mut s, "200 OK", &body);
+        return;
+    }
+
+    // A mock embeddings endpoint, gated the same way as /mock/chat/completions:
+    // lets a test drive the real fn_claim_agent_embedding/fn_claim_outbound ->
+    // perform_http (send_json) -> fn_complete_agent_embedding/
+    // fn_complete_outbound path through the actual background worker, without
+    // a real embedding provider. Deterministic and test-legible rather than a
+    // real model's output: each of a small fixed keyword list gets its own
+    // dimension, 1.0 if that keyword appears (case-insensitively) anywhere in
+    // the request's `input` text, else a small non-zero baseline (so an
+    // input matching none of them still embeds to a well-defined, if
+    // uninformative, direction instead of the zero vector cosine_similarity
+    // treats as undefined). A test can therefore pick exact expected
+    // rankings from the keywords it puts in an agent's system_prompt vs. a
+    // search query, rather than asserting on an opaque real model's output.
+    if path == "/mock/embeddings" {
+        if !cfg.mock_enabled {
+            respond_json(&mut s, "404 Not Found", "{\"ok\":false,\"error\":\"not_found\"}");
+            return;
+        }
+        const KEYWORDS: [&str; 8] =
+            ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"];
+        let input = serde_json::from_str::<Value>(&r.body)
+            .ok()
+            .and_then(|v| v.get("input").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let embedding: Vec<f64> = KEYWORDS
+            .iter()
+            .map(|k| if input.contains(k) { 1.0 } else { 0.05 })
+            .collect();
+        let body = json!({
+            "data": [{ "embedding": embedding, "index": 0 }],
+            "model": "allgres-mock-embed",
+            "object": "list"
         })
         .to_string();
         respond_json(&mut s, "200 OK", &body);

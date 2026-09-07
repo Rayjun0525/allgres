@@ -2561,3 +2561,188 @@ ones (`analyst`, `health_monitor`, and the six `is_system` agents --
 `system_root` and its five children) at a
 reasonable ~11KB response size instead of all 23 and growing.
 `fn_selftest` (140/140) and `tests/smoke.sql` both still pass.
+
+## 34. Generic `agent_config` -- every system agent's hardcoded behavior tunable, dashboard included
+
+Every system agent had at least one behavior constant baked into the SQL
+that decides how it fires: `session_compactor`'s trigger threshold (60
+uncompacted logs) and how many recent ones it leaves alone (10), and
+`orchestrator`'s minimum mention count to bother routing (more than one).
+None of these were reachable from anywhere -- changing them meant editing
+`control_plane.sql` and reinstalling the extension. Asked directly: how
+deep does control over the system agents actually go today, and can the
+compaction threshold specifically be tuned from the dashboard -- the
+honest answer was "not at all, it's compiled in." This item generalizes
+that to every such parameter, present and future, not just compaction's.
+
+Rather than a column per parameter (a migration for every future knob) or
+folding these into the existing `policies` table (versioned, audited,
+config-shaped for `system_prompt`/`llm_config`/limits -- the wrong
+lifecycle for "what number does this specific agent kind read"), agents
+got one new column: `allgres_private.agents.agent_config jsonb NOT NULL
+DEFAULT '{}'`. A new `fn_set_agent_config(agent_id, config)` merges
+(`agent_config || p_config`, then `jsonb_strip_nulls`) rather than
+replaces, so setting one key never disturbs another, and sending a key
+with JSON `null` clears it back to the coded default -- the same idiom
+`fn_set_project_config` already established for `preset_prompt`. Every
+reader applies `COALESCE((agent_config->>'key')::type, <old hardcoded
+value>)`, so an agent nobody has ever touched behaves exactly as before.
+
+`dashboard_rpc`'s `agents.list` now returns each agent's `agent_config`;
+`agents.update` accepts an `agent_config` key and calls
+`fn_set_agent_config`, reusing the same `require_admin_for_system_agent`
+gate every other field on a system agent already goes through -- editing
+an ordinary agent's config needs no admin session, editing
+`session_compactor`'s or `orchestrator`'s does, exactly like their
+`system_prompt` or `max_steps`. Two readers were migrated to prove the
+mechanism end to end: `maybe_trigger_compaction` now reads
+`compaction_threshold`/`compaction_keep_recent` from `session_compactor`'s
+own row (moving its lookup earlier, since the threshold itself now lives
+there instead of being a literal), and `fn_messenger_post`'s
+orchestrator-routing check reads `min_mentions_to_route` from
+`orchestrator`'s row instead of a bare `> 1`.
+
+The Agents page's edit modal gained a named, labeled number field per
+known parameter (`session_compactor`'s two, `orchestrator`'s one) shown
+only when editing that agent by name, plus a raw-JSON `agent_config`
+textarea shown for every agent as the forward-compatible fallback for any
+key not yet given a named field -- named fields win on save (merged over
+whatever the textarea holds), so the two never fight over the same key.
+Blank on a named field means the same thing blank already means on Max
+turn seconds: clear it, revert to default.
+
+Driving this through an actual browser surfaced a real, pre-existing bug
+this feature would otherwise have inherited silently: the edit modal's
+main Save button (`PATCH /api/v1/agents/:id`) never sent `session_token`
+in its body at all -- only the separate Autonomy-level dropdown did (it
+goes through the `rpc()` helper, which adds it automatically). Since
+`agents.update` requires an admin session for any field on a system
+agent, every save of `system_prompt`/`max_steps`/permissions/etc. on any
+of the six system agents from the dashboard has always failed with `not
+logged in`, silently working around it only for admins who never actually
+tried to change one. Fixed by adding `session_token:sessTok()` to that
+PATCH body, the same value `rpc()` already sends. Without this fix
+`agent_config` would have been unreachable from the dashboard for the
+exact two agents (`session_compactor`, `orchestrator`) it was built for.
+
+**Verified live**: `fn_selftest` grew from 140 to 147 cases (admin gating
+on ordinary vs. system agents, merge-not-replace persistence, `null`
+clearing a key, the compaction threshold actually firing early at a
+lowered value, and `orchestrator`'s routing threshold actually suppressing
+and restoring), passing and idempotent across three repeated runs on a
+fresh install; `tests/smoke.sql` 147/147. Beyond the SQL suite, a real
+headless-Chromium (Playwright) pass against the running dashboard: logged
+in as a real admin, opened `session_compactor`'s edit modal, filled both
+named fields, saved, confirmed a `200` response and the exact values
+(`{"compaction_threshold": 30, "compaction_keep_recent": 5}`) landing in
+the database; reopened the same modal and confirmed both the named fields
+and the raw-JSON textarea reflected the saved values back; repeated for
+`orchestrator`'s `min_mentions_to_route`; and confirmed a non-system,
+non-special agent (`analyst`) shows no named fields at all and persists an
+arbitrary key (`{"custom_key": 42}`) typed into the raw-JSON textarea --
+the forward-compatible path working for a parameter that doesn't have a
+named field yet.
+
+## 35. Agent embeddings and semantic delegate search -- pgvector as a genuine add-on, not a dependency
+
+Asked directly what "tool/skill search" should mean here: an agent IS the
+unit of capability in this platform, so it means finding another agent to
+`delegate` to by describing the task, not maintaining a separate tool
+registry. `delegate` itself has always required the caller to already know
+the exact `agent_name` string -- there was no way for an agent to discover
+which of the (possibly many) agents it holds `agent` permission for
+actually fits a given job.
+
+The harder constraint, stated explicitly up front: pgvector must be a
+genuine add-on, never a dependency the extension requires or silently
+enables. Concretely that means every embedding is stored as a plain
+`double precision[]` (a type every PostgreSQL has), never pgvector's own
+`vector` type -- a table or function naming `vector` directly would fail
+to even install on a server that never ran `CREATE EXTENSION vector`, the
+same problem pgcrypto already has an established answer for
+(`allgres_private.encrypt_secret`'s dynamic-SQL, schema-qualified-by-
+`%I`-lookup pattern, reused here as `vector_schema()`/`vector_available()`).
+Ranking always has a correct, unindexed `allgres_private.
+cosine_similarity()` path in plain SQL; when pgvector *is* installed,
+`allgres_private.ensure_vector_index()` -- called opportunistically on
+every embedding write, no separate "enable" admin step -- builds an HNSW
+expression index for whatever dimension is actually in use and rebuilds it
+if that dimension ever changes (an operator switching embedding models).
+Every dynamic-SQL string that names `vector`/`vector_cosine_ops`/`<=>`
+schema-qualifies them (`%I.vector`, `OPERATOR(%I.<=>)`) rather than relying
+on search_path, since `<=>` does not resolve as bare text even when its
+operand types do.
+
+Mechanism: `llm_providers` gained a `purpose` column (`chat`/`embedding`,
+the latter restricted to `kind='openai_compat'` and requiring an
+`embedding_model`) and `agents` gained `embedding double precision[]` +
+`embedding_model`/`embedding_updated_at`. A new `embedding_calls` table
+(shaped exactly like `oauth_calls` -- queued/in_flight/harvested/lost, no
+`task_id`, claimed by the same runtime HTTP pool) regenerates an agent's
+identity embedding (name + system_prompt) whenever `fn_create_agent`/
+`agents.update` touches it; failure at any point (no embedding provider
+configured, endpoint rejected) is a silent no-op, never a failed agent
+write, since this is an optional feature end to end. A new `search_agents`
+agent action queues its query text as `outbound_calls.kind='embedding'`
+(alongside `llm`/`tool`, reusing `fn_claim_outbound`/`perform_http`
+entirely unchanged -- an embeddings POST is just another JSON body);
+`fn_complete_outbound`'s new `'embedding'` branch calls
+`allgres_private.rank_agents_by_embedding`, which excludes the requester
+itself, any agent it lacks an `agent` permission grant for (the identical
+check `delegate` enforces -- a search can never surface a name the caller
+could not actually delegate to), and any embedding of a different
+dimension, then hands the ranked list back as a `tool_result` on the next
+step, exactly like `execute_sql`/`call_tool` already look to the agent.
+
+Two real bugs surfaced only by actually running this against a live mock
+embedding provider, not by reading the code:
+
+- The runtime worker's privilege-dropped role had no `EXECUTE` grant on
+  the two new `fn_claim_agent_embedding`/`fn_complete_agent_embedding`
+  functions -- every claim attempt raised `permission denied`, silently
+  crash-looping the whole `allgres runtime` background worker every 5
+  seconds (its own `restart_time`) with nothing surfacing anywhere but
+  the Postgres log. Fixed with the same `GRANT EXECUTE ... TO worker`
+  every other claim/complete pair already has.
+- Installing pgvector broke the SQL sandbox's function allowlist for the
+  *unrelated* built-in `sum`/`avg` names: pgvector adds its own
+  `sum(vector)`/`avg(vector)` aggregate overloads in `public`, and
+  `fn_validate_sql`'s allowlist check counted every same-named function
+  across *all* schemas, demanding all of them be non-volatile/non-
+  security-definer/pg_catalog -- so a plain `sum(amount)` over a numeric
+  column started failing the moment pgvector merely existed in the
+  database, regardless of whether this feature was ever used. The fix is
+  also a simplification: `sandbox` (the role every agent SQL statement
+  actually executes as) has `search_path = pg_temp`, so an unqualified
+  name can only ever resolve to `pg_catalog` at execution time (pg_catalog
+  is always implicitly searched, `public` is not) -- the check now counts
+  overloads in `pg_catalog` only (or the explicit schema, when the call is
+  schema-qualified) instead of every namespace in the database. This was a
+  real, exploitable-by-accident regression for anyone who installs
+  pgvector for any unrelated reason, not specific to this feature.
+
+The Docker image installs the `postgresql-17-pgvector` package so it is
+available to `CREATE EXTENSION vector;` out of the box, but never runs
+that statement itself -- identical to how `pgcrypto` is already handled in
+`001-create-extension.sql`. Settings' provider form gained a Purpose
+selector (`chat`/`embedding`) and an embedding-model field, shown only for
+an embedding-purpose provider; the providers table shows both.
+
+**Verified live**: `fn_selftest` grew from 147 to 149 cases (`allgres_private.
+rank_agents_by_embedding`'s ordering/permission-filtering/dimension-
+exclusion all in one assertion, and `search_agents` degrading to a
+friendly `continue` with no embedding provider configured), passing and
+idempotent across three runs, on a fresh install both with and without
+pgvector present. `tests/e2e_mock.sql` extended with a real end-to-end
+round trip through the actual runtime worker and a new `/mock/embeddings`
+endpoint (deterministic, keyword-based vectors so a test can assert an
+exact expected ranking rather than eyeballing a real model's output):
+`fn_create_agent` for two agents with distinct keyword identities, waiting
+for the worker to actually generate and store both embeddings via a real
+HTTP round trip, then a real `search_agents` action from a third agent
+correctly ranking the matching one first -- run and passing both with
+pgvector installed (confirmed the HNSW index gets created and used) and
+without it (confirmed the brute-force path returns the identical ranking,
+same values up to floating-point precision). Semantic recall over
+long-term agent memory (item 25), using this same embedding
+infrastructure, is deliberately left for a follow-up slice.
