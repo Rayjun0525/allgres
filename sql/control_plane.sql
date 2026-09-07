@@ -360,6 +360,25 @@ ALTER TABLE allgres_private.agents
   ADD COLUMN IF NOT EXISTS autonomy_level text NOT NULL DEFAULT 'admin_approval'
     CHECK (autonomy_level IN ('auto', 'self_approve', 'admin_approval'));
 
+-- Generic per-agent settings that are neither "operational policy"
+-- (system_prompt/llm_config/max_steps and friends, on allgres_private.
+-- policies, versioned with policy_history/generation) nor a general agent
+-- feature (autonomy_level, permissions) -- a specific system agent's own
+-- tunable behavior instead: session_compactor's compaction_threshold/
+-- compaction_keep_recent, orchestrator's min_mentions_to_route (see
+-- fn_set_agent_config and each reader's own comment). Unversioned and
+-- unstructured on purpose -- unlike a policy edit, changing one of these
+-- is not a decision anyone needs an approval trail or a rollback for, and
+-- a plain jsonb bag means a new tunable never needs a new migration: the
+-- reader that cares about a key applies its own default when the key is
+-- absent, the same COALESCE-a-default shape this file already uses
+-- throughout. Meaningless for an ordinary agent today (nothing reads it
+-- for anything but the two system-agent kinds above), the same "a plain
+-- column with a safe default, not a system-agent-only table" reasoning
+-- autonomy_level's own comment gives.
+ALTER TABLE allgres_private.agents
+  ADD COLUMN IF NOT EXISTS agent_config jsonb NOT NULL DEFAULT '{}'::jsonb;
+
 CREATE TABLE IF NOT EXISTS allgres_private.policies (
   agent_id        uuid PRIMARY KEY REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
   system_prompt   text NOT NULL,
@@ -537,23 +556,44 @@ $fn$;
 -- them, the first time) -- counting every row ever written, compacted or
 -- not, would stay past threshold forever, since raw logs are append-only
 -- and never deleted, and would queue a new compaction on every single step.
+-- The threshold (60) and how many recent logs stay uncompacted (10) are
+-- both admin-tunable via session_compactor's own agent_config
+-- (compaction_threshold/compaction_keep_recent, set through agents.update
+-- from the Agents page) -- these numbers are its defaults, applied only
+-- when an admin has never touched the setting.
 CREATE OR REPLACE FUNCTION allgres_private.maybe_trigger_compaction(p_session_id uuid, p_task_ids uuid[])
 RETURNS void
 LANGUAGE plpgsql
 AS $fn$
 DECLARE
-  c_threshold constant int := 60;
-  c_keep_recent constant int := 10;
+  c_threshold int;
+  c_keep_recent int;
   v_current_cutoff timestamptz;
   v_count int;
   v_cutoff timestamptz;
   v_compactor uuid;
   v_compactor_active boolean;
+  v_compactor_config jsonb;
   v_prev_summary text;
   v_old_logs jsonb;
   v_comp_session uuid;
   v_comp_task uuid;
 BEGIN
+  -- Read before the threshold check itself, since the threshold is one of
+  -- the values being read (item: agent metadata config) -- session_compactor's
+  -- own agent_config, not the target session's agent: the compactor is the
+  -- one actually doing the compacting, so its settings are what apply,
+  -- regardless of which agent owns the session. Defaults (60/10) match
+  -- this function's behavior before agent_config existed -- an admin who
+  -- never touches these settings sees no change at all.
+  SELECT agent_id, is_active, agent_config INTO v_compactor, v_compactor_active, v_compactor_config
+  FROM allgres_private.agents WHERE name = 'session_compactor';
+  IF v_compactor IS NULL OR NOT v_compactor_active THEN
+    RETURN;
+  END IF;
+  c_threshold := COALESCE((v_compactor_config->>'compaction_threshold')::int, 60);
+  c_keep_recent := COALESCE((v_compactor_config->>'compaction_keep_recent')::int, 10);
+
   SELECT compacted_before INTO v_current_cutoff
   FROM allgres_private.sessions WHERE session_id = p_session_id;
 
@@ -569,12 +609,6 @@ BEGIN
     SELECT 1 FROM allgres_private.sessions
     WHERE goal = 'session_compact:' || p_session_id::text AND status = 'open'
   ) THEN
-    RETURN;
-  END IF;
-
-  SELECT agent_id, is_active INTO v_compactor, v_compactor_active
-  FROM allgres_private.agents WHERE name = 'session_compactor';
-  IF v_compactor IS NULL OR NOT v_compactor_active THEN
     RETURN;
   END IF;
 
@@ -4111,6 +4145,35 @@ BEGIN
 END;
 $fn$;
 
+-- agent_config's own setter: a shallow merge (||), the same "only touch
+-- the keys you send" shape fn_set_project_config uses for preset_prompt --
+-- clearing one tunable back to its coded default means sending it as
+-- JSON null (jsonb_strip_nulls drops it, so the reader's own COALESCE
+-- applies again), not omitting the key, which would leave whatever was
+-- there before untouched.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_agent_config(p_agent_id uuid, p_config jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_config jsonb;
+BEGIN
+  IF p_config IS NULL OR jsonb_typeof(p_config) <> 'object' THEN
+    RAISE EXCEPTION 'agent_config must be a JSON object' USING ERRCODE = 'P0001';
+  END IF;
+  UPDATE allgres_private.agents
+  SET agent_config = jsonb_strip_nulls(agent_config || p_config), updated_at = now()
+  WHERE agent_id = p_agent_id
+  RETURNING agent_config INTO v_config;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'agent not found' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('ok', true, 'agent_config', v_config);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_create_project(
   p_name text,
   p_description text DEFAULT NULL,
@@ -5612,6 +5675,7 @@ DECLARE
   v_sids uuid[] := ARRAY[]::uuid[];
   v_mid uuid;
   v_orchestrator uuid;
+  v_orchestrator_config jsonb;
 BEGIN
   u := allgres_private.session_user(p_session_token);
   IF u.user_id IS NULL THEN
@@ -5657,11 +5721,15 @@ BEGIN
   -- above already happened in text order regardless. A real reordering-
   -- before-delivery pass is future work; this at least exercises the seeded
   -- agent against a real message rather than leaving it permanently idle.
-  IF array_length(v_agent_ids, 1) > 1 THEN
-    SELECT agent_id INTO v_orchestrator FROM allgres_private.agents WHERE name = 'orchestrator' AND is_active;
-    IF v_orchestrator IS NOT NULL THEN
-      PERFORM allgres_private.queue_orchestrator_opinion(v_orchestrator, v_mid, v_text, v_agent_ids);
-    END IF;
+  -- How many mentions actually engage it (default 2, i.e. "more than
+  -- one") is admin-tunable via orchestrator's own agent_config
+  -- (min_mentions_to_route, set through agents.update) -- the same
+  -- pattern session_compactor's thresholds use.
+  SELECT agent_id, agent_config INTO v_orchestrator, v_orchestrator_config
+  FROM allgres_private.agents WHERE name = 'orchestrator' AND is_active;
+  IF v_orchestrator IS NOT NULL
+     AND array_length(v_agent_ids, 1) >= COALESCE((v_orchestrator_config->>'min_mentions_to_route')::int, 2) THEN
+    PERFORM allgres_private.queue_orchestrator_opinion(v_orchestrator, v_mid, v_text, v_agent_ids);
   END IF;
 
   RETURN jsonb_build_object(
@@ -7752,6 +7820,76 @@ BEGIN
       AND (spec->'messages')::text LIKE '%selftest turn 71%';
     v := v || jsonb_build_array(jsonb_build_object('name', 'compacted_session_excludes_old_includes_summary_and_new', 'ok', ok));
 
+    -- 33b. agent_config (agent metadata settings, item: "make every such
+    -- parameter configurable, not just compaction"): a generic per-agent
+    -- jsonb bag, merged (not replaced) by fn_set_agent_config, admin-gated
+    -- for a system agent target through the same agents.update ->
+    -- require_admin_for_system_agent path as everything else system-agent
+    -- specific, unrestricted for an ordinary one.
+    -- Ordinary (non-system) agent: agents.update with agent_config needs
+    -- no admin session at all, same as every other agents.update field --
+    -- confirms the gate is really about is_system, not agent_config itself.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.update', 'agent_id', v_sys_target::text,
+      'agent_config', jsonb_build_object('probe', 1)
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_set_on_ordinary_agent_needs_no_admin', 'ok', ok));
+
+    -- dashboard_rpc never raises to its caller (its own outer EXCEPTION
+    -- WHEN OTHERS turns everything into {ok:false,...}), so a rejection
+    -- here shows up as ok is-distinct-from-true, not a thrown error.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.update', 'agent_id', v_creator_id::text,
+      'agent_config', jsonb_build_object('probe', 1)
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_system_agent_needs_admin', 'ok', ok));
+
+    comp := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.update', 'agent_id', v_creator_id::text, 'session_token', v_admin_tok,
+      'agent_config', jsonb_build_object('probe', 2)
+    ));
+    ok := COALESCE((comp->>'ok')::boolean, false)
+      AND (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = jsonb_build_object('probe', 2);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_persists_merged_not_replaced', 'ok', ok));
+
+    -- Setting a key to JSON null clears it back to the reader's own coded
+    -- default rather than leaving a stray {"probe":2} on a real seeded
+    -- agent.
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.update', 'agent_id', v_creator_id::text, 'session_token', v_admin_tok,
+      'agent_config', jsonb_build_object('probe', NULL)
+    ));
+    ok := (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = '{}'::jsonb;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_null_value_clears_the_key', 'ok', ok));
+
+    -- 33c. session_compactor's threshold/keep_recent are read from its own
+    -- agent_config, not hardcoded -- a lower threshold set here must
+    -- actually change when compaction fires, and is reset back to the
+    -- coded default afterward so real usage of this seeded agent is
+    -- unaffected by having run fn_selftest.
+    PERFORM allgres_public.fn_set_agent_config(
+      (SELECT agent_id FROM allgres_private.agents WHERE name = 'session_compactor'),
+      jsonb_build_object('compaction_threshold', 5, 'compaction_keep_recent', 2)
+    );
+    v_comp_base := now() - interval '1 hour';
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest configurable compaction threshold')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    FOR v_i IN 1..8 LOOP
+      INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content, created_at)
+      VALUES (v_tid, v_i, 'assistant', to_jsonb('selftest low-threshold turn ' || v_i::text), v_comp_base + (v_i * interval '1 second'));
+    END LOOP;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.sessions WHERE goal = 'session_compact:' || v_sid::text
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'configurable_compaction_threshold_fires_early', 'ok', ok));
+    PERFORM allgres_public.fn_set_agent_config(
+      (SELECT agent_id FROM allgres_private.agents WHERE name = 'session_compactor'),
+      jsonb_build_object('compaction_threshold', NULL, 'compaction_keep_recent', NULL)
+    );
+
     -- 34. orchestrator multi-mention (item 40): a message mentioning more
     -- than one agent is delivered to all of them, in text order, and
     -- queues a real (if advisory-only in this pass) opinion task for
@@ -7782,6 +7920,57 @@ BEGIN
       WHERE agent_id = v_orchestrator_id AND goal = 'messenger_route:' || v_msg_id::text
     );
     v := v || jsonb_build_array(jsonb_build_object('name', 'multi_mention_queues_orchestrator_opinion', 'ok', ok));
+
+    -- 34b. orchestrator's min_mentions_to_route (agent metadata config,
+    -- same as session_compactor's thresholds): raising it must actually
+    -- suppress routing for a mention count that used to qualify, and
+    -- clearing it back must restore the default (>= 2) behavior --
+    -- confirms this reads live from agent_config on every post, not once
+    -- at startup. Each re-mention below reuses the same two chat sessions
+    -- the multi-mention test above just opened, and fn_continue_session
+    -- refuses a second message while the last root task is still queued --
+    -- so the loop clears whatever the previous post left in flight first.
+    FOR v_tid IN
+      SELECT t.task_id FROM allgres_private.tasks t
+      JOIN allgres_private.user_agent_chat_sessions cs ON cs.session_id = t.session_id
+      WHERE cs.user_id = (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user')
+        AND cs.agent_id IN (v_sys_target, v_mention_target)
+        AND t.status IN ('queued', 'running', 'waiting_human')
+    LOOP
+      PERFORM allgres_public.fn_next_step(v_tid);
+      PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+        'type', 'llm_response', 'content', '{"action":"final_answer","answer":"ok"}',
+        'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'ok')
+      ));
+    END LOOP;
+    PERFORM allgres_public.fn_set_agent_config(v_orchestrator_id, jsonb_build_object('min_mentions_to_route', 3));
+    r := allgres_public.fn_messenger_post(v_user_tok, '@selftest_fix_target @selftest_mention_target selftest raised min-mentions');
+    ok := NOT EXISTS (
+      SELECT 1 FROM allgres_private.sessions
+      WHERE agent_id = v_orchestrator_id AND goal = 'messenger_route:' || (r->>'message_id')
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'raised_min_mentions_suppresses_routing', 'ok', ok));
+
+    FOR v_tid IN
+      SELECT t.task_id FROM allgres_private.tasks t
+      JOIN allgres_private.user_agent_chat_sessions cs ON cs.session_id = t.session_id
+      WHERE cs.user_id = (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user')
+        AND cs.agent_id IN (v_sys_target, v_mention_target)
+        AND t.status IN ('queued', 'running', 'waiting_human')
+    LOOP
+      PERFORM allgres_public.fn_next_step(v_tid);
+      PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+        'type', 'llm_response', 'content', '{"action":"final_answer","answer":"ok"}',
+        'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'ok')
+      ));
+    END LOOP;
+    PERFORM allgres_public.fn_set_agent_config(v_orchestrator_id, jsonb_build_object('min_mentions_to_route', NULL));
+    r := allgres_public.fn_messenger_post(v_user_tok, '@selftest_fix_target @selftest_mention_target selftest reset min-mentions');
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.sessions
+      WHERE agent_id = v_orchestrator_id AND goal = 'messenger_route:' || (r->>'message_id')
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'clearing_min_mentions_restores_default_routing', 'ok', ok));
 
     -- 35. Project chat mode (item 42): a project bound to an agent, with a
     -- preset_prompt appended after that agent's own effective prompt.
@@ -8391,6 +8580,7 @@ BEGIN
             'parent_agent_id', a.parent_agent_id,
             'parent_name', pa.name,
             'autonomy_level', a.autonomy_level,
+            'agent_config', a.agent_config,
             'created_at', a.created_at,
             'updated_at', a.updated_at,
             'system_prompt', p.system_prompt,
@@ -8429,6 +8619,9 @@ BEGIN
       PERFORM allgres_private.require_admin_for_system_agent(p_request->>'session_token', v_id);
       IF p_request ? 'is_active' THEN
         PERFORM allgres_public.fn_set_agent_active(v_id, (p_request->>'is_active')::boolean);
+      END IF;
+      IF p_request ? 'agent_config' THEN
+        PERFORM allgres_public.fn_set_agent_config(v_id, p_request->'agent_config');
       END IF;
       PERFORM allgres_public.fn_set_policy(
         v_id,

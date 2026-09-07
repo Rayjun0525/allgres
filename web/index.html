@@ -140,6 +140,24 @@ function taskRows(a,compact=false){if(!a.length)return '<div class="muted">No ta
 // its place in the root+five hierarchy and its autonomy dial right in the
 // list, not just buried in the edit modal.
 async function agents(){const d=await api('/api/v1/agents');state.agents=d.agents||[];$('#view').innerHTML=`<div class="row" style="margin-bottom:14px"><button class="btn primary" id="newAgent">New agent</button><span class="spacer"></span><span class="muted">${state.agents.length} agents</span></div><div class="panel"><table class="table"><thead><tr><th>Name</th><th>Model</th><th>Provider</th><th>Status</th><th>Permissions</th><th>System</th><th></th></tr></thead><tbody>${state.agents.map(a=>`<tr><td><b>${esc(a.name)}</b>${a.parent_name?`<div class="muted" style="font-size:11px">child of ${esc(a.parent_name)}</div>`:''}<div class="mono muted">${esc(a.agent_id).slice(0,12)}…</div></td><td>${esc(a.llm_config?.model||'—')}</td><td>${esc(a.llm_config?.provider||'—')}</td><td>${a.is_active?status('running'):status('disabled')}</td><td>${(a.permissions||[]).length}</td><td>${a.is_system?`<span class="status s-waiting_human">${esc(a.autonomy_level)}</span>`:'—'}</td><td><button class="btn editAgent" data-id="${esc(a.agent_id)}">${esc(t('edit'))}</button></td></tr>`).join('')}</tbody></table></div>`;$('#newAgent').onclick=()=>agentModal();document.querySelectorAll('.editAgent').forEach(b=>b.onclick=()=>agentModal(state.agents.find(a=>a.agent_id===b.dataset.id)))}
+// agent_config (item 49-52): a generic jsonb bag on the agent row for
+// whatever per-agent-kind behavior needs to be admin-tunable without a
+// schema migration per parameter. Known keys get a named, labeled field
+// here (blank = clear the key, restoring the coded default -- same idiom
+// as Max turn seconds above); the raw JSON textarea is the forward-
+// compatible fallback for anything not given a named field yet, and is
+// merged with (overridden by) the named fields on save.
+function agentConfigFields(a){
+  const cfg=a.agent_config||{};
+  const named=[];
+  if(a.name==='session_compactor'){
+    named.push(`<div class="grid2"><div class="field"><label>Compaction threshold <span class="muted">(logs before auto-compact, default 60)</span></label><input type="number" class="input" id="acCompactionThreshold" placeholder="60" value="${cfg.compaction_threshold??''}"></div><div class="field"><label>Compaction keep recent <span class="muted">(logs left uncompacted, default 10)</span></label><input type="number" class="input" id="acCompactionKeepRecent" placeholder="10" value="${cfg.compaction_keep_recent??''}"></div></div>`);
+  }
+  if(a.name==='orchestrator'){
+    named.push(`<div class="field"><label>Min mentions to route <span class="muted">(mentions needed to trigger an opinion, default 2)</span></label><input type="number" class="input" id="acMinMentions" placeholder="2" value="${cfg.min_mentions_to_route??''}"></div>`);
+  }
+  return `${named.join('')}<div class="field"><label>Agent config (raw JSON) <span class="muted">-- advanced, merges into the fields above</span></label><textarea class="textarea mono" id="aConfigRaw" style="min-height:60px" placeholder="{}">${esc(JSON.stringify(cfg,null,2))}</textarea></div>`;
+}
 async function agentModal(a){
   const isNew=!a;
   const opts=isNew?null:await rpc('permissions.options').catch(()=>null);
@@ -165,6 +183,7 @@ ${isNew?'':`<div class="grid2"><div class="field"><label>Provider</label>${provi
 <div class="grid2"><div class="field"><label>Max delegation depth</label><input type="number" class="input" id="aDelegDepth" value="${esc(a.max_delegation_depth??5)}"></div><div class="field"><label>Max session tasks</label><input type="number" class="input" id="aSessTasks" value="${esc(a.max_session_tasks??100)}"></div></div>
 <div class="field"><label><input type="checkbox" id="aActive" ${a.is_active?'checked':''}> Active</label></div>
 ${a.is_system?`<div class="field"><label>Autonomy level ${a.parent_name?`<span class="muted">(system agent, child of ${esc(a.parent_name)})</span>`:'<span class="muted">(root system agent)</span>'}</label><select class="select" id="aAutonomy"><option value="admin_approval"${a.autonomy_level==='admin_approval'?' selected':''}>admin_approval -- every action queued for an admin</option><option value="self_approve"${a.autonomy_level==='self_approve'?' selected':''}>self_approve -- applies immediately, may still ask when unsure</option><option value="auto"${a.autonomy_level==='auto'?' selected':''}>auto -- always applies immediately</option></select></div>`:''}
+${agentConfigFields(a)}
 <div class="field"><div class="row"><label style="margin:0">Permissions</label><span class="spacer"></span><span class="muted mono" style="font-size:11px">v${esc(a.generation||1)}</span><button class="btn small" id="viewProposals">Proposals</button><button class="btn small" id="viewHistory">History</button><button class="btn small" id="viewAssigned">Assigned users</button></div>
 <div id="permList">${(a.permissions||[]).map(p=>`<div class="row" style="padding:4px 0"><span class="mono" style="font-size:12px">${esc(p.type)}: ${esc(p.ref)}</span><span class="spacer"></span><button class="btn danger small revokeP" data-type="${esc(p.type)}" data-ref="${esc(p.ref)}">Revoke</button></div>`).join('')||'<div class="muted" style="font-size:12px">No permissions granted.</div>'}</div>
 <div class="row" style="margin-top:8px"><select class="select" id="permType" style="max-width:130px"><option value="view">view</option><option value="tool">tool</option><option value="agent">agent</option><option value="http_host">http_host</option></select><input class="input" id="permRef" placeholder="resource ref" list="permRefOptions"><datalist id="permRefOptions"></datalist><button class="btn" id="grantP">Grant</button></div>
@@ -180,7 +199,13 @@ ${a.is_system?`<div class="field"><label>Autonomy level ${a.parent_name?`<span c
     $('#viewProposals').onclick=()=>{state.proposalAgentFilter=a.agent_id;state.page='Approvals';state.approvalsTab='Proposals';closeModal();nav();loadPage()};
     $('#viewAssigned').onclick=()=>assignedUsersModal(a.agent_id);
   }
-  $('#saveA').onclick=async()=>{try{if(isNew){await api('/api/v1/agents',{method:'POST',body:JSON.stringify({name:$('#aName').value,system_prompt:$('#aPrompt').value,operator_name:opName()})})}else{await api('/api/v1/agents/'+encodeURIComponent(a.agent_id),{method:'PATCH',body:JSON.stringify({system_prompt:$('#aPrompt').value,is_active:$('#aActive').checked,max_steps:+$('#aSteps').value,max_retries:+$('#aRetries').value,max_concurrent_tasks:+$('#aConcurrent').value,max_turn_seconds:$('#aTurnSecs').value===''?null:+$('#aTurnSecs').value,max_delegation_depth:+$('#aDelegDepth').value,max_session_tasks:+$('#aSessTasks').value,llm_config:{provider:$('#aProvider').value,model:$('#aModel').value},operator_name:opName()})});if($('#aAutonomy'))await rpc('agents.set_autonomy',{agent_id:a.agent_id,autonomy_level:$('#aAutonomy').value})}closeModal();toast('Saved');agents()}catch(e){toast(e.message)}}
+  $('#saveA').onclick=async()=>{try{if(isNew){await api('/api/v1/agents',{method:'POST',body:JSON.stringify({name:$('#aName').value,system_prompt:$('#aPrompt').value,operator_name:opName()})})}else{
+    let agentConfig;
+    try{agentConfig=JSON.parse($('#aConfigRaw').value||'{}')}catch(e){toast('Agent config is not valid JSON');return}
+    if($('#acCompactionThreshold'))agentConfig.compaction_threshold=$('#acCompactionThreshold').value===''?null:+$('#acCompactionThreshold').value;
+    if($('#acCompactionKeepRecent'))agentConfig.compaction_keep_recent=$('#acCompactionKeepRecent').value===''?null:+$('#acCompactionKeepRecent').value;
+    if($('#acMinMentions'))agentConfig.min_mentions_to_route=$('#acMinMentions').value===''?null:+$('#acMinMentions').value;
+    await api('/api/v1/agents/'+encodeURIComponent(a.agent_id),{method:'PATCH',body:JSON.stringify({system_prompt:$('#aPrompt').value,is_active:$('#aActive').checked,max_steps:+$('#aSteps').value,max_retries:+$('#aRetries').value,max_concurrent_tasks:+$('#aConcurrent').value,max_turn_seconds:$('#aTurnSecs').value===''?null:+$('#aTurnSecs').value,max_delegation_depth:+$('#aDelegDepth').value,max_session_tasks:+$('#aSessTasks').value,llm_config:{provider:$('#aProvider').value,model:$('#aModel').value},agent_config:agentConfig,session_token:sessTok(),operator_name:opName()})});if($('#aAutonomy'))await rpc('agents.set_autonomy',{agent_id:a.agent_id,autonomy_level:$('#aAutonomy').value})}closeModal();toast('Saved');agents()}catch(e){toast(e.message)}}
 }
 // Assigned users (item 32's own "admin should be able to grant this from
 // the Agents page too"): the reverse direction of the Users page's own

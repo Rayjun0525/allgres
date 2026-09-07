@@ -2561,3 +2561,84 @@ ones (`analyst`, `health_monitor`, and the six `is_system` agents --
 `system_root` and its five children) at a
 reasonable ~11KB response size instead of all 23 and growing.
 `fn_selftest` (140/140) and `tests/smoke.sql` both still pass.
+
+## 34. Generic `agent_config` -- every system agent's hardcoded behavior tunable, dashboard included
+
+Every system agent had at least one behavior constant baked into the SQL
+that decides how it fires: `session_compactor`'s trigger threshold (60
+uncompacted logs) and how many recent ones it leaves alone (10), and
+`orchestrator`'s minimum mention count to bother routing (more than one).
+None of these were reachable from anywhere -- changing them meant editing
+`control_plane.sql` and reinstalling the extension. Asked directly: how
+deep does control over the system agents actually go today, and can the
+compaction threshold specifically be tuned from the dashboard -- the
+honest answer was "not at all, it's compiled in." This item generalizes
+that to every such parameter, present and future, not just compaction's.
+
+Rather than a column per parameter (a migration for every future knob) or
+folding these into the existing `policies` table (versioned, audited,
+config-shaped for `system_prompt`/`llm_config`/limits -- the wrong
+lifecycle for "what number does this specific agent kind read"), agents
+got one new column: `allgres_private.agents.agent_config jsonb NOT NULL
+DEFAULT '{}'`. A new `fn_set_agent_config(agent_id, config)` merges
+(`agent_config || p_config`, then `jsonb_strip_nulls`) rather than
+replaces, so setting one key never disturbs another, and sending a key
+with JSON `null` clears it back to the coded default -- the same idiom
+`fn_set_project_config` already established for `preset_prompt`. Every
+reader applies `COALESCE((agent_config->>'key')::type, <old hardcoded
+value>)`, so an agent nobody has ever touched behaves exactly as before.
+
+`dashboard_rpc`'s `agents.list` now returns each agent's `agent_config`;
+`agents.update` accepts an `agent_config` key and calls
+`fn_set_agent_config`, reusing the same `require_admin_for_system_agent`
+gate every other field on a system agent already goes through -- editing
+an ordinary agent's config needs no admin session, editing
+`session_compactor`'s or `orchestrator`'s does, exactly like their
+`system_prompt` or `max_steps`. Two readers were migrated to prove the
+mechanism end to end: `maybe_trigger_compaction` now reads
+`compaction_threshold`/`compaction_keep_recent` from `session_compactor`'s
+own row (moving its lookup earlier, since the threshold itself now lives
+there instead of being a literal), and `fn_messenger_post`'s
+orchestrator-routing check reads `min_mentions_to_route` from
+`orchestrator`'s row instead of a bare `> 1`.
+
+The Agents page's edit modal gained a named, labeled number field per
+known parameter (`session_compactor`'s two, `orchestrator`'s one) shown
+only when editing that agent by name, plus a raw-JSON `agent_config`
+textarea shown for every agent as the forward-compatible fallback for any
+key not yet given a named field -- named fields win on save (merged over
+whatever the textarea holds), so the two never fight over the same key.
+Blank on a named field means the same thing blank already means on Max
+turn seconds: clear it, revert to default.
+
+Driving this through an actual browser surfaced a real, pre-existing bug
+this feature would otherwise have inherited silently: the edit modal's
+main Save button (`PATCH /api/v1/agents/:id`) never sent `session_token`
+in its body at all -- only the separate Autonomy-level dropdown did (it
+goes through the `rpc()` helper, which adds it automatically). Since
+`agents.update` requires an admin session for any field on a system
+agent, every save of `system_prompt`/`max_steps`/permissions/etc. on any
+of the six system agents from the dashboard has always failed with `not
+logged in`, silently working around it only for admins who never actually
+tried to change one. Fixed by adding `session_token:sessTok()` to that
+PATCH body, the same value `rpc()` already sends. Without this fix
+`agent_config` would have been unreachable from the dashboard for the
+exact two agents (`session_compactor`, `orchestrator`) it was built for.
+
+**Verified live**: `fn_selftest` grew from 140 to 147 cases (admin gating
+on ordinary vs. system agents, merge-not-replace persistence, `null`
+clearing a key, the compaction threshold actually firing early at a
+lowered value, and `orchestrator`'s routing threshold actually suppressing
+and restoring), passing and idempotent across three repeated runs on a
+fresh install; `tests/smoke.sql` 147/147. Beyond the SQL suite, a real
+headless-Chromium (Playwright) pass against the running dashboard: logged
+in as a real admin, opened `session_compactor`'s edit modal, filled both
+named fields, saved, confirmed a `200` response and the exact values
+(`{"compaction_threshold": 30, "compaction_keep_recent": 5}`) landing in
+the database; reopened the same modal and confirmed both the named fields
+and the raw-JSON textarea reflected the saved values back; repeated for
+`orchestrator`'s `min_mentions_to_route`; and confirmed a non-system,
+non-special agent (`analyst`) shows no named fields at all and persists an
+arbitrary key (`{"custom_key": 42}`) typed into the raw-JSON textarea --
+the forward-compatible path working for a parameter that doesn't have a
+named field yet.

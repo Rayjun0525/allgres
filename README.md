@@ -396,6 +396,18 @@ permissions from the Agents page now requires an admin session
 (`require_admin_for_system_agent`) — an ordinary, non-system agent is
 completely unaffected by this check.
 
+Any behavior constant a specific agent kind needs — `session_compactor`'s
+trigger threshold and how many recent logs it leaves uncompacted,
+`orchestrator`'s minimum `@mention` count before it bothers routing —
+lives in a generic `agent_config jsonb` column on every agent rather than
+being compiled in, so a future parameter never needs a schema migration.
+`fn_set_agent_config` merges into it (a key sent as `null` clears back to
+the coded default), through the same admin gate as every other
+system-agent field. The Agents page's edit modal exposes each known key
+as a labeled number field for the agent it belongs to, plus a raw-JSON
+`agent_config` textarea on every agent as the fallback for anything not
+given a named field yet (see KNOWN_ISSUES item 34).
+
 `creator`, `fixer`, and `self_improve` can each take one real,
 consequential action, gated by a per-agent `autonomy_level` an admin sets
 from the Agents page (`agents.set_autonomy`): `admin_approval` (default)
