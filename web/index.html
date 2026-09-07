@@ -100,6 +100,23 @@ function nav(){const n=$('#nav');const list=pagesForRole();n.innerHTML=list.map(
 function renderWhoami(){const el=$('#whoami');if(!el)return;el.textContent=state.me?`${state.me.username} (${state.me.role})`:'';const lb=$('#logoutBtn');if(lb)lb.textContent=t('signOut')}
 function status(s){return `<span class="status s-${esc(s)}">${esc(s)}</span>`}
 function fmtContent(c){return typeof c==='string'?c:JSON.stringify(c)}
+// A chat bubble's assistant turn is the agent's raw step-loop reply --
+// {"action":"final_answer","answer":"..."} is the protocol shape every
+// agent in this system must reply in (see fn_next_step's own prompt), not
+// something a chat UI should show verbatim. Only that one shape unwraps to
+// plain text; anything else (execute_sql, an error, mid-turn actions still
+// worth seeing) falls back to the same raw rendering fmtContent already
+// gives everywhere else (Logs' full transcript included -- deliberately
+// untouched, since that view exists to show exactly this).
+function chatText(l){
+  if(l.role==='assistant'&&typeof l.content==='string'){
+    try{
+      const p=JSON.parse(l.content);
+      if(p&&p.action==='final_answer'&&typeof p.answer==='string')return p.answer;
+    }catch(e){}
+  }
+  return fmtContent(l.content);
+}
 async function loadPage(){
   // Chat/Messenger poll for an async reply on a setInterval; leaving the
   // page must stop it, or it keeps firing against DOM elements (#chatThread/
@@ -292,7 +309,7 @@ async function sessionsPage(target){
 }
 function msgBubble(l){
   const who=l.role==='user'?'me':l.role==='assistant'?'agent':'op';
-  return `<div class="bubblerow bubblerow-${who}"><div class="bubble bubble-${who}"><div class="bubble-meta">${status(l.role)}<span class="mono" style="font-size:11px;opacity:.7">${esc(l.created_at)}</span></div><div class="bubble-body">${esc(fmtContent(l.content))}</div></div></div>`;
+  return `<div class="bubblerow bubblerow-${who}"><div class="bubble bubble-${who}"><div class="bubble-meta">${status(l.role)}<span class="mono" style="font-size:11px;opacity:.7">${esc(l.created_at)}</span></div><div class="bubble-body">${esc(chatText(l))}</div></div></div>`;
 }
 async function threadModal(sessionId){
   $('#modal').classList.remove('hidden');
