@@ -6111,6 +6111,43 @@ BEGIN
 END;
 $fn$;
 
+-- The gate the rest of the platform-configuration surface was missing --
+-- agents.create, agents.update/permissions.grant/permissions.revoke/
+-- policy.rollback for an *ordinary* (non-system) agent, provider.create/
+-- provider.update, allowlist.add/remove, and agents.set_autonomy all either
+-- had no session check at all or (agents.update and friends) one that only
+-- ever fired for a system-agent target, leaving every one of these
+-- reachable by anyone holding the shared dashboard bearer token alone, with
+-- no relationship to whether that caller is logged in, or as what role --
+-- a real gap between the accounts system (item 28) and the admin-only
+-- surface that predates it, not a deliberate two-tier design.
+--
+-- The fix cannot be a bare require_admin the way require_admin_for_system_
+-- agent already is for a system-agent target: that would break the
+-- deployment mode this whole accounts system was always additive to (see
+-- the "Accounts, roles, ..." section comment on dashboard_rpc) -- a
+-- single-operator install that has never created a user account at all,
+-- where the shared bearer token alone has always been the entire security
+-- model and still needs to be enough. So this only starts requiring a
+-- logged-in admin once an operator has actually created at least one
+-- account -- at that point every action gated by this function requires
+-- one, uniformly, regardless of whether its specific target happens to be
+-- a system agent. Before that point (zero rows in allgres_private.users --
+-- checked fresh on every call, not cached, so the very next request after
+-- the first account is created is already covered) this is a no-op, the
+-- same as before this function existed.
+CREATE OR REPLACE FUNCTION allgres_private.require_admin_if_accounts_exist(p_token text)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
+    RETURN;
+  END IF;
+  PERFORM allgres_private.require_admin(p_token);
+END;
+$fn$;
+
 -- What approvals.list/proposals.list/fixes.list and their .decide
 -- counterparts scope by (item 41, "opening the approval inbox to regular
 -- users too"): NULL means unrestricted -- either nobody is logged in (the
@@ -8116,6 +8153,22 @@ BEGIN
 
   v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
 
+  -- item 36's own bootstrap guarantee: require_admin_if_accounts_exist must
+  -- be a true no-op for a deployment that has never created a user account
+  -- at all -- verified here, not assumed, since this is the one point in
+  -- the whole run where allgres_private.users is guaranteed still empty
+  -- (section 31 below is the only place fn_selftest ever creates one, and
+  -- always cleans up after itself before returning).
+  ok := NOT EXISTS (SELECT 1 FROM allgres_private.users);
+  IF ok THEN
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.create',
+      'name', 'selftest_bootstrap_probe_' || extract(epoch from clock_timestamp())::text
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+  END IF;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'admin_gate_is_a_noop_before_any_account_exists', 'ok', ok));
+
   -- 30. fn_continue_session: a session can be resumed with a follow-up
   --     message instead of only ever starting a brand new, contextless one
   --     (dashboard, "no way to chat"). The new turn is a new task, but
@@ -8525,19 +8578,26 @@ BEGIN
 
     -- 33b. agent_config (agent metadata settings, item: "make every such
     -- parameter configurable, not just compaction"): a generic per-agent
-    -- jsonb bag, merged (not replaced) by fn_set_agent_config, admin-gated
-    -- for a system agent target through the same agents.update ->
-    -- require_admin_for_system_agent path as everything else system-agent
-    -- specific, unrestricted for an ordinary one.
-    -- Ordinary (non-system) agent: agents.update with agent_config needs
-    -- no admin session at all, same as every other agents.update field --
-    -- confirms the gate is really about is_system, not agent_config itself.
+    -- jsonb bag, merged (not replaced) by fn_set_agent_config. agents.update
+    -- as a whole is now admin-gated the moment any account exists at all
+    -- (require_admin_if_accounts_exist, item 36's own fix for the gap an
+    -- outside review found), for a system-agent target *and* an ordinary
+    -- one alike -- accounts exist by this point in the run (the 31 section
+    -- above created selftest_admin/selftest_user), so both branches here
+    -- exercise the accounts-configured behavior, not the bootstrap no-op.
     sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'agents.update', 'agent_id', v_sys_target::text,
       'agent_config', jsonb_build_object('probe', 1)
     ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_ordinary_agent_now_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.update', 'agent_id', v_sys_target::text, 'session_token', v_admin_tok,
+      'agent_config', jsonb_build_object('probe', 1)
+    ));
     ok := COALESCE((sub->>'ok')::boolean, false);
-    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_set_on_ordinary_agent_needs_no_admin', 'ok', ok));
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_ordinary_agent_succeeds_with_admin_session', 'ok', ok));
 
     -- dashboard_rpc never raises to its caller (its own outer EXCEPTION
     -- WHEN OTHERS turns everything into {ok:false,...}), so a rejection
@@ -8556,6 +8616,51 @@ BEGIN
     ok := COALESCE((comp->>'ok')::boolean, false)
       AND (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = jsonb_build_object('probe', 2);
     v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_persists_merged_not_replaced', 'ok', ok));
+
+    -- item 36's own fix, spot-checked on a representative few of the
+    -- platform-configuration actions that used to have no session check at
+    -- all -- the underlying gate (require_admin_if_accounts_exist) is the
+    -- exact same one already proven above for agents.update, so this is
+    -- deliberately not exhaustive over every action it was also added to
+    -- (policy.rollback, permissions.revoke, provider.update, allowlist.
+    -- remove, agents.set_autonomy, providers.oauth_start/oauth_callback).
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'agents.create', 'name', 'selftest_should_not_exist'));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'selftest_should_not_exist');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agents_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.create', 'session_token', v_admin_tok,
+      'name', 'selftest_created_with_admin_' || extract(epoch from clock_timestamp())::text
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agents_create_succeeds_with_admin_session', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'provider.create', 'name', 'selftest_should_not_exist_provider',
+      'kind', 'openai_compat', 'base_url', 'https://example.invalid'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.llm_providers WHERE name = 'selftest_should_not_exist_provider');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'provider_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'allowlist.add', 'ref', 'allgres_public.v_should_not_be_added'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.sql_sandbox_allowlist WHERE resource_ref = 'allgres_public.v_should_not_be_added');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'allowlist_add_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'permissions.grant', 'agent_id', v_sys_target::text, 'type', 'tool', 'ref', 'http_get'
+    ));
+    -- Not also asserting NOT agent_has_permission(...) here: v_sys_target's
+    -- permission state going into this point isn't otherwise pinned down by
+    -- this test, so that clause would risk a false negative against a grant
+    -- some earlier, unrelated case happened to leave in place. The rejection
+    -- itself is what this case is for.
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'permissions_grant_needs_admin_once_accounts_exist', 'ok', ok));
 
     -- Setting a key to JSON null clears it back to the reader's own coded
     -- default rather than leaving a stray {"probe":2} on a real seeded
@@ -9430,17 +9535,27 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'agents.set_autonomy' THEN
-      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      -- Relaxed from a bare require_admin: that alone made this the one
+      -- action on the whole platform-configuration surface that could never
+      -- be reached at all in a deployment that has never created a user
+      -- account -- see require_admin_if_accounts_exist's own comment.
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_set_agent_autonomy(
         (p_request->>'agent_id')::uuid, p_request->>'autonomy_level'
       );
 
     WHEN 'agents.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_create_agent(p_request->>'name', p_request->>'system_prompt');
 
     WHEN 'agents.update' THEN
       v_id := (p_request->>'agent_id')::uuid;
+      -- Two gates, deliberately not one: require_admin_for_system_agent is
+      -- unconditional the moment the target is a system agent (it always
+      -- has been); require_admin_if_accounts_exist is what now also covers
+      -- an *ordinary* agent, but only once accounts are actually in use.
       PERFORM allgres_private.require_admin_for_system_agent(p_request->>'session_token', v_id);
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       IF p_request ? 'is_active' THEN
         PERFORM allgres_public.fn_set_agent_active(v_id, (p_request->>'is_active')::boolean);
       END IF;
@@ -9487,6 +9602,7 @@ BEGIN
       PERFORM allgres_private.require_admin_for_system_agent(
         p_request->>'session_token', (p_request->>'agent_id')::uuid
       );
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_rollback_policy(
         (p_request->>'agent_id')::uuid, (p_request->>'generation')::int
       );
@@ -9578,6 +9694,7 @@ BEGIN
       PERFORM allgres_private.require_admin_for_system_agent(
         p_request->>'session_token', (p_request->>'agent_id')::uuid
       );
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_grant_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
@@ -9586,6 +9703,7 @@ BEGIN
       PERFORM allgres_private.require_admin_for_system_agent(
         p_request->>'session_token', (p_request->>'agent_id')::uuid
       );
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_revoke_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
@@ -9616,9 +9734,11 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'allowlist.add' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_allowlist_add(p_request->>'ref');
 
     WHEN 'allowlist.remove' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_allowlist_del(p_request->>'ref');
 
     WHEN 'projects.list' THEN
@@ -10015,6 +10135,7 @@ BEGIN
       );
 
     WHEN 'provider.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'provider_id')::uuid;
       PERFORM allgres_public.fn_set_provider(
         v_id,
@@ -10034,6 +10155,7 @@ BEGIN
       RETURN jsonb_build_object('ok', true, 'provider_id', v_id);
 
     WHEN 'provider.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_create_provider(
         p_request->>'name',
         p_request->>'kind',
@@ -10048,6 +10170,7 @@ BEGIN
     -- fn_oauth_start only ever returns a redirect_url and a state, neither
     -- of which is secret, so this is safe for operator to call directly.
     WHEN 'providers.oauth_start' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'provider_id')::uuid;
       RETURN allgres_public.fn_oauth_start(v_id, p_request->>'redirect');
 
@@ -10058,6 +10181,7 @@ BEGIN
     -- fn_complete_oauth stores whatever comes back; settings.get's
     -- has_secret is how the dashboard finds out it landed.
     WHEN 'providers.oauth_callback' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_oauth_token_request(
         p_request->>'state', p_request->>'code', p_request->>'redirect'
       );

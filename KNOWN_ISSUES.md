@@ -2827,3 +2827,71 @@ provider-name/request-body-model reconstruction actually matches what
 first place. The three fixed `scripts/smoke.sh` assertions were run
 directly against a real live server (not just `bash -n`), each one
 succeeding exactly as it should.
+
+## 37. The same outside review's fourth finding: admin gating across `dashboard_rpc`'s platform-configuration actions was never consistent, just accidentally uniform until item 28 added real accounts
+
+Item 28 layered a real login system (`users`, `session_tokens`, roles) on
+top of a dashboard that had always been governed by one thing: possession
+of the shared bearer token in `Authorization: Bearer ...`. Before item 28,
+"logged in" didn't exist as a concept, so nothing in `dashboard_rpc` needed
+to check it. After item 28, a handful of actions were updated to call
+`require_admin(session_token)` -- but only the ones item 28 itself touched
+directly (`users.*`, `assignments.*`) plus, later, item 32's
+`require_admin_for_system_agent`, which is unconditional the instant its
+target happens to be a system agent, and a no-op otherwise. Nothing ever
+went back and gated the rest of the platform-configuration surface:
+`agents.create`, `agents.update`/`policy.rollback`/`permissions.grant`/
+`permissions.revoke`/`agents.set_autonomy` for an *ordinary* (non-system)
+agent, `provider.create`, `provider.update`, `allowlist.add`,
+`allowlist.remove`, and `providers.oauth_start`/`providers.oauth_callback`.
+Every one of these was reachable by anyone holding the shared dashboard
+token alone, with no relationship to whether that caller was logged in or
+as what role -- confirmed by reading each branch in `dashboard_rpc`
+directly, not inferred. A real gap between the accounts system and the
+admin-only surface that predates it, not a deliberate two-tier design.
+
+The fix cannot be a bare `require_admin` the way
+`require_admin_for_system_agent` already is for a system-agent target:
+that would break the deployment mode this whole accounts system was
+always additive to (see `dashboard_rpc`'s own "Accounts, roles, ..."
+section comment) -- a single-operator install that has never created a
+user account at all, where the shared bearer token alone has always been
+the entire security model and still needs to be enough on its own. Added
+`allgres_private.require_admin_if_accounts_exist(p_token text)`: a no-op
+if `allgres_private.users` has zero rows (accounts never configured --
+preserves the historical single-operator behavior exactly), otherwise it
+delegates to `require_admin`. Checked fresh on every call, not cached, so
+the very next request after the first account is created is already
+covered. Wired into every action named above; `agents.update` and its
+sibling system-agent-target actions keep `require_admin_for_system_agent`
+*alongside* the new gate, not replaced by it -- one call stays
+unconditional the moment the target is a system agent, the other now also
+covers an ordinary agent, but only once accounts exist. `users.*` and
+`assignments.*` were deliberately left untouched: those were already
+correctly strict (`require_admin` has no bootstrap fallback, which is
+right for account management specifically -- the first admin account is
+expected to be bootstrapped via direct SQL, not through the dashboard).
+
+**Deliberately out of scope for this pass**: `run`, `sessions.cancel`, and
+`sessions.continue` still have no session/scoping check at all and can act
+on any `agent_id`/`session_id` regardless of `user_agent_assignments` --
+a separate, arguably larger gap than what this finding named, left for a
+follow-up rather than folded into this fix.
+
+**Verified live**: `fn_selftest` grew from 153 to 160 cases -- a bootstrap
+no-op check (`admin_gate_is_a_noop_before_any_account_exists`, run at the
+one point in the whole suite where `allgres_private.users` is guaranteed
+still empty, confirming `agents.create` still works with no session_token
+at all before any account exists), the `agent_config`-on-ordinary-agent
+case rewritten to reflect that it now needs an admin session once accounts
+exist (its old premise, "no admin needed," stopped being true by design),
+and five representative spot-checks across the newly gated actions
+(`agents.create`, `provider.create`, `allowlist.add`, `permissions.grant`)
+each confirmed rejected without a session and confirmed to actually take
+effect with one. Idempotent across three consecutive runs on the same
+database, on a fresh install both with and without pgcrypto and both with
+and without pgvector. `tests/smoke.sql` and `tests/e2e_mock.sql` still pass
+unchanged -- neither exercises any of the newly gated actions through
+`dashboard_rpc` (the mock providers `e2e_mock.sql` needs are seeded via
+direct `INSERT`, not `provider.create`), confirming this fix didn't need
+to touch either script.

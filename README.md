@@ -395,9 +395,13 @@ and `self_improve`. `agent_id`/`name`/`system_prompt` inheritance is real —
 `parent_agent_id` so a child sees its own grants plus everything the root
 was granted, and its own prompt appended after the root's shared framing.
 Every one of the five is `is_system = true`: editing its policy or
-permissions from the Agents page now requires an admin session
-(`require_admin_for_system_agent`) — an ordinary, non-system agent is
-completely unaffected by this check.
+permissions from the Agents page always requires an admin session
+(`require_admin_for_system_agent`), unconditionally. An ordinary,
+non-system agent used to be unaffected by this specific check — but see
+[Security model](#security-model): once any account has ever been
+created, the platform-configuration surface as a whole (agent creation
+and edits, providers, the allowlist, OAuth connect) requires an admin
+session too, system agent or not.
 
 Any behavior constant a specific agent kind needs — `session_compactor`'s
 trigger threshold and how many recent logs it leaves uncompacted,
@@ -533,6 +537,19 @@ both ports on `127.0.0.1` only.
 Anyone who can reach `/api/v1/*` can create agents, rewrite system prompts, and
 register provider API keys. Put it behind TLS and a reverse proxy before
 exposing it.
+
+This is the whole security model in the default, single-operator
+deployment mode: no accounts have ever been created, so there is nothing
+for a login session to gate, and the bearer token above is doing all the
+work. The moment an operator creates even one account (Settings' Users
+section), that changes: `allgres_private.require_admin_if_accounts_exist`
+starts requiring a real admin *session*, on top of the bearer token, for
+every action on the platform-configuration surface — creating or editing
+an agent (system or not), providers, the SQL sandbox allowlist, and OAuth
+connect — checked fresh on every call against whether `allgres_private.
+users` is still empty, not cached. Before that point, holding the token
+is enough for all of it, by design; after it, the token alone is no
+longer sufficient for any of the actions above.
 
 ### Cross-origin requests
 
