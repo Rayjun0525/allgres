@@ -105,6 +105,59 @@ mod allgres {
         JsonB(analyze_dump(&raw_parse_dump(sql)))
     }
 
+    /// Host-level metrics the Overview page shows alongside PostgreSQL's own
+    /// `pg_stat_activity` counts (SQL can read those directly -- this is
+    /// only for what SQL cannot see: OS CPU load and memory). Linux-only, by
+    /// design -- `/proc` is the one interface that needs neither a
+    /// subprocess nor a C library binding, matching this file's existing
+    /// preference (see `raw_parse_dump` above) for the most direct
+    /// interface available rather than the most portable one. Best-effort:
+    /// a missing/unreadable file (a non-Linux host, or a locked-down
+    /// container) yields `null` for that section rather than an error, so
+    /// Overview still renders the parts it can.
+    #[pg_extern]
+    fn native_host_stats() -> JsonB {
+        let load = fs::read_to_string("/proc/loadavg").ok().and_then(|s| {
+            let mut it = s.split_whitespace();
+            let one: f64 = it.next()?.parse().ok()?;
+            let five: f64 = it.next()?.parse().ok()?;
+            let fifteen: f64 = it.next()?.parse().ok()?;
+            Some(json!({"load1": one, "load5": five, "load15": fifteen}))
+        });
+
+        let mem = fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
+            let mut kv: HashMap<&str, u64> = HashMap::new();
+            for line in s.lines() {
+                let mut parts = line.splitn(2, ':');
+                let key = parts.next()?;
+                let rest = parts.next()?.trim();
+                let n: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                kv.insert(key, n);
+            }
+            let total_kb = *kv.get("MemTotal")?;
+            // MemAvailable (kernel-estimated, accounts for reclaimable cache)
+            // is what every modern `free`-alike reports as "available";
+            // MemFree alone overstates memory pressure by not counting cache
+            // the kernel would gladly release under pressure.
+            let avail_kb = *kv.get("MemAvailable")?;
+            let used_kb = total_kb.saturating_sub(avail_kb);
+            Some(json!({
+                "total_mb": total_kb / 1024,
+                "used_mb": used_kb / 1024,
+                "available_mb": avail_kb / 1024,
+                "used_pct": if total_kb > 0 { (used_kb as f64 / total_kb as f64) * 100.0 } else { 0.0 },
+            }))
+        });
+
+        let cpu_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+
+        JsonB(json!({
+            "load": load,
+            "memory": mem,
+            "cpu_count": cpu_count,
+        }))
+    }
+
     #[pg_extern]
     fn native_status() -> JsonB {
         let preload = Spi::get_one::<String>("SELECT current_setting('shared_preload_libraries', true)")

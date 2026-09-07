@@ -20,6 +20,22 @@ Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
 a gap between what the code does and what it should do.
 
+**A note on version numbers**: this project has never had an actual release.
+`Cargo.toml`/`allgres.control` bumped through `0.2.0`–`0.5.0` during
+development (each bump documented, at the time, in the item below it); none
+of those were ever published anywhere, so none of them are a real prior
+version an operator could actually be running. The version has been reset to
+`0.1.0` and its matching `sql/allgres--<from>--<to>.sql` upgrade scripts for
+those never-shipped versions removed — the version number will move again
+only to mark an actual release, not every development milestone. This does
+**not** touch `sql/allgres--0.2.0.sql`, the frozen pre-rename (Argo-named)
+snapshot item 19 describes, or the `ALTER ROLE`/`SCHEMA ... RENAME`
+migration path built for it: that predates this project's own renaming and
+is a separate, real concern from this version-numbering cleanup. Every item
+below keeps whatever version number was live in the codebase at the time it
+was written — read them as a dated development diary, not as claims about
+the current version.
+
 ## 1. ~~Agent SQL does not run as the `sandbox` role~~ — fixed
 
 `fn_execute_sql` validated *and* executed in one `SECURITY DEFINER` call, which
@@ -1991,3 +2007,557 @@ actions (`*.list`, `settings.get`) — deliberately excluded, since the
 question this answers is "who changed something," not "who looked"; and
 any UI affordance to filter or search the Audit Log page beyond a flat,
 newest-first list of the most recent 300 entries.
+
+## 29. Four real product gaps found by actually using the installed dashboard: a fake default model, no way to add a provider, no chat, and selftest fixtures showing up as if they were real work
+
+Everything through item 28 was found by code review or external review of
+the diff. This batch is different: it came from someone actually installing
+Allgres end to end (Rocky Linux 9, PostgreSQL 18) and using the dashboard,
+which surfaced four things no amount of reading the SQL would have caught.
+
+**A fresh install looked like a provider had already been picked and
+authenticated when nothing had.** `allgres_private.ensure_policy()` — the
+trigger that gives every newly created agent a starting policy row — set
+`llm_config` to `{"provider":"xai","model":"grok-4.5",...}` unconditionally.
+The seeded `analyst` demo agent's own policy did the same in its one-time
+seed block. Neither of these is a credential leak (no `xai` API key or
+OAuth token is ever seeded), but the visible effect was exactly what got
+reported: every agent, seeded or freshly created, showed a real-looking
+model selection despite OAuth never having been run. Both now leave
+`llm_config` at `{}`, matching what `health_monitor`'s seed already did.
+That alone wasn't enough: `allgres_private.build_llm_http` still defaulted
+an *empty* `llm_config` to `provider: 'xai', model: 'grok-4.5'` before
+resolving it against `llm_providers` — meaning an agent with nothing
+configured at all would still build a real request pointed at xai's actual
+endpoint. It now raises a clear "no llm_config.provider/model configured"
+error instead, the same fail-closed shape item 23 already gave a
+*misconfigured* provider name; only a real, explicit choice ever reaches an
+endpoint.
+
+**There was no way to add an LLM provider — only edit one of the five
+seeded ones.** `fn_set_provider` only ever `UPDATE`s a row that already
+exists; nothing in this file could `INSERT` a new one, so an operator who
+wanted anything beyond xai/openai/anthropic/ollama/openai_compat had no
+path but editing the database by hand. `fn_create_provider(name, kind,
+base_url, api_key, allow_private_network)` is the missing counterpart —
+same endpoint/SSRF validation `fn_set_provider` already applies on edit,
+applied at creation time too — wired into `dashboard_rpc` as
+`provider.create` and into the audited-action list next to
+`provider.update`. The Settings page gained an "Add provider" form for it.
+The agent editor's Provider field was a free-text `<input>` with no
+base_url or api_key fields at all — the exact complaint, "there's no way to
+configure a model by URL, no API key field, nothing." It is now a `<select>`
+populated from currently-enabled providers (an agent can no longer be
+pointed at a provider name that was just typed and might not exist); Model
+stays free text, since one provider can host many model names.
+
+**There was no way to have a conversation.** `fn_create_session` builds
+exactly one task and that task runs once; there was no function to send a
+follow-up in the same session, only "start an entirely new session that
+remembers nothing." Before adding one, this needed an answer to a real
+design question: delegated child tasks (`fn_submit_result`'s `delegate`
+branch) share their parent's `session_id`, so a naive "pull every task in
+this session's logs" would blend a user-facing conversation with whatever
+sub-agent delegation happened to occur inside it. The fix distinguishes
+root-level tasks (`parent_task_id IS NULL` — a user-facing turn) from
+delegated ones (`parent_task_id IS NOT NULL` — a sub-agent's own isolated
+turn): `fn_next_step`'s message assembly now pulls every root-level task's
+log in the session, ordered by `created_at` across tasks instead of
+`step_number` within one, when the task being run is itself root-level;
+a delegated task stays scoped to only its own log, exactly as before.
+`fn_continue_session(session_id, message)` creates a new root-level task in
+an existing session (fresh `step_count`/`max_steps` budget per turn,
+deliberately, so an exhausted earlier turn can't block a later one),
+appends the message as a `user` log entry, and reopens the session
+(`status = 'open'`, `completed_at = NULL`) if it had already finished —
+rejecting a second message outright while an earlier turn in the same
+session is still `queued`/`running`/`waiting_human`, rather than racing
+`fn_next_step`'s own read of the session's task list. Wired into
+`dashboard_rpc` as `sessions.continue`.
+
+**Sessions created by running `fn_selftest` were permanently visible in the
+dashboard, indistinguishable from real work.** `selftest_cleanup()`
+existed, but only ever `UPDATE`d matching rows to a terminal status
+(`failed`/`cancelled`) — it never removed them, so every past
+`fn_selftest` run left real, permanent rows behind. The obvious fix —
+make it actually `DELETE` — does not work: `execution_logs` has a
+`BEFORE UPDATE OR DELETE` trigger (`forbid_log_mutation`) making it
+genuinely append-only, rejecting `DELETE` the same as `UPDATE`, for
+*anyone*, including this function's own owner — confirmed by trying it and
+watching PostgreSQL reject it live (`ERROR: execution_logs are
+append-only`), not by reading the trigger and assuming. Deleting
+`sql_calls`/`tasks`/`sessions` instead and leaving the now-orphaned
+`execution_logs` rows behind would either violate the `tasks`/`sessions`
+foreign key (nothing here cascades) or leave a log with no task to belong
+to. So selftest fixtures are still never deleted — `selftest_cleanup` only
+terminates anything an interrupted run left non-terminal, now called
+defensively at the *start* of `fn_selftest` too, not just the end — and
+every operator-facing listing (`overview`'s counts and `recent_tasks`,
+`sessions.list`, `tasks.list`, `logs.list`, the SSE `events` snapshot)
+filters out `goal LIKE 'selftest%'` instead. The dashboard never shows them;
+the database still has an honest, immutable record of every test run.
+
+**Verified live**, the same standard as items 12–28: rebuilt against local
+PostgreSQL 16.15, `fn_selftest` 104/104 (8 new cases: the fail-closed
+provider/model checks, a fresh agent's `llm_config` starting empty,
+`fn_create_provider`'s success/bad-kind/SSRF-rejection paths, both ends of
+`fn_continue_session` — rejecting a second message mid-turn and reopening a
+finished session with context intact — and `selftest_cleanup` actually
+being invisible to `tasks.list`/`sessions.list`/`events` rather than gone).
+`tests/smoke.sql` and `tests/e2e_mock.sql` both pass. Beyond the SQL-only
+suite: driven through the real async runtime worker end to end against the
+`allgres_mock` provider `tests/e2e_mock.sql` already sets up — one session
+run to completion, then `fn_continue_session` called against it directly,
+confirmed to flip the session back to `open`, dispatch a genuinely new
+task, and — read back from `execution_logs` across both root tasks,
+ordered by `created_at` — carry both turns' `user`/`assistant` messages in
+one continuous, correctly ordered thread. (One real environment trap found
+along the way, not a bug in this diff: the runtime worker connects to
+whichever database `ALLGRES_DATABASE` names, `postgres` by default, not
+whatever database `psql` happens to be pointed at — testing against a
+different database than the workers' own left tasks permanently `queued`
+with no error logged anywhere, since `extension_is_installed()` correctly
+reported `false` for a database that never had the extension created in
+it. Worth naming here since it is exactly the kind of silent, misleading
+non-failure someone else debugging this project could burn real time on.)
+
+**Deliberately not built in this pass**: the two chat *modes* (a Slack-style
+`@agent_name` channel where an unaddressed message posts without triggering
+a reply, versus a plain 1:1 conversation) and the real accounts/login system
+with admin/user roles and per-user agent assignment that the dashboard UI
+for `fn_continue_session` will sit on top of — both underway as a follow-up
+to this same round of feedback, tracked separately rather than folded into
+this entry after the fact. See item 30.
+
+## 30. Real accounts (admin/user roles, per-user agent assignment) and the two chat modes item 29 deferred
+
+A follow-up to item 29's own "deliberately not built in this pass" note,
+from the same round of feedback: a real username/password login distinct
+from the dashboard's one shared bearer token, admin vs. regular-user roles,
+an explicit per-user agent assignment list, and two ways to talk to an
+agent from the dashboard -- a plain 1:1 chat and a Slack-style channel
+where addressing a message with `@agent_name` is what routes it to that
+agent, everything else just posts.
+
+**Accounts.** `allgres_private.users` (username, a pgcrypto bcrypt
+`password_hash`, `role` in `('admin','user')`) and `allgres_private.
+web_sessions` (a bearer token distinct from the dashboard's own, resolved
+server-side by `allgres_private.session_user` rather than trusted at face
+value). Unlike provider-secret encryption, which degrades to plaintext
+storage with a loud warning when pgcrypto is missing (see "Secrets at
+rest"), a password hash has no safe degraded mode: `fn_create_user`/
+`fn_login` raise `pgcrypto is required` and refuse outright rather than
+ever hashing or comparing a password in plaintext -- confirmed live by
+temporarily uninstalling pgcrypto and watching both calls fail closed, then
+reinstalling and confirming they work. A failed login (wrong username or
+wrong password) is intentionally indistinguishable from the caller's
+side -- the same error message, plus a fixed `pg_sleep(0.2)` on the
+unknown-username path so it cannot be timed apart from a
+wrong-password one.
+
+**Roles.** `allgres_private.require_admin(token)` gates the new admin-only
+actions (`users.create`, `users.list`, `users.set_active`, `users.
+set_role`, `assignments.set`, `assignments.list`). `allgres_private.
+require_agent_access(token, agent_id)` is the one check every chat/
+messenger/model-config action for a specific agent goes through: an admin
+reaches any active agent with no assignment row needed at all; a regular
+user only one explicitly listed in `allgres_private.
+user_agent_assignments` (item 29's "explicit allowed set" pattern, not
+"everything visible unless removed"). Neither of these touches the
+dashboard's own shared token or `operator_name` -- a `session_token` in the
+request body identifies the logged-in user instead, alongside the existing
+mechanisms rather than replacing them. This is deliberately narrower than
+a full rewrite of the security model: the existing shared-token-gated
+`dashboard_rpc` surface (agent CRUD, permissions, providers, the SQL
+sandbox allowlist, and so on) is unchanged and still reachable by anyone
+holding that one token, same as before every item through 29. Real
+per-operator authorization for *that* surface remains the deferred item
+KNOWN_ISSUES.md, item 10, has always described -- this adds a second,
+separate identity layer for the new conversational surface specifically,
+not a retrofit of the first one.
+
+**Simple chat.** `allgres_private.user_agent_chat_sessions` maps one
+(user, agent) pair to one continuing session -- created via
+`fn_create_session` on the first message, resumed via `fn_continue_session`
+(item 29) on every one after, never a fresh, contextless session per
+message. `fn_chat_send`/`fn_chat_history` are the two calls the Chat page
+uses; `chat.send`/`chat.history` in `dashboard_rpc`.
+
+**Messenger.** `allgres_private.channel_messages` is a flat, append-style
+feed: every plain post is just stored (`mentioned_agent_id`/`session_id`
+both `NULL`); a post containing `@agent_name` additionally resolves that
+agent (through the same `require_agent_access` a direct `chat.send` would
+apply) and routes the *same* message through `fn_chat_send` -- so
+mentioning an agent in the channel and messaging it from the 1:1 Chat page
+share one conversation per (user, agent), not two divergent histories,
+confirmed live: a `chat.send` message and a later `@mention` in the
+channel landed in the same `session_id`, and the channel mention correctly
+picked up the earlier turn's context. `messenger.list` joins each
+mentioned row back to `allgres_private.sessions` for `status`/
+`final_answer` rather than duplicating the agent's reply into
+`channel_messages` itself -- the reply lives in exactly one place.
+
+**Dashboard.** A login screen gates the whole app -- on top of, not instead
+of, the existing dashboard-token prompt: that token still decides whether
+a browser reaches the HTTP surface at all, this decides who, having
+reached it, is using it. Nav is now role-scoped: an admin keeps every
+existing page, plus new **Users** (create an account, activate/deactivate,
+change role, manage one user's agent assignments), **Chat**, and
+**Messenger** pages; a regular user sees only **Chat**, **Messenger**, and
+**My Agents** -- their assigned agents, each with an inline Provider
+(dropdown of configured providers, the same as the operator-facing agent
+editor -- see item 29) / Model editor wired to `fn_set_my_model`, never the
+full `agents.update` surface (no prompt, budgets, or permissions).
+
+**Verified live**, the same standard as items 12–29: `fn_selftest` 113/113
+(9 new cases -- fail-closed without pgcrypto, wrong-password rejection, a
+correct login, `require_agent_access` admin-bypass vs. assigned-only-user,
+a plain messenger post carrying no mention, an unassigned `@mention`
+rejected, `fn_set_my_model` updating only an assigned agent and rejecting
+an unassigned one, and `fn_logout` invalidating a token idempotently), all
+using a throwaway agent created and torn down within the test, never the
+real seeded `analyst`/`health_monitor` fixtures. `tests/smoke.sql` and
+`tests/e2e_mock.sql` both still pass. Beyond the SQL suite: driven through
+an actual headless-Chromium (Playwright) pass against the real dashboard --
+the login gate blocking the app until signed in; an admin's full nav
+(including the three new pages) versus a freshly created regular user's
+three-item nav; creating a user and assigning an agent from the Users
+page; sending a chat message and reading it back on the Chat page; posting
+a plain message and an `@analyst` mention on the Messenger page and
+watching the mention's reply (`"Allgres mock runtime OK"`, from
+`tests/e2e_mock.sql`'s own mock provider) appear inline; and a regular
+user's My Agents page correctly listing only their one assigned agent
+with a provider dropdown.
+
+**Deliberately not built**: any UI affordance to search/paginate the
+Users or Messenger pages beyond a flat list (matching the Audit Log
+page's own accepted limitation, item 28); typing-indicator or read-receipt
+niceties for the messenger; and, as above, gating the pre-existing
+shared-token `dashboard_rpc` surface by role -- that remains the same
+single shared secret it always was, now with a second, narrower,
+per-user identity layer sitting alongside it for chat/messenger/my-model
+specifically.
+
+## 31. A system agent family: one root, five children, per-agent autonomy levels, and three new consequential actions
+
+A follow-up requested directly: built-in agents that operate the platform
+itself rather than a user's workload -- summarizing a long session,
+routing a multi-mention Messenger message, helping create new agents,
+proposing a fix for what `health_monitor` finds, and tuning another
+agent's cost -- structured as one inheritance hierarchy, with an
+admin-configurable dial on how much of each one's own consequential
+actions run unattended. This item is the backend half of that request;
+the SQL-side inbox (Approvals/Proposals plus a new Fixes queue) is real
+and role-scoped, but Overview's cluster monitoring, the Chat page's
+General/Messenger/Project mode switch, nav consolidation, and i18n/theme
+remain a follow-up pass, tracked separately.
+
+**Hierarchy.** `allgres_private.agents` gains `is_system boolean`,
+`parent_agent_id uuid` (self-referencing), and `autonomy_level text` in
+`('auto', 'self_approve', 'admin_approval')`, default `admin_approval`.
+One `system_root` agent carries no operational job of its own; five
+children -- `session_compactor`, `orchestrator`, `creator`, `fixer`,
+`self_improve` -- hang off it with `parent_agent_id = system_root`.
+`allgres_private.agent_has_permission`/`agent_permission_refs` replace
+every direct `SELECT ... FROM allgres_private.permissions WHERE agent_id =
+...` check in the file (`call_tool`'s tool/http_host grants, `delegate`'s
+target-agent grant, `execute_sql`'s view grant via `agent_may_read` and
+`fn_validate_sql`) with a recursive walk up `parent_agent_id` -- a grant on
+`system_root` reaches every child without being restated five times, and
+is invisible to every non-system agent, confirmed live (`selftest_agent`,
+an ordinary agent, does not see a permission granted only to
+`system_root`). `allgres_private.agent_effective_prompt` does the same for
+`system_prompt` text -- a child's own prompt is appended after its
+ancestors', root-first -- and `fn_next_step`'s "bounds" text (what an
+agent is told it may do) now reads from `agent_permission_refs` rather
+than the agent's own direct grants, so a system agent's displayed
+capabilities match what `agent_has_permission` will actually let it do.
+`allgres_private.require_admin_for_system_agent(token, agent_id)` is a
+no-op for an ordinary agent (the pre-existing shared-token-only surface,
+completely unaffected) and requires an admin session the moment the
+target `is_system` -- wired into `agents.update`, `policy.rollback`, and
+`permissions.grant`/`.revoke`, the first real narrowing of that
+shared-token surface by role since item 30 explicitly deferred it.
+`fn_set_agent_autonomy` (RPC: `agents.set_autonomy`, always admin-only,
+regardless of target) is the dial's own setter.
+
+**The three new actions**, each gated to exactly the one agent whose job
+it is (checked by name, since only that one agent is ever seeded with the
+matching prompt) and each respecting its own `autonomy_level`:
+`admin_approval` queues a request in the existing (or, for `propose_fix`,
+new) inbox for a human to accept or reject; `auto` or `self_approve` apply
+immediately, no human step in the path at all -- the nuance between those
+two is left to the agent's own prompt (an agent at `self_approve` is told
+it may still choose `await_human` itself when unsure, rather than the
+platform forcing an escalation on every call).
+
+- `create_agent` (`creator` only): `{"action":"create_agent","name":
+  "...","system_prompt":"..."}`. Queued as a new `change_proposals.kind =
+  'create_agent'` row (that table's existing `agent_id`/`base_generation`/
+  `target_agent_id` columns are meaningless for this kind -- there is no
+  existing policy to go stale); `fn_decide_proposal` calls
+  `fn_create_agent` on approval, same as if an admin had typed it into the
+  Agents page.
+- `propose_fix` (`fixer` only): `{"action":"propose_fix","fix_kind":
+  "revoke_permission"|"deactivate_agent","target_agent_id":"...","detail":
+  {...}}`. A new table, `allgres_private.fix_proposals`, shaped like
+  `change_proposals` but for a fix's payload rather than a policy edit;
+  `allgres_private.apply_fix` (shared by `fn_decide_fix` and the
+  `auto`/`self_approve` immediate path) is the one place that turns a
+  `fix_kind` into a real `fn_revoke_permission`/`fn_set_agent_active`
+  call. `fixer` is seeded with the same two read-only views
+  `health_monitor` already watches (`v_system_health`,
+  `v_permission_audit`) -- it can look at exactly what `health_monitor`
+  looks at, never anything more, and proposes rather than silently acts
+  by default.
+- Cross-agent `propose_change` (`self_improve` only): the existing
+  `propose_change` action, extended with an optional `target_agent_id` --
+  every other agent's `propose_change` is rejected outright
+  (`propose_change_cross_agent_not_permitted`) the moment it names one,
+  preserving item-whatever's original "an agent may only ever propose
+  a change to itself" invariant for everyone except this one agent.
+  `change_proposals.target_agent_id` records who it actually targets;
+  `base_generation` is read from *that* agent's policy, not
+  `self_improve`'s own, so the staleness check protects the right row;
+  `fn_decide_proposal` writes to `COALESCE(target_agent_id, agent_id)` on
+  approval. Confirmed live: an approved cross-agent proposal changed the
+  target's `system_prompt` and left `self_improve`'s own untouched.
+
+**Approvals, Proposals, and the new Fixes queue, opened to regular
+users.** `allgres_private.visible_agent_ids(token)` returns `NULL`
+(unrestricted -- no session, i.e. the original shared-token-only caller,
+or an admin) or a regular user's own `user_agent_assignments` list.
+`approvals.list`/`.decide`, `proposals.list`/`.decide`, and the new
+`fixes.list`/`.decide` all scope by it: a regular user sees and may decide
+only the rows whose underlying agent (a `propose_change`'s
+`COALESCE(target_agent_id, agent_id)`, a fix's `target_agent_id`) is one
+of their own assigned agents; `create_agent` proposals have no existing
+target to scope by and stay admin-only. Both inboxes also gained a
+`reason NOT LIKE 'selftest%'` filter, closing the same "fn_selftest
+fixtures visible as if real" gap item 29 fixed for Sessions/Tasks --
+confirmed live, `fixes.list` and `proposals.list` are empty of selftest
+rows immediately after a `fn_selftest` run.
+
+**Verified live**: `fn_selftest` grew from 105 to 129 cases (root-and-five
+seeded correctly under one parent; a `system_root` grant reaching every
+child and no unrelated agent; a child's effective prompt containing the
+root's framing text ahead of its own; `is_system` edits rejected without
+an admin session and unaffected for an ordinary agent; a bad
+`autonomy_level` rejected with a clear error; `create_agent` queuing then
+actually creating the agent on approval, rejected outright from any other
+agent, and applying immediately under `autonomy_level = 'auto'`;
+`propose_fix` queuing then applying a deactivation on approval;
+`self_improve`'s cross-agent proposal landing on the target's own
+generation and policy, and rejected from every other agent;
+`visible_agent_ids` scoping a regular user to their assigned agents and
+widening the moment one is assigned) -- all passing, and idempotent
+across repeated runs (checked twice back to back). `tests/smoke.sql`
+passes end to end, including a live `dashboard_rpc` round trip for
+`agents.set_autonomy`/`fixes.list`/`proposals.list`. The whole 0.4.0 ->
+0.5.0 upgrade path was exercised for real: an extension created at
+`'0.4.0'`, a real operator edit made to the seeded `analyst` agent's
+`system_prompt`, `ALTER EXTENSION allgres UPDATE TO '0.5.0'` run against
+it, and both the operator's edit and every new system agent/column
+confirmed present afterward.
+
+**Deliberately not built in this pass**: `session_compactor`'s actual
+trigger (summarizing a session automatically once it grows long -- today
+it is seeded with a prompt describing that job, but nothing calls it yet)
+and `orchestrator`'s multi-mention routing in Messenger (same -- seeded,
+not wired to a real multi-`@mention` code path); the Overview page's
+Postgres-version-plus-cluster-monitoring redesign; the Chat page's three
+mode buttons (General/Messenger/Project) replacing today's separate Chat/
+Messenger pages, and the matching extension of `allgres_private.projects`
+with an `agent_id` and preset prompt; folding Sessions/Tasks/Logs/Events
+into Audit and Users into Settings; and language (en/ko) and dark/light
+theme switches in Settings. All tracked as the immediate next pass on
+this same branch.
+
+## 32. The rest of item 31's own list, plus a real extension-tooling gap it exposed
+
+The immediate follow-up item 31 named: `session_compactor`'s actual
+trigger, `orchestrator`'s multi-mention routing, Overview's cluster
+monitoring, the Chat page's three-mode switch and Project mode, nav
+consolidation, and language/theme switches. All built and verified live
+in this pass; a genuine bug in `scripts/gen-upgrade.sh` itself (not in any
+SQL logic) was also found and fixed along the way -- see "Verified live"
+below for how it surfaced.
+
+**session_compactor, actually triggered.** `allgres_private.
+maybe_trigger_compaction(session_id, task_ids)`, called from
+`fn_next_step` on every root-level step: counts this session's own
+not-yet-summarized logs (everything after `sessions.compacted_before`, or
+all of them the first time -- counting every row ever written would stay
+past threshold forever, since raw logs are append-only and never
+deleted), and past 60 queues a real background task for `session_compactor`
+carrying the oldest of them (everything but the most recent 10) plus
+whatever it summarized last time, so a second compaction folds both into
+one updated summary instead of silently dropping the first one. Nothing
+sets `compacted_before` except `session_compactor`'s own `remember`
+landing (`fn_submit_result`) -- the trigger itself never does -- so a turn
+can never see neither the raw logs nor a finished summary; worst case, a
+few extra turns while compaction is still in flight. Once set,
+`fn_next_step` excludes logs older than the cutoff and prepends the latest
+summary as a system message instead. Confirmed live end to end with
+explicit, distinct `created_at` timestamps 1 second apart: 70 synthetic
+turns in one session, `fn_next_step` correctly triggering a compaction
+task, simulating that task's own `remember` + `final_answer`, and a
+following turn on the original session showing the summary and the most
+recent turns but not the compacted-away ones. (First attempt used a tight
+PL/pgSQL loop with the implicit `now()`, which is frozen for the whole
+transaction -- every row got the *same* timestamp, so the cutoff logic
+had nothing to compare against and silently kept everything. The fix
+belongs to the test, not the product: real turns, each its own
+transaction with real elapsed time between them, never collide like this.)
+
+**orchestrator, actually exercised -- advisory only.** `fn_messenger_post`
+now extracts every distinct `@mention` in text order (not just the
+first), validates and delivers to each via `fn_chat_send` the same way a
+single mention always did, and records the full ordered list
+(`channel_messages.mentioned_agent_ids`, `messenger.list`'s new
+`mentioned_agents` array). When more than one agent is mentioned,
+`allgres_private.queue_orchestrator_opinion` also fires a real task for
+`orchestrator` carrying the message and each candidate's own prompt, so it
+is genuinely exercised against real messages rather than sitting
+permanently idle -- but its opinion is not yet what decides delivery
+order; that stays text order for now. A real reordering-before-delivery
+pass needs the async completion hook this doesn't build (orchestrator's
+task completes on its own schedule, well after `fn_messenger_post` has
+already returned) and is tracked as further work, not silently dropped.
+
+**Project mode.** `allgres_private.projects` gains `agent_id`/
+`preset_prompt`; `fn_next_step` appends `preset_prompt` after the bound
+agent's own effective prompt when the session belongs to that project.
+`allgres_private.user_project_chat_sessions` +
+`fn_project_chat_send`/`fn_project_chat_history` mirror the General-mode
+chat surface exactly, keyed by project instead of by agent and
+deliberately its own table/session rather than reusing that agent's
+General-mode one -- a project's preset context must never leak into a
+plain chat with the same agent, or the other way around.
+`allgres_private.require_project_access` is `require_agent_access` plus
+"the project is active and bound to an agent at all" -- a regular user
+needs the same assignment a Project's agent would require in General
+mode; there is no separate project-level allow-list. Confirmed live: a
+project bound to `analyst` with a haiku-only preset, chatted with through
+`fn_project_chat_send`, and `fn_next_step`'s system message contained the
+preset text.
+
+**Overview's cluster monitoring.** A new native function,
+`allgres.native_host_stats()` (Linux-only by design -- `/proc/loadavg`/
+`/proc/meminfo`, the most direct interface available, degrading to `null`
+sections rather than an error if unavailable, the same reasoning
+`analyze_sql` already used for PostgreSQL's own parser instead of a
+hand-rolled one), plus `current_setting('server_version')` and a
+`pg_stat_activity` count scoped to `current_database()`, all folded into
+the existing `overview` RPC action rather than a new one.
+
+**Nav consolidation, language, and theme -- all in `web/index.html`.**
+Sessions/Tasks/Logs/the audit trail become one **Audit** page with four
+tabs; Users becomes a section of **Settings**; Approvals/Proposals/the new
+Fixes queue become three tabs of one **Approvals** page (open to regular
+users, per item 31); Chat/Messenger/Project become three mode buttons of
+one **Chat** page. `assignments.toggle`/`.for_agent` (admin-only, added
+alongside this) let an admin grant/revoke one user's access to one agent
+directly from the Agents page's edit modal -- the reverse direction of
+`assignments.set`/`.list`, which stay built for the Users page's own
+per-user checkbox list and would otherwise require reading a user's whole
+assignment list just to flip one entry. Language (English/한국어) and
+theme (dark/light) are both a plain `localStorage` preference, no
+server-side state at all; language covers navigation, page chrome, and
+common actions/empty-states -- not every field label in every modal, and
+never data from the database itself (an agent's own name, a log's own
+content), which was never translatable content to begin with.
+
+**A real bug in `scripts/gen-upgrade.sh` itself, caught by actually
+running the upgrade.** `sql/control_plane.sql` is hand-written SQL only
+(tables, PL/pgSQL) -- a native function declared in `src/lib.rs` via
+`#[pg_extern]` (`native_host_stats` above) is not in it at all; pgrx
+generates that function's own `CREATE FUNCTION ... LANGUAGE c` statement
+and splices it into the *fresh-install* file only
+(`allgres--<version>.sql`). `gen-upgrade.sh` had always just dumped
+`control_plane.sql` verbatim, which was never wrong before because every
+native function already existed since 0.1.0 -- `native_host_stats` is the
+first one ever added mid-project. Caught live: `ALTER EXTENSION allgres
+UPDATE TO '0.5.0'` against a real 0.4.0 database left `overview` failing
+with `function allgres.native_host_stats() does not exist` despite every
+fresh install passing, because `fn_next_step`/`fn_selftest` (hand-written
+SQL) upgraded correctly while the native function they call did not.
+Fixed in the script itself, not by hand-patching the generated file (which
+its own header says not to edit): it now extracts every native
+(`LANGUAGE c`) function declaration from the fresh-install file it just
+built, rewrites each as `CREATE OR REPLACE FUNCTION` (idempotent against a
+target that already has an older, or for one that predates this fix, no
+version of it), and prepends them before the `control_plane.sql` dump --
+so any future native function added mid-project is included automatically,
+not by remembering to hand-patch an upgrade script again. A second,
+smaller version of the identical rule (CREATE OR REPLACE cannot land a
+grown parameter list, see this file's own "Drop objects whose signature...
+changed" section) applied to `fn_create_project` gaining
+`agent_id`/`preset_prompt` -- without an explicit
+`DROP FUNCTION IF EXISTS fn_create_project(text, text)`, an upgrade would
+leave both the old 2-arg and new 4-arg overloads installed side by side,
+and a single-argument call (`fn_selftest`'s own project fixture) becomes
+ambiguous between them.
+
+**Verified live**: `fn_selftest` grew from 129 to 140 cases (all of the
+above, plus `assignments.toggle`/`.for_agent`), passing and idempotent
+across repeated runs on a fresh install. The corrected `0.4.0 -> 0.5.0`
+upgrade was re-verified for real end to end after the `gen-upgrade.sh`
+fix: a real 0.4.0 database, a real operator edit to `analyst`'s
+`system_prompt`, `ALTER EXTENSION ... UPDATE TO '0.5.0'`, and both the
+edit and `overview`'s new fields (which had failed before the fix)
+confirmed working afterward, with `fn_selftest` at 140/140 on the upgraded
+database too -- not just on a fresh install, which is exactly the gap that
+let the `native_host_stats` bug through the first time. `tests/smoke.sql`
+passes. Beyond the SQL suite: a full headless-Chromium (Playwright) pass
+against the real running dashboard -- admin's consolidated 9-page nav;
+Agents showing every system agent's `autonomy_level` inline and the
+edit modal's autonomy selector plus its new "Assigned users" button and
+modal; Approvals' three tabs (Approvals/Proposals/Fixes); Projects showing
+a project's bound chat agent; Chat's three mode buttons each actually
+sending and receiving a reply (General, an `@mention` in Messenger, and a
+Project-mode message with its preset applied); Settings showing the
+embedded Users section and switching the whole nav to 한국어 and the page
+to light theme live; Audit's four tabs; and a regular user's restricted
+three-item nav still reaching the Approvals page scoped to their own
+assignments -- zero console errors across the whole pass.
+
+## 33. `agents.list` never filtered `fn_selftest`'s own fixtures either -- caught by an actual CI failure
+
+Item 29 hid `fn_selftest`'s scratch sessions/tasks from Sessions/Tasks/
+Overview (`goal NOT LIKE 'selftest%'`); item 31 did the same for the new
+Proposals/Fixes queues. `agents.list` (the Agents page, and
+`/api/v1/agents`) never got the equivalent `name NOT LIKE 'selftest%'`
+filter -- every scratch agent `fn_selftest` creates (`selftest_delegate_a`/
+`_b`, `selftest_fix_target`, `selftest_mention_target`, an epoch-suffixed
+`selftest_created_by_creator_<ts>`/`selftest_auto_created_<ts>` pair per
+run, and more) has always accumulated there, real rows never deleted,
+same as the sessions/tasks case before item 29's fix.
+
+This stayed a cosmetic wart, not a real cost, back when `fn_selftest` only
+created a handful of scratch agents with short prompts. Item 32's five
+system agents each carry a multi-paragraph prompt, and item 36's new
+`create_agent`/`propose_fix` selftest cases add two more scratch agents
+per run -- so a CI job that calls `fn_selftest` more than once in the
+same database (this project's own `docker-smoke` job does, directly and
+through `tests/smoke.sql`) accumulates agents with long prompts fast.
+Caught live: a `docker-smoke` run failed with `curl: (23) Failure writing
+output to destination` (exit code 23) partway through printing a `curl`
+response -- the response itself (confirmed by reproducing locally) was
+`/api/v1/agents`, grown large enough after a few `fn_selftest` calls in
+one container's lifetime to trip a write failure logging it. The specific
+PR run this was caught on had already gone green on a later, unrelated
+push by the time this was investigated, but the underlying growth is
+real, cumulative within any one long-lived database (a real dashboard
+install, or a CI container that runs `fn_selftest` more than once), and
+was going to resurface.
+
+Fixed by adding the same `name NOT LIKE 'selftest%'` filter to
+`agents.list`'s query, exactly the pattern items 29 and 31 already
+established for every other listing. Confirmed live: three `fn_selftest`
+runs against one fresh database, `allgres_private.agents` growing to 23
+real rows, `agents.list` correctly still returning exactly the 8 real
+ones (`analyst`, `health_monitor`, and the six `is_system` agents --
+`system_root` and its five children) at a
+reasonable ~11KB response size instead of all 23 and growing.
+`fn_selftest` (140/140) and `tests/smoke.sql` both still pass.

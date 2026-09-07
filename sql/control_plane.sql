@@ -1,4 +1,4 @@
--- Allgres 0.3.0 control plane.
+-- Allgres 0.1.0 control plane.
 --
 -- Internal state lives in the allgres_private/allgres_public schemas and the
 -- allgres_owner role; user-facing native functions are exposed under schema
@@ -237,6 +237,13 @@ DROP FUNCTION IF EXISTS allgres_public.fn_set_policy(uuid, text, int, int, jsonb
 -- installed side by side.
 DROP FUNCTION IF EXISTS allgres_public.fn_set_policy(uuid, text, int, int, jsonb, int, int, boolean);
 
+-- fn_create_project gains optional agent_id/preset_prompt (item 42, Chat's
+-- Project mode) -- same signature-growth rule as above: without this drop,
+-- an upgrade leaves the 0.2.0-era 2-arg overload installed side by side,
+-- and any single-argument call (fn_selftest's own project fixture, the
+-- Run page's "no description" case) becomes ambiguous between the two.
+DROP FUNCTION IF EXISTS allgres_public.fn_create_project(text, text);
+
 -- The SQL sandbox no longer inspects statement text with regexes; it reads the
 -- tree produced by PostgreSQL's own parser (allgres.analyze_sql).  These are
 -- the hand-rolled lexer that replaced.
@@ -306,6 +313,52 @@ CREATE TABLE IF NOT EXISTS allgres_private.agents (
 -- fn_provision_agent_role and "6. SQL sandbox" below.
 ALTER TABLE allgres_private.agents
   ADD COLUMN IF NOT EXISTS pg_role text UNIQUE;
+
+-- System agents (item 32, "system agent hierarchy"): a small, fixed set of
+-- built-in agents that operate the platform itself rather than a user's
+-- workload -- session compaction, cross-agent orchestration in Messenger,
+-- helping create new agents/skills/tools, proposing fixes for what
+-- health_monitor finds, and tuning other agents for lower token/time cost.
+-- is_system marks a row as one of these: dashboard_rpc's agents.update/
+-- agents.create/policy.rollback/permissions.* branches require an admin
+-- session (require_admin) whenever the target is_system, where a regular
+-- user's own agents (created for them, or by them if ever allowed) need no
+-- such check today -- see the require_admin call added to those branches
+-- below. parent_agent_id is the inheritance edge: fn_effective_permissions
+-- and fn_effective_prompt (below) walk it to fold every ancestor's grants
+-- and system_prompt preamble into a child's own, so editing the one root
+-- system agent's permissions changes what every system agent may do without
+-- editing five rows by hand. A non-system agent's parent_agent_id is always
+-- NULL -- inheritance is a system-agent-only concept, not a general agent
+-- feature.
+ALTER TABLE allgres_private.agents
+  ADD COLUMN IF NOT EXISTS is_system boolean NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS parent_agent_id uuid REFERENCES allgres_private.agents(agent_id);
+
+CREATE INDEX IF NOT EXISTS agents_parent_idx ON allgres_private.agents (parent_agent_id)
+  WHERE parent_agent_id IS NOT NULL;
+
+-- autonomy_level: how much a system agent's own consequential actions
+-- (create_agent/create_skill/create_tool for `creator`, a remediation for
+-- `fixer`, a cross-agent propose_change for `self_improve`) may run without
+-- a human in the loop, set per-agent by an admin from the Agents page --
+-- not hardcoded per agent kind, so an operator can loosen or tighten any one
+-- of them independently as trust in it grows or drops.
+--   'admin_approval' (default, most cautious): every such action is queued
+--     for an admin to accept or reject before it takes effect -- the
+--     existing change_proposals/human_approvals inbox, unchanged.
+--   'self_approve': the action takes effect immediately, but the agent may
+--     still choose await_human/propose_change itself when its own
+--     confidence is low or the change looks unusually large -- an escalation
+--     the agent decides to make, not one the platform forces on every call.
+--   'auto': always takes effect immediately, no escalation path used.
+-- Meaningless for an ordinary (non-system) agent today -- nothing reads it
+-- for anything but the three system-agent action kinds above -- so it is a
+-- plain column with a safe default rather than a system-agent-only table,
+-- to keep this simple and leave room for a future agent kind to use it too.
+ALTER TABLE allgres_private.agents
+  ADD COLUMN IF NOT EXISTS autonomy_level text NOT NULL DEFAULT 'admin_approval'
+    CHECK (autonomy_level IN ('auto', 'self_approve', 'admin_approval'));
 
 CREATE TABLE IF NOT EXISTS allgres_private.policies (
   agent_id        uuid PRIMARY KEY REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
@@ -380,6 +433,225 @@ CREATE TABLE IF NOT EXISTS allgres_private.permissions (
   granted_at    timestamptz NOT NULL DEFAULT now(),
   UNIQUE (agent_id, resource_type, resource_ref)
 );
+
+-- Every permission check in this file (call_tool's tool/http_host grants,
+-- delegate's target-agent grant, execute_sql's view grant via
+-- agent_may_read/fn_validate_sql below) goes through this one function
+-- rather than querying allgres_private.permissions directly, so a system
+-- agent's inheritance (item 32/33: "borrow the parent's permissions,
+-- don't restate them") only has to be taught once. For an ordinary agent
+-- (parent_agent_id NULL) the recursive term never fires and this is
+-- exactly the direct-grant EXISTS check it replaces -- no behavior change
+-- for anything that isn't a system agent. Comparison is case-insensitive
+-- on both sides for every resource_type, matching the one caller
+-- (call_tool's http_host check) that already normalized this way; view/
+-- tool/agent refs are stored consistently-cased already, so this is a
+-- no-op widening for them, not a new match.
+CREATE OR REPLACE FUNCTION allgres_private.agent_has_permission(
+  p_agent_id uuid, p_resource_type text, p_resource_ref text
+) RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $fn$
+  WITH RECURSIVE chain AS (
+    SELECT agent_id, parent_agent_id FROM allgres_private.agents WHERE agent_id = p_agent_id
+    UNION ALL
+    SELECT a.agent_id, a.parent_agent_id
+    FROM allgres_private.agents a
+    JOIN chain c ON a.agent_id = c.parent_agent_id
+  )
+  SELECT EXISTS (
+    SELECT 1
+    FROM allgres_private.permissions p
+    JOIN chain c ON c.agent_id = p.agent_id
+    WHERE p.resource_type = p_resource_type
+      AND lower(p.resource_ref) = lower(p_resource_ref)
+  )
+$fn$;
+
+-- The listing form of agent_has_permission: every resource_ref of one
+-- resource_type an agent may use, own grants and inherited ones merged and
+-- de-duplicated -- what fn_next_step shows the LLM as its "bounds" (a
+-- system agent's displayed views/tools must match what it can actually
+-- call, the same reasoning as agent_has_permission's comment above).
+CREATE OR REPLACE FUNCTION allgres_private.agent_permission_refs(
+  p_agent_id uuid, p_resource_type text
+) RETURNS text[]
+LANGUAGE sql
+STABLE
+AS $fn$
+  WITH RECURSIVE chain AS (
+    SELECT agent_id, parent_agent_id FROM allgres_private.agents WHERE agent_id = p_agent_id
+    UNION ALL
+    SELECT a.agent_id, a.parent_agent_id
+    FROM allgres_private.agents a
+    JOIN chain c ON a.agent_id = c.parent_agent_id
+  )
+  SELECT COALESCE(array_agg(DISTINCT p.resource_ref ORDER BY p.resource_ref), ARRAY[]::text[])
+  FROM allgres_private.permissions p
+  JOIN chain c ON c.agent_id = p.agent_id
+  WHERE p.resource_type = p_resource_type
+$fn$;
+
+-- A system agent's own system_prompt is only its specific instructions
+-- ("you compact long sessions"); the shared "you are one of Allgres's own
+-- system agents, operate under the autonomy_level set for you" framing
+-- lives once on the root and is inherited, the same idea as
+-- agent_has_permission above but for prompt text instead of grants.
+-- Ordered root-first so the most specific (this agent's own) instructions
+-- land last in the text, closest to where the LLM actually acts on them.
+-- For a non-system agent (no parent) this returns exactly its own
+-- system_prompt, unchanged from before this function existed.
+CREATE OR REPLACE FUNCTION allgres_private.agent_effective_prompt(p_agent_id uuid)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $fn$
+  WITH RECURSIVE chain AS (
+    SELECT a.agent_id, a.parent_agent_id, 0 AS depth
+    FROM allgres_private.agents a WHERE a.agent_id = p_agent_id
+    UNION ALL
+    SELECT a.agent_id, a.parent_agent_id, c.depth + 1
+    FROM allgres_private.agents a
+    JOIN chain c ON a.agent_id = c.parent_agent_id
+  )
+  SELECT string_agg(p.system_prompt, E'\n\n---\n\n' ORDER BY c.depth DESC)
+  FROM chain c
+  JOIN allgres_private.policies p ON p.agent_id = c.agent_id
+$fn$;
+
+-- item 39: once a session's own not-yet-summarized root-level log grows
+-- past a threshold, queue a one-time background task for session_compactor
+-- to fold everything but the most recent handful of turns -- plus the
+-- previous summary, if any, so a second compaction never drops what the
+-- first one already captured -- into one updated summary. A no-op call in
+-- every ordinary case (below threshold, a compaction already in flight, or
+-- session_compactor missing/inactive) -- fn_next_step calls this on every
+-- root-level step, so it has to be cheap and safe to call repeatedly.
+-- Deliberately never sets sessions.compacted_before itself: that only
+-- happens once session_compactor's own remember actually lands
+-- (fn_submit_result), so a turn can never see neither the raw logs nor a
+-- finished summary -- worst case, a session sees a few turns' worth of
+-- extra history while its compaction is still in flight. The threshold is
+-- measured against logs *after* the current compacted_before (or all of
+-- them, the first time) -- counting every row ever written, compacted or
+-- not, would stay past threshold forever, since raw logs are append-only
+-- and never deleted, and would queue a new compaction on every single step.
+CREATE OR REPLACE FUNCTION allgres_private.maybe_trigger_compaction(p_session_id uuid, p_task_ids uuid[])
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  c_threshold constant int := 60;
+  c_keep_recent constant int := 10;
+  v_current_cutoff timestamptz;
+  v_count int;
+  v_cutoff timestamptz;
+  v_compactor uuid;
+  v_compactor_active boolean;
+  v_prev_summary text;
+  v_old_logs jsonb;
+  v_comp_session uuid;
+  v_comp_task uuid;
+BEGIN
+  SELECT compacted_before INTO v_current_cutoff
+  FROM allgres_private.sessions WHERE session_id = p_session_id;
+
+  SELECT count(*) INTO v_count
+  FROM allgres_private.execution_logs
+  WHERE task_id = ANY(p_task_ids)
+    AND (v_current_cutoff IS NULL OR created_at >= v_current_cutoff);
+  IF v_count <= c_threshold THEN
+    RETURN;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM allgres_private.sessions
+    WHERE goal = 'session_compact:' || p_session_id::text AND status = 'open'
+  ) THEN
+    RETURN;
+  END IF;
+
+  SELECT agent_id, is_active INTO v_compactor, v_compactor_active
+  FROM allgres_private.agents WHERE name = 'session_compactor';
+  IF v_compactor IS NULL OR NOT v_compactor_active THEN
+    RETURN;
+  END IF;
+
+  SELECT created_at INTO v_cutoff FROM (
+    SELECT created_at FROM allgres_private.execution_logs
+    WHERE task_id = ANY(p_task_ids)
+      AND (v_current_cutoff IS NULL OR created_at >= v_current_cutoff)
+    ORDER BY created_at DESC
+    OFFSET c_keep_recent - 1 LIMIT 1
+  ) q;
+  IF v_cutoff IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF v_current_cutoff IS NOT NULL THEN
+    SELECT am.content INTO v_prev_summary
+    FROM allgres_private.agent_memories am
+    WHERE am.agent_id = v_compactor AND am.subject_id = p_session_id::text
+    ORDER BY am.created_at DESC LIMIT 1;
+  END IF;
+
+  SELECT COALESCE(jsonb_agg(jsonb_build_object('role', role, 'content', content) ORDER BY created_at), '[]'::jsonb)
+  INTO v_old_logs
+  FROM allgres_private.execution_logs
+  WHERE task_id = ANY(p_task_ids)
+    AND (v_current_cutoff IS NULL OR created_at >= v_current_cutoff)
+    AND created_at < v_cutoff;
+
+  v_comp_session := (allgres_public.fn_create_session(
+    v_compactor, 'session_compact:' || p_session_id::text
+  )->>'session_id')::uuid;
+  SELECT task_id INTO v_comp_task FROM allgres_private.tasks WHERE session_id = v_comp_session LIMIT 1;
+
+  UPDATE allgres_private.tasks
+  SET input = jsonb_build_object('target_session_id', p_session_id, 'compact_cutoff', v_cutoff)
+  WHERE task_id = v_comp_task;
+
+  INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content)
+  VALUES (v_comp_task, 1, 'user', jsonb_build_object(
+    'target_session_id', p_session_id,
+    'previous_summary', v_prev_summary,
+    'turns', v_old_logs
+  ));
+END;
+$fn$;
+
+-- item 40: fires a one-shot advisory task for orchestrator whenever a
+-- Messenger post @mentions more than one agent -- see fn_messenger_post's
+-- own comment for what "advisory" means today (it records an opinion,
+-- delivery order is still text order). Kept as its own function, not
+-- inlined into fn_messenger_post, the same reasoning as
+-- maybe_trigger_compaction: a clearly-named, independently testable unit.
+CREATE OR REPLACE FUNCTION allgres_private.queue_orchestrator_opinion(
+  p_orchestrator uuid, p_message_id uuid, p_text text, p_agent_ids uuid[]
+) RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_sid uuid;
+  v_tid uuid;
+  v_candidates jsonb;
+BEGIN
+  SELECT COALESCE(jsonb_agg(jsonb_build_object('name', a.name, 'system_prompt', p.system_prompt)), '[]'::jsonb)
+  INTO v_candidates
+  FROM allgres_private.agents a
+  JOIN allgres_private.policies p USING (agent_id)
+  WHERE a.agent_id = ANY(p_agent_ids);
+
+  v_sid := (allgres_public.fn_create_session(
+    p_orchestrator, 'messenger_route:' || p_message_id::text
+  )->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+
+  INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content)
+  VALUES (v_tid, 1, 'user', jsonb_build_object('message', p_text, 'candidates', v_candidates));
+END;
+$fn$;
 
 CREATE TABLE IF NOT EXISTS allgres_private.sql_sandbox_allowlist (
   resource_ref text PRIMARY KEY
@@ -458,6 +730,17 @@ CREATE TABLE IF NOT EXISTS allgres_private.projects (
   updated_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- The Chat page's "Project" mode (item 42): a project used to be only a
+-- label sessions could optionally carry (still true when agent_id is
+-- NULL -- existing projects, and the Run page's own project picker, are
+-- unaffected). One bound to an agent is also a chat target in its own
+-- right, with preset_prompt appended after that agent's own effective
+-- prompt (see fn_next_step) -- a project narrows a general-purpose agent
+-- to one particular job/context without touching the agent's own policy.
+ALTER TABLE allgres_private.projects
+  ADD COLUMN IF NOT EXISTS agent_id uuid REFERENCES allgres_private.agents(agent_id),
+  ADD COLUMN IF NOT EXISTS preset_prompt text;
+
 CREATE TABLE IF NOT EXISTS allgres_private.sessions (
   session_id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   agent_id      uuid NOT NULL REFERENCES allgres_private.agents(agent_id),
@@ -472,6 +755,14 @@ CREATE TABLE IF NOT EXISTS allgres_private.sessions (
 -- doesn't have to belong to a project.
 ALTER TABLE allgres_private.sessions
   ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES allgres_private.projects(project_id);
+
+-- Set once session_compactor's own remember for this session actually
+-- lands (fn_submit_result's remember branch), never by the trigger side
+-- itself (allgres_private.maybe_trigger_compaction) -- see that function's
+-- comment for why. NULL means "never compacted, include every root-level
+-- log," the behavior every session had before item 39.
+ALTER TABLE allgres_private.sessions
+  ADD COLUMN IF NOT EXISTS compacted_before timestamptz;
 
 CREATE INDEX IF NOT EXISTS sessions_project_idx
   ON allgres_private.sessions (project_id, started_at DESC)
@@ -556,6 +847,48 @@ CREATE INDEX IF NOT EXISTS change_proposals_pending_idx
 CREATE INDEX IF NOT EXISTS change_proposals_agent_idx
   ON allgres_private.change_proposals (agent_id, created_at DESC);
 
+-- kind/target_agent_id (item 36/38, the creator and self_improve system
+-- agents): 'policy_change' is every proposal this table has ever held --
+-- agent_id proposes a change to its own policy, target_agent_id stays NULL,
+-- and fn_decide_proposal reads COALESCE(target_agent_id, agent_id) for
+-- backward compatibility with every existing row. 'create_agent' is new:
+-- agent_id (always 'creator') proposes a brand-new agent, proposed_changes
+-- holds {name, system_prompt} instead of {system_prompt, llm_config},
+-- target_agent_id and base_generation are both meaningless (there is no
+-- existing target, so base_generation is stored as 0 and never compared).
+-- target_agent_id lets self_improve (and only self_improve, enforced in
+-- fn_submit_result) propose a change to an agent other than itself --
+-- something no other agent may do, since propose_change's normal shape
+-- assumes agent_id names both the proposer and the target.
+ALTER TABLE allgres_private.change_proposals
+  ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'policy_change'
+    CHECK (kind IN ('policy_change', 'create_agent')),
+  ADD COLUMN IF NOT EXISTS target_agent_id uuid REFERENCES allgres_private.agents(agent_id);
+
+-- fixer's remediation queue (item 37): shaped like change_proposals but for
+-- an action on permissions/agents.is_active rather than on policy fields --
+-- deliberately a separate table rather than another change_proposals kind,
+-- since a fix's payload (fix_kind + target_agent_id + detail) shares no
+-- columns with proposed_changes's {system_prompt, llm_config} shape.
+CREATE TABLE IF NOT EXISTS allgres_private.fix_proposals (
+  fix_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id        uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  task_id         uuid REFERENCES allgres_private.tasks(task_id),
+  fix_kind        text NOT NULL CHECK (fix_kind IN ('revoke_permission', 'deactivate_agent')),
+  target_agent_id uuid NOT NULL REFERENCES allgres_private.agents(agent_id),
+  detail          jsonb NOT NULL DEFAULT '{}'::jsonb,
+  reason          text,
+  status          text NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'approved', 'rejected')),
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  decided_at      timestamptz,
+  decided_reply   text
+);
+
+CREATE INDEX IF NOT EXISTS fix_proposals_pending_idx
+  ON allgres_private.fix_proposals (created_at)
+  WHERE status = 'pending';
+
 CREATE TABLE IF NOT EXISTS allgres_private.execution_logs (
   log_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
@@ -632,6 +965,99 @@ CREATE TABLE IF NOT EXISTS allgres_private.audit_log (
 
 CREATE INDEX IF NOT EXISTS audit_log_created_idx
   ON allgres_private.audit_log (created_at DESC);
+
+-- Real per-operator accounts (KNOWN_ISSUES.md, item 10 -- what item 28's
+-- lighter audit log kept deferring): a username/password login, distinct
+-- from the dashboard's one shared bearer token, so the conversational
+-- (chat/messenger) surface can tell an admin apart from a regular user and
+-- scope what each one can reach. password_hash is a pgcrypto bcrypt hash
+-- (see fn_create_user/fn_login) -- never handled or compared in plaintext
+-- past the one call that sets or checks it.
+CREATE TABLE IF NOT EXISTS allgres_private.users (
+  user_id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  username      text NOT NULL UNIQUE,
+  password_hash text NOT NULL,
+  role          text NOT NULL CHECK (role IN ('admin', 'user')),
+  is_active     boolean NOT NULL DEFAULT true,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- A bearer token distinct from the dashboard's own shared one: this one
+-- identifies a single logged-in user, carried by the browser the same way
+-- (sessionStorage, sent back on every chat/messenger/account call) but
+-- resolved server-side to a real row instead of trusted at face value.
+CREATE TABLE IF NOT EXISTS allgres_private.web_sessions (
+  session_token text PRIMARY KEY,
+  user_id       uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  expires_at    timestamptz NOT NULL,
+  last_seen_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS web_sessions_user_idx ON allgres_private.web_sessions (user_id);
+CREATE INDEX IF NOT EXISTS web_sessions_expiry_idx ON allgres_private.web_sessions (expires_at);
+
+-- Which agents a regular user may see or talk to at all -- an admin needs
+-- no row here (see require_agent_access); this table only ever narrows a
+-- regular user's reach, never widens an admin's.
+CREATE TABLE IF NOT EXISTS allgres_private.user_agent_assignments (
+  user_id    uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  agent_id   uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, agent_id)
+);
+
+-- One continuing session per (user, agent) pair for the simple 1:1 chat
+-- page, and the same pair's session for a messenger @mention (see
+-- messenger.post): "chat with this agent" is one ongoing conversation per
+-- user, not a new session every message. Deliberately separate from
+-- fn_create_session's ordinary sessions table -- this is only the pointer
+-- to which session a user's chat with an agent currently lives in.
+CREATE TABLE IF NOT EXISTS allgres_private.user_agent_chat_sessions (
+  user_id    uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  agent_id   uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES allgres_private.sessions(session_id),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, agent_id)
+);
+
+-- Project mode's own continuing-session map (item 42), the same one
+-- session per pair shape as user_agent_chat_sessions above, kept as its
+-- own table rather than folding project_id into that one's key: a user
+-- chatting with the same agent both in General mode and through a Project
+-- bound to it are deliberately two separate conversations (the project's
+-- preset_prompt context shouldn't leak into the plain General chat, or the
+-- other way around).
+CREATE TABLE IF NOT EXISTS allgres_private.user_project_chat_sessions (
+  user_id    uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  project_id uuid NOT NULL REFERENCES allgres_private.projects(project_id) ON DELETE CASCADE,
+  session_id uuid NOT NULL REFERENCES allgres_private.sessions(session_id),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, project_id)
+);
+
+-- The Slack-style messenger channel: every plain post, and every message
+-- that addressed an agent with "@agent_name". mentioned_agent_id/session_id
+-- are set only for the latter; messenger.list joins session_id back to
+-- allgres_private.sessions to show the agent's reply once that session
+-- completes, rather than duplicating the answer into this table itself.
+CREATE TABLE IF NOT EXISTS allgres_private.channel_messages (
+  message_id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  author_user_id    uuid NOT NULL REFERENCES allgres_private.users(user_id) ON DELETE CASCADE,
+  content            text NOT NULL,
+  mentioned_agent_id uuid REFERENCES allgres_private.agents(agent_id),
+  session_id         uuid REFERENCES allgres_private.sessions(session_id),
+  created_at         timestamptz NOT NULL DEFAULT now()
+);
+
+-- item 40: a message that @mentions more than one agent reaches all of
+-- them, not just the first -- mentioned_agent_id/session_id above stay
+-- populated with the *first* one (text order) so every existing reader of
+-- those two columns keeps working unchanged; this is the full ordered list
+-- for a multi-mention post, NULL for a plain post or a single mention.
+ALTER TABLE allgres_private.channel_messages
+  ADD COLUMN IF NOT EXISTS mentioned_agent_ids uuid[];
+CREATE INDEX IF NOT EXISTS channel_messages_created_idx
+  ON allgres_private.channel_messages (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS allgres_private.human_approvals (
   approval_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -942,12 +1368,10 @@ Reply with a single JSON object, no markdown, no extra keys:
 {"action":"await_human","reason":"..."}
 SQL must be a single SELECT or WITH against schema-qualified views you were given.
 $prompt$,
-    jsonb_build_object(
-      'provider', 'xai',
-      'model', 'grok-4.5',
-      'temperature', 0.2,
-      'max_tokens', 1024
-    )
+    -- Deliberately empty: a new agent has no provider/model until an
+    -- operator configures one. Defaulting this to any real provider would
+    -- make every fresh agent look already set up when it never was.
+    '{}'::jsonb
   )
   ON CONFLICT (agent_id) DO NOTHING;
   RETURN NEW;
@@ -1140,12 +1564,7 @@ AS $fn$
        SELECT 1 FROM allgres_private.sql_sandbox_allowlist a
        WHERE a.resource_ref = p_ref
      )
-     AND EXISTS (
-       SELECT 1 FROM allgres_private.permissions p
-       WHERE p.agent_id = p_agent_id
-         AND p.resource_type = 'view'
-         AND p.resource_ref = p_ref
-     )
+     AND allgres_private.agent_has_permission(p_agent_id, 'view', p_ref)
 $fn$;
 
 CREATE OR REPLACE VIEW allgres_public.v_my_tasks
@@ -1690,12 +2109,7 @@ BEGIN
     SELECT EXISTS (
       SELECT 1 FROM allgres_private.sql_sandbox_allowlist a
       WHERE a.resource_ref = v_ref
-    ) AND EXISTS (
-      SELECT 1 FROM allgres_private.permissions p
-      WHERE p.agent_id = p_agent_id
-        AND p.resource_type = 'view'
-        AND p.resource_ref = v_ref
-    )
+    ) AND allgres_private.agent_has_permission(p_agent_id, 'view', v_ref)
     INTO v_ok;
     IF NOT v_ok THEN
       RAISE EXCEPTION 'fn_validate_sql: "%" not in allowlist', v_ref
@@ -1937,6 +2351,10 @@ DECLARE
   v_cfg jsonb;
   v_memories jsonb;
   v_memory_ids uuid[];
+  v_task_ids uuid[];
+  v_compacted_before timestamptz;
+  v_summary_text text;
+  v_project_preset text;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -1999,15 +2417,12 @@ BEGIN
     RETURN jsonb_build_object('action', 'done', 'reason', 'max_steps');
   END IF;
 
-  SELECT coalesce(jsonb_agg(resource_ref ORDER BY resource_ref), '[]'::jsonb)
-  INTO v_views
-  FROM allgres_private.permissions
-  WHERE agent_id = t.agent_id AND resource_type = 'view';
-
-  SELECT coalesce(jsonb_agg(resource_ref ORDER BY resource_ref), '[]'::jsonb)
-  INTO v_tools
-  FROM allgres_private.permissions
-  WHERE agent_id = t.agent_id AND resource_type = 'tool';
+  -- Own grants plus (for a system agent) whatever its parent chain grants --
+  -- see agent_permission_refs's comment; this is what the LLM is actually
+  -- bound by (agent_has_permission), so the bounds text it reads must show
+  -- the same set, not just this agent's own direct grants.
+  SELECT to_jsonb(allgres_private.agent_permission_refs(t.agent_id, 'view')) INTO v_views;
+  SELECT to_jsonb(allgres_private.agent_permission_refs(t.agent_id, 'tool')) INTO v_tools;
 
   -- Recalled every turn, the same way system_prompt and the view/tool bounds
   -- are: an agent's own memories, live ones only, ranked by importance then
@@ -2040,12 +2455,22 @@ BEGIN
   END IF;
 
   -- Bounds come from the database, not from worker code, so revoking a
+  -- Project mode (item 42): this session's project, if any, may narrow the
+  -- agent with a preset -- appended after the agent's own effective prompt,
+  -- so a project focuses a general-purpose agent for one particular job
+  -- without editing that agent's own policy.
+  SELECT pr.preset_prompt INTO v_project_preset
+  FROM allgres_private.sessions se
+  JOIN allgres_private.projects pr ON pr.project_id = se.project_id
+  WHERE se.session_id = t.session_id;
+
   -- permission takes effect on the very next step.
   v_messages := v_messages || jsonb_build_array(
     jsonb_build_object(
       'role', 'system',
       'content',
-      p.system_prompt
+      allgres_private.agent_effective_prompt(t.agent_id)
+      || CASE WHEN v_project_preset IS NOT NULL THEN E'\n\n# project preset\n' || v_project_preset ELSE '' END
       || E'\n\n# bounds (authoritative, from the database)\nviews: '
       || v_views::text
       || E'\ntools: '
@@ -2065,11 +2490,50 @@ BEGIN
     )
   );
 
+  -- A root-level task (parent_task_id IS NULL -- the dashboard's Run page,
+  -- or a chat turn from fn_continue_session) sees every root-level task's
+  -- log in this session, not just its own: fn_continue_session starts a
+  -- fresh task per turn (its own step_count/max_steps budget), so without
+  -- this the model would forget everything said in an earlier turn the
+  -- moment a new one started. A delegated task (parent_task_id IS NOT
+  -- NULL) stays scoped to only its own log, unchanged from before -- a
+  -- sub-agent's turn must not see the parent conversation, or another
+  -- sibling delegate's, just because they happen to share a session_id.
+  IF t.parent_task_id IS NULL THEN
+    SELECT array_agg(task_id) INTO v_task_ids
+    FROM allgres_private.tasks
+    WHERE session_id = t.session_id AND parent_task_id IS NULL;
+
+    -- session_compactor auto-trigger (item 39): a no-op unless this
+    -- session's own root-level log has actually grown past the threshold.
+    PERFORM allgres_private.maybe_trigger_compaction(t.session_id, v_task_ids);
+  ELSE
+    v_task_ids := ARRAY[p_task_id];
+  END IF;
+
+  SELECT compacted_before INTO v_compacted_before
+  FROM allgres_private.sessions WHERE session_id = t.session_id;
+
+  IF v_compacted_before IS NOT NULL THEN
+    SELECT am.content INTO v_summary_text
+    FROM allgres_private.agent_memories am
+    JOIN allgres_private.agents sc ON sc.agent_id = am.agent_id AND sc.name = 'session_compactor'
+    WHERE am.subject_id = t.session_id::text
+    ORDER BY am.created_at DESC
+    LIMIT 1;
+    IF v_summary_text IS NOT NULL THEN
+      v_messages := v_messages || jsonb_build_array(
+        jsonb_build_object('role', 'system', 'content', E'# earlier in this conversation, summarized\n' || v_summary_text)
+      );
+    END IF;
+  END IF;
+
   FOR v_log IN
     SELECT role, content
     FROM allgres_private.execution_logs
-    WHERE task_id = p_task_id
-    ORDER BY step_number, created_at
+    WHERE task_id = ANY(v_task_ids)
+      AND (v_compacted_before IS NULL OR created_at >= v_compacted_before)
+    ORDER BY created_at, step_number
   LOOP
     -- 'operator' carries a human's reply to an await_human approval (see
     -- fn_decide_approval); it has to reach the model as a 'user' turn just
@@ -2154,6 +2618,7 @@ DECLARE
   v_ok boolean;
   v_proposal uuid;
   v_mem_result jsonb;
+  v_created jsonb;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -2242,7 +2707,8 @@ BEGIN
 
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
-    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change', 'remember'
+    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change', 'remember',
+    'create_agent', 'propose_fix'
   ) THEN
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
@@ -2302,12 +2768,7 @@ BEGIN
   IF v_action = 'call_tool' THEN
     v_tool := v_parsed->>'tool';
     v_args := COALESCE(v_parsed->'args', '{}'::jsonb);
-    SELECT EXISTS (
-      SELECT 1 FROM allgres_private.permissions
-      WHERE agent_id = t.agent_id
-        AND resource_type = 'tool'
-        AND resource_ref = v_tool
-    ) INTO v_allowed;
+    v_allowed := allgres_private.agent_has_permission(t.agent_id, 'tool', v_tool);
     IF NOT v_allowed THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
@@ -2344,12 +2805,7 @@ BEGIN
     END IF;
 
     v_host := allgres_private.url_host(v_url);
-    SELECT EXISTS (
-      SELECT 1 FROM allgres_private.permissions
-      WHERE agent_id = t.agent_id
-        AND resource_type = 'http_host'
-        AND lower(resource_ref) = v_host
-    ) INTO v_allowed;
+    v_allowed := allgres_private.agent_has_permission(t.agent_id, 'http_host', v_host);
     IF NOT v_allowed THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
@@ -2389,12 +2845,7 @@ BEGIN
       WHERE task_id = p_task_id;
       RETURN jsonb_build_object('action', 'continue');
     END IF;
-    SELECT EXISTS (
-      SELECT 1 FROM allgres_private.permissions
-      WHERE agent_id = t.agent_id
-        AND resource_type = 'agent'
-        AND resource_ref = v_parsed->>'agent_name'
-    ) INTO v_allowed;
+    v_allowed := allgres_private.agent_has_permission(t.agent_id, 'agent', v_parsed->>'agent_name');
     IF NOT v_allowed THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
@@ -2537,16 +2988,163 @@ BEGIN
       END IF;
     END IF;
 
-    INSERT INTO allgres_private.change_proposals (agent_id, task_id, proposed_changes, reason, base_generation)
-    VALUES (t.agent_id, p_task_id, v_changes, NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), ''), p.generation)
+    -- Only self_improve may target an agent other than itself (item 38) --
+    -- every other agent's propose_change stays exactly what it always was,
+    -- a proposal against its own policy.
+    v_target := NULL;
+    IF v_parsed ? 'target_agent_id' THEN
+      IF a.name <> 'self_improve' THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'propose_change_cross_agent_not_permitted', 'changes', v_changes)
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+      v_target := NULLIF(v_parsed->>'target_agent_id', '')::uuid;
+      IF v_target IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM allgres_private.agents WHERE agent_id = v_target AND is_active
+      ) THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'propose_change_target_not_found', 'target_agent_id', v_target)
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+    END IF;
+    v_target := COALESCE(v_target, t.agent_id);
+
+    -- A system agent whose autonomy_level opts out of admin_approval takes
+    -- effect immediately instead of queueing (item 33's autonomy_level;
+    -- creator/propose_fix below follow the same shape). Every non-system
+    -- agent keeps autonomy_level='admin_approval' by default and is
+    -- unaffected -- this branch is unreachable for them in practice, since
+    -- only self_improve/creator/fixer ever set a different level.
+    IF a.is_system AND a.autonomy_level <> 'admin_approval' THEN
+      PERFORM allgres_public.fn_set_policy(
+        v_target, v_changes->>'system_prompt', NULL, NULL, v_changes->'llm_config',
+        NULL, NULL, false
+      );
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'assistant',
+        jsonb_build_object('applied_change', v_changes, 'target_agent_id', v_target, 'autonomy_level', a.autonomy_level)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue', 'applied', true, 'target_agent_id', v_target);
+    END IF;
+
+    INSERT INTO allgres_private.change_proposals
+      (agent_id, task_id, proposed_changes, reason, base_generation, target_agent_id)
+    SELECT t.agent_id, p_task_id, v_changes, NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), ''),
+           tp.generation, NULLIF(v_target, t.agent_id)
+    FROM allgres_private.policies tp WHERE tp.agent_id = v_target
     RETURNING proposal_id INTO v_proposal;
 
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'assistant',
-      jsonb_build_object('proposed_change', v_changes, 'proposal_id', v_proposal)
+      jsonb_build_object('proposed_change', v_changes, 'proposal_id', v_proposal, 'target_agent_id', v_target)
     );
     UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
+  END IF;
+
+  IF v_action = 'create_agent' THEN
+    IF a.name <> 'creator' THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'create_agent_not_permitted')
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+    IF NULLIF(btrim(COALESCE(v_parsed->>'name', '')), '') IS NULL
+       OR NULLIF(btrim(COALESCE(v_parsed->>'system_prompt', '')), '') IS NULL THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'create_agent_incomplete', 'parsed', v_parsed)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    IF a.autonomy_level <> 'admin_approval' THEN
+      v_created := allgres_public.fn_create_agent(v_parsed->>'name', v_parsed->>'system_prompt');
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'assistant',
+        jsonb_build_object('created_agent', v_created, 'autonomy_level', a.autonomy_level)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue', 'applied', true, 'created_agent', v_created);
+    END IF;
+
+    INSERT INTO allgres_private.change_proposals (agent_id, task_id, kind, proposed_changes, reason, base_generation)
+    VALUES (
+      t.agent_id, p_task_id, 'create_agent',
+      jsonb_build_object('name', v_parsed->>'name', 'system_prompt', v_parsed->>'system_prompt'),
+      NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), ''), 0
+    )
+    RETURNING proposal_id INTO v_proposal;
+
+    PERFORM allgres_private.append_log(
+      p_task_id, t.step_count + 1, 'assistant',
+      jsonb_build_object('proposed_agent', v_parsed, 'proposal_id', v_proposal)
+    );
+    UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
+  END IF;
+
+  IF v_action = 'propose_fix' THEN
+    IF a.name <> 'fixer' THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'propose_fix_not_permitted')
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+    IF v_parsed->>'fix_kind' IS NULL OR v_parsed->>'fix_kind' NOT IN ('revoke_permission', 'deactivate_agent') THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'propose_fix_unknown_kind', 'parsed', v_parsed)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+    v_target := NULLIF(v_parsed->>'target_agent_id', '')::uuid;
+    IF v_target IS NULL OR NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = v_target) THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'propose_fix_target_not_found', 'target_agent_id', v_target)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    IF a.autonomy_level <> 'admin_approval' THEN
+      v_created := allgres_private.apply_fix(v_parsed->>'fix_kind', v_target, COALESCE(v_parsed->'detail', '{}'::jsonb));
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'assistant',
+        jsonb_build_object('applied_fix', v_parsed, 'result', v_created, 'autonomy_level', a.autonomy_level)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue', 'applied', true, 'result', v_created);
+    END IF;
+
+    INSERT INTO allgres_private.fix_proposals (agent_id, task_id, fix_kind, target_agent_id, detail, reason)
+    VALUES (
+      t.agent_id, p_task_id, v_parsed->>'fix_kind', v_target,
+      COALESCE(v_parsed->'detail', '{}'::jsonb),
+      NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), '')
+    )
+    RETURNING fix_id INTO v_proposal;
+
+    PERFORM allgres_private.append_log(
+      p_task_id, t.step_count + 1, 'assistant',
+      jsonb_build_object('proposed_fix', v_parsed, 'fix_id', v_proposal)
+    );
+    UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'continue', 'fix_id', v_proposal);
   END IF;
 
   -- No queue, no claim/complete: unlike execute_sql/call_tool this never
@@ -2579,6 +3177,18 @@ BEGIN
       jsonb_build_object('remembered', v_mem_result->>'memory_id', 'memory_type', v_mem_result->>'memory_type')
     );
     UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+
+    -- session_compactor's own remember is what actually takes the older
+    -- logs out of future context (see maybe_trigger_compaction): only once
+    -- the summary memory exists does fn_next_step start excluding what it
+    -- summarizes -- never the other way around, which would risk a turn
+    -- seeing neither the raw logs nor a finished summary.
+    IF a.name = 'session_compactor' AND t.input ? 'target_session_id' AND t.input ? 'compact_cutoff' THEN
+      UPDATE allgres_private.sessions
+      SET compacted_before = (t.input->>'compact_cutoff')::timestamptz
+      WHERE session_id = (t.input->>'target_session_id')::uuid;
+    END IF;
+
     RETURN jsonb_build_object('action', 'continue', 'memory_id', v_mem_result->>'memory_id');
   END IF;
 
@@ -2620,7 +3230,7 @@ SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   v_cfg jsonb := COALESCE(p_spec->'llm_config', '{}'::jsonb);
-  v_name text := COALESCE(v_cfg->>'provider', 'xai');
+  v_name text := v_cfg->>'provider';
   v_prov allgres_private.llm_providers%ROWTYPE;
   v_url text;
   v_reason text;
@@ -2644,6 +3254,15 @@ BEGIN
   -- fallback_provider_id or similar explicit opt-in for cross-provider
   -- fallback in this file; if that is ever wanted, it needs to be a real,
   -- named policy an operator turns on, not the default.
+  --
+  -- An agent with no provider configured at all must fail the same way, not
+  -- quietly resolve to whichever provider happens to be seeded: an agent
+  -- that was never set up should never actually reach a real LLM endpoint.
+  IF v_name IS NULL THEN
+    RAISE EXCEPTION 'agent has no llm_config.provider configured -- set a provider and model before running this agent'
+      USING ERRCODE = 'P0001';
+  END IF;
+
   SELECT * INTO v_prov
   FROM allgres_private.llm_providers
   WHERE name = v_name AND is_enabled
@@ -2665,7 +3284,11 @@ BEGIN
   -- that is the only credential-shaped thing this function ever produces:
   -- which provider and which header name, not the secret itself.
 
-  v_model := COALESCE(v_cfg->>'model', 'grok-4.5');
+  v_model := v_cfg->>'model';
+  IF v_model IS NULL THEN
+    RAISE EXCEPTION 'agent has no llm_config.model configured -- set a provider and model before running this agent'
+      USING ERRCODE = 'P0001';
+  END IF;
 
   -- The endpoint comes only from the provider row.  Per-agent llm_config can no
   -- longer redirect it (see sanitize_llm_config).
@@ -3462,7 +4085,38 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION allgres_public.fn_create_project(p_name text, p_description text DEFAULT NULL)
+-- autonomy_level's own setter, separate from fn_set_policy: it is a
+-- request-per-agent behavioral toggle (how much of creator/fixer/
+-- self_improve's own consequential actions run unattended), not a policy
+-- field an agent could ever propose_change for itself, and the CHECK
+-- constraint on allgres_private.agents does the real validation -- this
+-- just gives it a friendly error instead of a raw constraint-violation.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_agent_autonomy(p_agent_id uuid, p_level text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF p_level IS NULL OR p_level NOT IN ('auto', 'self_approve', 'admin_approval') THEN
+    RAISE EXCEPTION 'invalid autonomy_level: %', p_level USING ERRCODE = 'P0001';
+  END IF;
+  UPDATE allgres_private.agents
+  SET autonomy_level = p_level, updated_at = now()
+  WHERE agent_id = p_agent_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'agent not found' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('ok', true, 'autonomy_level', p_level);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_project(
+  p_name text,
+  p_description text DEFAULT NULL,
+  p_agent_id uuid DEFAULT NULL,
+  p_preset_prompt text DEFAULT NULL
+)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -3474,8 +4128,16 @@ BEGIN
   IF btrim(COALESCE(p_name, '')) = '' THEN
     RAISE EXCEPTION 'project name required' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO allgres_private.projects (name, description)
-  VALUES (btrim(p_name), NULLIF(btrim(COALESCE(p_description, '')), ''))
+  IF p_agent_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_active
+  ) THEN
+    RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO allgres_private.projects (name, description, agent_id, preset_prompt)
+  VALUES (
+    btrim(p_name), NULLIF(btrim(COALESCE(p_description, '')), ''),
+    p_agent_id, NULLIF(btrim(COALESCE(p_preset_prompt, '')), '')
+  )
   RETURNING project_id INTO v_id;
   RETURN jsonb_build_object('ok', true, 'project_id', v_id);
 END;
@@ -3495,6 +4157,36 @@ BEGIN
     RAISE EXCEPTION 'project not found' USING ERRCODE = 'P0001';
   END IF;
   RETURN jsonb_build_object('ok', true, 'is_active', p_active);
+END;
+$fn$;
+
+-- Project mode's chat config (item 42), separate from fn_set_project_active
+-- the same way fn_set_agent_autonomy is separate from fn_set_agent_active:
+-- a project already usable as a plain session label needs neither field
+-- touched, so this is opt-in per call (NULL means "leave unchanged" for
+-- agent_id, and preset_prompt is only cleared by passing an empty string).
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_project_config(
+  p_project_id uuid, p_agent_id uuid DEFAULT NULL, p_preset_prompt text DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF p_agent_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_active
+  ) THEN
+    RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+  UPDATE allgres_private.projects
+  SET agent_id = COALESCE(p_agent_id, agent_id),
+      preset_prompt = COALESCE(p_preset_prompt, preset_prompt),
+      updated_at = now()
+  WHERE project_id = p_project_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'project not found' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
 
@@ -3609,6 +4301,8 @@ DECLARE
   r allgres_private.change_proposals%ROWTYPE;
   v_cur_gen int;
   v_policy jsonb;
+  v_target uuid;
+  v_created jsonb;
 BEGIN
   SELECT * INTO r FROM allgres_private.change_proposals WHERE proposal_id = p_proposal_id FOR UPDATE;
   IF NOT FOUND THEN
@@ -3625,12 +4319,29 @@ BEGIN
     RETURN jsonb_build_object('ok', true, 'status', 'rejected');
   END IF;
 
-  -- The live policy may have moved on since this was proposed -- an
-  -- operator edit, or another proposal already applied. Approving blindly
-  -- here would silently clobber whatever changed it with a decision made
-  -- against a policy that no longer exists; mark it stale instead and let
-  -- the operator re-propose or handle it directly.
-  SELECT generation INTO v_cur_gen FROM allgres_private.policies WHERE agent_id = r.agent_id;
+  -- 'create_agent' (the creator system agent): there is no existing policy
+  -- to go stale, so the generation check below does not apply -- it simply
+  -- creates the agent proposed_changes described.
+  IF r.kind = 'create_agent' THEN
+    v_created := allgres_public.fn_create_agent(
+      r.proposed_changes->>'name', r.proposed_changes->>'system_prompt'
+    );
+    UPDATE allgres_private.change_proposals
+    SET status = 'approved', decided_at = now(), decided_reply = p_reply
+    WHERE proposal_id = p_proposal_id;
+    RETURN jsonb_build_object('ok', true, 'status', 'approved', 'created_agent', v_created);
+  END IF;
+
+  -- 'policy_change': target_agent_id is who this actually changes -- the
+  -- proposer itself (agent_id) for every ordinary propose_change, or a
+  -- different agent for self_improve's cross-agent proposals (see
+  -- fn_submit_result). The live policy may have moved on since this was
+  -- proposed -- an operator edit, or another proposal already applied.
+  -- Approving blindly here would silently clobber whatever changed it with
+  -- a decision made against a policy that no longer exists; mark it stale
+  -- instead and let the operator re-propose or handle it directly.
+  v_target := COALESCE(r.target_agent_id, r.agent_id);
+  SELECT generation INTO v_cur_gen FROM allgres_private.policies WHERE agent_id = v_target;
   IF v_cur_gen IS DISTINCT FROM r.base_generation THEN
     UPDATE allgres_private.change_proposals
     SET status = 'stale', decided_at = now(),
@@ -3640,7 +4351,7 @@ BEGIN
   END IF;
 
   v_policy := allgres_public.fn_set_policy(
-    r.agent_id,
+    v_target,
     r.proposed_changes->>'system_prompt',
     NULL, NULL,
     r.proposed_changes->'llm_config',
@@ -3713,6 +4424,65 @@ BEGIN
 END;
 $fn$;
 
+-- What a fixer proposal actually does once let through -- shared by
+-- fn_decide_fix (admin_approval level) and fn_submit_result's immediate
+-- path (auto/self_approve level), so there is exactly one place that knows
+-- how to turn a fix_kind into a real change.
+CREATE OR REPLACE FUNCTION allgres_private.apply_fix(
+  p_fix_kind text, p_target_agent_id uuid, p_detail jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+BEGIN
+  IF p_fix_kind = 'revoke_permission' THEN
+    RETURN allgres_public.fn_revoke_permission(
+      p_target_agent_id, p_detail->>'resource_type', p_detail->>'resource_ref'
+    );
+  ELSIF p_fix_kind = 'deactivate_agent' THEN
+    RETURN allgres_public.fn_set_agent_active(p_target_agent_id, false);
+  END IF;
+  RAISE EXCEPTION 'apply_fix: unknown fix_kind %', p_fix_kind USING ERRCODE = 'P0001';
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_decide_fix(
+  p_fix_id uuid, p_approve boolean, p_reply text DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r allgres_private.fix_proposals%ROWTYPE;
+  v_result jsonb;
+BEGIN
+  SELECT * INTO r FROM allgres_private.fix_proposals WHERE fix_id = p_fix_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_decide_fix: not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF r.status <> 'pending' THEN
+    RAISE EXCEPTION 'fn_decide_fix: already decided (%)', r.status USING ERRCODE = 'P0001';
+  END IF;
+
+  IF NOT p_approve THEN
+    UPDATE allgres_private.fix_proposals
+    SET status = 'rejected', decided_at = now(), decided_reply = p_reply
+    WHERE fix_id = p_fix_id;
+    RETURN jsonb_build_object('ok', true, 'status', 'rejected');
+  END IF;
+
+  v_result := allgres_private.apply_fix(r.fix_kind, r.target_agent_id, r.detail);
+
+  UPDATE allgres_private.fix_proposals
+  SET status = 'approved', decided_at = now(), decided_reply = p_reply
+  WHERE fix_id = p_fix_id;
+
+  RETURN jsonb_build_object('ok', true, 'status', 'approved', 'result', v_result);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_create_session(
   p_agent_id uuid,
   p_goal text,
@@ -3750,6 +4520,65 @@ BEGIN
 END;
 $fn$;
 
+-- Before this, a session was a one-shot exchange: fn_create_session, one
+-- task, done -- there was no way to send a follow-up in the same
+-- conversation, only start a brand new session that remembered nothing.
+-- This creates a new root-level task in the *same* session; fn_next_step's
+-- message assembly now stitches every root-level task in a session back
+-- together (see its own comment), so the agent sees the prior turns too,
+-- not just this one message.
+CREATE OR REPLACE FUNCTION allgres_public.fn_continue_session(
+  p_session_id uuid,
+  p_message text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  s allgres_private.sessions%ROWTYPE;
+  v_tid uuid;
+BEGIN
+  IF btrim(COALESCE(p_message, '')) = '' THEN
+    RAISE EXCEPTION 'message required' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT * INTO s FROM allgres_private.sessions WHERE session_id = p_session_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'session not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = s.agent_id AND is_active) THEN
+    RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+
+  -- One turn at a time: a second message while the agent is still working
+  -- the last one would race fn_next_step's own read of this session's
+  -- root-level tasks rather than cleanly queue behind it.
+  IF EXISTS (
+    SELECT 1 FROM allgres_private.tasks
+    WHERE session_id = p_session_id AND parent_task_id IS NULL
+      AND status IN ('queued', 'running', 'waiting_human')
+  ) THEN
+    RAISE EXCEPTION 'this session has a turn still in progress -- wait for it to finish before sending another message'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  -- A session that already finished (or was cancelled) is reopened by a new
+  -- message the same way a chat thread resumes when someone replies to it.
+  UPDATE allgres_private.sessions
+  SET status = 'open', completed_at = NULL
+  WHERE session_id = p_session_id;
+
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status, input)
+  VALUES (p_session_id, s.agent_id, 'queued', jsonb_build_object('goal', btrim(p_message)))
+  RETURNING task_id INTO v_tid;
+  INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content)
+  VALUES (v_tid, 0, 'user', to_jsonb(btrim(p_message)));
+
+  RETURN jsonb_build_object('ok', true, 'session_id', p_session_id, 'task_id', v_tid);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_set_provider_secret(p_provider_id uuid, p_api_key text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -3769,6 +4598,61 @@ BEGIN
     'has_secret', true,
     'storage', allgres_private.secret_storage_mode()
   );
+END;
+$fn$;
+
+-- fn_set_provider only ever UPDATEs a row that already exists -- there was
+-- no way for an operator to add a provider beyond the fixed seed list
+-- (xai/openai/anthropic/ollama/openai_compat) without editing the database
+-- by hand. This is the create counterpart: name/kind/base_url up front,
+-- api_key and allow_private_network optional at creation time (both can
+-- still be changed later via fn_set_provider / fn_set_provider_secret).
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_provider(
+  p_name text,
+  p_kind text,
+  p_base_url text,
+  p_api_key text DEFAULT NULL,
+  p_allow_private_network boolean DEFAULT false
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_id uuid;
+  v_url text;
+  v_reason text;
+BEGIN
+  IF NULLIF(trim(p_name), '') IS NULL THEN
+    RAISE EXCEPTION 'provider name is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_kind NOT IN ('openai_compat', 'anthropic', 'oauth') THEN
+    RAISE EXCEPTION 'invalid provider kind: %', p_kind USING ERRCODE = 'P0001';
+  END IF;
+
+  v_url := rtrim(NULLIF(trim(p_base_url), ''), '/');
+  IF v_url IS NULL THEN
+    RAISE EXCEPTION 'provider base_url is required' USING ERRCODE = 'P0001';
+  END IF;
+
+  -- Same endpoint validation fn_set_provider applies to an edit, applied at
+  -- creation time too, so a bad or SSRF-shaped URL is rejected up front
+  -- rather than only failing later when an agent first tries to use it.
+  v_reason := allgres_private.check_outbound_url(v_url, COALESCE(p_allow_private_network, false));
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'provider endpoint rejected: % (%)', v_reason, v_url
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  INSERT INTO allgres_private.llm_providers (name, kind, base_url, is_enabled, allow_private_network)
+  VALUES (trim(p_name), p_kind, v_url, true, COALESCE(p_allow_private_network, false))
+  RETURNING provider_id INTO v_id;
+
+  IF NULLIF(p_api_key, '') IS NOT NULL THEN
+    PERFORM allgres_public.fn_set_provider_secret(v_id, p_api_key);
+  END IF;
+
+  RETURN jsonb_build_object('ok', true, 'provider_id', v_id);
 END;
 $fn$;
 
@@ -4258,6 +5142,16 @@ RETURNS void
 LANGUAGE plpgsql
 AS $fn$
 BEGIN
+  -- A real DELETE of these rows was tried and reverted: execution_logs'
+  -- append-only trigger (forbid_log_mutation) rejects DELETE the same as
+  -- UPDATE, for anyone, including this function's own owner -- by design,
+  -- see that trigger's comment. Deleting sql_calls/tasks/sessions instead
+  -- and leaving orphaned execution_logs behind would either violate the
+  -- tasks/sessions FK (nothing here cascades) or leave logs with no task to
+  -- belong to. So selftest fixtures are never deleted; instead this only
+  -- terminates anything left non-terminal by an interrupted run, and the
+  -- operator-facing views/listings filter out goal LIKE 'selftest%' (see
+  -- their own comments) so they never actually show up in the dashboard.
   UPDATE allgres_private.tasks t
   SET status = 'failed', error = 'selftest', updated_at = now()
   FROM allgres_private.sessions s
@@ -4267,6 +5161,536 @@ BEGIN
   UPDATE allgres_private.sessions
   SET status = 'cancelled', completed_at = now()
   WHERE goal LIKE 'selftest%' AND status = 'open';
+END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- 9b. Accounts, roles, and the chat/messenger surface built on them.
+--     Real login (username/password, pgcrypto bcrypt hashes), distinct from
+--     the dashboard's one shared bearer token -- see the users/web_sessions
+--     table comments above for why this exists alongside, not instead of,
+--     the lighter audit log item 28 already built.
+-- ---------------------------------------------------------------------------
+
+-- Every password operation here requires pgcrypto -- unlike provider secret
+-- encryption (allgres_private.encrypt_secret), which degrades to plaintext
+-- with a loud warning when pgcrypto is missing, a password hash has no safe
+-- degraded mode: fail closed instead, the same way encrypt_secret already
+-- fails closed when a secret *key* is configured but pgcrypto is not.
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_user(
+  p_username text,
+  p_password text,
+  p_role text DEFAULT 'user'
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_ns text := allgres_private.pgcrypto_schema();
+  v_hash text;
+  v_id uuid;
+  v_username text := btrim(COALESCE(p_username, ''));
+BEGIN
+  IF v_ns IS NULL THEN
+    RAISE EXCEPTION 'pgcrypto is required for the accounts system but is not installed'
+      USING ERRCODE = 'P0001';
+  END IF;
+  IF v_username = '' THEN
+    RAISE EXCEPTION 'username required' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_role NOT IN ('admin', 'user') THEN
+    RAISE EXCEPTION 'invalid role: %', p_role USING ERRCODE = 'P0001';
+  END IF;
+  IF length(COALESCE(p_password, '')) < 8 THEN
+    RAISE EXCEPTION 'password must be at least 8 characters' USING ERRCODE = 'P0001';
+  END IF;
+
+  EXECUTE format('SELECT %I.crypt($1, %I.gen_salt(''bf''))', v_ns, v_ns)
+    INTO v_hash USING p_password;
+
+  INSERT INTO allgres_private.users (username, password_hash, role)
+  VALUES (v_username, v_hash, p_role)
+  RETURNING user_id INTO v_id;
+
+  RETURN jsonb_build_object('ok', true, 'user_id', v_id, 'username', v_username, 'role', p_role);
+END;
+$fn$;
+
+-- A failed login (unknown username or wrong password) is indistinguishable
+-- from the caller's side -- same error message, and a fixed pg_sleep so a
+-- valid-username-wrong-password attempt does not visibly resolve faster
+-- than an unknown-username one.
+CREATE OR REPLACE FUNCTION allgres_public.fn_login(p_username text, p_password text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_ns text := allgres_private.pgcrypto_schema();
+  u allgres_private.users%ROWTYPE;
+  v_ok boolean;
+  v_token text;
+BEGIN
+  IF v_ns IS NULL THEN
+    RAISE EXCEPTION 'pgcrypto is required for login but is not installed' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT * INTO u FROM allgres_private.users
+  WHERE username = btrim(COALESCE(p_username, '')) AND is_active;
+
+  IF NOT FOUND THEN
+    PERFORM pg_sleep(0.2);
+    RAISE EXCEPTION 'invalid username or password' USING ERRCODE = 'P0001';
+  END IF;
+
+  EXECUTE format('SELECT %I.crypt($1, $2) = $2', v_ns)
+    INTO v_ok USING COALESCE(p_password, ''), u.password_hash;
+
+  IF NOT v_ok THEN
+    RAISE EXCEPTION 'invalid username or password' USING ERRCODE = 'P0001';
+  END IF;
+
+  EXECUTE format('SELECT encode(%I.gen_random_bytes(32), ''hex'')', v_ns) INTO v_token;
+
+  INSERT INTO allgres_private.web_sessions (session_token, user_id, expires_at)
+  VALUES (v_token, u.user_id, now() + interval '7 days');
+
+  RETURN jsonb_build_object(
+    'ok', true, 'session_token', v_token,
+    'user_id', u.user_id, 'username', u.username, 'role', u.role
+  );
+END;
+$fn$;
+
+-- Idempotent: logging out a token that is already gone (expired, or logged
+-- out from another tab) is not an error.
+CREATE OR REPLACE FUNCTION allgres_public.fn_logout(p_session_token text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.web_sessions WHERE session_token = p_session_token;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- Resolves a bearer token to the user it belongs to, or a NULL row if the
+-- token is missing, unknown, expired, or the account was deactivated since
+-- the token was issued. Touches last_seen_at only on a hit, so a wall of
+-- invalid tokens can never generate write traffic.
+CREATE OR REPLACE FUNCTION allgres_private.session_user(p_token text)
+RETURNS allgres_private.users
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+BEGIN
+  IF p_token IS NULL OR p_token = '' THEN
+    RETURN NULL;
+  END IF;
+  SELECT us.* INTO u
+  FROM allgres_private.web_sessions ws
+  JOIN allgres_private.users us ON us.user_id = ws.user_id
+  WHERE ws.session_token = p_token AND ws.expires_at > now() AND us.is_active;
+  IF FOUND THEN
+    UPDATE allgres_private.web_sessions SET last_seen_at = now() WHERE session_token = p_token;
+    RETURN u;
+  END IF;
+  RETURN NULL;
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_private.require_admin(p_token text)
+RETURNS allgres_private.users
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+BEGIN
+  u := allgres_private.session_user(p_token);
+  IF u.user_id IS NULL THEN
+    RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+  END IF;
+  IF u.role <> 'admin' THEN
+    RAISE EXCEPTION 'admin role required' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN u;
+END;
+$fn$;
+
+-- The guard on every agent-config action that can reach a system agent
+-- (agents.update, policy.rollback, permissions.grant/revoke): a regular
+-- agent needs no session_token at all today (the shared dashboard bearer
+-- token alone has always been enough, see the module comment on
+-- allgres_private.users), so this only starts requiring a logged-in admin
+-- once the *target* is a system agent -- an ordinary agent's config is
+-- unaffected, exactly the "borrow the idea, don't touch what already
+-- works" shape the rest of this file follows. NULL p_agent_id (a request
+-- with no/invalid agent_id) is left to the caller's own validation to
+-- reject -- this function only ever tightens an is_system=true target.
+CREATE OR REPLACE FUNCTION allgres_private.require_admin_for_system_agent(p_token text, p_agent_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  IF p_agent_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_system
+  ) THEN
+    PERFORM allgres_private.require_admin(p_token);
+  END IF;
+END;
+$fn$;
+
+-- What approvals.list/proposals.list/fixes.list and their .decide
+-- counterparts scope by (item 41, "opening the approval inbox to regular
+-- users too"): NULL means unrestricted -- either nobody is logged in (the
+-- original shared-bearer-token caller, unaffected by any of this) or the
+-- caller is an admin, who could always see everything here before item 28
+-- added accounts at all. A non-NULL, possibly empty, array is a regular
+-- user's own assigned agents -- exactly user_agent_assignments, the same
+-- explicit allow-list require_agent_access already enforces for chat.
+CREATE OR REPLACE FUNCTION allgres_private.visible_agent_ids(p_token text)
+RETURNS uuid[]
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+  v_ids uuid[];
+BEGIN
+  u := allgres_private.session_user(p_token);
+  IF u.user_id IS NULL OR u.role = 'admin' THEN
+    RETURN NULL;
+  END IF;
+  SELECT COALESCE(array_agg(agent_id), ARRAY[]::uuid[]) INTO v_ids
+  FROM allgres_private.user_agent_assignments WHERE user_id = u.user_id;
+  RETURN v_ids;
+END;
+$fn$;
+
+-- The one check every chat/messenger/model-config action for a specific
+-- agent goes through: an admin may reach any active agent; a regular user
+-- only one explicitly assigned via user_agent_assignments (item 29's
+-- "explicit allowed set", not "everything visible by default").
+CREATE OR REPLACE FUNCTION allgres_private.require_agent_access(p_token text, p_agent_id uuid)
+RETURNS allgres_private.users
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+BEGIN
+  u := allgres_private.session_user(p_token);
+  IF u.user_id IS NULL THEN
+    RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_active) THEN
+    RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+  IF u.role <> 'admin' AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.user_agent_assignments
+    WHERE user_id = u.user_id AND agent_id = p_agent_id
+  ) THEN
+    RAISE EXCEPTION 'agent not assigned to this user' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN u;
+END;
+$fn$;
+
+-- Project mode's own access check (item 42): a project is a valid chat
+-- target only once bound to an agent and active, and reaching it still
+-- goes through require_agent_access for that agent -- a regular user needs
+-- the same assignment a Project's bound agent would require in General
+-- mode, there is no separate project-level allow-list.
+CREATE OR REPLACE FUNCTION allgres_private.require_project_access(p_token text, p_project_id uuid)
+RETURNS TABLE(u allgres_private.users, agent_id uuid)
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_project allgres_private.projects%ROWTYPE;
+  v_user allgres_private.users%ROWTYPE;
+BEGIN
+  SELECT * INTO v_project FROM allgres_private.projects WHERE project_id = p_project_id AND is_active;
+  IF v_project IS NULL THEN
+    RAISE EXCEPTION 'project inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_project.agent_id IS NULL THEN
+    RAISE EXCEPTION 'project has no agent configured for chat' USING ERRCODE = 'P0001';
+  END IF;
+  v_user := allgres_private.require_agent_access(p_token, v_project.agent_id);
+  RETURN QUERY SELECT v_user, v_project.agent_id;
+END;
+$fn$;
+
+-- The simple 1:1 chat surface: one continuing session per (user, agent)
+-- pair (user_agent_chat_sessions), created on first message and continued
+-- (fn_continue_session) on every one after -- never a fresh, contextless
+-- session per message.
+CREATE OR REPLACE FUNCTION allgres_public.fn_chat_send(
+  p_session_token text,
+  p_agent_id uuid,
+  p_message text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+  v_sid uuid;
+  v_created jsonb;
+BEGIN
+  u := allgres_private.require_agent_access(p_session_token, p_agent_id);
+  IF btrim(COALESCE(p_message, '')) = '' THEN
+    RAISE EXCEPTION 'message required' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT session_id INTO v_sid
+  FROM allgres_private.user_agent_chat_sessions
+  WHERE user_id = u.user_id AND agent_id = p_agent_id;
+
+  IF v_sid IS NULL THEN
+    v_created := allgres_public.fn_create_session(p_agent_id, btrim(p_message));
+    v_sid := (v_created->>'session_id')::uuid;
+    INSERT INTO allgres_private.user_agent_chat_sessions (user_id, agent_id, session_id)
+    VALUES (u.user_id, p_agent_id, v_sid);
+    RETURN jsonb_build_object('ok', true, 'session_id', v_sid, 'task_id', v_created->>'task_id');
+  END IF;
+
+  v_created := allgres_public.fn_continue_session(v_sid, btrim(p_message));
+  UPDATE allgres_private.user_agent_chat_sessions SET updated_at = now()
+  WHERE user_id = u.user_id AND agent_id = p_agent_id;
+  RETURN v_created;
+END;
+$fn$;
+
+-- The full thread for a user's ongoing chat with one agent -- same
+-- session-wide, root-tasks-only stitching fn_next_step itself now uses,
+-- read back for display rather than to build a prompt.
+CREATE OR REPLACE FUNCTION allgres_public.fn_chat_history(p_session_token text, p_agent_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+  v_sid uuid;
+BEGIN
+  u := allgres_private.require_agent_access(p_session_token, p_agent_id);
+
+  SELECT session_id INTO v_sid
+  FROM allgres_private.user_agent_chat_sessions
+  WHERE user_id = u.user_id AND agent_id = p_agent_id;
+
+  IF v_sid IS NULL THEN
+    RETURN jsonb_build_object('ok', true, 'session_id', NULL, 'status', NULL, 'messages', '[]'::jsonb);
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'session_id', v_sid,
+    'status', (SELECT status FROM allgres_private.sessions WHERE session_id = v_sid),
+    'messages', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'role', l.role, 'content', allgres_private.log_content_text(l.content), 'created_at', l.created_at
+      ) ORDER BY l.created_at)
+      FROM allgres_private.execution_logs l
+      JOIN allgres_private.tasks t USING (task_id)
+      WHERE t.session_id = v_sid AND t.parent_task_id IS NULL
+        AND l.role IN ('user', 'assistant', 'operator')
+    ), '[]'::jsonb)
+  );
+END;
+$fn$;
+
+-- Project mode's fn_chat_send: identical shape (one continuing session,
+-- created on first message, resumed after), keyed by project instead of
+-- agent -- see user_project_chat_sessions's comment for why this is its
+-- own table/session rather than reusing an agent's General-mode one. The
+-- session itself still belongs to the project's bound agent
+-- (fn_create_session's p_agent_id); fn_next_step is what makes the
+-- resulting conversation actually see the project's preset_prompt, by
+-- reading sessions.project_id back off the session it creates here.
+CREATE OR REPLACE FUNCTION allgres_public.fn_project_chat_send(
+  p_session_token text,
+  p_project_id uuid,
+  p_message text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  v_access record;
+  v_sid uuid;
+  v_created jsonb;
+BEGIN
+  SELECT * INTO v_access FROM allgres_private.require_project_access(p_session_token, p_project_id);
+  IF btrim(COALESCE(p_message, '')) = '' THEN
+    RAISE EXCEPTION 'message required' USING ERRCODE = 'P0001';
+  END IF;
+
+  SELECT session_id INTO v_sid
+  FROM allgres_private.user_project_chat_sessions
+  WHERE user_id = (v_access.u).user_id AND project_id = p_project_id;
+
+  IF v_sid IS NULL THEN
+    v_created := allgres_public.fn_create_session(v_access.agent_id, btrim(p_message), p_project_id);
+    v_sid := (v_created->>'session_id')::uuid;
+    INSERT INTO allgres_private.user_project_chat_sessions (user_id, project_id, session_id)
+    VALUES ((v_access.u).user_id, p_project_id, v_sid);
+    RETURN jsonb_build_object('ok', true, 'session_id', v_sid, 'task_id', v_created->>'task_id');
+  END IF;
+
+  v_created := allgres_public.fn_continue_session(v_sid, btrim(p_message));
+  UPDATE allgres_private.user_project_chat_sessions SET updated_at = now()
+  WHERE user_id = (v_access.u).user_id AND project_id = p_project_id;
+  RETURN v_created;
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_project_chat_history(p_session_token text, p_project_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_access record;
+  v_sid uuid;
+BEGIN
+  SELECT * INTO v_access FROM allgres_private.require_project_access(p_session_token, p_project_id);
+
+  SELECT session_id INTO v_sid
+  FROM allgres_private.user_project_chat_sessions
+  WHERE user_id = (v_access.u).user_id AND project_id = p_project_id;
+
+  IF v_sid IS NULL THEN
+    RETURN jsonb_build_object('ok', true, 'session_id', NULL, 'status', NULL, 'messages', '[]'::jsonb);
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'session_id', v_sid,
+    'status', (SELECT status FROM allgres_private.sessions WHERE session_id = v_sid),
+    'messages', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'role', l.role, 'content', allgres_private.log_content_text(l.content), 'created_at', l.created_at
+      ) ORDER BY l.created_at)
+      FROM allgres_private.execution_logs l
+      JOIN allgres_private.tasks t USING (task_id)
+      WHERE t.session_id = v_sid AND t.parent_task_id IS NULL
+        AND l.role IN ('user', 'assistant', 'operator')
+    ), '[]'::jsonb)
+  );
+END;
+$fn$;
+
+-- The Slack-style messenger: a plain post is just stored; a post containing
+-- "@agent_name" additionally resolves that agent (subject to the same
+-- require_agent_access an unaddressed regular user could not bypass) and
+-- routes the *same* message through fn_chat_send, so mentioning an agent in
+-- the channel and messaging it in the 1:1 chat page share one conversation
+-- per (user, agent) -- not two divergent histories.
+CREATE OR REPLACE FUNCTION allgres_public.fn_messenger_post(p_session_token text, p_text text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  u allgres_private.users%ROWTYPE;
+  v_text text := btrim(COALESCE(p_text, ''));
+  v_names text[];
+  v_name text;
+  v_agent_id uuid;
+  v_agent_ids uuid[] := ARRAY[]::uuid[];
+  v_sid uuid;
+  v_sids uuid[] := ARRAY[]::uuid[];
+  v_mid uuid;
+  v_orchestrator uuid;
+BEGIN
+  u := allgres_private.session_user(p_session_token);
+  IF u.user_id IS NULL THEN
+    RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_text = '' THEN
+    RAISE EXCEPTION 'message required' USING ERRCODE = 'P0001';
+  END IF;
+
+  -- Every distinct @mention, in the order it first appears in the text --
+  -- that order is what actually decides delivery order today (see
+  -- orchestrator's comment below for what it decides instead).
+  SELECT array_agg(name ORDER BY first_pos) INTO v_names FROM (
+    SELECT (m)[1] AS name, min(ord) AS first_pos
+    FROM regexp_matches(v_text, '@([A-Za-z0-9_-]+)', 'g') WITH ORDINALITY AS t(m, ord)
+    GROUP BY (m)[1]
+  ) q;
+
+  IF v_names IS NOT NULL THEN
+    FOREACH v_name IN ARRAY v_names LOOP
+      SELECT agent_id INTO v_agent_id FROM allgres_private.agents WHERE name = v_name;
+      IF v_agent_id IS NULL THEN
+        RAISE EXCEPTION 'no such agent: %', v_name USING ERRCODE = 'P0001';
+      END IF;
+      -- Validates access the same way chat.send would, for every mention --
+      -- a plain post (no mention) skips this entirely.
+      PERFORM allgres_private.require_agent_access(p_session_token, v_agent_id);
+      v_agent_ids := v_agent_ids || v_agent_id;
+      v_sids := v_sids || (allgres_public.fn_chat_send(p_session_token, v_agent_id, v_text)->>'session_id')::uuid;
+    END LOOP;
+    v_agent_id := v_agent_ids[1];
+    v_sid := v_sids[1];
+  END IF;
+
+  INSERT INTO allgres_private.channel_messages
+    (author_user_id, content, mentioned_agent_id, session_id, mentioned_agent_ids)
+  VALUES (u.user_id, v_text, v_agent_id, v_sid, NULLIF(v_agent_ids, ARRAY[]::uuid[]))
+  RETURNING message_id INTO v_mid;
+
+  -- orchestrator (item 40): advisory only in this pass -- it reads the same
+  -- multi-mention message and the mentioned agents' own prompts and records
+  -- its opinion on response order via its own final_answer, but delivery
+  -- above already happened in text order regardless. A real reordering-
+  -- before-delivery pass is future work; this at least exercises the seeded
+  -- agent against a real message rather than leaving it permanently idle.
+  IF array_length(v_agent_ids, 1) > 1 THEN
+    SELECT agent_id INTO v_orchestrator FROM allgres_private.agents WHERE name = 'orchestrator' AND is_active;
+    IF v_orchestrator IS NOT NULL THEN
+      PERFORM allgres_private.queue_orchestrator_opinion(v_orchestrator, v_mid, v_text, v_agent_ids);
+    END IF;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true, 'message_id', v_mid, 'mentioned_agent_id', v_agent_id, 'session_id', v_sid,
+    'mentioned_agent_ids', to_jsonb(v_agent_ids)
+  );
+END;
+$fn$;
+
+-- Regular users can only reach this narrow slice of an agent's policy --
+-- llm_config, through fn_set_policy the same way the operator-facing agent
+-- editor already does -- never max_steps/permissions/prompt, which stay
+-- admin-only via the existing agents.update surface.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_my_model(
+  p_session_token text,
+  p_agent_id uuid,
+  p_provider text,
+  p_model text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+BEGIN
+  PERFORM allgres_private.require_agent_access(p_session_token, p_agent_id);
+  RETURN allgres_public.fn_set_policy(
+    p_agent_id, NULL, NULL, NULL,
+    jsonb_build_object('provider', p_provider, 'model', p_model)
+  );
 END;
 $fn$;
 
@@ -4323,12 +5747,9 @@ When you have the result, emit final_answer in one short sentence.
 $prompt$,
         max_steps = 8,
         max_retries = 2,
-        llm_config = jsonb_build_object(
-          'provider', 'xai',
-          'model', 'grok-4.5',
-          'temperature', 0.2,
-          'max_tokens', 1024
-        ),
+        -- Deliberately no llm_config here (see ensure_policy): a fresh
+        -- install must not look like a provider was already picked and
+        -- authenticated when nothing has actually been configured yet.
         updated_at = now()
     WHERE agent_id = v_agent;
   END IF;
@@ -4412,6 +5833,197 @@ END
 $seed$;
 
 -- ---------------------------------------------------------------------------
+-- 10a-2. The system agent family (item 32/33): one root plus five children,
+-- all is_system=true. The root carries no operational job of its own -- it
+-- exists so the five children have one place to inherit shared framing and
+-- shared grants from (allgres_private.agent_effective_prompt/
+-- agent_has_permission walk parent_agent_id up to it); editing the root
+-- changes what every child says and may do without editing five rows.
+-- Every child's is_system=true means only an admin session may edit its
+-- policy/permissions/autonomy from here on (require_admin_for_system_agent,
+-- fn_set_agent_autonomy) -- a regular user can see one it is assigned to
+-- (My Agents) but never change it. None of these five ships with an
+-- llm_config, same as analyst/health_monitor above and for the same reason
+-- (ensure_policy's comment): a fresh install must not look like a provider
+-- was already picked before an operator actually chose one.
+DO $seed$
+DECLARE
+  v_root uuid;
+BEGIN
+  SELECT agent_id INTO v_root FROM allgres_private.agents WHERE name = 'system_root';
+  IF v_root IS NULL THEN
+    INSERT INTO allgres_private.agents (name, is_system)
+    VALUES ('system_root', true) RETURNING agent_id INTO v_root;
+
+    UPDATE allgres_private.policies
+    SET system_prompt = $prompt$You are part of Allgres's own system agent family -- built-in agents that
+operate the platform itself (this database, its other agents, its own
+configuration) rather than a user's workload. You never act alone: every
+child agent below adds its own specific job on top of this shared framing.
+
+Reply with one JSON object only. No markdown, no prose. Whatever your
+autonomy_level is (visible in your own agent record), never claim an action
+took effect before it actually has -- an admin_approval-level action is only
+a proposal until decided; a self_approve-level action still means you chose
+to act, not that no one is watching; only auto means no human step exists
+in the path at all.
+$prompt$,
+        max_steps = 4,
+        updated_at = now()
+    WHERE agent_id = v_root;
+  END IF;
+
+  -- session_compactor: summarizes a session's older turns once it grows
+  -- long, so a long-running Chat/Messenger conversation stays within a
+  -- reasonable prompt size without losing what was actually said -- see
+  -- fn_maybe_compact_session, the real mechanism this agent's prompt
+  -- describes; autonomy_level is 'auto' because its output is additive (a
+  -- summary memory placed alongside the untouched, append-only logs, never
+  -- a deletion) -- there is nothing here for a human to approve.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'session_compactor') THEN
+    DECLARE v_agent uuid;
+    BEGIN
+      INSERT INTO allgres_private.agents (name, is_system, parent_agent_id, autonomy_level)
+      VALUES ('session_compactor', true, v_root, 'auto') RETURNING agent_id INTO v_agent;
+      UPDATE allgres_private.policies
+      SET system_prompt = $prompt$Your job is session compaction. Your task input carries: target_session_id
+(what this belongs to), turns (the oldest turns of a long conversation that
+no longer fit in a normal context window), and previous_summary (a prior
+summary of everything before these turns, or null if this is the first
+compaction of this session). On your first step, reply with one JSON
+object only: {"action":"remember","content":"<summary>","memory_type":"episodic","importance":0.6,"subject_id":"<target_session_id from your input>"}
+where <summary> folds previous_summary (when present) together with turns
+into one updated, faithful, dense summary (decisions made, facts
+established, open questions) -- short enough to replace all of it in future
+context, complete enough that nothing important from either is lost. Never
+invent anything not actually in previous_summary or turns. Once remember
+succeeds, your next step should give final_answer with a one-line
+confirmation -- this task is otherwise done.
+$prompt$,
+          max_steps = 4,
+          updated_at = now()
+      WHERE agent_id = v_agent;
+    END;
+  END IF;
+
+  -- orchestrator: Messenger's routing brain for a message that @mentions
+  -- more than one agent at once -- decides the order they respond in (and,
+  -- through delegate, whether one should hand off to another) instead of
+  -- firing every mentioned agent independently and interleaving their
+  -- replies at random. See fn_messenger_post's multi-mention branch, the
+  -- real call site.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'orchestrator') THEN
+    DECLARE v_agent uuid;
+    BEGIN
+      INSERT INTO allgres_private.agents (name, is_system, parent_agent_id, autonomy_level)
+      VALUES ('orchestrator', true, v_root, 'auto') RETURNING agent_id INTO v_agent;
+      UPDATE allgres_private.policies
+      SET system_prompt = $prompt$Your job is multi-agent routing in a shared Messenger channel. You are given
+one message that @mentions more than one agent, and the name/system_prompt
+summary of each. Reply with one JSON object only:
+{"action":"final_answer","answer":"<json array of agent names, in the order they should respond>"}
+Order by who most directly owns the request first; an agent whose answer
+would depend on another's should come after it. You do not answer the
+message yourself.
+$prompt$,
+          max_steps = 4,
+          updated_at = now()
+      WHERE agent_id = v_agent;
+    END;
+  END IF;
+
+  -- creator: the only agent that may call create_agent (see fn_submit_result's
+  -- create_agent branch) -- proposing a brand-new agent (name + prompt) for
+  -- a human or its own admin_approval/self_approve setting to let through.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'creator') THEN
+    DECLARE v_agent uuid;
+    BEGIN
+      INSERT INTO allgres_private.agents (name, is_system, parent_agent_id, autonomy_level)
+      VALUES ('creator', true, v_root, 'admin_approval') RETURNING agent_id INTO v_agent;
+      UPDATE allgres_private.policies
+      SET system_prompt = $prompt$Your job is helping build new agents for this platform: turn a plain-language
+request ("I want something that watches X and tells me Y") into a concrete
+new agent. Reply with one JSON object only:
+{"action":"create_agent","name":"...","system_prompt":"...","reason":"..."}
+name must be short, lowercase, underscore_separated, and not already in
+use. system_prompt must fully specify the new agent's job the same way
+every other agent's does: what it reads, what it decides, what its
+final_answer should look like -- it will run with zero other permissions
+until an admin grants some, so say so in the prompt rather than assuming
+access it does not have. Depending on your own autonomy_level this either
+takes effect immediately or is queued for an admin to accept or reject --
+either way, your job ends at proposing it well.
+$prompt$,
+          max_steps = 6,
+          updated_at = now()
+      WHERE agent_id = v_agent;
+    END;
+  END IF;
+
+  -- fixer: reads what health_monitor already found (same two diagnostic
+  -- views) and, instead of only reporting, proposes an actual remediation
+  -- for a human (or, at higher autonomy, itself) to let through -- see
+  -- fn_submit_result's propose_fix branch and fn_decide_fix.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'fixer') THEN
+    DECLARE v_agent uuid;
+    BEGIN
+      INSERT INTO allgres_private.agents (name, is_system, parent_agent_id, autonomy_level)
+      VALUES ('fixer', true, v_root, 'admin_approval') RETURNING agent_id INTO v_agent;
+      UPDATE allgres_private.policies
+      SET system_prompt = $prompt$Your job is remediation. You can read allgres_public.v_system_health and
+allgres_public.v_permission_audit, the same two views health_monitor
+watches. When you see something actually wrong (an inactive agent still
+holding grants, a queue backlog that never drains, a spike in failed
+tasks), propose a concrete, narrow fix. Reply with one JSON object only:
+{"action":"propose_fix","fix_kind":"revoke_permission|deactivate_agent","target_agent_id":"...","detail":{...},"reason":"..."}
+Never propose anything you cannot fully explain the effect of. If nothing
+is actually wrong, use final_answer to say so -- do not manufacture a fix
+to have something to propose.
+$prompt$,
+          max_steps = 6,
+          updated_at = now()
+      WHERE agent_id = v_agent;
+      INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+      SELECT v_agent, x.resource_type, x.resource_ref
+      FROM (VALUES
+        ('view', 'allgres_public.v_system_health'),
+        ('view', 'allgres_public.v_permission_audit')
+      ) AS x(resource_type, resource_ref)
+      ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
+    END;
+  END IF;
+
+  -- self_improve: the one agent allowed to propose_change against an agent
+  -- other than itself (see fn_submit_result's cross-agent propose_change
+  -- extension) -- aimed specifically at cost/efficiency (a shorter prompt,
+  -- a cheaper model, a lower max_tokens) backed by this agent's own
+  -- execution_logs cost stats, never at what the target agent does.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'self_improve') THEN
+    DECLARE v_agent uuid;
+    BEGIN
+      INSERT INTO allgres_private.agents (name, is_system, parent_agent_id, autonomy_level)
+      VALUES ('self_improve', true, v_root, 'admin_approval') RETURNING agent_id INTO v_agent;
+      UPDATE allgres_private.policies
+      SET system_prompt = $prompt$Your job is cost efficiency, not behavior. You are given one agent's recent
+execution_logs cost stats (steps per task, tokens per step, wall-clock time)
+and its current system_prompt/llm_config. Look for waste: a prompt padded
+with content that never changes the outcome, a model/max_tokens larger than
+the task needs, a step pattern that could be shorter. Reply with one JSON
+object only:
+{"action":"propose_change","target_agent_id":"...","changes":{"system_prompt":"...","llm_config":{...}},"reason":"..."}
+Never change what the target agent is supposed to accomplish -- only how
+cheaply it gets there. If you find nothing worth changing, use final_answer
+to say so.
+$prompt$,
+          max_steps = 6,
+          updated_at = now()
+      WHERE agent_id = v_agent;
+    END;
+  END IF;
+END
+$seed$;
+
+-- ---------------------------------------------------------------------------
 -- 10b. Extension configuration tables -- which of this extension's own
 --      tables `pg_dump` includes data for, and on what terms.
 --
@@ -4432,7 +6044,8 @@ $seed$;
 -- Tables with no seed rows at all dump unconditionally. The tables section
 -- 10 above seeds (llm_providers, sql_sandbox_allowlist, and
 -- agents/policies/permissions for the built-in 'analyst' and
--- 'health_monitor' agents, plus demo_sales for 'analyst' alone)
+-- 'health_monitor' agents plus the six is_system=true system agents from
+-- 10a-2, plus demo_sales for 'analyst' alone)
 -- exclude exactly those seeded rows: the extension script recreates them
 -- fresh on every install, and dumping them too would try to INSERT a
 -- second copy on top and fail on the same UNIQUE constraint that makes
@@ -4457,11 +6070,11 @@ $seed$;
 -- ---------------------------------------------------------------------------
 
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agents',
-  $cfgdump$WHERE name NOT IN ('analyst', 'health_monitor')$cfgdump$);
+  $cfgdump$WHERE NOT (name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.policies',
-  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor'))$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.permissions',
-  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor'))$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.demo_sales',
   $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_providers',
@@ -4530,7 +6143,30 @@ DECLARE
   v_low_mem uuid;
   v_high_mem uuid;
   v_mem_gc int;
+  v_new_agent uuid;
+  v_root_id uuid;
+  v_creator_id uuid;
+  v_fixer_id uuid;
+  v_self_id uuid;
+  v_sys_target uuid;
+  v_fix_id uuid;
+  v_i int;
+  v_comp_sid uuid;
+  v_comp_tid uuid;
+  v_comp_base timestamptz;
+  v_orchestrator_id uuid;
+  v_msg_id uuid;
+  v_mentioned_ids uuid[];
+  v_mention_target uuid;
+  v_admin_tok text;
+  v_user_tok text;
+  v_acct_agent uuid;
 BEGIN
+  -- Clear out any leftover fixtures from an interrupted prior run before
+  -- creating new ones, so a crash mid-selftest can't leave stale rows
+  -- behind indefinitely.
+  PERFORM allgres_private.selftest_cleanup();
+
   SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM allgres_private.policies WHERE agent_id = v_agent;
 
@@ -5376,6 +7012,62 @@ BEGIN
   END;
   v := v || jsonb_build_array(jsonb_build_object('name', 'llm_provider_fails_closed_not_substituted', 'ok', ok));
 
+  -- 25b. An agent with no llm_config at all (a fresh agent, before any
+  --      operator has configured a model) must fail the same way -- this
+  --      used to silently resolve to the seeded xai/grok-4.5 provider/model,
+  --      which made every unconfigured agent look already set up.
+  BEGIN
+    PERFORM allgres_private.build_llm_http(jsonb_build_object('llm_config', '{}'::jsonb));
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%no llm_config.provider configured%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'llm_provider_required_not_defaulted', 'ok', ok));
+
+  -- 25c. New agents must start with an empty llm_config, not a hardcoded
+  --      provider/model -- ensure_policy used to default every new agent's
+  --      policy to xai/grok-4.5 regardless of what the operator asked for.
+  INSERT INTO allgres_private.agents (name) VALUES ('selftest_new_agent_' || extract(epoch from clock_timestamp())::text)
+  RETURNING agent_id INTO v_new_agent;
+  ok := (SELECT llm_config FROM allgres_private.policies WHERE agent_id = v_new_agent) = '{}'::jsonb;
+  DELETE FROM allgres_private.agents WHERE agent_id = v_new_agent;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'new_agent_llm_config_starts_empty', 'ok', ok));
+
+  -- 25d. fn_create_provider: an operator can add a brand new provider (not
+  --      just edit one of the fixed seeded ones), with a working api_key set
+  --      in the same call, and it fails closed on a bad kind/URL just like
+  --      fn_set_provider does on edit.
+  DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider';
+  r := allgres_public.fn_create_provider('selftest_new_provider', 'openai_compat',
+    'https://selftest.invalid/v1', 'selftest-new-provider-key', false);
+  ok := (r->>'ok')::boolean AND (r->>'provider_id') IS NOT NULL;
+  ok := ok AND EXISTS (
+    SELECT 1 FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider' AND is_enabled
+  );
+  ok := ok AND allgres_private.provider_secret((r->>'provider_id')::uuid) = 'selftest-new-provider-key';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_provider_adds_working_provider', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_create_provider('selftest_bad_kind', 'not_a_real_kind', 'https://selftest.invalid/v1');
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_provider_rejects_bad_kind', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_create_provider('selftest_ssrf_provider', 'openai_compat', 'http://169.254.169.254/latest');
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_provider_rejects_ssrf_url', 'ok', ok));
+
+  DELETE FROM allgres_private.llm_secrets WHERE provider_id IN (
+    SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider'
+  );
+  DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider';
+
   -- 26. OAuth token exchange, queued rather than handed back to the caller
   --     (see KNOWN_ISSUES.md, "a second-round external review of items 18
   --     and 19": fn_oauth_token_request used to decrypt the client secret
@@ -5652,6 +7344,544 @@ BEGIN
   END;
 
   v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
+
+  -- 30. fn_continue_session: a session can be resumed with a follow-up
+  --     message instead of only ever starting a brand new, contextless one
+  --     (dashboard, "no way to chat"). The new turn is a new task, but
+  --     fn_next_step now sees every root-level task's log in the session
+  --     (see its own comment), so the follow-up still includes the first
+  --     turn's goal -- and a second message cannot be sent while the first
+  --     turn is still in flight.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest continue_session turn one')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid AND parent_task_id IS NULL;
+
+  BEGIN
+    PERFORM allgres_public.fn_continue_session(v_sid, 'should be rejected -- turn one still running');
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%turn still in progress%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_continue_session_rejects_while_turn_in_progress', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'completed', output = jsonb_build_object('answer', 'first answer')
+  WHERE task_id = v_tid;
+  PERFORM allgres_private.maybe_complete_session(v_sid);
+  ok := (SELECT status FROM allgres_private.sessions WHERE session_id = v_sid) = 'completed';
+
+  r := allgres_public.fn_continue_session(v_sid, 'selftest continue_session turn two');
+  v_tid2 := (r->>'task_id')::uuid;
+  ok := ok AND v_tid2 IS NOT NULL AND v_tid2 <> v_tid;
+  ok := ok AND (SELECT status FROM allgres_private.sessions WHERE session_id = v_sid) = 'open';
+
+  spec := allgres_public.fn_next_step(v_tid2);
+  ok := ok AND (spec->'messages')::text LIKE '%turn one%'
+    AND (spec->'messages')::text LIKE '%turn two%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_continue_session_reopens_and_keeps_context', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'completed', output = jsonb_build_object('answer', 'second answer')
+  WHERE task_id = v_tid2;
+  PERFORM allgres_private.maybe_complete_session(v_sid);
+
+  -- 31. Real accounts (item 29's follow-up to item 28's lighter audit log):
+  --     pgcrypto-backed login, role gating (require_admin/
+  --     require_agent_access), and the chat/messenger surface built on
+  --     them. A fresh agent of its own, never the real 'analyst' fixture --
+  --     fn_set_my_model below actually mutates llm_config, and fn_selftest
+  --     must never leave a real seeded agent's policy different from how
+  --     it found it.
+  DELETE FROM allgres_private.web_sessions WHERE user_id IN (
+    SELECT user_id FROM allgres_private.users WHERE username IN ('selftest_admin', 'selftest_user')
+  );
+  DELETE FROM allgres_private.users WHERE username IN ('selftest_admin', 'selftest_user');
+  SELECT agent_id INTO v_acct_agent FROM allgres_private.agents WHERE name = 'selftest_accounts_agent';
+  IF v_acct_agent IS NULL THEN
+    v_acct_agent := (allgres_public.fn_create_agent('selftest_accounts_agent')->>'agent_id')::uuid;
+  END IF;
+
+  IF allgres_private.pgcrypto_schema() IS NULL THEN
+    -- Accounts have no degraded mode, unlike secret encryption: fail
+    -- closed and loudly instead of ever hashing or comparing a password
+    -- in plaintext.
+    BEGIN
+      PERFORM allgres_public.fn_create_user('selftest_no_pgcrypto', 'irrelevant123', 'admin');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%pgcrypto is required%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'accounts_fail_closed_without_pgcrypto', 'ok', ok));
+  ELSE
+    PERFORM allgres_public.fn_create_user('selftest_admin', 'selftest-admin-pw1', 'admin');
+    PERFORM allgres_public.fn_create_user('selftest_user', 'selftest-user-pw1', 'user');
+
+    BEGIN
+      PERFORM allgres_public.fn_login('selftest_admin', 'wrong-password');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%invalid username or password%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_login_rejects_wrong_password', 'ok', ok));
+
+    comp := allgres_public.fn_login('selftest_admin', 'selftest-admin-pw1');
+    v_admin_tok := comp->>'session_token';
+    ok := (comp->>'ok')::boolean AND v_admin_tok IS NOT NULL AND (comp->>'role') = 'admin';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_login_succeeds_with_correct_password', 'ok', ok));
+
+    comp := allgres_public.fn_login('selftest_user', 'selftest-user-pw1');
+    v_user_tok := comp->>'session_token';
+
+    -- An admin reaches any active agent with no assignment row at all; a
+    -- regular user is rejected from the same agent until explicitly
+    -- assigned, then allowed.
+    BEGIN
+      PERFORM allgres_private.require_agent_access(v_user_tok, v_acct_agent);
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%not assigned%';
+    END;
+    ok := ok AND (allgres_private.require_agent_access(v_admin_tok, v_acct_agent)).user_id IS NOT NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'require_agent_access_admin_bypasses_assignment', 'ok', ok));
+
+    INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+    VALUES ((SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'), v_acct_agent);
+    ok := (allgres_private.require_agent_access(v_user_tok, v_acct_agent)).user_id IS NOT NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'require_agent_access_allows_assigned_user', 'ok', ok));
+
+    -- fn_messenger_post: a plain post carries no mentioned_agent_id/
+    -- session_id; an @mention of an agent the user cannot reach is
+    -- rejected the same way chat.send would reject it directly.
+    comp := allgres_public.fn_messenger_post(v_user_tok, 'just a plain selftest channel message');
+    ok := (comp->>'mentioned_agent_id') IS NULL AND (comp->>'session_id') IS NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'messenger_plain_post_has_no_mention', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_public.fn_messenger_post(v_user_tok, '@health_monitor selftest not assigned');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%not assigned%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'messenger_mention_of_unassigned_agent_rejected', 'ok', ok));
+
+    -- fn_set_my_model: the one thing a regular user may change on their
+    -- assigned agent's policy -- never max_steps/permissions/prompt, which
+    -- stay behind the operator-only agents.update surface.
+    comp := allgres_public.fn_set_my_model(v_user_tok, v_acct_agent, 'selftest_placeholder_provider', 'some-model');
+    ok := (comp->>'ok')::boolean
+      AND (SELECT llm_config FROM allgres_private.policies WHERE agent_id = v_acct_agent)
+        = jsonb_build_object('provider', 'selftest_placeholder_provider', 'model', 'some-model');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_my_model_updates_assigned_agent', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_public.fn_set_my_model(
+        v_user_tok, (SELECT agent_id FROM allgres_private.agents WHERE name = 'health_monitor'), 'x', 'y'
+      );
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%not assigned%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_my_model_rejects_unassigned_agent', 'ok', ok));
+
+    -- 32. The system agent family (item 32/33): hierarchy, inheritance,
+    --     autonomy_level, and the three new consequential actions --
+    --     create_agent (creator), propose_fix (fixer), cross-agent
+    --     propose_change (self_improve). Uses the real seeded agents (their
+    --     names are what fn_submit_result's own-action gates check), never
+    --     a scratch stand-in, but every mutation below is either reversed
+    --     (autonomy_level reset to admin_approval) or lands on a disposable
+    --     scratch target agent created just for this section.
+    SELECT agent_id INTO v_root_id FROM allgres_private.agents WHERE name = 'system_root';
+    SELECT agent_id INTO v_creator_id FROM allgres_private.agents WHERE name = 'creator';
+    SELECT agent_id INTO v_fixer_id FROM allgres_private.agents WHERE name = 'fixer';
+    SELECT agent_id INTO v_self_id FROM allgres_private.agents WHERE name = 'self_improve';
+
+    ok := v_root_id IS NOT NULL AND v_creator_id IS NOT NULL AND v_fixer_id IS NOT NULL AND v_self_id IS NOT NULL
+      AND (SELECT parent_agent_id FROM allgres_private.agents WHERE agent_id = v_creator_id) = v_root_id
+      AND (SELECT parent_agent_id FROM allgres_private.agents WHERE agent_id = v_fixer_id) = v_root_id
+      AND (SELECT parent_agent_id FROM allgres_private.agents WHERE agent_id = v_self_id) = v_root_id;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'system_agents_seeded_under_one_root', 'ok', ok));
+
+    -- Inheritance: a grant on the root reaches every child through
+    -- agent_has_permission/agent_permission_refs, and reaches no unrelated
+    -- agent; agent_effective_prompt folds the root's framing text in ahead
+    -- of the child's own (root-first, self last).
+    PERFORM allgres_public.fn_grant_permission(v_root_id, 'tool', 'selftest_inherited_tool');
+    ok := allgres_private.agent_has_permission(v_creator_id, 'tool', 'selftest_inherited_tool')
+      AND allgres_private.agent_has_permission(v_fixer_id, 'tool', 'selftest_inherited_tool')
+      AND 'selftest_inherited_tool' = ANY(allgres_private.agent_permission_refs(v_self_id, 'tool'))
+      AND NOT allgres_private.agent_has_permission(v_acct_agent, 'tool', 'selftest_inherited_tool');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'system_agent_inherits_root_permission', 'ok', ok));
+    PERFORM allgres_public.fn_revoke_permission(v_root_id, 'tool', 'selftest_inherited_tool');
+
+    ok := allgres_private.agent_effective_prompt(v_creator_id) LIKE '%system agent family%'
+      AND allgres_private.agent_effective_prompt(v_creator_id) LIKE '%create_agent%'
+      AND allgres_private.agent_effective_prompt(v_acct_agent) NOT LIKE '%system agent family%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'system_agent_prompt_inherits_root_framing', 'ok', ok));
+
+    -- is_system agents may only be edited from an admin session; an
+    -- ordinary agent (v_acct_agent) is unaffected and needs no token at
+    -- all, exactly as before item 32.
+    BEGIN
+      PERFORM allgres_private.require_admin_for_system_agent(NULL, v_creator_id);
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%not logged in%';
+    END;
+    BEGIN
+      PERFORM allgres_private.require_admin_for_system_agent(v_admin_tok, v_creator_id);
+    EXCEPTION WHEN others THEN
+      ok := false;
+    END;
+    BEGIN
+      -- No session_token at all, but the target isn't a system agent --
+      -- must be a silent no-op, not a "not logged in" rejection.
+      PERFORM allgres_private.require_admin_for_system_agent(NULL, v_acct_agent);
+    EXCEPTION WHEN others THEN
+      ok := false;
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'system_agent_edits_require_admin_session', 'ok', ok));
+
+    -- fn_set_agent_autonomy: a friendly rejection for a bad level, and it
+    -- actually changes the column.
+    BEGIN
+      PERFORM allgres_public.fn_set_agent_autonomy(v_creator_id, 'not_a_real_level');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%invalid autonomy_level%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'set_agent_autonomy_rejects_bad_level', 'ok', ok));
+
+    -- create_agent (creator only): admin_approval queues a create_agent
+    -- proposal that fn_decide_proposal turns into a real agent; a
+    -- non-creator agent may never call it.
+    v_sid := (allgres_public.fn_create_session(v_creator_id, 'selftest creator create_agent')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"create_agent"}',
+      'parsed', jsonb_build_object(
+        'action', 'create_agent',
+        'name', 'selftest_created_by_creator_' || extract(epoch from clock_timestamp())::text,
+        'system_prompt', 'selftest-created agent, safe to ignore.',
+        'reason', 'selftest'
+      )
+    ));
+    v_proposal := (sub->>'proposal_id')::uuid;
+    ok := v_proposal IS NOT NULL AND EXISTS (
+      SELECT 1 FROM allgres_private.change_proposals
+      WHERE proposal_id = v_proposal AND kind = 'create_agent' AND status = 'pending'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'create_agent_queues_a_proposal', 'ok', ok));
+
+    comp := allgres_public.fn_decide_proposal(v_proposal, true);
+    ok := comp->>'status' = 'approved'
+      AND EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = (comp->'created_agent'->>'agent_id')::uuid);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_creates_the_agent', 'ok', ok));
+
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest create_agent not permitted')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"create_agent"}',
+      'parsed', jsonb_build_object('action', 'create_agent', 'name', 'should_not_exist', 'system_prompt', 'x')
+    ));
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'create_agent_not_permitted'
+    ) AND NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'should_not_exist');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'create_agent_rejected_from_non_creator', 'ok', ok));
+
+    -- autonomy_level='auto' skips the proposal queue entirely.
+    PERFORM allgres_public.fn_set_agent_autonomy(v_creator_id, 'auto');
+    v_sid := (allgres_public.fn_create_session(v_creator_id, 'selftest creator auto create_agent')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"create_agent"}',
+      'parsed', jsonb_build_object(
+        'action', 'create_agent',
+        'name', 'selftest_auto_created_' || extract(epoch from clock_timestamp())::text,
+        'system_prompt', 'selftest-created agent, safe to ignore.'
+      )
+    ));
+    ok := COALESCE((sub->>'applied')::boolean, false)
+      AND EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = (sub->'created_agent'->>'agent_id')::uuid);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'autonomy_auto_creates_agent_immediately', 'ok', ok));
+    PERFORM allgres_public.fn_set_agent_autonomy(v_creator_id, 'admin_approval');
+
+    -- propose_fix (fixer only): admin_approval queues a fix that
+    -- fn_decide_fix applies; only ever against a disposable scratch target,
+    -- never a real seeded agent.
+    SELECT agent_id INTO v_sys_target FROM allgres_private.agents WHERE name = 'selftest_fix_target';
+    IF v_sys_target IS NULL THEN
+      v_sys_target := (allgres_public.fn_create_agent('selftest_fix_target')->>'agent_id')::uuid;
+    END IF;
+    PERFORM allgres_public.fn_set_agent_active(v_sys_target, true);
+    v_sid := (allgres_public.fn_create_session(v_fixer_id, 'selftest fixer propose_fix')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_fix"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_fix', 'fix_kind', 'deactivate_agent',
+        'target_agent_id', v_sys_target::text, 'reason', 'selftest'
+      )
+    ));
+    v_fix_id := (sub->>'fix_id')::uuid;
+    ok := v_fix_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM allgres_private.fix_proposals WHERE fix_id = v_fix_id AND status = 'pending'
+    ) AND (SELECT is_active FROM allgres_private.agents WHERE agent_id = v_sys_target);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'propose_fix_queues_a_fix', 'ok', ok));
+
+    comp := allgres_public.fn_decide_fix(v_fix_id, true);
+    ok := comp->>'status' = 'approved'
+      AND NOT (SELECT is_active FROM allgres_private.agents WHERE agent_id = v_sys_target);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'decide_fix_applies_deactivation', 'ok', ok));
+
+    -- self_improve cross-agent propose_change: only self_improve may set
+    -- target_agent_id; the proposal's base_generation and eventual write
+    -- land on the target, not on self_improve's own policy.
+    PERFORM allgres_public.fn_set_agent_active(v_sys_target, true);
+    SELECT generation INTO v_gen FROM allgres_private.policies WHERE agent_id = v_sys_target;
+    v_sid := (allgres_public.fn_create_session(v_self_id, 'selftest self_improve cross-agent')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_agent_id', v_sys_target::text,
+        'changes', jsonb_build_object('system_prompt', 'selftest cheaper prompt'), 'reason', 'selftest cost'
+      )
+    ));
+    v_proposal := (sub->>'proposal_id')::uuid;
+    ok := v_proposal IS NOT NULL AND EXISTS (
+      SELECT 1 FROM allgres_private.change_proposals
+      WHERE proposal_id = v_proposal AND target_agent_id = v_sys_target AND base_generation = v_gen
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'self_improve_proposes_against_target_generation', 'ok', ok));
+
+    comp := allgres_public.fn_decide_proposal(v_proposal, true);
+    ok := comp->>'status' = 'approved'
+      AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_sys_target) = 'selftest cheaper prompt'
+      AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_self_id) <> 'selftest cheaper prompt';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_writes_to_target_not_proposer', 'ok', ok));
+
+    -- Only self_improve may name a target_agent_id at all.
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest cross-agent not permitted')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_agent_id', v_sys_target::text,
+        'changes', jsonb_build_object('system_prompt', 'should not apply')
+      )
+    ));
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'propose_change_cross_agent_not_permitted'
+    ) AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_sys_target) <> 'should not apply';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'propose_change_cross_agent_rejected_from_others', 'ok', ok));
+
+    -- Regular-user approval scoping (item 41): an admin sees/decides
+    -- everything; a regular user only proposals/fixes whose target is one
+    -- of their own assigned agents.
+    PERFORM allgres_public.fn_set_agent_active(v_sys_target, false);
+    v_fix_id := NULL;
+    INSERT INTO allgres_private.fix_proposals (agent_id, task_id, fix_kind, target_agent_id, detail, reason)
+    VALUES (v_fixer_id, v_tid, 'deactivate_agent', v_sys_target, '{}'::jsonb, 'selftest scoping')
+    RETURNING fix_id INTO v_fix_id;
+
+    ok := allgres_private.visible_agent_ids(v_admin_tok) IS NULL;
+    ok := ok AND NOT (v_sys_target = ANY(COALESCE(allgres_private.visible_agent_ids(v_user_tok), ARRAY[]::uuid[])));
+    v := v || jsonb_build_array(jsonb_build_object('name', 'visible_agent_ids_scopes_regular_users', 'ok', ok));
+
+    INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+    VALUES ((SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'), v_sys_target)
+    ON CONFLICT DO NOTHING;
+    ok := v_sys_target = ANY(allgres_private.visible_agent_ids(v_user_tok));
+    v := v || jsonb_build_array(jsonb_build_object('name', 'visible_agent_ids_includes_assigned_target', 'ok', ok));
+
+    UPDATE allgres_private.fix_proposals SET status = 'rejected' WHERE fix_id = v_fix_id;
+    PERFORM allgres_public.fn_set_agent_active(v_sys_target, true);
+
+    -- 33. session_compactor auto-trigger (item 39): once a session's own
+    -- root-level log passes the threshold, fn_next_step queues a real
+    -- compaction task; once that task's own remember lands, the original
+    -- session's next turn excludes what got summarized and includes the
+    -- summary instead. Explicit, distinct created_at values -- inserted
+    -- this fast, real turns would never collide, but a tight loop in one
+    -- transaction shares plpgsql's single now() otherwise, which would
+    -- make every row indistinguishable by time and defeat the cutoff
+    -- entirely (caught live while first writing this test).
+    v_comp_base := now() - interval '1 hour';
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest compaction trigger')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    FOR v_i IN 1..70 LOOP
+      INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content, created_at)
+      VALUES (v_tid, v_i, 'assistant', to_jsonb('selftest turn ' || v_i::text), v_comp_base + (v_i * interval '1 second'));
+    END LOOP;
+    PERFORM allgres_public.fn_next_step(v_tid);
+
+    SELECT s.session_id INTO v_comp_sid FROM allgres_private.sessions s
+    WHERE s.goal = 'session_compact:' || v_sid::text;
+    ok := v_comp_sid IS NOT NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'compaction_triggers_past_threshold', 'ok', ok));
+
+    SELECT task_id INTO v_comp_tid FROM allgres_private.tasks WHERE session_id = v_comp_sid;
+    PERFORM allgres_public.fn_next_step(v_comp_tid);
+    PERFORM allgres_public.fn_submit_result(v_comp_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{}',
+      'parsed', jsonb_build_object(
+        'action', 'remember', 'content', 'SELFTEST COMPACTION SUMMARY',
+        'memory_type', 'episodic', 'importance', 0.6, 'subject_id', v_sid::text
+      )
+    ));
+    PERFORM allgres_public.fn_next_step(v_comp_tid);
+    PERFORM allgres_public.fn_submit_result(v_comp_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{}',
+      'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'done')
+    ));
+    ok := (SELECT compacted_before FROM allgres_private.sessions WHERE session_id = v_sid) IS NOT NULL;
+    ok := ok AND (SELECT status FROM allgres_private.sessions WHERE session_id = v_comp_sid) = 'completed';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'compaction_task_completes_and_sets_cutoff', 'ok', ok));
+
+    INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content, created_at)
+    VALUES (v_tid, 71, 'assistant', to_jsonb('selftest turn 71'::text), v_comp_base + interval '71 seconds');
+    spec := allgres_public.fn_next_step(v_tid);
+    ok := (spec->'messages')::text LIKE '%SELFTEST COMPACTION SUMMARY%'
+      AND (spec->'messages')::text NOT LIKE '%selftest turn 1"%'
+      AND (spec->'messages')::text LIKE '%selftest turn 71%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'compacted_session_excludes_old_includes_summary_and_new', 'ok', ok));
+
+    -- 34. orchestrator multi-mention (item 40): a message mentioning more
+    -- than one agent is delivered to all of them, in text order, and
+    -- queues a real (if advisory-only in this pass) opinion task for
+    -- orchestrator. Never v_acct_agent, which fn_chat_send would leave a
+    -- session referencing -- the same FK this whole section is careful to
+    -- avoid for v_acct_agent everywhere else, so it stays deletable at the
+    -- very end; v_sys_target and a second disposable target are used
+    -- instead, both fine to accumulate sessions on forever.
+    SELECT agent_id INTO v_mention_target FROM allgres_private.agents WHERE name = 'selftest_mention_target';
+    IF v_mention_target IS NULL THEN
+      v_mention_target := (allgres_public.fn_create_agent('selftest_mention_target')->>'agent_id')::uuid;
+    END IF;
+    INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+    VALUES ((SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'), v_mention_target)
+    ON CONFLICT DO NOTHING;
+
+    r := allgres_public.fn_messenger_post(v_user_tok, '@selftest_fix_target @selftest_mention_target selftest multi-mention');
+    v_mentioned_ids := ARRAY(SELECT jsonb_array_elements_text(r->'mentioned_agent_ids'))::uuid[];
+    ok := array_length(v_mentioned_ids, 1) = 2
+      AND v_mentioned_ids[1] = v_sys_target
+      AND v_mentioned_ids[2] = v_mention_target;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'messenger_multi_mention_delivers_to_all_in_text_order', 'ok', ok));
+
+    v_msg_id := (r->>'message_id')::uuid;
+    SELECT agent_id INTO v_orchestrator_id FROM allgres_private.agents WHERE name = 'orchestrator';
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.sessions
+      WHERE agent_id = v_orchestrator_id AND goal = 'messenger_route:' || v_msg_id::text
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'multi_mention_queues_orchestrator_opinion', 'ok', ok));
+
+    -- 35. Project chat mode (item 42): a project bound to an agent, with a
+    -- preset_prompt appended after that agent's own effective prompt.
+    -- Bound to v_sys_target, never v_acct_agent -- fn_project_chat_send
+    -- creates a real session against the project's agent, the same FK
+    -- concern as every other use of v_acct_agent in this section.
+    SELECT project_id INTO v_project FROM allgres_private.projects WHERE name = 'selftest_project';
+    IF v_project IS NULL THEN
+      v_project := (allgres_public.fn_create_project(
+        'selftest_project', 'selftest', v_sys_target, 'Selftest preset: answer only in haiku.'
+      )->>'project_id')::uuid;
+    ELSE
+      PERFORM allgres_public.fn_set_project_config(v_project, v_sys_target, 'Selftest preset: answer only in haiku.');
+      PERFORM allgres_public.fn_set_project_active(v_project, true);
+    END IF;
+
+    r := allgres_public.fn_project_chat_send(v_user_tok, v_project, 'selftest project chat turn one');
+    v_sid := (r->>'session_id')::uuid;
+    ok := v_sid IS NOT NULL AND (SELECT project_id FROM allgres_private.sessions WHERE session_id = v_sid) = v_project;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'project_chat_send_creates_project_scoped_session', 'ok', ok));
+
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    spec := allgres_public.fn_next_step(v_tid);
+    ok := (spec->'messages'->0->>'content') LIKE '%Selftest preset: answer only in haiku%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'project_preset_prompt_reaches_the_model', 'ok', ok));
+
+    r := allgres_public.fn_project_chat_history(v_user_tok, v_project);
+    ok := (r->>'session_id')::uuid = v_sid AND (r->'messages')::text LIKE '%selftest project chat turn one%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'project_chat_history_reads_back_the_session', 'ok', ok));
+
+    -- 35b. assignments.for_agent/assignments.toggle (item 32's own "grant
+    -- access from the Agents page too, not only from Users"): the reverse
+    -- direction of assignments.list/assignments.set, admin-only, one
+    -- (user, agent) pair at a time rather than replacing a user's whole list.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.toggle', 'session_token', v_admin_tok,
+      'user_id', (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'),
+      'agent_id', v_sys_target, 'assigned', true
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.for_agent', 'session_token', v_admin_tok, 'agent_id', v_sys_target
+    ));
+    ok := ok AND (sub->'user_ids')::text LIKE '%'||(SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user')::text||'%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'assignments_toggle_and_for_agent_admin_only', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.toggle', 'session_token', v_user_tok,
+      'user_id', (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'),
+      'agent_id', v_sys_target, 'assigned', false
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'assignments_toggle_rejects_non_admin', 'ok', ok));
+
+    -- 36. Overview's cluster monitoring (item 44): PostgreSQL version and
+    -- this cluster's own pg_stat_activity counts (SQL-visible) alongside
+    -- native_host_stats (OS-level CPU load/memory, not SQL-visible at
+    -- all). Values themselves are host-dependent -- this only checks the
+    -- shape is present, not any particular number.
+    r := allgres.dashboard_rpc(jsonb_build_object('action', 'overview'));
+    ok := (r->>'pg_version') IS NOT NULL
+      AND (r->'db_sessions'->>'total')::int >= 1
+      AND (r->'host'->'cpu_count') IS NOT NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'overview_reports_pg_version_db_sessions_and_host_stats', 'ok', ok));
+
+    -- fn_logout is idempotent, and a logged-out token no longer resolves.
+    PERFORM allgres_public.fn_logout(v_user_tok);
+    ok := allgres_private.session_user(v_user_tok) IS NULL;
+    PERFORM allgres_public.fn_logout(v_user_tok);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_logout_invalidates_token_and_is_idempotent', 'ok', ok));
+
+    PERFORM allgres_public.fn_logout(v_admin_tok);
+  END IF;
+
+  DELETE FROM allgres_private.web_sessions WHERE user_id IN (
+    SELECT user_id FROM allgres_private.users WHERE username IN ('selftest_admin', 'selftest_user')
+  );
+  DELETE FROM allgres_private.user_agent_assignments WHERE agent_id = v_acct_agent;
+  DELETE FROM allgres_private.users WHERE username IN ('selftest_admin', 'selftest_user');
+  DELETE FROM allgres_private.policies WHERE agent_id = v_acct_agent;
+  DELETE FROM allgres_private.agents WHERE agent_id = v_acct_agent;
+
+  -- selftest_cleanup cannot delete these rows outright -- execution_logs'
+  -- append-only trigger rejects DELETE the same as UPDATE, for anyone -- so
+  -- an operator must never see them a different way: every operator-facing
+  -- listing/count filters out goal LIKE 'selftest%' instead. A still-open
+  -- task left behind (as if selftest crashed mid-run) is also terminated,
+  -- not left to look "running" forever.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest cleanup probe')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_private.append_log(v_tid, 1, 'assistant', jsonb_build_object('note', 'selftest'));
+  PERFORM allgres_private.selftest_cleanup();
+  ok := EXISTS (SELECT 1 FROM allgres_private.sessions WHERE session_id = v_sid AND status = 'cancelled')
+    AND EXISTS (SELECT 1 FROM allgres_private.tasks WHERE task_id = v_tid AND status = 'failed')
+    AND EXISTS (SELECT 1 FROM allgres_private.execution_logs WHERE task_id = v_tid);
+  ok := ok
+    AND NOT ((allgres.dashboard_rpc('{"action":"sessions.list","limit":500}'::jsonb))::text LIKE '%'||v_sid::text||'%')
+    AND NOT ((allgres.dashboard_rpc('{"action":"tasks.list","limit":500}'::jsonb))::text LIKE '%'||v_tid::text||'%')
+    AND NOT ((allgres.dashboard_rpc('{"action":"events"}'::jsonb))::text LIKE '%'||v_tid::text||'%');
+  v := v || jsonb_build_array(jsonb_build_object('name', 'selftest_fixtures_hidden_not_deleted', 'ok', ok));
 
   PERFORM allgres_private.selftest_cleanup();
 
@@ -6047,6 +8277,8 @@ AS $fn$
 DECLARE
   v_action text := COALESCE(p_request->>'action', '');
   v_id uuid;
+  v_user allgres_private.users%ROWTYPE;
+  v_scope uuid[];
 BEGIN
   -- One audit_log row per consequential action, written here rather than
   -- scattered across each branch below, so no future action can be added
@@ -6061,22 +8293,27 @@ BEGIN
   -- authorization code or state) -- generic by design, so a new audited
   -- action needs no bespoke mapping here, only its name added to the list.
   IF v_action = ANY (ARRAY[
-    'agents.create', 'agents.update', 'policy.rollback', 'proposals.decide',
+    'agents.create', 'agents.update', 'agents.set_autonomy', 'policy.rollback', 'proposals.decide',
     'permissions.grant', 'permissions.revoke', 'allowlist.add', 'allowlist.remove',
     'projects.create', 'projects.update', 'sessions.cancel',
-    'memories.create', 'memories.remove', 'provider.update',
-    'providers.oauth_callback', 'approvals.decide'
+    'memories.create', 'memories.remove', 'provider.update', 'provider.create',
+    'providers.oauth_callback', 'approvals.decide', 'fixes.decide',
+    'users.create', 'users.set_active', 'users.set_role', 'assignments.set', 'assignments.toggle'
   ]) THEN
     INSERT INTO allgres_private.audit_log (operator_name, action, details)
     VALUES (
       NULLIF(btrim(COALESCE(p_request->>'operator_name', '')), ''),
       v_action,
       (p_request - 'action' - 'operator_name')
-        - ARRAY['api_key', 'oauth_client_secret', 'code', 'state']::text[]
+        - ARRAY['api_key', 'oauth_client_secret', 'code', 'state', 'password', 'session_token']::text[]
     );
   END IF;
 
   CASE v_action
+    -- Every count/listing here excludes goal LIKE 'selftest%' (see
+    -- selftest_cleanup's comment: those rows can never be deleted outright,
+    -- only hidden) -- a headline metric or "recent" list is exactly where an
+    -- operator would otherwise see fn_selftest's own fixtures.
     WHEN 'overview' THEN
       RETURN jsonb_build_object(
         'ok', true,
@@ -6084,13 +8321,46 @@ BEGIN
         'version', allgres.native_version(),
         'agents', (SELECT count(*) FROM allgres_private.agents),
         'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active),
-        'running_tasks', (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued','running','waiting_human')),
-        'queued_outbound', (SELECT count(*) FROM allgres_private.outbound_calls WHERE status = 'queued'),
-        'queued_sql', (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'queued'),
-        'pending_approvals', (SELECT count(*) FROM allgres_private.human_approvals WHERE status = 'pending'),
-        'failed_tasks', (SELECT count(*) FROM allgres_private.tasks WHERE status = 'failed'),
-        'sessions', (SELECT count(*) FROM allgres_private.sessions),
+        'running_tasks', (
+          SELECT count(*) FROM allgres_private.tasks t JOIN allgres_private.sessions s USING (session_id)
+          WHERE t.status IN ('queued','running','waiting_human') AND s.goal NOT LIKE 'selftest%'
+        ),
+        'queued_outbound', (
+          SELECT count(*) FROM allgres_private.outbound_calls o
+          JOIN allgres_private.tasks t USING (task_id) JOIN allgres_private.sessions s USING (session_id)
+          WHERE o.status = 'queued' AND s.goal NOT LIKE 'selftest%'
+        ),
+        'queued_sql', (
+          SELECT count(*) FROM allgres_private.sql_calls c
+          JOIN allgres_private.tasks t USING (task_id) JOIN allgres_private.sessions s USING (session_id)
+          WHERE c.status = 'queued' AND s.goal NOT LIKE 'selftest%'
+        ),
+        'pending_approvals', (
+          SELECT count(*) FROM allgres_private.human_approvals h
+          JOIN allgres_private.tasks t USING (task_id) JOIN allgres_private.sessions s USING (session_id)
+          WHERE h.status = 'pending' AND s.goal NOT LIKE 'selftest%'
+        ),
+        'failed_tasks', (
+          SELECT count(*) FROM allgres_private.tasks t JOIN allgres_private.sessions s USING (session_id)
+          WHERE t.status = 'failed' AND s.goal NOT LIKE 'selftest%'
+        ),
+        'sessions', (SELECT count(*) FROM allgres_private.sessions WHERE goal NOT LIKE 'selftest%'),
         'secret_storage', allgres_private.secret_storage_mode(),
+        -- Overview's cluster monitoring (item 44): PostgreSQL version + this
+        -- cluster's own session counts come straight from SQL; CPU load and
+        -- memory come from the one place SQL cannot see them, native_host_stats.
+        'pg_version', current_setting('server_version'),
+        'db_sessions', (
+          SELECT jsonb_build_object(
+            'active', count(*) FILTER (WHERE state = 'active'),
+            'idle', count(*) FILTER (WHERE state = 'idle'),
+            'idle_in_transaction', count(*) FILTER (WHERE state = 'idle in transaction'),
+            'total', count(*)
+          )
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+        ),
+        'host', allgres.native_host_stats(),
         'workers', COALESCE((
           SELECT jsonb_agg(jsonb_build_object('name', backend_type, 'pid', pid) ORDER BY backend_type)
           FROM pg_stat_activity
@@ -6104,6 +8374,7 @@ BEGIN
             FROM allgres_private.tasks t
             JOIN allgres_private.agents a USING (agent_id)
             JOIN allgres_private.sessions s USING (session_id)
+            WHERE s.goal NOT LIKE 'selftest%'
             ORDER BY t.updated_at DESC LIMIT 8
           ) q
         ), '[]'::jsonb)
@@ -6116,6 +8387,10 @@ BEGIN
             'agent_id', a.agent_id,
             'name', a.name,
             'is_active', a.is_active,
+            'is_system', a.is_system,
+            'parent_agent_id', a.parent_agent_id,
+            'parent_name', pa.name,
+            'autonomy_level', a.autonomy_level,
             'created_at', a.created_at,
             'updated_at', a.updated_at,
             'system_prompt', p.system_prompt,
@@ -6136,13 +8411,22 @@ BEGIN
         )
         FROM allgres_private.agents a
         JOIN allgres_private.policies p USING (agent_id)
+        LEFT JOIN allgres_private.agents pa ON pa.agent_id = a.parent_agent_id
+        WHERE a.name NOT LIKE 'selftest%'
       ), '[]'::jsonb));
+
+    WHEN 'agents.set_autonomy' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      RETURN allgres_public.fn_set_agent_autonomy(
+        (p_request->>'agent_id')::uuid, p_request->>'autonomy_level'
+      );
 
     WHEN 'agents.create' THEN
       RETURN allgres_public.fn_create_agent(p_request->>'name', p_request->>'system_prompt');
 
     WHEN 'agents.update' THEN
       v_id := (p_request->>'agent_id')::uuid;
+      PERFORM allgres_private.require_admin_for_system_agent(p_request->>'session_token', v_id);
       IF p_request ? 'is_active' THEN
         PERFORM allgres_public.fn_set_agent_active(v_id, (p_request->>'is_active')::boolean);
       END IF;
@@ -6173,6 +8457,9 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'policy.rollback' THEN
+      PERFORM allgres_private.require_admin_for_system_agent(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid
+      );
       RETURN allgres_public.fn_rollback_policy(
         (p_request->>'agent_id')::uuid, (p_request->>'generation')::int
       );
@@ -6181,9 +8468,11 @@ BEGIN
     -- 'pending' for an inbox view); neither is required, so this also
     -- serves "every proposal, newest first".
     WHEN 'proposals.list' THEN
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'proposals', COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
           'proposal_id', cp.proposal_id, 'agent_id', cp.agent_id, 'agent', a.name,
+          'kind', cp.kind, 'target_agent_id', cp.target_agent_id, 'target_agent', ta.name,
           'task_id', cp.task_id, 'proposed_changes', cp.proposed_changes,
           'reason', cp.reason, 'base_generation', cp.base_generation,
           'status', cp.status, 'created_at', cp.created_at,
@@ -6191,13 +8480,59 @@ BEGIN
         ) ORDER BY cp.created_at DESC)
         FROM allgres_private.change_proposals cp
         JOIN allgres_private.agents a ON a.agent_id = cp.agent_id
+        LEFT JOIN allgres_private.agents ta ON ta.agent_id = cp.target_agent_id
         WHERE (NOT (p_request ? 'agent_id') OR cp.agent_id = (p_request->>'agent_id')::uuid)
           AND (NOT (p_request ? 'status') OR cp.status = p_request->>'status')
+          AND COALESCE(cp.reason, '') NOT LIKE 'selftest%'
+          -- create_agent has no existing target to scope by, so it stays
+          -- admin-only in this inbox; a policy_change is visible to whoever
+          -- may reach its actual target (COALESCE(target_agent_id, agent_id)).
+          AND (v_scope IS NULL OR (cp.kind = 'policy_change' AND COALESCE(cp.target_agent_id, cp.agent_id) = ANY(v_scope)))
       ), '[]'::jsonb));
 
     WHEN 'proposals.decide' THEN
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
+      IF v_scope IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM allgres_private.change_proposals cp
+        WHERE cp.proposal_id = (p_request->>'proposal_id')::uuid
+          AND cp.kind = 'policy_change'
+          AND COALESCE(cp.target_agent_id, cp.agent_id) = ANY(v_scope)
+      ) THEN
+        RAISE EXCEPTION 'proposal not visible to this user' USING ERRCODE = 'P0001';
+      END IF;
       RETURN allgres_public.fn_decide_proposal(
         (p_request->>'proposal_id')::uuid,
+        (p_request->>'approve')::boolean,
+        NULLIF(p_request->>'reply', '')
+      );
+
+    WHEN 'fixes.list' THEN
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'fixes', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'fix_id', f.fix_id, 'agent_id', f.agent_id, 'agent', a.name,
+          'fix_kind', f.fix_kind, 'target_agent_id', f.target_agent_id, 'target_agent', ta.name,
+          'detail', f.detail, 'reason', f.reason, 'status', f.status,
+          'created_at', f.created_at, 'decided_at', f.decided_at, 'decided_reply', f.decided_reply
+        ) ORDER BY f.created_at DESC)
+        FROM allgres_private.fix_proposals f
+        JOIN allgres_private.agents a ON a.agent_id = f.agent_id
+        JOIN allgres_private.agents ta ON ta.agent_id = f.target_agent_id
+        WHERE (NOT (p_request ? 'status') OR f.status = p_request->>'status')
+          AND COALESCE(f.reason, '') NOT LIKE 'selftest%'
+          AND (v_scope IS NULL OR f.target_agent_id = ANY(v_scope))
+      ), '[]'::jsonb));
+
+    WHEN 'fixes.decide' THEN
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
+      IF v_scope IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM allgres_private.fix_proposals f
+        WHERE f.fix_id = (p_request->>'fix_id')::uuid AND f.target_agent_id = ANY(v_scope)
+      ) THEN
+        RAISE EXCEPTION 'fix not visible to this user' USING ERRCODE = 'P0001';
+      END IF;
+      RETURN allgres_public.fn_decide_fix(
+        (p_request->>'fix_id')::uuid,
         (p_request->>'approve')::boolean,
         NULLIF(p_request->>'reply', '')
       );
@@ -6213,11 +8548,17 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'permissions.grant' THEN
+      PERFORM allgres_private.require_admin_for_system_agent(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid
+      );
       RETURN allgres_public.fn_grant_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
 
     WHEN 'permissions.revoke' THEN
+      PERFORM allgres_private.require_admin_for_system_agent(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid
+      );
       RETURN allgres_public.fn_revoke_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
@@ -6257,20 +8598,40 @@ BEGIN
       RETURN jsonb_build_object('ok', true, 'projects', COALESCE((
         SELECT jsonb_agg(to_jsonb(pr) ORDER BY pr.name)
         FROM (
-          SELECT project_id, name, description, is_active, created_at, updated_at
-          FROM allgres_private.projects
+          SELECT p.project_id, p.name, p.description, p.is_active, p.created_at, p.updated_at,
+                 p.agent_id, a.name AS agent, p.preset_prompt
+          FROM allgres_private.projects p
+          LEFT JOIN allgres_private.agents a ON a.agent_id = p.agent_id
         ) pr
       ), '[]'::jsonb));
 
     WHEN 'projects.create' THEN
-      RETURN allgres_public.fn_create_project(p_request->>'name', p_request->>'description');
+      RETURN allgres_public.fn_create_project(
+        p_request->>'name', p_request->>'description',
+        NULLIF(p_request->>'agent_id', '')::uuid, p_request->>'preset_prompt'
+      );
 
     WHEN 'projects.update' THEN
       v_id := (p_request->>'project_id')::uuid;
       IF p_request ? 'is_active' THEN
         PERFORM allgres_public.fn_set_project_active(v_id, (p_request->>'is_active')::boolean);
       END IF;
+      IF p_request ? 'agent_id' OR p_request ? 'preset_prompt' THEN
+        PERFORM allgres_public.fn_set_project_config(
+          v_id, NULLIF(p_request->>'agent_id', '')::uuid, p_request->>'preset_prompt'
+        );
+      END IF;
       RETURN jsonb_build_object('ok', true, 'project_id', v_id);
+
+    WHEN 'project_chat.send' THEN
+      RETURN allgres_public.fn_project_chat_send(
+        p_request->>'session_token', (p_request->>'project_id')::uuid, p_request->>'message'
+      );
+
+    WHEN 'project_chat.history' THEN
+      RETURN allgres_public.fn_project_chat_history(
+        p_request->>'session_token', (p_request->>'project_id')::uuid
+      );
 
     WHEN 'run' THEN
       RETURN allgres_public.fn_create_session(
@@ -6285,6 +8646,188 @@ BEGIN
         p_request->>'reason'
       );
 
+    WHEN 'sessions.continue' THEN
+      RETURN allgres_public.fn_continue_session(
+        (p_request->>'session_id')::uuid,
+        p_request->>'message'
+      );
+
+    -- ---------------------------------------------------------------------
+    -- Accounts, roles, and the chat/messenger surface (see the
+    -- users/web_sessions table comments and require_admin/
+    -- require_agent_access). None of these touch operator_name/the
+    -- dashboard's own shared bearer token -- a session_token in the request
+    -- body identifies the logged-in user instead, resolved server-side by
+    -- allgres_private.session_user rather than trusted at face value.
+    -- ---------------------------------------------------------------------
+
+    WHEN 'auth.login' THEN
+      RETURN allgres_public.fn_login(p_request->>'username', p_request->>'password');
+
+    WHEN 'auth.logout' THEN
+      RETURN allgres_public.fn_logout(p_request->>'session_token');
+
+    WHEN 'auth.me' THEN
+      v_user := allgres_private.session_user(p_request->>'session_token');
+      IF v_user.user_id IS NULL THEN
+        RETURN jsonb_build_object('ok', true, 'logged_in', false);
+      END IF;
+      RETURN jsonb_build_object(
+        'ok', true, 'logged_in', true,
+        'user_id', v_user.user_id, 'username', v_user.username, 'role', v_user.role
+      );
+
+    WHEN 'users.create' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      RETURN allgres_public.fn_create_user(
+        p_request->>'username', p_request->>'password',
+        COALESCE(NULLIF(p_request->>'role', ''), 'user')
+      );
+
+    WHEN 'users.list' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'users', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'user_id', user_id, 'username', username, 'role', role,
+          'is_active', is_active, 'created_at', created_at
+        ) ORDER BY created_at)
+        FROM allgres_private.users
+      ), '[]'::jsonb));
+
+    WHEN 'users.set_active' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      UPDATE allgres_private.users SET is_active = (p_request->>'is_active')::boolean
+      WHERE user_id = (p_request->>'user_id')::uuid;
+      RETURN jsonb_build_object('ok', true);
+
+    WHEN 'users.set_role' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      IF p_request->>'role' NOT IN ('admin', 'user') THEN
+        RAISE EXCEPTION 'invalid role: %', p_request->>'role' USING ERRCODE = 'P0001';
+      END IF;
+      UPDATE allgres_private.users SET role = p_request->>'role'
+      WHERE user_id = (p_request->>'user_id')::uuid;
+      RETURN jsonb_build_object('ok', true);
+
+    -- Replaces the full assignment set for one user with the given
+    -- agent_ids array -- simpler and less error-prone from the UI than
+    -- incremental add/remove calls for what is always edited as one list.
+    WHEN 'assignments.set' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      v_id := (p_request->>'user_id')::uuid;
+      DELETE FROM allgres_private.user_agent_assignments WHERE user_id = v_id;
+      INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+      SELECT v_id, (a)::uuid FROM jsonb_array_elements_text(COALESCE(p_request->'agent_ids', '[]'::jsonb)) a;
+      RETURN jsonb_build_object('ok', true);
+
+    WHEN 'assignments.list' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'agent_ids', COALESCE((
+        SELECT jsonb_agg(agent_id) FROM allgres_private.user_agent_assignments
+        WHERE user_id = (p_request->>'user_id')::uuid
+      ), '[]'::jsonb));
+
+    -- The reverse direction of assignments.list (item 32: "admin should be
+    -- able to grant user access from the Agents page too, not only from
+    -- Users") -- every user who may reach one agent, and a single add/
+    -- remove that doesn't require replacing that user's whole assignment
+    -- list the way assignments.set (built for the Users page's own
+    -- per-user checkbox list) does.
+    WHEN 'assignments.for_agent' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'user_ids', COALESCE((
+        SELECT jsonb_agg(user_id) FROM allgres_private.user_agent_assignments
+        WHERE agent_id = (p_request->>'agent_id')::uuid
+      ), '[]'::jsonb));
+
+    WHEN 'assignments.toggle' THEN
+      PERFORM allgres_private.require_admin(p_request->>'session_token');
+      IF (p_request->>'assigned')::boolean THEN
+        INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+        VALUES ((p_request->>'user_id')::uuid, (p_request->>'agent_id')::uuid)
+        ON CONFLICT DO NOTHING;
+      ELSE
+        DELETE FROM allgres_private.user_agent_assignments
+        WHERE user_id = (p_request->>'user_id')::uuid AND agent_id = (p_request->>'agent_id')::uuid;
+      END IF;
+      RETURN jsonb_build_object('ok', true);
+
+    -- The agents a logged-in user may see at all: every active agent for an
+    -- admin, only explicitly assigned ones for a regular user.
+    WHEN 'agents.mine' THEN
+      v_user := allgres_private.session_user(p_request->>'session_token');
+      IF v_user.user_id IS NULL THEN
+        RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'agents', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'agent_id', a.agent_id, 'name', a.name,
+          'provider', p.llm_config->>'provider', 'model', p.llm_config->>'model'
+        ) ORDER BY a.name)
+        FROM allgres_private.agents a
+        JOIN allgres_private.policies p USING (agent_id)
+        WHERE a.is_active AND (
+          v_user.role = 'admin'
+          OR EXISTS (
+            SELECT 1 FROM allgres_private.user_agent_assignments x
+            WHERE x.user_id = v_user.user_id AND x.agent_id = a.agent_id
+          )
+        )
+      ), '[]'::jsonb));
+
+    WHEN 'agents.set_my_model' THEN
+      RETURN allgres_public.fn_set_my_model(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid,
+        NULLIF(p_request->>'provider', ''), NULLIF(p_request->>'model', '')
+      );
+
+    WHEN 'chat.send' THEN
+      RETURN allgres_public.fn_chat_send(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid, p_request->>'message'
+      );
+
+    WHEN 'chat.history' THEN
+      RETURN allgres_public.fn_chat_history(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid
+      );
+
+    WHEN 'messenger.post' THEN
+      RETURN allgres_public.fn_messenger_post(p_request->>'session_token', p_request->>'text');
+
+    WHEN 'messenger.list' THEN
+      v_user := allgres_private.session_user(p_request->>'session_token');
+      IF v_user.user_id IS NULL THEN
+        RAISE EXCEPTION 'not logged in' USING ERRCODE = 'P0001';
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'messages', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at)
+        FROM (
+          SELECT m.message_id, m.content, m.created_at,
+                 au.username AS author, ag.name AS mentioned_agent,
+                 s.status AS reply_status, s.final_answer AS reply,
+                 -- Every mentioned agent's own reply, for a multi-mention
+                 -- post (item 40) -- each agent keeps its own (user, agent)
+                 -- session, so this is found the same way fn_chat_send
+                 -- itself resolves one, not a column stored on this row.
+                 (
+                   SELECT jsonb_agg(jsonb_build_object(
+                     'agent', a2.name, 'reply_status', s2.status, 'reply', s2.final_answer
+                   ) ORDER BY x.ord)
+                   FROM unnest(m.mentioned_agent_ids) WITH ORDINALITY AS x(agent_id, ord)
+                   JOIN allgres_private.agents a2 ON a2.agent_id = x.agent_id
+                   LEFT JOIN allgres_private.user_agent_chat_sessions ucs
+                     ON ucs.user_id = m.author_user_id AND ucs.agent_id = x.agent_id
+                   LEFT JOIN allgres_private.sessions s2 ON s2.session_id = ucs.session_id
+                 ) AS mentioned_agents
+          FROM allgres_private.channel_messages m
+          JOIN allgres_private.users au ON au.user_id = m.author_user_id
+          LEFT JOIN allgres_private.agents ag ON ag.agent_id = m.mentioned_agent_id
+          LEFT JOIN allgres_private.sessions s ON s.session_id = m.session_id
+          ORDER BY m.created_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
+        ) q
+      ), '[]'::jsonb));
+
     WHEN 'sessions.list' THEN
       RETURN jsonb_build_object('ok', true, 'sessions', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.started_at DESC)
@@ -6293,8 +8836,9 @@ BEGIN
                  s.goal, s.status, s.final_answer, s.started_at, s.completed_at
           FROM allgres_private.sessions s
           JOIN allgres_private.agents a USING (agent_id)
-          WHERE NOT (p_request ? 'project_id')
-             OR s.project_id IS NOT DISTINCT FROM NULLIF(p_request->>'project_id', '')::uuid
+          WHERE s.goal NOT LIKE 'selftest%'
+            AND (NOT (p_request ? 'project_id')
+             OR s.project_id IS NOT DISTINCT FROM NULLIF(p_request->>'project_id', '')::uuid)
           ORDER BY s.started_at DESC
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 100), 1), 500)
         ) q
@@ -6334,6 +8878,10 @@ BEGIN
         ), '[]'::jsonb)
       );
 
+    -- goal NOT LIKE 'selftest%' excludes fn_selftest's own fixture sessions
+    -- (see selftest_cleanup's comment: they can never be deleted outright,
+    -- execution_logs' append-only trigger forbids it even for this
+    -- function's owner, so they are hidden here instead).
     WHEN 'tasks.list' THEN
       RETURN jsonb_build_object('ok', true, 'tasks', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.updated_at DESC)
@@ -6344,6 +8892,7 @@ BEGIN
           FROM allgres_private.tasks t
           JOIN allgres_private.agents a USING (agent_id)
           JOIN allgres_private.sessions s USING (session_id)
+          WHERE s.goal NOT LIKE 'selftest%'
           ORDER BY t.updated_at DESC
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 100), 1), 500)
         ) q
@@ -6358,6 +8907,8 @@ BEGIN
           FROM allgres_private.execution_logs l
           JOIN allgres_private.tasks t USING (task_id)
           JOIN allgres_private.agents a USING (agent_id)
+          JOIN allgres_private.sessions s USING (session_id)
+          WHERE s.goal NOT LIKE 'selftest%'
           ORDER BY l.created_at DESC
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 150), 1), 1000)
         ) q
@@ -6452,6 +9003,15 @@ BEGIN
       END IF;
       RETURN jsonb_build_object('ok', true, 'provider_id', v_id);
 
+    WHEN 'provider.create' THEN
+      RETURN allgres_public.fn_create_provider(
+        p_request->>'name',
+        p_request->>'kind',
+        p_request->>'base_url',
+        NULLIF(p_request->>'api_key',''),
+        COALESCE((p_request->>'allow_private_network')::boolean, false)
+      );
+
     -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
     -- fn_oauth_start only ever returns a redirect_url and a state, neither
     -- of which is secret, so this is safe for operator to call directly.
@@ -6479,7 +9039,10 @@ BEGIN
           FROM (
             SELECT t.task_id, a.name AS agent, t.status, t.step_count, t.updated_at,
                    left(COALESCE(t.error,''), 240) AS error
-            FROM allgres_private.tasks t JOIN allgres_private.agents a USING (agent_id)
+            FROM allgres_private.tasks t
+            JOIN allgres_private.agents a USING (agent_id)
+            JOIN allgres_private.sessions s USING (session_id)
+            WHERE s.goal NOT LIKE 'selftest%'
             ORDER BY t.updated_at DESC LIMIT 12
           ) q
         ), '[]'::jsonb),
@@ -6488,12 +9051,16 @@ BEGIN
           FROM (
             SELECT l.log_id, l.task_id, l.step_number, l.role, l.content, l.created_at
             FROM allgres_private.execution_logs l
+            JOIN allgres_private.tasks t USING (task_id)
+            JOIN allgres_private.sessions s USING (session_id)
+            WHERE s.goal NOT LIKE 'selftest%'
             ORDER BY l.created_at DESC LIMIT 15
           ) q
         ), '[]'::jsonb)
       );
 
     WHEN 'approvals.list' THEN
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'approvals', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at)
         FROM (
@@ -6505,12 +9072,21 @@ BEGIN
           JOIN allgres_private.agents a USING (agent_id)
           JOIN allgres_private.sessions s USING (session_id)
           WHERE h.status = 'pending'
+            AND (v_scope IS NULL OR t.agent_id = ANY(v_scope))
           ORDER BY h.created_at
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 100), 1), 500)
         ) q
       ), '[]'::jsonb));
 
     WHEN 'approvals.decide' THEN
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
+      IF v_scope IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM allgres_private.human_approvals h
+        JOIN allgres_private.tasks t USING (task_id)
+        WHERE h.approval_id = (p_request->>'approval_id')::uuid AND t.agent_id = ANY(v_scope)
+      ) THEN
+        RAISE EXCEPTION 'approval not visible to this user' USING ERRCODE = 'P0001';
+      END IF;
       RETURN allgres_public.fn_decide_approval(
         (p_request->>'approval_id')::uuid,
         (p_request->>'accept')::boolean,

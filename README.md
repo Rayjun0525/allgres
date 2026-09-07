@@ -6,7 +6,9 @@ Allgres is a PostgreSQL-native agent control plane. It packages the PL/pgSQL
 state machine, a Rust/pgrx native runtime worker, outbound HTTP/HTTPS, and an
 embedded browser control panel into one PostgreSQL extension.
 
-Version 0.3.0. This is an MVP: read [Security model](#security-model) before
+Version 0.1.0 -- pre-release; the version number tracks an actual release,
+not every development milestone (see KNOWN_ISSUES.md's versioning note).
+This is an MVP: read [Security model](#security-model) before
 putting it anywhere that matters.
 
 ## Status
@@ -313,6 +315,154 @@ person typing it chooses to be. A real answer needs per-operator accounts
 Browsable from the new **Audit Log** dashboard page (`audit.list`), newest
 first, with the same self-reported-not-authentication banner repeated
 there.
+
+## Model configuration and conversations
+
+A fresh agent's `llm_config` starts empty — `{}` — whether it was just
+created or is the seeded `analyst` demo agent. Nothing runs until an
+operator explicitly picks a provider and model; there is no fallback
+provider or model name baked in anywhere, so an agent with nothing
+configured fails closed with a clear error (`agent has no llm_config.provider
+configured`) instead of quietly reaching a real endpoint.
+
+Providers are managed from **Settings**: `provider.create`
+(`fn_create_provider`) adds a new one (name, kind, base URL, an optional API
+key, and whether it may point at a loopback/private-network address) — not
+just the five seeded ones (`xai`, `openai`, `anthropic`, `ollama`,
+`openai_compat`) — and `provider.update` (`fn_set_provider`) edits an
+existing one, including OAuth fields and connecting via the OAuth flow (see
+above). In the agent editor, Provider is a dropdown populated from
+currently-enabled providers, not a free-text field an agent could be
+pointed at a nonexistent name with; Model stays free text, since one
+provider can host many model names.
+
+A session is no longer a single one-shot exchange. `fn_continue_session`
+adds a follow-up message to an existing session — a new task in the same
+session, sharing its `agent_id` — and `fn_next_step` assembles the full
+conversation for it: every root-level task's log in that session, in
+chronological order, not just the one task currently running. A delegated
+sub-agent task (`parent_task_id` set — see `delegate` in the SQL sandbox
+section above) stays scoped to only its own log, so a sub-agent's turn
+never sees the parent conversation, or a sibling delegate's, just because
+they share a `session_id`. A session that already finished is reopened
+(`status` back to `open`) by a new message, the same way a chat thread
+resumes when someone replies to it; sending a second message while an
+earlier turn in the same session is still in flight is rejected outright
+rather than racing it. Wired into `dashboard_rpc` as `sessions.continue`.
+
+A real login gates the dashboard on top of the token above, not instead of
+it: the token still decides whether a browser reaches the HTTP surface at
+all, login decides who, having reached it, is using it. An **admin**
+account sees every existing page plus **Users** (create an account,
+activate/deactivate it, change its role, and manage which agents it can
+reach), **Chat**, and **Messenger**. A **user** account sees only three
+pages: **Chat** (a plain, continuing 1:1 conversation with one of their
+assigned agents at a time — `fn_chat_send`/`fn_chat_history`, one ongoing
+session per (user, agent) pair, resumed via `fn_continue_session` above),
+**Messenger** (a Slack-style shared channel — a plain post is just stored;
+a post containing `@agent_name` additionally routes that message to the
+agent the same way Chat would, sharing the same conversation rather than
+starting a second, divergent one — `fn_messenger_post`/`messenger.list`),
+and **My Agents** (their assigned agents, each with an inline Provider/
+Model editor — `fn_set_my_model` — never the full agent editor's
+prompt/budget/permission fields). Which agents a regular user can reach at
+all is an explicit allow-list (`allgres_private.user_agent_assignments`,
+managed by an admin from the Users page), not everything minus a
+block-list. See KNOWN_ISSUES.md, item 30, for what this deliberately does
+not change: the pre-existing shared-token `dashboard_rpc` surface (agent
+CRUD, permissions, providers, the SQL sandbox allowlist) is untouched and
+still reachable by anyone holding that one token, same as every version
+before this — login adds a second, narrower identity layer for chat/
+messenger/my-model specifically, not a retrofit of the first one (that
+remains KNOWN_ISSUES.md, item 10).
+
+## System agents
+
+Beyond the two demo/maintenance agents above, five built-in agents operate
+the platform itself, seeded under one shared parent (`system_root`) so a
+grant or a framing sentence added to the root reaches all five without
+being restated per agent: `session_compactor` (summarizes a session's
+older turns once its log passes a threshold — `allgres_private.
+maybe_trigger_compaction`, called on every `fn_next_step`), `orchestrator`
+(records an advisory opinion on response order whenever a Messenger post
+`@mentions` more than one agent — delivery itself is still text order; see
+KNOWN_ISSUES item 31 for what "advisory" means here), `creator`, `fixer`,
+and `self_improve`. `agent_id`/`name`/`system_prompt` inheritance is real —
+`allgres_private.agent_has_permission`/`agent_effective_prompt` walk
+`parent_agent_id` so a child sees its own grants plus everything the root
+was granted, and its own prompt appended after the root's shared framing.
+Every one of the five is `is_system = true`: editing its policy or
+permissions from the Agents page now requires an admin session
+(`require_admin_for_system_agent`) — an ordinary, non-system agent is
+completely unaffected by this check.
+
+`creator`, `fixer`, and `self_improve` can each take one real,
+consequential action, gated by a per-agent `autonomy_level` an admin sets
+from the Agents page (`agents.set_autonomy`): `admin_approval` (default)
+queues it for a human to accept or reject; `auto`/`self_approve` apply it
+immediately.
+
+- **creator** proposes a brand-new agent (`create_agent`); approval calls
+  the same `fn_create_agent` the Agents page itself uses.
+- **fixer** reads the same two read-only views `health_monitor` does
+  (`v_system_health`, `v_permission_audit`) and, instead of only
+  reporting, proposes a concrete remediation (`propose_fix`: revoke a
+  permission, or deactivate an agent) into a new Fixes queue.
+- **self_improve** is the one agent allowed to `propose_change` against an
+  *other* agent's policy (every other agent's `propose_change` stays
+  self-only) — aimed at cost/efficiency, not behavior.
+
+Approvals, Proposals, and the new Fixes queue are no longer admin-only
+inboxes: a regular user sees and may decide the ones whose target is one
+of their own assigned agents (`allgres_private.visible_agent_ids`); an
+admin still sees everything. Both inboxes also filter out
+`fn_selftest`'s own fixtures, the same as Sessions/Tasks already did.
+
+An admin can also grant/revoke a user's access to one agent directly from
+the Agents page's own edit modal (`assignments.toggle`/`.for_agent`), not
+only from Settings' Users section — the reverse direction of the same
+`user_agent_assignments` table, one pair at a time rather than replacing a
+user's whole list.
+
+## Chat: General, Messenger, and Project modes
+
+The Chat page is one page with three mode buttons, not three separate nav
+entries: **General** (a plain, continuing 1:1 conversation — unchanged from
+before), **Messenger** (the Slack-style shared channel — unchanged, now
+also delivering to every agent a post `@mentions`, in text order, when more
+than one is addressed), and **Project** — a project (Settings/Projects,
+admin-managed) may be bound to one agent with a `preset_prompt` appended
+after that agent's own system prompt (`fn_next_step`), giving it a focused,
+reusable context (e.g. "only ever answer about the Seoul region") without
+touching the agent's own policy. Project mode has its own continuing
+session per (user, project) pair (`user_project_chat_sessions`,
+`fn_project_chat_send`/`fn_project_chat_history`) — deliberately separate
+from that same agent's General-mode conversation, so a project's preset
+context never leaks into a plain chat with the same agent or vice versa.
+
+## Overview: cluster monitoring
+
+Overview also reports PostgreSQL's own version and this database's
+`pg_stat_activity` session counts (active/idle/idle-in-transaction), plus
+host-level CPU load and memory — the one thing SQL cannot see on its own,
+read from `/proc/loadavg`/`/proc/meminfo` by a new native function,
+`allgres.native_host_stats()` (Linux-only by design, the same reasoning as
+`analyze_sql`'s use of PostgreSQL's own parser: the most direct interface
+available, not the most portable one — it degrades to `null` sections
+rather than an error if `/proc` is unavailable).
+
+## Navigation, language, and theme
+
+Sessions/Tasks/Logs and the audit trail are one **Audit** page with four
+tabs now, not four separate nav entries; Users is a section of **Settings**
+rather than its own page; Approvals/Proposals/Fixes are three tabs of one
+**Approvals** page, open to regular users too (see "System agents" above).
+Settings also has a language switch (English/한국어) and a dark/light theme
+switch — both a plain per-browser `localStorage` preference with nothing
+server-side to configure. The language switch covers navigation, page
+chrome, and common actions/empty-states, not every field label in every
+modal, and never data that came from the database itself (an agent's own
+name, a log's own content) — see KNOWN_ISSUES item 31 for the exact scope.
 
 ## Known limitations
 
