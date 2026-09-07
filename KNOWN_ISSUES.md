@@ -2521,3 +2521,43 @@ embedded Users section and switching the whole nav to 한국어 and the page
 to light theme live; Audit's four tabs; and a regular user's restricted
 three-item nav still reaching the Approvals page scoped to their own
 assignments -- zero console errors across the whole pass.
+
+## 33. `agents.list` never filtered `fn_selftest`'s own fixtures either -- caught by an actual CI failure
+
+Item 29 hid `fn_selftest`'s scratch sessions/tasks from Sessions/Tasks/
+Overview (`goal NOT LIKE 'selftest%'`); item 31 did the same for the new
+Proposals/Fixes queues. `agents.list` (the Agents page, and
+`/api/v1/agents`) never got the equivalent `name NOT LIKE 'selftest%'`
+filter -- every scratch agent `fn_selftest` creates (`selftest_delegate_a`/
+`_b`, `selftest_fix_target`, `selftest_mention_target`, an epoch-suffixed
+`selftest_created_by_creator_<ts>`/`selftest_auto_created_<ts>` pair per
+run, and more) has always accumulated there, real rows never deleted,
+same as the sessions/tasks case before item 29's fix.
+
+This stayed a cosmetic wart, not a real cost, back when `fn_selftest` only
+created a handful of scratch agents with short prompts. Item 32's five
+system agents each carry a multi-paragraph prompt, and item 36's new
+`create_agent`/`propose_fix` selftest cases add two more scratch agents
+per run -- so a CI job that calls `fn_selftest` more than once in the
+same database (this project's own `docker-smoke` job does, directly and
+through `tests/smoke.sql`) accumulates agents with long prompts fast.
+Caught live: a `docker-smoke` run failed with `curl: (23) Failure writing
+output to destination` (exit code 23) partway through printing a `curl`
+response -- the response itself (confirmed by reproducing locally) was
+`/api/v1/agents`, grown large enough after a few `fn_selftest` calls in
+one container's lifetime to trip a write failure logging it. The specific
+PR run this was caught on had already gone green on a later, unrelated
+push by the time this was investigated, but the underlying growth is
+real, cumulative within any one long-lived database (a real dashboard
+install, or a CI container that runs `fn_selftest` more than once), and
+was going to resurface.
+
+Fixed by adding the same `name NOT LIKE 'selftest%'` filter to
+`agents.list`'s query, exactly the pattern items 29 and 31 already
+established for every other listing. Confirmed live: three `fn_selftest`
+runs against one fresh database, `allgres_private.agents` growing to 23
+real rows, `agents.list` correctly still returning exactly the 8 real
+ones (`analyst`, `health_monitor`, and the six `is_system` agents --
+`system_root` and its five children) at a
+reasonable ~11KB response size instead of all 23 and growing.
+`fn_selftest` (140/140) and `tests/smoke.sql` both still pass.

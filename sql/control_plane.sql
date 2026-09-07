@@ -8412,6 +8412,7 @@ BEGIN
         FROM allgres_private.agents a
         JOIN allgres_private.policies p USING (agent_id)
         LEFT JOIN allgres_private.agents pa ON pa.agent_id = a.parent_agent_id
+        WHERE a.name NOT LIKE 'selftest%'
       ), '[]'::jsonb));
 
     WHEN 'agents.set_autonomy' THEN
