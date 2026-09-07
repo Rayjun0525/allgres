@@ -173,4 +173,112 @@ BEGIN
   END IF;
 END $$;
 
+-- Agent-identity embeddings and semantic delegate search, driven through
+-- the real background worker's HTTP pool end to end: fn_create_agent ->
+-- queue_agent_embedding -> fn_claim_agent_embedding -> perform_http
+-- (send_json) -> mock embeddings endpoint -> fn_complete_agent_embedding
+-- (writes allgres_private.agents.embedding), then a real 'search_agents'
+-- agent action -> outbound_calls kind='embedding' -> fn_claim_outbound ->
+-- perform_http -> fn_complete_outbound's own 'embedding' branch ->
+-- allgres_private.rank_agents_by_embedding -> a 'tool_result' landing in
+-- execution_logs. fn_selftest exercises the same SQL functions directly
+-- (no HTTP, no worker); this is the one place a real request/response
+-- round trip through the actual runtime process is proven, the same
+-- distinction the LLM and OAuth mock round trips above draw.
+INSERT INTO allgres_private.llm_providers
+  (name, kind, base_url, is_enabled, allow_private_network, purpose, embedding_model)
+VALUES ('allgres_mock_embed', 'openai_compat', 'http://127.0.0.1:8088/mock', true, true,
+        'embedding', 'allgres-mock-embed')
+ON CONFLICT (name) DO UPDATE
+SET base_url = EXCLUDED.base_url,
+    is_enabled = true,
+    allow_private_network = true,
+    purpose = 'embedding',
+    embedding_model = 'allgres-mock-embed';
+
+CREATE TEMP TABLE _allgres_embed_agents(name text, agent_id uuid);
+INSERT INTO _allgres_embed_agents
+SELECT 'e2e_alpha_agent', (allgres_public.fn_create_agent('e2e_alpha_agent', 'You specialize in alpha tasks.')->>'agent_id')::uuid
+UNION ALL
+SELECT 'e2e_gamma_agent', (allgres_public.fn_create_agent('e2e_gamma_agent', 'You specialize in gamma tasks.')->>'agent_id')::uuid;
+
+DO $$
+DECLARE
+  v_n int;
+  i int;
+BEGIN
+  FOR i IN 1..200 LOOP
+    SELECT count(*) INTO v_n
+    FROM allgres_private.agents a JOIN _allgres_embed_agents e ON e.agent_id = a.agent_id
+    WHERE a.embedding IS NOT NULL;
+    EXIT WHEN v_n = 2;
+    PERFORM pg_sleep(0.1);
+  END LOOP;
+  IF v_n <> 2 THEN
+    RAISE EXCEPTION 'Allgres E2E agent-identity embeddings did not complete (got %)', v_n;
+  END IF;
+END $$;
+
+CREATE TEMP TABLE _allgres_search_agent(agent_id uuid, task_id uuid);
+INSERT INTO _allgres_search_agent (agent_id)
+SELECT (allgres_public.fn_create_agent('e2e_search_requester')->>'agent_id')::uuid;
+
+SELECT allgres_public.fn_grant_permission(agent_id, 'agent', 'e2e_alpha_agent') FROM _allgres_search_agent;
+SELECT allgres_public.fn_grant_permission(agent_id, 'agent', 'e2e_gamma_agent') FROM _allgres_search_agent;
+
+DO $$
+DECLARE
+  v_agent uuid;
+  v_sid uuid;
+  v_tid uuid;
+BEGIN
+  SELECT agent_id INTO v_agent FROM _allgres_search_agent;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'find me an alpha specialist')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"search_agents","query":"I need an alpha specialist"}',
+    'parsed', jsonb_build_object('action', 'search_agents', 'query', 'I need an alpha specialist')
+  ));
+  UPDATE _allgres_search_agent SET task_id = v_tid;
+END $$;
+
+DO $$
+DECLARE
+  v_n int;
+  i int;
+BEGIN
+  FOR i IN 1..200 LOOP
+    SELECT count(*) INTO v_n
+    FROM allgres_private.execution_logs e
+    JOIN _allgres_search_agent s ON s.task_id = e.task_id
+    WHERE e.role = 'tool';
+    EXIT WHEN v_n = 1;
+    PERFORM pg_sleep(0.1);
+  END LOOP;
+  IF v_n <> 1 THEN
+    RAISE EXCEPTION 'Allgres E2E search_agents did not complete (got % tool results)', v_n;
+  END IF;
+END $$;
+
+DO $$
+DECLARE
+  v_body jsonb;
+  v_top text;
+BEGIN
+  SELECT (e.content->>'body')::jsonb INTO v_body
+  FROM allgres_private.execution_logs e
+  JOIN _allgres_search_agent s ON s.task_id = e.task_id
+  WHERE e.role = 'tool';
+
+  v_top := v_body->0->>'name';
+  IF v_top <> 'e2e_alpha_agent' THEN
+    RAISE EXCEPTION 'Allgres E2E search_agents ranked % first, expected e2e_alpha_agent: %', v_top, v_body;
+  END IF;
+  IF jsonb_array_length(v_body) <> 2 THEN
+    RAISE EXCEPTION 'Allgres E2E search_agents returned % candidates, expected 2: %', jsonb_array_length(v_body), v_body;
+  END IF;
+END $$;
+
 SELECT 'e2e ok' AS result;

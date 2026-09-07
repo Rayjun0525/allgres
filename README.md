@@ -102,6 +102,9 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 - `allgres` extension
 - `shared_preload_libraries = 'allgres'`
 - `pgcrypto` (optional, for encrypted provider secrets)
+- `pgvector` (optional, accelerates semantic delegate search — see
+  [Semantic delegate search](#semantic-delegate-search); everything works
+  without it, just unindexed)
 
 No Node, Python, Redis, RabbitMQ, pg_net, pg_cron, or external web server is
 required at runtime.
@@ -435,6 +438,33 @@ the Agents page's own edit modal (`assignments.toggle`/`.for_agent`), not
 only from Settings' Users section — the reverse direction of the same
 `user_agent_assignments` table, one pair at a time rather than replacing a
 user's whole list.
+
+## Semantic delegate search
+
+`delegate` has always required an agent to already know the exact
+`agent_name` of who to hand a task to. A new `search_agents` action lets
+it describe the task instead: register a `purpose='embedding'` provider in
+Settings (`kind` must be `openai_compat` — an OpenAI-shaped `/embeddings`
+endpoint, real or a local server), and every agent's name + system_prompt
+is embedded and kept current automatically whenever it's created or its
+prompt changes. `search_agents` embeds the query the same way and ranks
+every agent the caller actually holds an `agent` permission for by cosine
+similarity — the identical permission check `delegate` itself enforces, so
+a search can never surface a name the caller could not actually delegate
+to — returning the ranked list as a `tool_result` on the next step.
+
+Embeddings are stored as a plain array (`agents.embedding`), never
+[pgvector](https://github.com/pgvector/pgvector)'s own `vector` type, so
+none of this requires pgvector at all — ranking falls back to an unindexed
+but exactly-correct SQL cosine similarity. Installing pgvector
+(`CREATE EXTENSION vector;`, entirely the operator's own opt-in step —
+allgres never runs it, the same as `pgcrypto`; the Docker image installs
+the package so it's available if wanted) only adds an HNSW index for
+speed, built and kept in sync with whatever embedding dimension is
+actually in use automatically the first time it would help. See
+KNOWN_ISSUES.md item 35 for the full mechanism and two real bugs this
+found (a missing worker grant, and pgvector's own `sum(vector)` overload
+breaking the SQL sandbox's unrelated function allowlist).
 
 ## Chat: General, Messenger, and Project modes
 

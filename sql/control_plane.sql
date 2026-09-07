@@ -379,6 +379,23 @@ ALTER TABLE allgres_private.agents
 ALTER TABLE allgres_private.agents
   ADD COLUMN IF NOT EXISTS agent_config jsonb NOT NULL DEFAULT '{}'::jsonb;
 
+-- Semantic identity for delegation discovery (fn_search_agents): a vector
+-- embedding of this agent's own name + system_prompt, so another agent can
+-- find it by describing a task instead of already knowing its exact name.
+-- See the llm_providers.purpose comment above for why this is a plain
+-- double precision[], not pgvector's `vector` type. embedding_model records
+-- "<provider name>:<model>" at the time it was generated so a later switch
+-- of the configured embedding provider/model can be detected as staleness
+-- (the dashboard's job, not this column's) rather than silently mixing
+-- embeddings from two different models in one ranking -- fn_search_agents
+-- already refuses to compare mismatched dimensions (cosine_similarity
+-- returns NULL for those), but two different 1536-dimension models are not
+-- comparable either even though nothing about their shape would catch it.
+ALTER TABLE allgres_private.agents
+  ADD COLUMN IF NOT EXISTS embedding double precision[],
+  ADD COLUMN IF NOT EXISTS embedding_model text,
+  ADD COLUMN IF NOT EXISTS embedding_updated_at timestamptz;
+
 CREATE TABLE IF NOT EXISTS allgres_private.policies (
   agent_id        uuid PRIMARY KEY REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
   system_prompt   text NOT NULL,
@@ -1139,6 +1156,242 @@ CREATE TABLE IF NOT EXISTS allgres_private.llm_providers (
 ALTER TABLE allgres_private.llm_providers
   ADD COLUMN IF NOT EXISTS allow_private_network boolean NOT NULL DEFAULT false;
 
+-- What a provider is *for*: a 'chat' provider serves an agent's own turns
+-- (llm_config.provider on a policy) the same as before this column existed;
+-- an 'embedding' provider exists only to turn text into a vector for
+-- semantic search (agent-identity search, and later memory recall -- see
+-- fn_queue_agent_embedding). Restricted to kind='openai_compat' because
+-- POST <base_url>/embeddings with {"model","input"} and a
+-- {"data":[{"embedding":[...]}]} response is the one shape every embedding
+-- API (OpenAI, Voyage AI's OpenAI-compat mode, a local Ollama/LM Studio
+-- server) actually agrees on; 'anthropic' has no embeddings endpoint at
+-- all, and 'oauth' is a token-exchange shape, not a completions one.
+ALTER TABLE allgres_private.llm_providers
+  ADD COLUMN IF NOT EXISTS purpose text NOT NULL DEFAULT 'chat'
+    CHECK (purpose IN ('chat', 'embedding'));
+
+ALTER TABLE allgres_private.llm_providers
+  DROP CONSTRAINT IF EXISTS llm_providers_embedding_purpose_kind_check;
+ALTER TABLE allgres_private.llm_providers
+  ADD CONSTRAINT llm_providers_embedding_purpose_kind_check
+    CHECK (purpose <> 'embedding' OR kind = 'openai_compat');
+
+-- Which model an 'embedding' provider actually calls -- meaningless for a
+-- 'chat' provider, which already gets its model per-agent from
+-- llm_config.model instead, since a chat provider genuinely serves many
+-- models at once while an embedding provider row exists to call exactly
+-- one (mixing embedding models in the same vector space is meaningless, see
+-- agents.embedding_model). Required, not defaulted, the same way base_url
+-- has no default: fn_create_provider/fn_set_provider reject an
+-- embedding-purpose row without one rather than silently guessing a model
+-- name that might not exist on that provider.
+ALTER TABLE allgres_private.llm_providers
+  ADD COLUMN IF NOT EXISTS embedding_model text;
+ALTER TABLE allgres_private.llm_providers
+  DROP CONSTRAINT IF EXISTS llm_providers_embedding_needs_model_check;
+ALTER TABLE allgres_private.llm_providers
+  ADD CONSTRAINT llm_providers_embedding_needs_model_check
+    CHECK (purpose <> 'embedding' OR NULLIF(trim(embedding_model), '') IS NOT NULL);
+
+-- Everything below (agent-identity embeddings, semantic delegate search, and
+-- later memory recall) is an optional feature layered on top of a plain
+-- PostgreSQL install, never a hard dependency the way pgcrypto effectively
+-- is for gen_random_uuid() on pre-13 servers. Embeddings are therefore
+-- stored as an ordinary double precision[] -- a type every PostgreSQL has --
+-- not pgvector's own `vector` type, which would make every table and
+-- function that touches this column fail to even install on a server
+-- without the `vector` extension. Ranking is done with plain SQL cosine
+-- similarity (allgres_private.cosine_similarity below) everywhere, always
+-- correct, just an unindexed sequential scan.
+--
+-- When the operator *has* installed pgvector (CREATE EXTENSION vector,
+-- entirely their own opt-in step -- allgres never runs it itself, the same
+-- way it never runs CREATE EXTENSION pgcrypto itself), every place that
+-- reads or ranks embeddings checks allgres_private.vector_available() and
+-- switches to a dynamic-SQL query built with EXECUTE (see fn_search_agents)
+-- so it can use vector(N)'s <=> operator and an HNSW index -- speed, not
+-- correctness, is the only thing pgvector changes here. Because a plain
+-- CREATE FUNCTION body naming the `vector` type would fail to compile on a
+-- server that has never installed the extension, every reference to it is
+-- inside a string literal passed to EXECUTE, never written as literal SQL.
+CREATE OR REPLACE FUNCTION allgres_private.vector_available()
+RETURNS boolean
+LANGUAGE sql STABLE
+AS $fn$
+  SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector');
+$fn$;
+
+-- Every dynamic-SQL string that names the `vector` type or its operator
+-- classes schema-qualifies them with this, rather than relying on
+-- search_path: this function's own SECURITY DEFINER search_path (allgres_
+-- private/allgres_public/pg_temp, never `public`) is still in effect for
+-- an EXECUTE run from inside another SECURITY DEFINER function -- PL/pgSQL
+-- does not restore the caller's search_path for a nested EXECUTE the way
+-- it might look like it should -- so an unqualified `vector(N)` reference
+-- would fail with "type vector does not exist" even on a server that has
+-- it installed, the moment it is only visible via a search_path this
+-- function does not share. Defaults to 'public' (CREATE EXTENSION vector's
+-- own default target) only when pgvector is not installed at all, so a
+-- caller that forgot to check vector_available() first still gets a
+-- sensible "not found" error naming the schema it looked in, not a NULL
+-- silently formatted into invalid SQL.
+CREATE OR REPLACE FUNCTION allgres_private.vector_schema()
+RETURNS text
+LANGUAGE sql STABLE
+AS $fn$
+  SELECT COALESCE(
+    (SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'),
+    'public'
+  );
+$fn$;
+
+-- Idempotent, safe to call on every embedding write: if pgvector is
+-- installed and the accelerating index either does not exist yet or was
+-- built for a dimension count that no longer matches what is actually
+-- being written (an operator switched the configured embedding provider
+-- or model -- see agents.embedding_model), drop and rebuild it for the
+-- dimension count actually in use now. If pgvector is not installed, this
+-- is a no-op -- there is deliberately no separate "enable vector support"
+-- admin step; the index simply appears the first time an embedding is
+-- written after the operator installs pgvector, which is what "it's an
+-- add-on, not a dependency" means in practice. A plain expression index on
+-- the array cast to vector(N), not a second synced column -- one less
+-- thing that can drift out of sync with the real data. Its WHERE clause
+-- restricts it to rows of that exact dimension, matching
+-- fn_search_agents/rank_agents_by_embedding's own dimension filtering, so
+-- an old-dimension row left behind by a provider switch is simply invisible
+-- to this index rather than corrupting a distance comparison.
+CREATE OR REPLACE FUNCTION allgres_private.ensure_vector_index()
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_dims int;
+  v_idx_oid oid;
+  v_indexed_dims int;
+BEGIN
+  IF NOT allgres_private.vector_available() THEN
+    RETURN;
+  END IF;
+
+  SELECT array_length(embedding, 1) INTO v_dims
+  FROM allgres_private.agents
+  WHERE embedding IS NOT NULL
+  ORDER BY embedding_updated_at DESC NULLS LAST
+  LIMIT 1;
+  IF v_dims IS NULL THEN
+    RETURN;
+  END IF;
+
+  v_idx_oid := to_regclass('allgres_private.agents_embedding_hnsw_idx')::oid;
+  IF v_idx_oid IS NOT NULL THEN
+    SELECT (regexp_match(pg_get_indexdef(v_idx_oid), 'vector\((\d+)\)'))[1]::int INTO v_indexed_dims;
+    IF v_indexed_dims = v_dims THEN
+      RETURN;
+    END IF;
+    EXECUTE 'DROP INDEX allgres_private.agents_embedding_hnsw_idx';
+  END IF;
+
+  EXECUTE format(
+    'CREATE INDEX agents_embedding_hnsw_idx ON allgres_private.agents '
+    || 'USING hnsw ((embedding::%2$I.vector(%1$s)) %2$I.vector_cosine_ops) '
+    || 'WHERE embedding IS NOT NULL AND array_length(embedding, 1) = %1$s',
+    v_dims, allgres_private.vector_schema()
+  );
+END;
+$fn$;
+
+-- Brute-force cosine similarity over two plain float arrays -- 1 = identical
+-- direction, 0 = orthogonal, -1 = opposite; NULL if either side is empty or
+-- their dimensions do not match (an agent embedded under a since-changed
+-- embedding model, most likely -- see agents.embedding_model), since a
+-- distance between vectors of different length is not meaningful. Used
+-- directly when pgvector is not installed, and doubles as the correctness
+-- reference the pgvector-accelerated path is checked against in
+-- fn_selftest.
+CREATE OR REPLACE FUNCTION allgres_private.cosine_similarity(
+  a double precision[], b double precision[]
+) RETURNS double precision
+LANGUAGE sql IMMUTABLE
+AS $fn$
+  SELECT CASE
+    WHEN a IS NULL OR b IS NULL OR array_length(a, 1) IS NULL OR array_length(a, 1) <> array_length(b, 1) THEN NULL
+    ELSE (
+      -- NULLIF, not a CASE: a zero-magnitude vector (degenerate, but not
+      -- something to trust an embedding API never returns) must come back
+      -- NULL, not raise "division by zero" and take fn_search_agents' whole
+      -- ranking query down with it.
+      SELECT sum(x * y) / NULLIF(sqrt(sum(x * x)) * sqrt(sum(y * y)), 0)
+      FROM unnest(a, b) AS t(x, y)
+    )
+  END;
+$fn$;
+
+-- The actual ranking behind the 'search_agents' agent action (see
+-- fn_next_step and fn_complete_outbound's 'embedding' branch): every other
+-- active, embedded agent the requester actually holds an 'agent' permission
+-- grant for (allgres_private.agent_has_permission -- the exact same check
+-- 'delegate' itself enforces, so a search can never surface a name the
+-- caller could not actually delegate to), ranked by cosine similarity to
+-- the caller's query embedding, nearest first. Uses the pgvector-
+-- accelerated <=> operator via dynamic SQL when
+-- allgres_private.vector_available(), a brute-force
+-- allgres_private.cosine_similarity() scan otherwise -- see the
+-- llm_providers.purpose comment for why both paths have to exist. Excludes
+-- the requester itself (searching for a delegate target, not a mirror) and
+-- any agent whose embedding has a different dimension than the query's
+-- (cosine_similarity already returns NULL for that mismatch in the
+-- brute-force path; the accelerated path filters it explicitly since
+-- casting a mismatched-length array to vector(N) would error, not just
+-- rank oddly).
+CREATE OR REPLACE FUNCTION allgres_private.rank_agents_by_embedding(
+  p_query_embedding double precision[],
+  p_requester_agent_id uuid,
+  p_limit int DEFAULT 5
+) RETURNS jsonb
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_out jsonb;
+  v_dims int;
+  v_n int := GREATEST(1, LEAST(COALESCE(p_limit, 5), 20));
+BEGIN
+  v_dims := array_length(p_query_embedding, 1);
+  IF v_dims IS NULL THEN
+    RETURN '[]'::jsonb;
+  END IF;
+
+  IF allgres_private.vector_available() THEN
+    EXECUTE format(
+      'SELECT COALESCE(jsonb_agg(jsonb_build_object(''agent_id'', agent_id, ''name'', name, ''similarity'', similarity) ORDER BY similarity DESC), ''[]''::jsonb) '
+      || 'FROM (SELECT agent_id, name, 1 - (embedding::%2$I.vector(%1$s) OPERATOR(%2$I.<=>) $1::%2$I.vector(%1$s)) AS similarity '
+      || 'FROM allgres_private.agents '
+      || 'WHERE embedding IS NOT NULL AND is_active AND agent_id <> $2 AND array_length(embedding, 1) = %1$s '
+      || 'AND allgres_private.agent_has_permission($2, ''agent'', name) '
+      || 'ORDER BY embedding::%2$I.vector(%1$s) OPERATOR(%2$I.<=>) $1::%2$I.vector(%1$s) LIMIT $3) s',
+      v_dims, allgres_private.vector_schema()
+    ) INTO v_out USING p_query_embedding, p_requester_agent_id, v_n;
+  ELSE
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'agent_id', agent_id, 'name', name, 'similarity', similarity
+    ) ORDER BY similarity DESC), '[]'::jsonb)
+    INTO v_out
+    FROM (
+      SELECT agent_id, name, allgres_private.cosine_similarity(embedding, p_query_embedding) AS similarity
+      FROM allgres_private.agents
+      WHERE embedding IS NOT NULL AND is_active
+        AND agent_id <> p_requester_agent_id
+        AND array_length(embedding, 1) = v_dims
+        AND allgres_private.agent_has_permission(p_requester_agent_id, 'agent', name)
+      ORDER BY allgres_private.cosine_similarity(embedding, p_query_embedding) DESC NULLS LAST
+      LIMIT v_n
+    ) s;
+  END IF;
+
+  RETURN v_out;
+END;
+$fn$;
+
 -- Never returned by list functions.  Operator writes via fn_set_provider_secret.
 CREATE TABLE IF NOT EXISTS allgres_private.llm_secrets (
   provider_id         uuid PRIMARY KEY REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
@@ -1171,6 +1424,16 @@ CREATE TABLE IF NOT EXISTS allgres_private.outbound_calls (
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now()
 );
+
+-- 'embedding': fn_search_agents' own query text, queued and claimed exactly
+-- like 'llm' (same provider/auth_kind resolution in fn_claim_outbound, same
+-- JSON-POST shape in perform_http) -- task-bound because a search happens
+-- mid-turn, unlike an agent's own identity embedding (embedding_calls
+-- above, which has no task to belong to). See fn_complete_outbound's
+-- 'embedding' branch for what happens to the response.
+ALTER TABLE allgres_private.outbound_calls DROP CONSTRAINT IF EXISTS outbound_calls_kind_check;
+ALTER TABLE allgres_private.outbound_calls ADD CONSTRAINT outbound_calls_kind_check
+  CHECK (kind IN ('llm', 'tool', 'embedding'));
 
 -- The URL's host string is checked against allgres_private.is_blocked_host at
 -- queue time (see check_outbound_url), but the worker connects by hostname
@@ -1237,6 +1500,39 @@ CREATE INDEX IF NOT EXISTS oauth_calls_ready_idx
   WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS oauth_calls_inflight_idx
   ON allgres_private.oauth_calls (updated_at)
+  WHERE status = 'in_flight';
+
+-- Regenerating an agent's identity embedding (fn_queue_agent_embedding,
+-- called whenever fn_create_agent/agents.update touches name or
+-- system_prompt) is, like an OAuth token exchange, not an agent turn --
+-- there is no task_id to hang it off. Same queued -> in_flight ->
+-- harvested/lost shape as oauth_calls, claimed by the same runtime worker
+-- HTTP pool; fn_complete_agent_embedding writes the result straight into
+-- allgres_private.agents.embedding instead of routing through
+-- fn_submit_result. A task-bound embedding (fn_search_agents' own query
+-- text) goes through outbound_calls instead, alongside 'llm'/'tool' -- see
+-- that table's kind check and fn_complete_outbound's 'embedding' branch.
+CREATE TABLE IF NOT EXISTS allgres_private.embedding_calls (
+  call_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id         uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  provider_id      uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
+  model            text NOT NULL,
+  url              text NOT NULL,
+  request_headers  jsonb NOT NULL DEFAULT '{}'::jsonb,
+  request_body     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  allow_private    boolean NOT NULL DEFAULT false,
+  status           text NOT NULL CHECK (status IN ('queued', 'in_flight', 'harvested', 'lost')),
+  response_status  int,
+  error            text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS embedding_calls_ready_idx
+  ON allgres_private.embedding_calls (created_at)
+  WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS embedding_calls_inflight_idx
+  ON allgres_private.embedding_calls (updated_at)
   WHERE status = 'in_flight';
 
 -- Agent SQL is validated here (fn_validate_sql) but executed by the runtime
@@ -2182,15 +2478,27 @@ BEGIN
         USING ERRCODE = 'P0001';
     END IF;
 
-    SELECT count(*) FILTER (
-             WHERE p.provolatile <> 'v' AND NOT p.prosecdef AND n.nspname = 'pg_catalog'
-           ),
+    -- An unqualified call in this check's own denominator must only ever
+    -- be counted against pg_catalog, never every namespace in the
+    -- database: `sandbox` (the role every agent SQL statement actually
+    -- runs as) has search_path = pg_temp, so pg_catalog -- always searched
+    -- implicitly regardless of search_path -- is the *only* place a bare
+    -- name can resolve at execution time. Before this, an unqualified
+    -- name was checked against every schema's same-named overload
+    -- (v_fn->>'schema' IS NULL matched all of them), which made a
+    -- genuinely safe, pg_catalog-only call like plain `sum(amount)` fail
+    -- this check the moment any *other* extension defined its own
+    -- same-named overload in its own schema -- pgvector's own sum(vector)/
+    -- avg(vector) aggregates are exactly this, and could never actually be
+    -- reached by a sandboxed query in the first place, since `public` is
+    -- not in sandbox's search_path either.
+    SELECT count(*) FILTER (WHERE p.provolatile <> 'v' AND NOT p.prosecdef),
            count(*)
     INTO v_safe_fns, v_all_fns
     FROM pg_catalog.pg_proc p
     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
     WHERE p.proname = (v_fn->>'name')
-      AND (v_fn->>'schema' IS NULL OR n.nspname = (v_fn->>'schema'));
+      AND n.nspname = COALESCE(v_fn->>'schema', 'pg_catalog');
 
     IF v_all_fns = 0 THEN
       RAISE EXCEPTION 'fn_validate_sql: unknown function "%"', v_fn->>'name'
@@ -2653,6 +2961,7 @@ DECLARE
   v_proposal uuid;
   v_mem_result jsonb;
   v_created jsonb;
+  v_provider allgres_private.llm_providers%ROWTYPE;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -2741,8 +3050,8 @@ BEGIN
 
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
-    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'await_human', 'propose_change', 'remember',
-    'create_agent', 'propose_fix'
+    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'search_agents', 'await_human', 'propose_change',
+    'remember', 'create_agent', 'propose_fix'
   ) THEN
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
@@ -2863,6 +3172,71 @@ BEGIN
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'call_tool', 'tool', v_tool, 'args', v_args, 'call_id', v_call);
+  END IF;
+
+  -- Semantic delegate-target discovery ("tool/skill search" -- an agent IS
+  -- the unit of capability in this platform, so searching for one to
+  -- delegate to is what "finding a tool" means here; see the agent_config
+  -- KNOWN_ISSUES item this follows). A query embedding is itself an
+  -- outbound HTTP call, so this only queues one (kind='embedding' on
+  -- outbound_calls, alongside 'llm'/'tool') and returns -- the ranked
+  -- candidate list comes back as a plain 'tool_result' on a later step,
+  -- from fn_complete_outbound's own 'embedding' branch, exactly the way
+  -- call_tool's result always has. Never returns a name the caller could
+  -- not actually delegate() to: allgres_private.rank_agents_by_embedding
+  -- applies the identical agent_has_permission check delegate enforces.
+  IF v_action = 'search_agents' THEN
+    IF NULLIF(trim(v_parsed->>'query'), '') IS NULL THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'search_agents_needs_query')
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    SELECT * INTO v_provider FROM allgres_private.llm_providers
+    WHERE purpose = 'embedding' AND is_enabled
+    ORDER BY created_at LIMIT 1;
+    IF NOT FOUND THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'no_embedding_provider_configured')
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    v_url := v_provider.base_url || '/embeddings';
+    v_reason := allgres_private.check_outbound_url(v_url, v_provider.allow_private_network);
+    IF v_reason IS NOT NULL THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', v_reason, 'url', v_url)
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    INSERT INTO allgres_private.outbound_calls (
+      task_id, kind, url, request_headers, request_body, status, allow_private, provider_id, auth_kind
+    ) VALUES (
+      p_task_id, 'embedding', v_url,
+      jsonb_build_object('content-type', 'application/json'),
+      jsonb_build_object('model', v_provider.embedding_model, 'input', left(v_parsed->>'query', 8000)),
+      'queued', v_provider.allow_private_network, v_provider.provider_id, 'authorization'
+    ) RETURNING call_id INTO v_call;
+
+    UPDATE allgres_private.tasks
+    SET step_count = step_count + 1, updated_at = now()
+    WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'search_agents', 'query', v_parsed->>'query', 'call_id', v_call);
   END IF;
 
   IF v_action = 'delegate' THEN
@@ -3656,6 +4030,8 @@ DECLARE
   v_payload jsonb;
   v_result jsonb;
   v_running boolean;
+  v_query_vec double precision[];
+  v_requester uuid;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -3698,6 +4074,41 @@ BEGIN
         'body', left(COALESCE(p_body, ''), 16000)
       )
     );
+  -- fn_search_agents' own query embedding (item: semantic delegate
+  -- discovery). Same {"data":[{"embedding":[...]}]} response shape as
+  -- fn_complete_agent_embedding parses, but the result here is a ranked
+  -- candidate list handed back as a 'tool_result' -- exactly what
+  -- 'execute_sql'/'call_tool' already look like to the agent on its next
+  -- step -- rather than written into a stored column.
+  ELSIF c.kind = 'embedding' THEN
+    IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+      v_payload := jsonb_build_object(
+        'type', 'error',
+        'message', 'embedding http ' || COALESCE(p_status::text, '0') || ': ' || left(COALESCE(p_body, ''), 2000)
+      );
+    ELSE
+      BEGIN
+        v_parsed := p_body::jsonb;
+      EXCEPTION WHEN others THEN
+        v_parsed := NULL;
+      END;
+      SELECT array_agg((x)::double precision) INTO v_query_vec
+      FROM jsonb_array_elements_text(v_parsed->'data'->0->'embedding') AS x;
+      IF v_query_vec IS NULL OR array_length(v_query_vec, 1) IS NULL THEN
+        v_payload := jsonb_build_object(
+          'type', 'error', 'message', 'embedding response had no usable data[0].embedding'
+        );
+      ELSE
+        SELECT agent_id INTO v_requester FROM allgres_private.tasks WHERE task_id = c.task_id;
+        v_payload := jsonb_build_object(
+          'type', 'tool_result',
+          'content', jsonb_build_object(
+            'status', p_status,
+            'body', COALESCE(allgres_private.rank_agents_by_embedding(v_query_vec, v_requester, 5), '[]'::jsonb)::text
+          )
+        );
+      END IF;
+    END IF;
   ELSIF p_status IS NULL OR p_status >= 400 OR p_status < 200 THEN
     v_payload := jsonb_build_object(
       'type', 'error',
@@ -3909,6 +4320,24 @@ BEGIN
     n := n + 1;
   END LOOP;
 
+  -- Same reclaim, for an agent-identity embedding call the worker never came
+  -- back from. Also no task to notify; unlike an OAuth exchange this is
+  -- fully retriable, since queue_agent_embedding is called again on the
+  -- agent's next edit -- there is deliberately no automatic retry here, the
+  -- embedding just stays whatever it was (possibly still NULL) until then.
+  FOR r IN
+    SELECT call_id
+    FROM allgres_private.embedding_calls
+    WHERE status = 'in_flight'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE allgres_private.embedding_calls
+    SET status = 'lost', error = 'timeout', updated_at = now()
+    WHERE call_id = r.call_id;
+    n := n + 1;
+  END LOOP;
+
   -- Same self-healing shape again, on human timescales: an await_human that
   -- nobody ever answers before its expires_at (set by fn_submit_result, 24h
   -- default) gets auto-rejected instead of holding the task open forever.
@@ -4098,6 +4527,7 @@ BEGIN
     WHERE agent_id = v_id;
   END IF;
   v_role := allgres_private.fn_provision_agent_role(v_id);
+  PERFORM allgres_private.queue_agent_embedding(v_id);
   RETURN jsonb_build_object('ok', true, 'agent_id', v_id, 'pg_role', v_role);
 END;
 $fn$;
@@ -4675,7 +5105,9 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_create_provider(
   p_kind text,
   p_base_url text,
   p_api_key text DEFAULT NULL,
-  p_allow_private_network boolean DEFAULT false
+  p_allow_private_network boolean DEFAULT false,
+  p_purpose text DEFAULT 'chat',
+  p_embedding_model text DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -4685,12 +5117,24 @@ DECLARE
   v_id uuid;
   v_url text;
   v_reason text;
+  v_purpose text := COALESCE(NULLIF(trim(p_purpose), ''), 'chat');
 BEGIN
   IF NULLIF(trim(p_name), '') IS NULL THEN
     RAISE EXCEPTION 'provider name is required' USING ERRCODE = 'P0001';
   END IF;
   IF p_kind NOT IN ('openai_compat', 'anthropic', 'oauth') THEN
     RAISE EXCEPTION 'invalid provider kind: %', p_kind USING ERRCODE = 'P0001';
+  END IF;
+  IF v_purpose NOT IN ('chat', 'embedding') THEN
+    RAISE EXCEPTION 'invalid provider purpose: %', v_purpose USING ERRCODE = 'P0001';
+  END IF;
+  IF v_purpose = 'embedding' THEN
+    IF p_kind <> 'openai_compat' THEN
+      RAISE EXCEPTION 'embedding providers must be kind=openai_compat' USING ERRCODE = 'P0001';
+    END IF;
+    IF NULLIF(trim(p_embedding_model), '') IS NULL THEN
+      RAISE EXCEPTION 'embedding_model is required for an embedding provider' USING ERRCODE = 'P0001';
+    END IF;
   END IF;
 
   v_url := rtrim(NULLIF(trim(p_base_url), ''), '/');
@@ -4707,8 +5151,10 @@ BEGIN
       USING ERRCODE = 'P0001';
   END IF;
 
-  INSERT INTO allgres_private.llm_providers (name, kind, base_url, is_enabled, allow_private_network)
-  VALUES (trim(p_name), p_kind, v_url, true, COALESCE(p_allow_private_network, false))
+  INSERT INTO allgres_private.llm_providers
+    (name, kind, base_url, is_enabled, allow_private_network, purpose, embedding_model)
+  VALUES (trim(p_name), p_kind, v_url, true, COALESCE(p_allow_private_network, false),
+          v_purpose, NULLIF(trim(p_embedding_model), ''))
   RETURNING provider_id INTO v_id;
 
   IF NULLIF(p_api_key, '') IS NOT NULL THEN
@@ -4727,7 +5173,8 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_set_provider(
   p_oauth_auth_url text DEFAULT NULL,
   p_oauth_token_url text DEFAULT NULL,
   p_oauth_client_id text DEFAULT NULL,
-  p_oauth_client_secret text DEFAULT NULL
+  p_oauth_client_secret text DEFAULT NULL,
+  p_embedding_model text DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -4776,7 +5223,8 @@ BEGIN
     allow_private_network = v_allow,
     oauth_auth_url = COALESCE(p_oauth_auth_url, oauth_auth_url),
     oauth_token_url = COALESCE(p_oauth_token_url, oauth_token_url),
-    oauth_client_id = COALESCE(p_oauth_client_id, oauth_client_id)
+    oauth_client_id = COALESCE(p_oauth_client_id, oauth_client_id),
+    embedding_model = COALESCE(NULLIF(trim(p_embedding_model), ''), embedding_model)
   WHERE provider_id = p_provider_id;
 
   IF p_oauth_client_secret IS NOT NULL AND p_oauth_client_secret <> '' THEN
@@ -5014,6 +5462,187 @@ BEGIN
   WHERE call_id = p_call_id;
 
   RETURN jsonb_build_object('action', 'stored', 'provider_id', c.provider_id);
+END;
+$fn$;
+
+-- Queues (or re-queues) regenerating one agent's identity embedding --
+-- called from fn_create_agent and agents.update whenever name/system_prompt
+-- changes. Silent no-op, never an exception, whenever embeddings are not
+-- actually usable right now: no purpose='embedding' provider registered, or
+-- its endpoint fails the same SSRF check every other outbound URL goes
+-- through -- an agent create/update must never fail, or even warn, over a
+-- missing optional feature. Any still-'queued' row for this agent is
+-- deleted first so rapid edits (a few Save clicks in the dashboard modal)
+-- do not pile up redundant calls; an 'in_flight' one is left alone and
+-- simply gets overwritten by whichever call completes last -- last-write-
+-- wins, not ordered, the same tolerance fn_complete_agent_embedding's own
+-- comment explains.
+CREATE OR REPLACE FUNCTION allgres_private.queue_agent_embedding(p_agent_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_provider allgres_private.llm_providers%ROWTYPE;
+  v_name text;
+  v_prompt text;
+  v_url text;
+  v_reason text;
+BEGIN
+  SELECT * INTO v_provider FROM allgres_private.llm_providers
+  WHERE purpose = 'embedding' AND is_enabled
+  ORDER BY created_at LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  SELECT a.name, COALESCE(pol.system_prompt, '') INTO v_name, v_prompt
+  FROM allgres_private.agents a
+  LEFT JOIN allgres_private.policies pol ON pol.agent_id = a.agent_id
+  WHERE a.agent_id = p_agent_id;
+  IF v_name IS NULL THEN
+    RETURN;
+  END IF;
+
+  v_url := v_provider.base_url || '/embeddings';
+  v_reason := allgres_private.check_outbound_url(v_url, v_provider.allow_private_network);
+  IF v_reason IS NOT NULL THEN
+    RETURN;
+  END IF;
+
+  DELETE FROM allgres_private.embedding_calls WHERE agent_id = p_agent_id AND status = 'queued';
+
+  INSERT INTO allgres_private.embedding_calls
+    (agent_id, provider_id, model, url, request_headers, request_body, allow_private, status)
+  VALUES (
+    p_agent_id, v_provider.provider_id, v_provider.embedding_model, v_url,
+    jsonb_build_object('content-type', 'application/json'),
+    jsonb_build_object('model', v_provider.embedding_model, 'input', left(v_name || ': ' || v_prompt, 8000)),
+    v_provider.allow_private_network,
+    'queued'
+  );
+END;
+$fn$;
+
+-- Claims queued agent-identity embedding calls for the runtime worker's HTTP
+-- pool -- same claim shape as fn_claim_oauth, credential resolved and
+-- merged into the response right here, never written back to
+-- embedding_calls.request_headers.
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_agent_embedding(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+  v_key text;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT call_id, provider_id, url, request_headers, request_body, allow_private
+    FROM allgres_private.embedding_calls
+    WHERE status = 'queued'
+    ORDER BY created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE allgres_private.embedding_calls
+    SET status = 'in_flight', updated_at = now()
+    WHERE call_id = r.call_id;
+
+    v_key := allgres_private.provider_secret(r.provider_id);
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'call_id', r.call_id,
+      'url', r.url,
+      'headers', r.request_headers || jsonb_build_object('authorization', 'Bearer ' || COALESCE(v_key, '')),
+      'body', r.request_body,
+      'allow_private', r.allow_private
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'calls', v_out);
+END;
+$fn$;
+
+-- Parses {"data":[{"embedding":[...]}]} (OpenAI's embeddings response
+-- shape, which Voyage AI's OpenAI-compat mode and most local servers also
+-- return) and writes straight into allgres_private.agents.embedding --
+-- there is no task_id to route this through fn_submit_result the way a
+-- task-bound outbound call does. Fenced identically to
+-- fn_complete_outbound/fn_complete_oauth: only ever completes from
+-- 'in_flight', so a belated response for a call fn_watchdog already
+-- reclaimed as 'lost' cannot overwrite a newer embedding.
+-- allgres_private.ensure_vector_index() runs on every successful write --
+-- cheap (one catalog lookup) once the index already exists, and is what
+-- makes the pgvector-accelerated path "just appear" the first time an
+-- embedding is written after the operator installs pgvector, with no
+-- separate admin step.
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_agent_embedding(
+  p_call_id uuid,
+  p_status int,
+  p_body text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  c allgres_private.embedding_calls%ROWTYPE;
+  v_parsed jsonb;
+  v_vec double precision[];
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+
+  SELECT * INTO c FROM allgres_private.embedding_calls WHERE call_id = p_call_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_complete_agent_embedding: not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF c.status <> 'in_flight' THEN
+    RETURN jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status);
+  END IF;
+
+  IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+    UPDATE allgres_private.embedding_calls
+    SET status = 'harvested', response_status = p_status,
+        error = left(COALESCE(p_body, ''), 2000), updated_at = now()
+    WHERE call_id = p_call_id;
+    RETURN jsonb_build_object('action', 'error', 'status', p_status);
+  END IF;
+
+  BEGIN
+    v_parsed := p_body::jsonb;
+    SELECT array_agg((x)::double precision)
+    INTO v_vec
+    FROM jsonb_array_elements_text(v_parsed->'data'->0->'embedding') AS x;
+  EXCEPTION WHEN others THEN
+    v_vec := NULL;
+  END;
+
+  IF v_vec IS NULL OR array_length(v_vec, 1) IS NULL THEN
+    UPDATE allgres_private.embedding_calls
+    SET status = 'harvested', response_status = p_status,
+        error = 'embedding response had no usable data[0].embedding', updated_at = now()
+    WHERE call_id = p_call_id;
+    RETURN jsonb_build_object('action', 'error', 'reason', 'no_embedding_in_response');
+  END IF;
+
+  UPDATE allgres_private.agents
+  SET embedding = v_vec,
+      embedding_model = (SELECT name FROM allgres_private.llm_providers WHERE provider_id = c.provider_id) || ':' || c.model,
+      embedding_updated_at = now(),
+      updated_at = now()
+  WHERE agent_id = c.agent_id;
+
+  UPDATE allgres_private.embedding_calls
+  SET status = 'harvested', response_status = p_status, updated_at = now()
+  WHERE call_id = p_call_id;
+
+  PERFORM allgres_private.ensure_vector_index();
+
+  RETURN jsonb_build_object('action', 'stored', 'agent_id', c.agent_id, 'dims', array_length(v_vec, 1));
 END;
 $fn$;
 
@@ -8072,6 +8701,78 @@ BEGIN
     AND NOT ((allgres.dashboard_rpc('{"action":"events"}'::jsonb))::text LIKE '%'||v_tid::text||'%');
   v := v || jsonb_build_array(jsonb_build_object('name', 'selftest_fixtures_hidden_not_deleted', 'ok', ok));
 
+  -- Agent-identity embeddings / semantic delegate search (item 34-follow-up:
+  -- generic embeddings, an optional pgvector-accelerated feature). No real
+  -- HTTP round trip here -- that is tests/e2e_mock.sql's job, driven through
+  -- the actual runtime worker -- this is allgres_private.
+  -- rank_agents_by_embedding's own ranking/permission/dimension logic in
+  -- isolation, with embeddings set directly rather than generated.
+  DECLARE
+    v_req uuid;
+    v_near uuid;
+    v_far uuid;
+    v_wrongdim uuid;
+    v_nopermission uuid;
+    v_ranked jsonb;
+  BEGIN
+    SELECT agent_id INTO v_req FROM allgres_private.agents WHERE name = 'selftest_embed_requester';
+    IF v_req IS NULL THEN
+      v_req := (allgres_public.fn_create_agent('selftest_embed_requester')->>'agent_id')::uuid;
+    END IF;
+    SELECT agent_id INTO v_near FROM allgres_private.agents WHERE name = 'selftest_embed_near';
+    IF v_near IS NULL THEN
+      v_near := (allgres_public.fn_create_agent('selftest_embed_near')->>'agent_id')::uuid;
+    END IF;
+    SELECT agent_id INTO v_far FROM allgres_private.agents WHERE name = 'selftest_embed_far';
+    IF v_far IS NULL THEN
+      v_far := (allgres_public.fn_create_agent('selftest_embed_far')->>'agent_id')::uuid;
+    END IF;
+    SELECT agent_id INTO v_wrongdim FROM allgres_private.agents WHERE name = 'selftest_embed_wrongdim';
+    IF v_wrongdim IS NULL THEN
+      v_wrongdim := (allgres_public.fn_create_agent('selftest_embed_wrongdim')->>'agent_id')::uuid;
+    END IF;
+    SELECT agent_id INTO v_nopermission FROM allgres_private.agents WHERE name = 'selftest_embed_nopermission';
+    IF v_nopermission IS NULL THEN
+      v_nopermission := (allgres_public.fn_create_agent('selftest_embed_nopermission')->>'agent_id')::uuid;
+    END IF;
+
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[] WHERE agent_id = v_near;
+    UPDATE allgres_private.agents SET embedding = ARRAY[0,1,0,0]::double precision[] WHERE agent_id = v_far;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0]::double precision[] WHERE agent_id = v_wrongdim;
+    -- Closer to the query than v_near, but the requester is never granted
+    -- 'agent' permission for it -- must still be excluded, the same check
+    -- 'delegate' itself enforces.
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[] WHERE agent_id = v_nopermission;
+
+    PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_near');
+    PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_far');
+    PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_wrongdim');
+
+    v_ranked := allgres_private.rank_agents_by_embedding(ARRAY[1,0,0,0]::double precision[], v_req, 5);
+    ok := jsonb_array_length(v_ranked) = 2
+      AND v_ranked->0->>'name' = 'selftest_embed_near'
+      AND (v_ranked->0->>'similarity')::numeric = 1
+      AND v_ranked->1->>'name' = 'selftest_embed_far';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'rank_agents_by_embedding_orders_filters_and_excludes_mismatched_dims', 'ok', ok));
+
+    -- search_agents with no purpose='embedding' provider configured (the
+    -- default state here) must be a friendly continue, not an exception --
+    -- an optional feature's absence can never fail a task.
+    v_sid := (allgres_public.fn_create_session(v_req, 'selftest search_agents no provider')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response',
+      'content', '{"action":"search_agents","query":"anything"}',
+      'parsed', jsonb_build_object('action', 'search_agents', 'query', 'anything')
+    ));
+    ok := sub->>'action' = 'continue' AND EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'no_embedding_provider_configured'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'search_agents_no_provider_is_a_friendly_continue', 'ok', ok));
+  END;
+
   PERFORM allgres_private.selftest_cleanup();
 
   -- Leave the agent as we found it.
@@ -8314,6 +9015,8 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_sql(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_oauth(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_agent_embedding(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_agent_embedding(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
 
@@ -8635,6 +9338,16 @@ BEGIN
         CASE WHEN p_request ? 'max_delegation_depth' THEN (p_request->>'max_delegation_depth')::int ELSE NULL END,
         CASE WHEN p_request ? 'max_session_tasks' THEN (p_request->>'max_session_tasks')::int ELSE NULL END
       );
+      -- A changed system_prompt is a changed identity for fn_search_agents'
+      -- purposes -- name never changes after fn_create_agent, so that alone
+      -- decides staleness. Queuing unconditionally on every non-empty
+      -- system_prompt in the request (not a real before/after diff) is the
+      -- same tolerance-for-a-harmless-extra-call the rest of this file
+      -- already accepts elsewhere; the worst case is one wasted embedding
+      -- call when an operator "changes" a prompt to its own current text.
+      IF NULLIF(p_request->>'system_prompt', '') IS NOT NULL THEN
+        PERFORM allgres_private.queue_agent_embedding(v_id);
+      END IF;
       RETURN jsonb_build_object('ok', true, 'agent_id', v_id);
 
     WHEN 'policy.history' THEN
@@ -9158,6 +9871,8 @@ BEGIN
             'provider_id', p.provider_id,
             'name', p.name,
             'kind', p.kind,
+            'purpose', p.purpose,
+            'embedding_model', p.embedding_model,
             'base_url', p.base_url,
             'is_enabled', p.is_enabled,
             'allow_private_network', p.allow_private_network,
@@ -9189,7 +9904,8 @@ BEGIN
         NULLIF(p_request->>'oauth_auth_url',''),
         NULLIF(p_request->>'oauth_token_url',''),
         NULLIF(p_request->>'oauth_client_id',''),
-        NULLIF(p_request->>'oauth_client_secret','')
+        NULLIF(p_request->>'oauth_client_secret',''),
+        NULLIF(p_request->>'embedding_model','')
       );
       IF NULLIF(p_request->>'api_key','') IS NOT NULL THEN
         PERFORM allgres_public.fn_set_provider_secret(v_id, p_request->>'api_key');
@@ -9202,7 +9918,9 @@ BEGIN
         p_request->>'kind',
         p_request->>'base_url',
         NULLIF(p_request->>'api_key',''),
-        COALESCE((p_request->>'allow_private_network')::boolean, false)
+        COALESCE((p_request->>'allow_private_network')::boolean, false),
+        COALESCE(NULLIF(p_request->>'purpose',''), 'chat'),
+        NULLIF(p_request->>'embedding_model','')
       );
 
     -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
