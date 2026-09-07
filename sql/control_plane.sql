@@ -1193,6 +1193,30 @@ ALTER TABLE allgres_private.llm_providers
   ADD CONSTRAINT llm_providers_embedding_needs_model_check
     CHECK (purpose <> 'embedding' OR NULLIF(trim(embedding_model), '') IS NOT NULL);
 
+-- Whether this provider's OpenAI-compat /chat/completions call may include
+-- `response_format: {"type":"json_object"}` -- real OpenAI (and most hosted
+-- openai_compat services) accept it and it measurably improves this file's
+-- own "reply with one JSON object only" contract; a number of locally-run
+-- openai_compat servers do not (confirmed live against LM Studio: HTTP 400,
+-- "'response_format.type' must be 'json_schema' or 'text'"). This used to
+-- be a single hardcoded `v_prov.name <> 'ollama'` check inside
+-- build_llm_http -- true for every provider except the one literally
+-- *named* 'ollama', including any other operator-added local server (LM
+-- Studio, llama.cpp's own server, vLLM, ...) that shares the exact same
+-- restriction under a different name. A real per-provider column instead,
+-- defaulting to true (unchanged behavior for every existing provider except
+-- the seeded 'ollama' row, retroactively flipped below), settable from the
+-- provider create/edit form.
+ALTER TABLE allgres_private.llm_providers
+  ADD COLUMN IF NOT EXISTS response_format_json_object boolean NOT NULL DEFAULT true;
+-- The retroactive UPDATE for the seeded 'ollama' row lives just after that
+-- row's own INSERT further down this file, not here -- on a fresh install
+-- this ALTER runs before that INSERT ever creates the row, so an UPDATE
+-- here would silently match zero rows and the seed would keep the column's
+-- 'true' default instead (confirmed live: exactly this ordering bug, caught
+-- by fn_selftest's own seeded_ollama_provider_still_omits_response_format
+-- case failing on a fresh install).
+
 -- Everything below (agent-identity embeddings, semantic delegate search, and
 -- later memory recall) is an optional feature layered on top of a plain
 -- PostgreSQL install, never a hard dependency the way pgcrypto effectively
@@ -3752,8 +3776,9 @@ BEGIN
       'temperature', COALESCE((v_cfg->>'temperature')::float, 0.2),
       'max_tokens', COALESCE((v_cfg->>'max_tokens')::int, 1024)
     );
-    -- Ollama rejects response_format; everything else parses better with it.
-    IF v_prov.name <> 'ollama' THEN
+    -- Per-provider, not a name check -- see response_format_json_object's
+    -- own comment on allgres_private.llm_providers.
+    IF v_prov.response_format_json_object THEN
       v_body := v_body || jsonb_build_object(
         'response_format', jsonb_build_object('type', 'json_object')
       );
@@ -5181,7 +5206,8 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_create_provider(
   p_api_key text DEFAULT NULL,
   p_allow_private_network boolean DEFAULT false,
   p_purpose text DEFAULT 'chat',
-  p_embedding_model text DEFAULT NULL
+  p_embedding_model text DEFAULT NULL,
+  p_response_format_json_object boolean DEFAULT true
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -5226,9 +5252,10 @@ BEGIN
   END IF;
 
   INSERT INTO allgres_private.llm_providers
-    (name, kind, base_url, is_enabled, allow_private_network, purpose, embedding_model)
+    (name, kind, base_url, is_enabled, allow_private_network, purpose, embedding_model,
+     response_format_json_object)
   VALUES (trim(p_name), p_kind, v_url, true, COALESCE(p_allow_private_network, false),
-          v_purpose, NULLIF(trim(p_embedding_model), ''))
+          v_purpose, NULLIF(trim(p_embedding_model), ''), COALESCE(p_response_format_json_object, true))
   RETURNING provider_id INTO v_id;
 
   IF NULLIF(p_api_key, '') IS NOT NULL THEN
@@ -5248,7 +5275,8 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_set_provider(
   p_oauth_token_url text DEFAULT NULL,
   p_oauth_client_id text DEFAULT NULL,
   p_oauth_client_secret text DEFAULT NULL,
-  p_embedding_model text DEFAULT NULL
+  p_embedding_model text DEFAULT NULL,
+  p_response_format_json_object boolean DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -5298,7 +5326,8 @@ BEGIN
     oauth_auth_url = COALESCE(p_oauth_auth_url, oauth_auth_url),
     oauth_token_url = COALESCE(p_oauth_token_url, oauth_token_url),
     oauth_client_id = COALESCE(p_oauth_client_id, oauth_client_id),
-    embedding_model = COALESCE(NULLIF(trim(p_embedding_model), ''), embedding_model)
+    embedding_model = COALESCE(NULLIF(trim(p_embedding_model), ''), embedding_model),
+    response_format_json_object = COALESCE(p_response_format_json_object, response_format_json_object)
   WHERE provider_id = p_provider_id;
 
   IF p_oauth_client_secret IS NOT NULL AND p_oauth_client_secret <> '' THEN
@@ -6524,6 +6553,17 @@ VALUES
   ('21b55be9-aef4-4709-8a65-b3dc10e008ac', 'ollama',        'openai_compat', 'http://127.0.0.1:11434/v1',  true,  true),
   ('93ad5476-8d3a-4443-8b98-f50b6d1d4fbc', 'openai_compat', 'openai_compat', 'https://api.openai.com/v1',  true,  false)
 ON CONFLICT (name) DO NOTHING;
+
+-- response_format_json_object's own retroactive fix (its column comment
+-- above explains why): must run after the INSERT above, whether that
+-- INSERT just created the row (fresh install) or found it already there
+-- and did nothing (ON CONFLICT DO NOTHING, an existing install) -- either
+-- way the row exists by the time this runs, unlike the ALTER TABLE far
+-- above it. Unconditional on every re-run of this file, not gated by
+-- whether the row was just inserted, so an install that already had the
+-- pre-fix default overwritten some other way is also corrected the next
+-- time control_plane.sql is applied.
+UPDATE allgres_private.llm_providers SET response_format_json_object = false WHERE name = 'ollama';
 
 INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
 VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks'),
@@ -7870,6 +7910,42 @@ BEGIN
     ok := true;
   END;
   v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_provider_rejects_ssrf_url', 'ok', ok));
+
+  -- 25e. response_format_json_object (item 37's own fix): a per-provider
+  -- flag replacing what used to be a single `v_prov.name <> 'ollama'` check
+  -- inside build_llm_http -- confirmed live against a real LM Studio
+  -- instance, which rejects response_format outright (HTTP 400) the same
+  -- way Ollama's own openai_compat endpoint always has, under a name
+  -- nothing in that old check ever recognized. Default true (unchanged
+  -- behavior for selftest_new_provider above and every other existing
+  -- provider); an operator can turn it off per provider, exercised here by
+  -- checking build_llm_http's actual request body, not just the stored
+  -- column.
+  r := allgres_public.fn_create_provider('selftest_no_json_mode', 'openai_compat',
+    'https://selftest.invalid/v1', NULL, false, 'chat', NULL, false);
+  ok := (r->>'ok')::boolean;
+  spec := allgres_private.build_llm_http(jsonb_build_object(
+    'llm_config', jsonb_build_object('provider', 'selftest_no_json_mode', 'model', 'x'),
+    'messages', '[]'::jsonb
+  ));
+  ok := ok AND NOT (spec->'body' ? 'response_format');
+  v := v || jsonb_build_array(jsonb_build_object('name', 'response_format_json_object_false_omits_it', 'ok', ok));
+
+  spec := allgres_private.build_llm_http(jsonb_build_object(
+    'llm_config', jsonb_build_object('provider', 'selftest_new_provider', 'model', 'x'),
+    'messages', '[]'::jsonb
+  ));
+  ok := (spec->'body'->'response_format'->>'type') = 'json_object';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'response_format_json_object_true_by_default', 'ok', ok));
+
+  -- The migration's own retroactive fix, not just the new column's default:
+  -- the seeded 'ollama' row must still come out false after this file's own
+  -- ALTER TABLE/UPDATE runs, exactly matching what the old name check used
+  -- to give it.
+  ok := (SELECT response_format_json_object FROM allgres_private.llm_providers WHERE name = 'ollama') IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'seeded_ollama_provider_still_omits_response_format', 'ok', ok));
+
+  DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_no_json_mode';
 
   DELETE FROM allgres_private.llm_secrets WHERE provider_id IN (
     SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider'
@@ -10117,6 +10193,7 @@ BEGIN
             'base_url', p.base_url,
             'is_enabled', p.is_enabled,
             'allow_private_network', p.allow_private_network,
+            'response_format_json_object', p.response_format_json_object,
             'oauth_auth_url', p.oauth_auth_url,
             'oauth_token_url', p.oauth_token_url,
             'oauth_client_id', p.oauth_client_id,
@@ -10147,7 +10224,9 @@ BEGIN
         NULLIF(p_request->>'oauth_token_url',''),
         NULLIF(p_request->>'oauth_client_id',''),
         NULLIF(p_request->>'oauth_client_secret',''),
-        NULLIF(p_request->>'embedding_model','')
+        NULLIF(p_request->>'embedding_model',''),
+        CASE WHEN p_request ? 'response_format_json_object'
+             THEN (p_request->>'response_format_json_object')::boolean ELSE NULL END
       );
       IF NULLIF(p_request->>'api_key','') IS NOT NULL THEN
         PERFORM allgres_public.fn_set_provider_secret(v_id, p_request->>'api_key');
@@ -10163,7 +10242,8 @@ BEGIN
         NULLIF(p_request->>'api_key',''),
         COALESCE((p_request->>'allow_private_network')::boolean, false),
         COALESCE(NULLIF(p_request->>'purpose',''), 'chat'),
-        NULLIF(p_request->>'embedding_model','')
+        NULLIF(p_request->>'embedding_model',''),
+        COALESCE((p_request->>'response_format_json_object')::boolean, true)
       );
 
     -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
