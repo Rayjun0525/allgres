@@ -4157,6 +4157,24 @@ BEGIN
       END IF;
     END IF;
   ELSIF p_status IS NULL OR p_status >= 400 OR p_status < 200 THEN
+    -- Auto-detect a provider that rejects response_format outright (a real
+    -- local-server incompatibility, not a hypothetical -- confirmed live
+    -- against LM Studio) instead of leaving an operator to notice the same
+    -- HTTP 400 and flip response_format_json_object's own checkbox by
+    -- hand. This flips it here, at the moment the error is first seen, on
+    -- the row's real provider_id; the task's own next retry (already
+    -- happening on its own via the normal max_retries path -- nothing
+    -- extra queued or requeued from here) calls build_llm_http fresh, the
+    -- same as any other retry, which reads this column live and simply
+    -- stops sending the field. A narrow signature match on p_status and
+    -- the exact phrase this specific rejection uses, not "any 400 means
+    -- turn it off" -- an unrelated 400 (a bad API key, a context-length
+    -- error, ...) must never touch this column.
+    IF p_status = 400 AND p_body ILIKE '%response_format.type%' THEN
+      UPDATE allgres_private.llm_providers
+      SET response_format_json_object = false
+      WHERE provider_id = c.provider_id AND response_format_json_object;
+    END IF;
     v_payload := jsonb_build_object(
       'type', 'error',
       'message', 'llm http ' || COALESCE(p_status::text, '0') || ': ' || left(COALESCE(p_body, ''), 2000)
@@ -4874,6 +4892,52 @@ BEGIN
     'generation', p_row.generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
     'changed', v_changed
   );
+END;
+$fn$;
+
+-- Bulk-set every active agent's provider/model in one call, reusing
+-- fn_set_policy's own merge (a per-agent system_prompt/max_steps/etc. is
+-- left untouched -- only llm_config.provider/model change) rather than a
+-- silent global fallback an agent with nothing configured would ever
+-- reach on its own: README has said from early on that "there is no
+-- fallback provider or model name baked in anywhere" and that stays true
+-- here too -- this is one explicit, admin-initiated write touching every
+-- row at once, the same as if an operator had opened each agent's editor
+-- and typed the same two fields in, not a standing default new agents
+-- inherit later. System agents are included -- they run turns the same
+-- way any other agent does and would otherwise be the one thing this
+-- can't reach in one pass.
+CREATE OR REPLACE FUNCTION allgres_public.fn_bulk_set_model(
+  p_provider text,
+  p_model text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  v_agent record;
+  v_count int := 0;
+BEGIN
+  IF NULLIF(trim(p_provider), '') IS NULL OR NULLIF(trim(p_model), '') IS NULL THEN
+    RAISE EXCEPTION 'provider and model are both required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM allgres_private.llm_providers WHERE name = p_provider AND is_enabled
+  ) THEN
+    RAISE EXCEPTION 'llm provider "%" is not configured or not enabled', p_provider
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  FOR v_agent IN SELECT agent_id FROM allgres_private.agents WHERE is_active LOOP
+    PERFORM allgres_public.fn_set_policy(
+      v_agent.agent_id, NULL, NULL, NULL,
+      jsonb_build_object('provider', p_provider, 'model', p_model)
+    );
+    v_count := v_count + 1;
+  END LOOP;
+
+  RETURN jsonb_build_object('ok', true, 'updated_count', v_count);
 END;
 $fn$;
 
@@ -6625,6 +6689,39 @@ $prompt$,
 END
 $seed$;
 
+-- A second, deliberately plain demo agent for the Chat page's own "General"
+-- tab: item 39's own follow-up to that tab always needing an agent picked
+-- from a dropdown first, reported live as friction an operator (or a
+-- regular user with exactly one thing they want to talk to) shouldn't have
+-- to deal with just to say hello. Unlike 'analyst' it holds no view/tool
+-- permissions and no demo data -- a plain conversational partner, not a
+-- data-query one -- so its own prompt only ever offers final_answer/
+-- await_human, never execute_sql/call_tool.
+DO $seed$
+DECLARE
+  v_agent uuid;
+BEGIN
+  SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'general';
+
+  IF v_agent IS NULL THEN
+    INSERT INTO allgres_private.agents (name) VALUES ('general') RETURNING agent_id INTO v_agent;
+
+    UPDATE allgres_private.policies
+    SET system_prompt = $prompt$You are a helpful, general-purpose conversational assistant. Reply with one JSON object only. No markdown, no prose.
+
+Allowed:
+{"action":"final_answer","answer":"..."}
+{"action":"await_human","reason":"..."}
+
+Have a normal, friendly conversation. When you have a reply, emit final_answer with your answer as plain text.
+$prompt$,
+        -- Deliberately no llm_config here, same reason as 'analyst' above.
+        updated_at = now()
+    WHERE agent_id = v_agent;
+  END IF;
+END
+$seed$;
+
 -- A first, deliberately narrow maintenance/auditor agent (README,
 -- "Maintenance agents"): read-only, no mutation surface at all in this
 -- slice -- not even propose_change is part of its seeded prompt. It reads
@@ -6891,7 +6988,7 @@ $seed$;
 --
 -- Tables with no seed rows at all dump unconditionally. The tables section
 -- 10 above seeds (llm_providers, sql_sandbox_allowlist, and
--- agents/policies/permissions for the built-in 'analyst' and
+-- agents/policies/permissions for the built-in 'analyst', 'general', and
 -- 'health_monitor' agents plus the six is_system=true system agents from
 -- 10a-2, plus demo_sales for 'analyst' alone)
 -- exclude exactly those seeded rows: the extension script recreates them
@@ -6918,11 +7015,11 @@ $seed$;
 -- ---------------------------------------------------------------------------
 
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agents',
-  $cfgdump$WHERE NOT (name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
+  $cfgdump$WHERE NOT (name IN ('analyst', 'health_monitor', 'general') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.policies',
-  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor', 'general') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.permissions',
-  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor', 'general') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.demo_sales',
   $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_providers',
@@ -7945,7 +8042,105 @@ BEGIN
   ok := (SELECT response_format_json_object FROM allgres_private.llm_providers WHERE name = 'ollama') IS FALSE;
   v := v || jsonb_build_array(jsonb_build_object('name', 'seeded_ollama_provider_still_omits_response_format', 'ok', ok));
 
-  DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_no_json_mode';
+  -- 25f. fn_complete_outbound's own auto-detect for the same rejection,
+  -- so an operator never has to notice the HTTP 400 and flip the checkbox
+  -- by hand -- a synthetic outbound_calls row stands in for one
+  -- fn_dispatch_tasks would have queued, same technique as
+  -- complete_outbound_fences_stale_result above.
+  r := allgres_public.fn_create_provider('selftest_autodetect_provider', 'openai_compat',
+    'https://selftest.invalid/v1');
+  v_provider := (r->>'provider_id')::uuid;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest response_format autodetect')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status, provider_id)
+  VALUES (v_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', 'in_flight', v_provider)
+  RETURNING call_id INTO v_call;
+  PERFORM allgres_public.fn_complete_outbound(v_call, 400,
+    '{"error":"''response_format.type'' must be ''json_schema'' or ''text''"}');
+  ok := (SELECT response_format_json_object FROM allgres_private.llm_providers WHERE provider_id = v_provider) IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'response_format_rejection_autodetected_and_disabled', 'ok', ok));
+
+  -- A narrow signature match, not "any 400 turns it off" -- an unrelated
+  -- failure (bad key, context length, ...) must never touch the column.
+  r := allgres_public.fn_create_provider('selftest_autodetect_unrelated', 'openai_compat',
+    'https://selftest.invalid/v1');
+  v_provider := (r->>'provider_id')::uuid;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status, provider_id)
+  VALUES (v_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', 'in_flight', v_provider)
+  RETURNING call_id INTO v_call;
+  PERFORM allgres_public.fn_complete_outbound(v_call, 400, '{"error":"context length exceeded"}');
+  ok := (SELECT response_format_json_object FROM allgres_private.llm_providers WHERE provider_id = v_provider);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'unrelated_400_does_not_disable_response_format', 'ok', ok));
+
+  DELETE FROM allgres_private.outbound_calls WHERE provider_id IN (
+    SELECT provider_id FROM allgres_private.llm_providers
+    WHERE name IN ('selftest_no_json_mode', 'selftest_autodetect_provider', 'selftest_autodetect_unrelated')
+  );
+  DELETE FROM allgres_private.llm_providers WHERE name IN
+    ('selftest_no_json_mode', 'selftest_autodetect_provider', 'selftest_autodetect_unrelated');
+
+  -- 25g0. The 'general' demo agent (item 39's own follow-up): seeded
+  -- active, no llm_config picked for it yet (same reason as 'analyst'),
+  -- and no view/tool permissions -- a plain conversational partner, unlike
+  -- 'analyst', which is deliberately a data-query one. Checked here, before
+  -- fn_bulk_set_model below runs against every active agent including this
+  -- one -- that would otherwise give this its own llm_config and make the
+  -- "still unconfigured" half of this assertion fail on nothing but test
+  -- ordering.
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.agents a JOIN allgres_private.policies p USING (agent_id)
+    WHERE a.name = 'general' AND a.is_active AND p.llm_config = '{}'::jsonb
+  );
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.permissions
+    WHERE agent_id = (SELECT agent_id FROM allgres_private.agents WHERE name = 'general')
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'general_agent_seeded_plain_and_unconfigured', 'ok', ok));
+
+  -- 25g. fn_bulk_set_model: one call sets llm_config.provider/model on
+  -- every active agent, reusing fn_set_policy's own merge (nothing else on
+  -- any of those policies changes) rather than a hand-rolled UPDATE that
+  -- would bypass policy_history/generation the way every other agent
+  -- mutation in this file goes through.
+  -- fn_bulk_set_model is deliberately "every active agent", so exercising
+  -- it for real -- not against some carved-out subset -- means every real
+  -- seeded agent's llm_config changes too. Snapshotted here and restored
+  -- below before this function returns, the same idempotence-on-rerun
+  -- requirement every other fixture in this file already meets (a second
+  -- fn_selftest call on the same database must see the same starting
+  -- state, not one already bulk-set from the first run).
+  CREATE TEMP TABLE IF NOT EXISTS _selftest_bulk_snapshot (agent_id uuid PRIMARY KEY, llm_config jsonb);
+  DELETE FROM _selftest_bulk_snapshot;
+  INSERT INTO _selftest_bulk_snapshot
+  SELECT agent_id, llm_config FROM allgres_private.policies
+  WHERE agent_id IN (SELECT agent_id FROM allgres_private.agents WHERE is_active);
+
+  DELETE FROM allgres_private.agents WHERE name IN ('selftest_bulk_agent_a', 'selftest_bulk_agent_b');
+  INSERT INTO allgres_private.agents (name) VALUES ('selftest_bulk_agent_a'), ('selftest_bulk_agent_b');
+  r := allgres_public.fn_create_provider('selftest_bulk_provider', 'openai_compat', 'https://selftest.invalid/v1');
+  comp := allgres_public.fn_bulk_set_model('selftest_bulk_provider', 'selftest-model-x');
+  ok := COALESCE((comp->>'ok')::boolean, false) AND COALESCE((comp->>'updated_count')::int, 0) >= 2;
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.agents a JOIN allgres_private.policies p USING (agent_id)
+    WHERE a.name IN ('selftest_bulk_agent_a', 'selftest_bulk_agent_b')
+      AND (p.llm_config->>'provider' <> 'selftest_bulk_provider' OR p.llm_config->>'model' <> 'selftest-model-x')
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_bulk_set_model_updates_every_active_agent', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_bulk_set_model('selftest_nonexistent_provider_xyz', 'x');
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%is not configured or not enabled%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_bulk_set_model_rejects_unknown_provider', 'ok', ok));
+
+  UPDATE allgres_private.policies p SET llm_config = s.llm_config
+  FROM _selftest_bulk_snapshot s WHERE p.agent_id = s.agent_id;
+  DROP TABLE _selftest_bulk_snapshot;
+
+  DELETE FROM allgres_private.agents WHERE name IN ('selftest_bulk_agent_a', 'selftest_bulk_agent_b');
+  DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_bulk_provider';
 
   DELETE FROM allgres_private.llm_secrets WHERE provider_id IN (
     SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider'
@@ -8737,6 +8932,15 @@ BEGIN
     -- itself is what this case is for.
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
     v := v || jsonb_build_array(jsonb_build_object('name', 'permissions_grant_needs_admin_once_accounts_exist', 'ok', ok));
+
+    -- Same gate, for the new bulk provider/model action: touches every
+    -- active agent at once, so it needs the admin session at least as much
+    -- as any single-agent action above does.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.bulk_set_model', 'provider', 'analyst', 'model', 'should-not-apply'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'bulk_set_model_needs_admin_once_accounts_exist', 'ok', ok));
 
     -- Setting a key to JSON null clears it back to the reader's own coded
     -- default rather than leaving a stray {"probe":2} on a real seeded
@@ -9619,6 +9823,10 @@ BEGIN
       RETURN allgres_public.fn_set_agent_autonomy(
         (p_request->>'agent_id')::uuid, p_request->>'autonomy_level'
       );
+
+    WHEN 'agents.bulk_set_model' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_bulk_set_model(p_request->>'provider', p_request->>'model');
 
     WHEN 'agents.create' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
