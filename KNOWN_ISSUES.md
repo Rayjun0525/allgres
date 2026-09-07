@@ -2746,3 +2746,84 @@ without it (confirmed the brute-force path returns the identical ranking,
 same values up to floating-point precision). Semantic recall over
 long-term agent memory (item 25), using this same embedding
 infrastructure, is deliberately left for a follow-up slice.
+
+## 36. Three real gaps found by an outside review of item 35's own commit: a flaky CI mechanism, an unvalidated agent_config, and an embedding-model mix-up
+
+An external review of the merged commit (b539afc) flagged three things
+worth checking against the real code rather than taking on faith. All
+three turned out to be real.
+
+**`docker-smoke` was failing on `main`, not just a stale PR run.** The
+review caught this live: `native-matrix (16/17/18)` all green, but
+`docker-smoke` red on both the merge that landed item 35 and the *previous*
+merge (PR #3) before it -- a pre-existing, recurring failure, not something
+this session's own changes introduced. `scripts/smoke.sh`'s own log showed
+the actual failing line every time: `curl: (23) Failure writing output to
+destination`, immediately after `dashboard stayed responsive under
+outbound load` and before one of the CSP-header assertions. The
+`set -euo pipefail` script piped `curl` straight into `grep -q`/`grep -qv`
+in three places; `-q` makes grep exit the instant it finds (or definitively
+rules out) a match, closing its end of the pipe while curl may still be
+mid-write, so curl gets a broken-pipe write failure (exit 23) for what was
+actually a *successful* assertion -- and `pipefail` turns that broken-pipe
+exit into a script failure regardless of what grep found. This is a
+textbook `curl | grep -q` race, not a size limit or a real HTTP problem:
+confirmed live by fetching the exact same responses with `curl | wc -c`
+(reads to EOF, no early-exiting consumer) against a real running server --
+same bytes, no failure, including the by-now-fairly-large `/api/v1/agents`
+response. Fixed by capturing each response into a shell variable first
+(`body=$(curl ...)`) and grepping the variable via a here-string
+(`grep -q pattern <<<"$body"`) instead of a live pipe -- command
+substitution waits for curl to fully exit before grep ever runs, so there
+is no pipe left to race. All three occurrences in `scripts/smoke.sh` fixed
+the same way; a repo-wide grep confirms no other script has the same
+pattern.
+
+**`agent_config`'s known integer keys had no value validation.** Item 35's
+own `fn_set_agent_config` only ever checked that the whole value was a
+JSON object -- `compaction_threshold: "not_a_number"` or
+`min_mentions_to_route: 0` would both write successfully and only surface
+as a runtime error the next time `maybe_trigger_compaction` or
+`fn_messenger_post` actually cast the value with `::int`, mid-turn, on
+whatever task happened to trigger it next -- exactly the "fails late
+instead of fails fast" gap the review named. Fixed with
+`allgres_private.validate_agent_config`, called from `fn_set_agent_config`
+before the merge: for each of the file's own known integer-typed keys
+present and non-null in the incoming config, it must be a whole number
+within a sane range, or the write is rejected with a friendly error naming
+the key -- the same "friendly rejection instead of a raw error" shape
+`fn_set_agent_autonomy` already has for a bad `autonomy_level`. A key not
+on this list is completely unvalidated and always was -- that is still the
+entire point of `agent_config` being a generic bag rather than one column
+per tunable; only names this file's own readers already cast get checked.
+
+**Embedding-model mix-up: same dimension, different model, ranked as if
+comparable.** `rank_agents_by_embedding` already refused to compare
+embeddings of different *dimension* (item 35), but two different embedding
+models can produce the same dimension while meaning something completely
+different per axis -- switching the configured provider/model would have
+silently started ranking an old embedding against a new query in an
+incomparable vector space, with nothing about the shape of the data to
+catch it. Fixed: `rank_agents_by_embedding` takes a new
+`p_expected_model` parameter and only considers agents whose
+`embedding_model` matches it exactly, in both the pgvector-accelerated and
+brute-force paths. `fn_complete_outbound`'s `'embedding'` branch derives
+the expected model from the *actual* call that was just completed
+(`request_body->>'model'` plus that row's own `provider_id` looked up
+against `llm_providers.name`) rather than re-querying "the" current
+embedding provider, which could have changed between when the query was
+queued and when it completed.
+
+**Verified live**: `fn_selftest` grew from 149 to 153 cases (rejecting a
+non-numeric and an out-of-range known key, confirming the rejected value
+was never persisted, confirming an unknown key stays fully unvalidated,
+and extending the ranking test with a same-dimension-different-model agent
+that must be excluded even though it would otherwise rank first),
+idempotent across repeated runs, on a fresh install both with and without
+pgvector. `tests/e2e_mock.sql`'s real end-to-end round trip (item 35) still
+passes both ways with the model filter in place, confirming the
+provider-name/request-body-model reconstruction actually matches what
+`fn_complete_agent_embedding` stamped onto `agents.embedding_model` in the
+first place. The three fixed `scripts/smoke.sh` assertions were run
+directly against a real live server (not just `bash -n`), each one
+succeeding exactly as it should.

@@ -1338,15 +1338,23 @@ $fn$;
 -- allgres_private.vector_available(), a brute-force
 -- allgres_private.cosine_similarity() scan otherwise -- see the
 -- llm_providers.purpose comment for why both paths have to exist. Excludes
--- the requester itself (searching for a delegate target, not a mirror) and
--- any agent whose embedding has a different dimension than the query's
+-- the requester itself (searching for a delegate target, not a mirror), any
+-- agent whose embedding has a different dimension than the query's
 -- (cosine_similarity already returns NULL for that mismatch in the
 -- brute-force path; the accelerated path filters it explicitly since
--- casting a mismatched-length array to vector(N) would error, not just
--- rank oddly).
+-- casting a mismatched-length array to vector(N) would error, not just rank
+-- oddly), and -- p_expected_model, the "<provider name>:<model>" the query
+-- embedding was itself just generated with (see fn_complete_outbound) --
+-- any agent embedded under a *different* model. Two different embedding
+-- models can produce vectors of the identical dimension while meaning
+-- something completely different per axis; matching dimension alone would
+-- silently rank across two incomparable vector spaces the moment an
+-- operator switches embedding providers/models without an accident this
+-- obvious ever surfacing as an error.
 CREATE OR REPLACE FUNCTION allgres_private.rank_agents_by_embedding(
   p_query_embedding double precision[],
   p_requester_agent_id uuid,
+  p_expected_model text,
   p_limit int DEFAULT 5
 ) RETURNS jsonb
 LANGUAGE plpgsql
@@ -1367,10 +1375,11 @@ BEGIN
       || 'FROM (SELECT agent_id, name, 1 - (embedding::%2$I.vector(%1$s) OPERATOR(%2$I.<=>) $1::%2$I.vector(%1$s)) AS similarity '
       || 'FROM allgres_private.agents '
       || 'WHERE embedding IS NOT NULL AND is_active AND agent_id <> $2 AND array_length(embedding, 1) = %1$s '
+      || 'AND embedding_model = $4 '
       || 'AND allgres_private.agent_has_permission($2, ''agent'', name) '
       || 'ORDER BY embedding::%2$I.vector(%1$s) OPERATOR(%2$I.<=>) $1::%2$I.vector(%1$s) LIMIT $3) s',
       v_dims, allgres_private.vector_schema()
-    ) INTO v_out USING p_query_embedding, p_requester_agent_id, v_n;
+    ) INTO v_out USING p_query_embedding, p_requester_agent_id, v_n, p_expected_model;
   ELSE
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
       'agent_id', agent_id, 'name', name, 'similarity', similarity
@@ -1382,6 +1391,7 @@ BEGIN
       WHERE embedding IS NOT NULL AND is_active
         AND agent_id <> p_requester_agent_id
         AND array_length(embedding, 1) = v_dims
+        AND embedding_model = p_expected_model
         AND allgres_private.agent_has_permission(p_requester_agent_id, 'agent', name)
       ORDER BY allgres_private.cosine_similarity(embedding, p_query_embedding) DESC NULLS LAST
       LIMIT v_n
@@ -4032,6 +4042,7 @@ DECLARE
   v_running boolean;
   v_query_vec double precision[];
   v_requester uuid;
+  v_expected_model text;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -4100,11 +4111,22 @@ BEGIN
         );
       ELSE
         SELECT agent_id INTO v_requester FROM allgres_private.tasks WHERE task_id = c.task_id;
+        -- The same "<provider name>:<model>" string fn_complete_agent_embedding
+        -- stamps onto agents.embedding_model, built from what this very call
+        -- was actually queued with (c.request_body->>'model', the provider it
+        -- was actually sent to) rather than re-deriving "the" current
+        -- embedding provider -- which could have changed between queue time
+        -- and this completion.
+        SELECT p.name || ':' || (c.request_body->>'model') INTO v_expected_model
+        FROM allgres_private.llm_providers p WHERE p.provider_id = c.provider_id;
         v_payload := jsonb_build_object(
           'type', 'tool_result',
           'content', jsonb_build_object(
             'status', p_status,
-            'body', COALESCE(allgres_private.rank_agents_by_embedding(v_query_vec, v_requester, 5), '[]'::jsonb)::text
+            'body', COALESCE(
+              allgres_private.rank_agents_by_embedding(v_query_vec, v_requester, v_expected_model, 5),
+              '[]'::jsonb
+            )::text
           )
         );
       END IF;
@@ -4575,6 +4597,57 @@ BEGIN
 END;
 $fn$;
 
+-- agent_config stays a fully open jsonb bag for any key a future tunable
+-- needs -- see its own column comment, "a new tunable never needs a new
+-- migration" -- but every key a *current* reader actually casts (the three
+-- below, all via (value->>'key')::int) is checked here at set time instead
+-- of only failing later, mid-turn, the moment maybe_trigger_compaction or
+-- fn_messenger_post finally reads a bad one back. An unknown key -- the
+-- whole reason this column is a jsonb bag and not one column per tunable --
+-- is left alone entirely; only names this file's own readers already
+-- depend on get a fail-fast check, and it never blocks the key from being
+-- set to jsonb null (the documented "clear it back to default" signal,
+-- checked before this loop ever sees it as a would-be integer).
+CREATE OR REPLACE FUNCTION allgres_private.validate_agent_config(p_config jsonb)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  r record;
+  v_val jsonb;
+  v_num numeric;
+BEGIN
+  FOR r IN
+    SELECT * FROM (VALUES
+      ('compaction_threshold', 1, 1000000),
+      ('compaction_keep_recent', 0, 1000000),
+      ('min_mentions_to_route', 1, 1000)
+    ) AS t(key, min_val, max_val)
+  LOOP
+    IF NOT (p_config ? r.key) THEN
+      CONTINUE;
+    END IF;
+    v_val := p_config -> r.key;
+    IF jsonb_typeof(v_val) = 'null' THEN
+      CONTINUE;
+    END IF;
+    IF jsonb_typeof(v_val) <> 'number' THEN
+      RAISE EXCEPTION 'agent_config.% must be a number, got %', r.key, jsonb_typeof(v_val)
+        USING ERRCODE = 'P0001';
+    END IF;
+    v_num := v_val::text::numeric;
+    IF v_num <> trunc(v_num) THEN
+      RAISE EXCEPTION 'agent_config.% must be a whole number, got %', r.key, v_num
+        USING ERRCODE = 'P0001';
+    END IF;
+    IF v_num < r.min_val OR v_num > r.max_val THEN
+      RAISE EXCEPTION 'agent_config.% must be between % and %, got %', r.key, r.min_val, r.max_val, v_num
+        USING ERRCODE = 'P0001';
+    END IF;
+  END LOOP;
+END;
+$fn$;
+
 -- agent_config's own setter: a shallow merge (||), the same "only touch
 -- the keys you send" shape fn_set_project_config uses for preset_prompt --
 -- clearing one tunable back to its coded default means sending it as
@@ -4593,6 +4666,7 @@ BEGIN
   IF p_config IS NULL OR jsonb_typeof(p_config) <> 'object' THEN
     RAISE EXCEPTION 'agent_config must be a JSON object' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.validate_agent_config(p_config);
   UPDATE allgres_private.agents
   SET agent_config = jsonb_strip_nulls(agent_config || p_config), updated_at = now()
   WHERE agent_id = p_agent_id
@@ -8493,6 +8567,40 @@ BEGIN
     ok := (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = '{}'::jsonb;
     v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_null_value_clears_the_key', 'ok', ok));
 
+    -- A known-integer key must fail fast at set time on a value fn_next_step
+    -- would otherwise only choke on much later, mid-turn -- a non-numeric
+    -- string, and a numeric value outside its sane range.
+    BEGIN
+      PERFORM allgres_public.fn_set_agent_config(
+        v_creator_id, jsonb_build_object('compaction_threshold', 'not_a_number')
+      );
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%must be a number%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_rejects_non_numeric_known_key', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_public.fn_set_agent_config(
+        v_creator_id, jsonb_build_object('min_mentions_to_route', 0)
+      );
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%must be between%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_rejects_out_of_range_known_key', 'ok', ok));
+
+    -- Neither rejection above left a partial write behind, and an unknown
+    -- key (not one of the file's own known-integer readers) still passes
+    -- through untouched -- the whole point of this staying a generic bag.
+    ok := (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = '{}'::jsonb;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_rejected_value_not_persisted', 'ok', ok));
+
+    PERFORM allgres_public.fn_set_agent_config(v_creator_id, jsonb_build_object('some_future_string_tunable', 'anything goes'));
+    ok := (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = jsonb_build_object('some_future_string_tunable', 'anything goes');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_unknown_key_stays_unvalidated', 'ok', ok));
+    PERFORM allgres_public.fn_set_agent_config(v_creator_id, jsonb_build_object('some_future_string_tunable', NULL));
+
     -- 33c. session_compactor's threshold/keep_recent are read from its own
     -- agent_config, not hardcoded -- a lower threshold set here must
     -- actually change when compaction fires, and is reset back to the
@@ -8714,6 +8822,7 @@ BEGIN
     v_wrongdim uuid;
     v_nopermission uuid;
     v_ranked jsonb;
+    v_wrongmodel uuid;
   BEGIN
     SELECT agent_id INTO v_req FROM allgres_private.agents WHERE name = 'selftest_embed_requester';
     IF v_req IS NULL THEN
@@ -8735,25 +8844,37 @@ BEGIN
     IF v_nopermission IS NULL THEN
       v_nopermission := (allgres_public.fn_create_agent('selftest_embed_nopermission')->>'agent_id')::uuid;
     END IF;
+    -- Same dimension AND same direction as v_near -- would rank first on
+    -- similarity alone -- but embedded under a different model, so must be
+    -- excluded exactly like a dimension mismatch is: two models can agree
+    -- on vector length while meaning something entirely different per axis.
+    SELECT agent_id INTO v_wrongmodel FROM allgres_private.agents WHERE name = 'selftest_embed_wrongmodel';
+    IF v_wrongmodel IS NULL THEN
+      v_wrongmodel := (allgres_public.fn_create_agent('selftest_embed_wrongmodel')->>'agent_id')::uuid;
+    END IF;
 
-    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[] WHERE agent_id = v_near;
-    UPDATE allgres_private.agents SET embedding = ARRAY[0,1,0,0]::double precision[] WHERE agent_id = v_far;
-    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0]::double precision[] WHERE agent_id = v_wrongdim;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE agent_id = v_near;
+    UPDATE allgres_private.agents SET embedding = ARRAY[0,1,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE agent_id = v_far;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE agent_id = v_wrongdim;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-b' WHERE agent_id = v_wrongmodel;
     -- Closer to the query than v_near, but the requester is never granted
     -- 'agent' permission for it -- must still be excluded, the same check
     -- 'delegate' itself enforces.
-    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[] WHERE agent_id = v_nopermission;
+    UPDATE allgres_private.agents SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE agent_id = v_nopermission;
 
     PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_near');
     PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_far');
     PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_wrongdim');
+    PERFORM allgres_public.fn_grant_permission(v_req, 'agent', 'selftest_embed_wrongmodel');
 
-    v_ranked := allgres_private.rank_agents_by_embedding(ARRAY[1,0,0,0]::double precision[], v_req, 5);
+    v_ranked := allgres_private.rank_agents_by_embedding(
+      ARRAY[1,0,0,0]::double precision[], v_req, 'selftest_provider:model-a', 5
+    );
     ok := jsonb_array_length(v_ranked) = 2
       AND v_ranked->0->>'name' = 'selftest_embed_near'
       AND (v_ranked->0->>'similarity')::numeric = 1
       AND v_ranked->1->>'name' = 'selftest_embed_far';
-    v := v || jsonb_build_array(jsonb_build_object('name', 'rank_agents_by_embedding_orders_filters_and_excludes_mismatched_dims', 'ok', ok));
+    v := v || jsonb_build_array(jsonb_build_object('name', 'rank_agents_by_embedding_orders_filters_and_excludes_mismatched_dims_and_models', 'ok', ok));
 
     -- search_agents with no purpose='embedding' provider configured (the
     -- default state here) must be a friendly continue, not an exception --
