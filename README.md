@@ -517,6 +517,43 @@ targets; and there is no dedicated dashboard view of the dependency graph
 itself yet — a paused task and its children are visible today the same way
 any other task is, through Audit → Sessions/Tasks.
 
+## Schedules
+
+Roadmap item 6: a schedule (Settings → Schedules) runs an agent against a
+goal on a recurring interval — each firing calls `fn_create_session` exactly
+as if an operator had typed the goal in by hand, so a fired run is an
+ordinary session, visible and inspectable the same way any other one is
+(Audit → Sessions). Firing is a plain `next_run_at <= now()` poll
+(`fn_run_schedules`, called from `fn_pump` alongside `fn_watchdog`/
+`fn_dispatch_tasks`) — no `pg_cron` or other external scheduler, and no
+state held in worker memory, so a worker or database restart between ticks
+loses nothing: the next tick just finds the same due row. A schedule that
+missed several intervals (the extension was down, or simply never got a
+tick) fires once to catch up, never in a burst — `next_run_at` is always
+recomputed as `now() + interval_seconds`, never by walking forward in fixed
+steps from where it was.
+
+A schedule's own `name`/`goal` plus its `run_count`/`last_run_at`/
+`last_session_id` *are* the durable long-term-goal-tracking record — how
+many times has this actually been checked on, most recently when, against
+which session — queryable in PostgreSQL like everything else here, not a
+separate concept kept anywhere else. Two independent, optional stop
+conditions — `max_runs` (a run budget) and `ends_at` (a wall-clock deadline)
+— are enforced on every tick, not only at create time: a schedule that
+reaches either is deactivated (`is_active = false`) rather than fired one
+run past the limit. `schedules.run_now` fires one immediately regardless of
+`next_run_at`, still subject to both stop conditions — the closest thing in
+this slice to a genuinely event-driven trigger (an operator, or an external
+system calling the same RPC action, is the "event").
+
+Deliberately not in this slice: a real *cost*-based stop condition (a
+dollar or token budget) — nothing in this codebase parses token usage out
+of an LLM response or prices a provider/model today, so a cost cap would
+only ever compare against a number nothing populates; and a genuinely
+event/webhook-triggered schedule (fired by an external condition, not a
+timer or a manual call) — `schedules.run_now` covers the manual case today,
+a real inbound trigger is future work.
+
 ## Semantic delegate search
 
 `delegate` has always required an agent to already know the exact

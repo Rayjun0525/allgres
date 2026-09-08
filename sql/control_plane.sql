@@ -874,6 +874,49 @@ CREATE INDEX IF NOT EXISTS sessions_project_idx
   ON allgres_private.sessions (project_id, started_at DESC)
   WHERE project_id IS NOT NULL;
 
+-- Roadmap item 6: schedule/event-driven execution tied to long-term goal
+-- tracking. A schedule *is* the durable goal-tracking record, not a
+-- separate concept bolted alongside one: its name and goal text describe
+-- what is being pursued, and run_count/last_run_at/last_session_id are the
+-- actual history of checking on it over time -- "how many times has this
+-- run, most recently when, against which session" -- queryable in
+-- PostgreSQL like everything else here, not held anywhere in worker memory.
+-- Firing is a plain now() >= next_run_at poll (fn_run_schedules, called
+-- from fn_pump alongside fn_watchdog/fn_dispatch_tasks), not pg_cron or any
+-- external scheduler -- one less extension dependency, and the same
+-- restart-survives-for-free property every other queue in this file
+-- already has: state is a row, not a timer running somewhere.
+--
+-- Two independent stop conditions, both optional: max_runs (a run budget)
+-- and ends_at (a wall-clock deadline) -- fn_run_schedules auto-deactivates
+-- a schedule that has hit either, so "still is_active" itself means
+-- "still eligible to fire," not just "was never turned off." A real
+-- *cost*-based stop condition (a dollar or token budget) is deliberately
+-- not here: nothing in this codebase parses token usage out of an LLM
+-- response or prices a provider/model today, so a cost cap here would only
+-- ever compare against a number nothing ever populates. That is real
+-- follow-up work, not something to fake with an unenforced column.
+CREATE TABLE IF NOT EXISTS allgres_private.schedules (
+  schedule_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name             text NOT NULL UNIQUE,
+  agent_id         uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  goal             text NOT NULL,
+  interval_seconds int NOT NULL CHECK (interval_seconds > 0),
+  next_run_at      timestamptz NOT NULL,
+  is_active        boolean NOT NULL DEFAULT true,
+  max_runs         int CHECK (max_runs IS NULL OR max_runs > 0),
+  run_count        int NOT NULL DEFAULT 0,
+  ends_at          timestamptz,
+  last_run_at      timestamptz,
+  last_session_id  uuid REFERENCES allgres_private.sessions(session_id),
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS schedules_due_idx
+  ON allgres_private.schedules (next_run_at)
+  WHERE is_active;
+
 CREATE TABLE IF NOT EXISTS allgres_private.tasks (
   task_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   session_id      uuid NOT NULL REFERENCES allgres_private.sessions(session_id),
@@ -4830,15 +4873,23 @@ DECLARE
   w jsonb;
   s jsonb;
   o jsonb;
+  sc jsonb;
 BEGIN
   -- Does not perform HTTP or run sandboxed SQL.  Caller claims queued rows
   -- AFTER this commits.
   w := allgres_public.fn_watchdog();
+  -- Roadmap item 6: due schedules fire before dispatch, so a session (and
+  -- its first queued task) a schedule creates this very tick is picked up
+  -- by the same fn_dispatch_tasks call right below, not left waiting a
+  -- full extra tick.
+  sc := allgres_public.fn_run_schedules();
   d := allgres_public.fn_dispatch_tasks();
   c := allgres_public.fn_claim_outbound(4, p_fallback_key);
   s := allgres_public.fn_claim_sql(4);
   o := allgres_public.fn_claim_oauth(4);
-  RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s, 'claim_oauth', o);
+  RETURN jsonb_build_object(
+    'watchdog', w, 'schedules', sc, 'dispatch', d, 'claim', c, 'claim_sql', s, 'claim_oauth', o
+  );
 END;
 $fn$;
 
@@ -5655,6 +5706,223 @@ BEGIN
   VALUES (v_tid, 0, 'user', to_jsonb(btrim(p_message)));
 
   RETURN jsonb_build_object('ok', true, 'session_id', p_session_id, 'task_id', v_tid);
+END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- Roadmap item 6: schedules -- see allgres_private.schedules' own comment.
+-- Same create/set/delete shape as fn_create_connection/fn_set_connection on
+-- purpose: a named, operator-managed row with its own lifecycle.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_schedule(
+  p_name text,
+  p_agent_id uuid,
+  p_goal text,
+  p_interval_seconds int,
+  p_max_runs int DEFAULT NULL,
+  p_ends_at timestamptz DEFAULT NULL,
+  p_start_at timestamptz DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF NULLIF(trim(p_name), '') IS NULL THEN
+    RAISE EXCEPTION 'schedule name is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NULLIF(trim(p_goal), '') IS NULL THEN
+    RAISE EXCEPTION 'schedule goal is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_active) THEN
+    RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+  IF COALESCE(p_interval_seconds, 0) <= 0 THEN
+    RAISE EXCEPTION 'interval_seconds must be a positive number of seconds' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_max_runs IS NOT NULL AND p_max_runs <= 0 THEN
+    RAISE EXCEPTION 'max_runs must be a positive number' USING ERRCODE = 'P0001';
+  END IF;
+
+  INSERT INTO allgres_private.schedules (name, agent_id, goal, interval_seconds, next_run_at, max_runs, ends_at)
+  VALUES (trim(p_name), p_agent_id, trim(p_goal), p_interval_seconds, COALESCE(p_start_at, now()), p_max_runs, p_ends_at)
+  RETURNING schedule_id INTO v_id;
+  RETURN jsonb_build_object('ok', true, 'schedule_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_schedule(
+  p_schedule_id uuid,
+  p_goal text DEFAULT NULL,
+  p_interval_seconds int DEFAULT NULL,
+  p_is_active boolean DEFAULT NULL,
+  p_max_runs int DEFAULT NULL,
+  p_clear_max_runs boolean DEFAULT false,
+  p_ends_at timestamptz DEFAULT NULL,
+  p_clear_ends_at boolean DEFAULT false
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  s allgres_private.schedules%ROWTYPE;
+BEGIN
+  SELECT * INTO s FROM allgres_private.schedules WHERE schedule_id = p_schedule_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_interval_seconds IS NOT NULL AND p_interval_seconds <= 0 THEN
+    RAISE EXCEPTION 'interval_seconds must be a positive number of seconds' USING ERRCODE = 'P0001';
+  END IF;
+
+  UPDATE allgres_private.schedules
+  SET goal = COALESCE(NULLIF(p_goal, ''), goal),
+      interval_seconds = COALESCE(p_interval_seconds, interval_seconds),
+      is_active = COALESCE(p_is_active, is_active),
+      max_runs = CASE WHEN p_clear_max_runs THEN NULL ELSE COALESCE(p_max_runs, max_runs) END,
+      ends_at = CASE WHEN p_clear_ends_at THEN NULL ELSE COALESCE(p_ends_at, ends_at) END,
+      updated_at = now()
+  WHERE schedule_id = p_schedule_id;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- No FK cascade onto a schedule from anything that must survive it (a past
+-- run's own session stands on its own once created -- see last_session_id's
+-- ON DELETE default, no action, matching how a delegated task outlives a
+-- deleted parent nowhere in this file either). Deleting a schedule only
+-- ever removes the row that decides whether it fires again; every session
+-- it already created stays exactly as it was.
+CREATE OR REPLACE FUNCTION allgres_public.fn_delete_schedule(p_schedule_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.schedules WHERE schedule_id = p_schedule_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule not found' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- The firing sweep, called from fn_pump every tick alongside fn_watchdog/
+-- fn_dispatch_tasks -- entirely a poll against next_run_at, no external
+-- scheduler and nothing held in worker memory, so a restart between ticks
+-- loses nothing: the next tick just finds the same due row again. Always
+-- reschedules from *now*, never by walking next_run_at forward in
+-- interval_seconds steps -- a schedule that missed several intervals while
+-- the extension was down (or simply never got a tick) fires once to catch
+-- up, not N times in a burst.
+CREATE OR REPLACE FUNCTION allgres_public.fn_run_schedules()
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_created jsonb;
+  n int := 0;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT schedule_id, agent_id, goal, interval_seconds, max_runs, run_count, ends_at
+    FROM allgres_private.schedules
+    WHERE is_active AND next_run_at <= now()
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    -- A stop condition reached between ticks (an operator lowering max_runs,
+    -- or ends_at simply arriving) is honoured here too, not only at create/
+    -- set time -- deactivate and skip firing rather than run one more time
+    -- past the limit.
+    IF (r.max_runs IS NOT NULL AND r.run_count >= r.max_runs)
+       OR (r.ends_at IS NOT NULL AND r.ends_at <= now()) THEN
+      UPDATE allgres_private.schedules SET is_active = false, updated_at = now()
+      WHERE schedule_id = r.schedule_id;
+      CONTINUE;
+    END IF;
+
+    BEGIN
+      v_created := allgres_public.fn_create_session(r.agent_id, r.goal);
+    EXCEPTION WHEN others THEN
+      -- The agent went inactive, or some other transient failure -- push
+      -- next_run_at forward anyway so a permanently-broken schedule cannot
+      -- spin every tick forever; the operator sees run_count stay behind
+      -- what elapsed time would predict and can investigate.
+      RAISE WARNING 'fn_run_schedules: fn_create_session failed for schedule %: %', r.schedule_id, SQLERRM;
+      UPDATE allgres_private.schedules
+      SET next_run_at = now() + make_interval(secs => r.interval_seconds),
+          updated_at = now()
+      WHERE schedule_id = r.schedule_id;
+      CONTINUE;
+    END;
+
+    UPDATE allgres_private.schedules
+    SET run_count = run_count + 1,
+        last_run_at = now(),
+        last_session_id = (v_created->>'session_id')::uuid,
+        next_run_at = now() + make_interval(secs => interval_seconds),
+        is_active = NOT (
+          (max_runs IS NOT NULL AND run_count + 1 >= max_runs)
+          OR (ends_at IS NOT NULL AND ends_at <= now())
+        ),
+        updated_at = now()
+    WHERE schedule_id = r.schedule_id;
+    n := n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('fired', n);
+END;
+$fn$;
+
+-- Fires one schedule immediately -- an operator's "run it now" button, or
+-- an external system's own event hitting this through dashboard_rpc
+-- ('schedules.run_now'), the closest this slice comes to genuinely
+-- event-driven execution (see README, "Task dependencies" -- the same
+-- deferred-scope note applies here: a real condition/webhook-triggered
+-- schedule is future work, not this). Bypasses next_run_at, but never a
+-- stop condition: a schedule that has already hit max_runs/ends_at (or is
+-- simply paused) cannot be forced past that by this either.
+CREATE OR REPLACE FUNCTION allgres_public.fn_run_schedule_now(p_schedule_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  s allgres_private.schedules%ROWTYPE;
+  v_created jsonb;
+BEGIN
+  SELECT * INTO s FROM allgres_private.schedules WHERE schedule_id = p_schedule_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT s.is_active THEN
+    RAISE EXCEPTION 'schedule is not active' USING ERRCODE = 'P0001';
+  END IF;
+  IF (s.max_runs IS NOT NULL AND s.run_count >= s.max_runs) OR (s.ends_at IS NOT NULL AND s.ends_at <= now()) THEN
+    RAISE EXCEPTION 'schedule has already reached a stop condition' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_created := allgres_public.fn_create_session(s.agent_id, s.goal);
+
+  UPDATE allgres_private.schedules
+  SET run_count = run_count + 1,
+      last_run_at = now(),
+      last_session_id = (v_created->>'session_id')::uuid,
+      is_active = NOT (
+        (max_runs IS NOT NULL AND run_count + 1 >= max_runs)
+        OR (ends_at IS NOT NULL AND ends_at <= now())
+      ),
+      updated_at = now()
+  WHERE schedule_id = p_schedule_id;
+  RETURN v_created;
 END;
 $fn$;
 
@@ -7650,6 +7918,7 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connections', ''
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connection_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedures', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_history', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.schedules', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
@@ -8720,6 +8989,78 @@ BEGIN
   PERFORM allgres_public.fn_cancel_session(v_sid, 'selftest cancel test');
   ok := ok AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'cancelled';
   v := v || jsonb_build_array(jsonb_build_object('name', 'cancel_session_cancels_a_task_waiting_on_children', 'ok', ok));
+
+  -- Roadmap item 6: schedules -- see allgres_private.schedules' own
+  -- comment. Exercises the exact function fn_pump calls (fn_run_schedules),
+  -- not a substitute.
+  DELETE FROM allgres_private.schedules WHERE name = 'selftest_schedule';
+  r := allgres_public.fn_create_schedule(
+    'selftest_schedule', v_agent, 'selftest schedule goal', 3600, NULL, NULL, now() - interval '1 minute'
+  );
+  ok := (r->>'ok')::boolean;
+  v_call := (r->>'schedule_id')::uuid;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_schedule_starts_due', 'ok', ok));
+
+  sub := allgres_public.fn_run_schedules();
+  ok := COALESCE((sub->>'fired')::int, 0) >= 1
+    AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 1
+    AND (SELECT last_session_id FROM allgres_private.schedules WHERE schedule_id = v_call) IS NOT NULL
+    AND (SELECT next_run_at FROM allgres_private.schedules WHERE schedule_id = v_call) > now();
+  ok := ok AND EXISTS (
+    SELECT 1 FROM allgres_private.sessions
+    WHERE session_id = (SELECT last_session_id FROM allgres_private.schedules WHERE schedule_id = v_call)
+      AND goal = 'selftest schedule goal'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_run_schedules_fires_a_due_schedule_and_creates_a_session', 'ok', ok));
+
+  PERFORM allgres_public.fn_run_schedules();
+  ok := (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_run_schedules_does_not_fire_before_next_run_at', 'ok', ok));
+
+  r := allgres_public.fn_run_schedule_now(v_call);
+  ok := (r->>'ok')::boolean
+    AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 2;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_run_schedule_now_bypasses_next_run_at', 'ok', ok));
+
+  -- max_runs reached mid-flight (an operator lowering it, or simply
+  -- accumulating runs) is honoured the next time the schedule would
+  -- actually fire, not only at create/set time -- deactivated, not fired
+  -- one run past the budget.
+  UPDATE allgres_private.schedules SET max_runs = 2, next_run_at = now() - interval '1 minute' WHERE schedule_id = v_call;
+  sub := allgres_public.fn_run_schedules();
+  ok := COALESCE((sub->>'fired')::int, 0) = 0
+    AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 2
+    AND (SELECT is_active FROM allgres_private.schedules WHERE schedule_id = v_call) IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'schedule_deactivates_on_reaching_max_runs', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_run_schedule_now(v_call);
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_run_schedule_now_rejects_an_inactive_schedule', 'ok', ok));
+
+  -- ends_at is an independent stop condition, same auto-deactivate.
+  UPDATE allgres_private.schedules
+  SET is_active = true, max_runs = NULL, ends_at = now() - interval '1 minute',
+      next_run_at = now() - interval '1 minute'
+  WHERE schedule_id = v_call;
+  sub := allgres_public.fn_run_schedules();
+  ok := COALESCE((sub->>'fired')::int, 0) = 0
+    AND (SELECT is_active FROM allgres_private.schedules WHERE schedule_id = v_call) IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'schedule_deactivates_on_reaching_ends_at', 'ok', ok));
+
+  -- A paused (is_active=false) schedule never fires, no matter how overdue.
+  UPDATE allgres_private.schedules
+  SET is_active = false, ends_at = NULL, next_run_at = now() - interval '1 minute'
+  WHERE schedule_id = v_call;
+  sub := allgres_public.fn_run_schedules();
+  ok := COALESCE((sub->>'fired')::int, 0) = 0
+    AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 2;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'inactive_schedule_never_fires', 'ok', ok));
+
+  DELETE FROM allgres_private.schedules WHERE schedule_id = v_call;
 
   -- 25. build_llm_http fails closed on an unconfigured/disabled provider
   --     instead of silently substituting whichever other enabled provider
@@ -9944,6 +10285,14 @@ BEGIN
     v := v || jsonb_build_array(jsonb_build_object('name', 'procedures_create_needs_admin_once_accounts_exist', 'ok', ok));
 
     sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'schedules.create', 'name', 'selftest_should_not_exist_schedule',
+      'agent_id', v_agent::text, 'goal', 'x', 'interval_seconds', 3600
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.schedules WHERE name = 'selftest_should_not_exist_schedule');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'schedules_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'allowlist.add', 'ref', 'allgres_public.v_should_not_be_added'
     ));
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true
@@ -10769,6 +11118,7 @@ REVOKE ALL ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int,
 REVOKE ALL ON FUNCTION allgres_public.fn_claim_oauth(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_watchdog(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_run_schedules() FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_selftest() FROM PUBLIC;
 
 -- fn_run_sandboxed_sql is SECURITY INVOKER and does not itself validate what
@@ -10791,6 +11141,7 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) TO w
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_agent_embedding(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_agent_embedding(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_run_schedules() TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
 
 -- current_agent_id() is deliberately SECURITY INVOKER, not DEFINER (see its
@@ -10966,6 +11317,7 @@ BEGIN
     'memories.create', 'memories.remove', 'provider.update', 'provider.create',
     'connections.create', 'connections.update', 'connections.delete',
     'procedures.create', 'procedures.update', 'procedures.rollback',
+    'schedules.create', 'schedules.update', 'schedules.delete', 'schedules.run_now',
     'providers.oauth_callback', 'approvals.decide', 'fixes.decide',
     'users.create', 'users.set_active', 'users.set_role', 'assignments.set', 'assignments.toggle'
   ]) THEN
@@ -11933,6 +12285,57 @@ BEGIN
       RETURN allgres_public.fn_rollback_procedure(
         (p_request->>'procedure_id')::uuid, (p_request->>'generation')::int
       );
+
+    -- Roadmap item 6: schedule/event-driven execution (see
+    -- allgres_private.schedules' own comment). Listing is open, same as
+    -- procedures.list/connections.list -- a shared, operator-curated
+    -- surface; every mutation (including run_now, which actually creates a
+    -- session and so is consequential the same way sessions.cancel is) is
+    -- admin-gated once any account exists.
+    WHEN 'schedules.list' THEN
+      RETURN jsonb_build_object('ok', true, 'schedules', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'schedule_id', sc.schedule_id, 'name', sc.name, 'agent_id', sc.agent_id, 'agent', a.name,
+          'goal', sc.goal, 'interval_seconds', sc.interval_seconds, 'next_run_at', sc.next_run_at,
+          'is_active', sc.is_active, 'max_runs', sc.max_runs, 'run_count', sc.run_count,
+          'ends_at', sc.ends_at, 'last_run_at', sc.last_run_at, 'last_session_id', sc.last_session_id
+        ) ORDER BY sc.name)
+        FROM allgres_private.schedules sc
+        JOIN allgres_private.agents a USING (agent_id)
+      ), '[]'::jsonb));
+
+    WHEN 'schedules.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_create_schedule(
+        p_request->>'name',
+        (p_request->>'agent_id')::uuid,
+        p_request->>'goal',
+        (p_request->>'interval_seconds')::int,
+        NULLIF(p_request->>'max_runs', '')::int,
+        NULLIF(p_request->>'ends_at', '')::timestamptz,
+        NULLIF(p_request->>'start_at', '')::timestamptz
+      );
+
+    WHEN 'schedules.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_set_schedule(
+        (p_request->>'schedule_id')::uuid,
+        NULLIF(p_request->>'goal', ''),
+        NULLIF(p_request->>'interval_seconds', '')::int,
+        CASE WHEN p_request ? 'is_active' THEN (p_request->>'is_active')::boolean ELSE NULL END,
+        NULLIF(p_request->>'max_runs', '')::int,
+        COALESCE((p_request->>'clear_max_runs')::boolean, false),
+        NULLIF(p_request->>'ends_at', '')::timestamptz,
+        COALESCE((p_request->>'clear_ends_at')::boolean, false)
+      );
+
+    WHEN 'schedules.delete' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_delete_schedule((p_request->>'schedule_id')::uuid);
+
+    WHEN 'schedules.run_now' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_run_schedule_now((p_request->>'schedule_id')::uuid);
 
     -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
     -- fn_oauth_start only ever returns a redirect_url and a state, neither
