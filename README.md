@@ -554,6 +554,57 @@ event/webhook-triggered schedule (fired by an external condition, not a
 timer or a manual call) — `schedules.run_now` covers the manual case today,
 a real inbound trigger is future work.
 
+## Evaluation-gated self-improvement
+
+Roadmap item 7: every prior slice let `self_improve` (or an operator)
+change an agent's policy, but nothing ever recorded whether that change
+actually helped. `agent_recent_success_rate(agent_id, limit=20)` is the
+underlying signal — the completed/failed ratio over an agent's most recent
+root-level tasks only (`parent_task_id IS NULL`), so a delegated child's own
+outcome never blurs the delegating agent's own score, and it deliberately
+returns `NULL` (not `0`) when there is no evaluable data yet, so a brand
+new agent is never read as "0% success." It also excludes any session whose
+`goal LIKE 'selftest%'`, the same convention every other operator-facing
+count in this file already applies to `fn_selftest`'s own fixtures.
+
+`fn_set_policy` now stamps every archived version with this rate, in
+`policy_history.success_rate_at_change`, at the exact moment it is
+overwritten — so "how was this agent actually doing right before this
+change was made" is a real historical fact attached to that row, not
+something recomputed later from a moving window. `fn_evaluate_last_change
+(agent_id)` compares that snapshot against the agent's *current* rate and
+returns one of five verdicts: `improved`, `regressed`, `unchanged`,
+`insufficient_data` (either side is `NULL`), or `no_change_recorded_yet`
+(the agent has never had a policy change at all). `v_agent_health` is the
+same permission-gated shape as `v_system_health`, one row per agent
+instead of a single aggregate, and `self_improve` is granted read access
+to it by default (both at seed time and, for an existing install, via an
+unconditional grant so upgrading picks it up too). `self_improve`'s system
+prompt now points it at both `v_agent_health` and `fn_evaluate_last_change`
+so it can check the outcome of its own prior proposals before making a new
+one.
+
+Both are exposed read-only, the same way `policy.history` already is:
+`dashboard_rpc` action `agents.evaluate` (wraps `fn_evaluate_last_change`
+directly) and the extended `policy.history` output (`success_rate_at_change`
+per version). The Agents page's edit modal has a new "Evaluate last
+change" button next to History that shows the verdict and both rates, and
+the History modal itself now shows each version's `success_rate_at_change`
+inline.
+
+Deliberately not in this slice: a mechanical block on `self_improve`
+proposing a change (e.g. refusing a new proposal until the last one shows
+`improved`) — `self_improve`'s stated purpose is token/time cost, not
+correctness, and a hard gate on that basis would be enforcing something
+this feature was never meant to guarantee. This makes a change's outcome
+*evaluable*, not automatically enforced: no automatic rollback on
+`regressed` either, only a computed verdict for a human, or a future
+`self_improve` turn reading its own history, to act on. A real cost-based
+signal (tokens or dollars per change) is the same deferred item Schedules
+above already named — nothing in this codebase prices a provider or parses
+token usage out of a response yet, so a cost dimension here would only
+ever compare against a number nothing populates.
+
 ## Semantic delegate search
 
 `delegate` has always required an agent to already know the exact

@@ -458,6 +458,20 @@ ALTER TABLE allgres_private.policy_history
   ADD COLUMN IF NOT EXISTS max_delegation_depth int NOT NULL DEFAULT 5,
   ADD COLUMN IF NOT EXISTS max_session_tasks int NOT NULL DEFAULT 100;
 
+-- Roadmap item 7: evaluation-gated self-improvement. Every archived version
+-- is stamped with how the agent was actually doing (its own recent
+-- completed/failed ratio, see allgres_private.agent_recent_success_rate)
+-- right before it was replaced -- populated by fn_set_policy at the exact
+-- moment a version is overwritten, alongside the row's other now-historical
+-- fields. NULL means no evaluable data existed yet (a brand-new agent's
+-- very first change), not zero -- never treated as "0% success" by
+-- fn_evaluate_last_change below. This is what turns "self_improve proposed
+-- a change" into something a later turn (or an operator) can actually
+-- check the outcome of, instead of trusting a proposal was good on its own
+-- say-so.
+ALTER TABLE allgres_private.policy_history
+  ADD COLUMN IF NOT EXISTS success_rate_at_change numeric;
+
 CREATE INDEX IF NOT EXISTS policy_history_agent_idx
   ON allgres_private.policy_history (agent_id, generation DESC);
 
@@ -2055,6 +2069,43 @@ BEGIN
 END;
 $fn$;
 
+-- Roadmap item 7: the one evaluation signal this slice computes -- an
+-- agent's own recent completed-vs-failed ratio, over its last p_limit
+-- root-level tasks (parent_task_id IS NULL: a delegated child reflects
+-- whatever agent it was delegated *to*, not this one, and counting it here
+-- would blur the two; the same root-level distinction fn_next_step's own
+-- message assembly already draws). Deliberately not a lifetime average --
+-- an agent that was bad for its first 500 tasks and has been solid for its
+-- last 20 should read as solid, not dragged down by history a since-fixed
+-- problem no longer reflects. selftest's own fixture sessions are excluded
+-- the same way every operator-facing count already excludes them
+-- (goal LIKE 'selftest%'). NULL (not zero) when there is no evaluable data
+-- yet -- a brand-new agent, or one whose only tasks are still open -- so a
+-- caller can tell "nothing to judge yet" from "judged and found wanting."
+CREATE OR REPLACE FUNCTION allgres_private.agent_recent_success_rate(p_agent_id uuid, p_limit int DEFAULT 20)
+RETURNS numeric
+LANGUAGE sql
+STABLE
+AS $fn$
+  SELECT CASE WHEN count(*) FILTER (WHERE q.status IN ('completed', 'failed')) = 0 THEN NULL
+    ELSE round(
+      count(*) FILTER (WHERE q.status = 'completed')::numeric
+        / count(*) FILTER (WHERE q.status IN ('completed', 'failed')),
+      3
+    )
+  END
+  FROM (
+    SELECT t.status
+    FROM allgres_private.tasks t
+    JOIN allgres_private.sessions s ON s.session_id = t.session_id
+    WHERE t.agent_id = p_agent_id
+      AND t.parent_task_id IS NULL
+      AND s.goal NOT LIKE 'selftest%'
+    ORDER BY t.created_at DESC
+    LIMIT GREATEST(1, COALESCE(p_limit, 20))
+  ) q
+$fn$;
+
 -- Authorisation for agent-visible views lives in the views, so it holds even if
 -- the statement analysis in fn_validate_sql misses a reference.  An agent that
 -- reaches a view it has no permission for sees no rows rather than a leak.
@@ -2135,6 +2186,32 @@ AS
     (SELECT count(*) FROM allgres_private.human_approvals WHERE status = 'pending') AS pending_approvals,
     (SELECT count(*) FROM allgres_private.agent_memories WHERE expires_at IS NOT NULL AND expires_at < now()) AS expired_memories_pending
   WHERE allgres_private.agent_may_read('allgres_public.v_system_health', allgres_private.current_agent_id());
+
+-- Roadmap item 7: per-agent evaluation data (allgres_private.
+-- agent_recent_success_rate's own comment explains the metric itself).
+-- Same permission-gated shape as v_system_health -- an agent without the
+-- grant sees zero rows -- but per-row rather than a single aggregate, since
+-- this describes each agent individually, the comparison self_improve (or
+-- an operator) actually needs before proposing or judging a change.
+CREATE OR REPLACE VIEW allgres_public.v_agent_health
+  WITH (security_barrier = true)
+AS
+  SELECT
+    a.agent_id,
+    a.name,
+    p.generation,
+    allgres_private.agent_recent_success_rate(a.agent_id, 20) AS recent_success_rate,
+    (
+      SELECT h.success_rate_at_change
+      FROM allgres_private.policy_history h
+      WHERE h.agent_id = a.agent_id
+      ORDER BY h.generation DESC
+      LIMIT 1
+    ) AS success_rate_before_last_change
+  FROM allgres_private.agents a
+  JOIN allgres_private.policies p USING (agent_id)
+  WHERE a.is_active
+    AND allgres_private.agent_may_read('allgres_public.v_agent_health', allgres_private.current_agent_id());
 
 -- One row per (agent, resource) grant -- the full permission matrix a
 -- security-auditor agent needs to spot an anomaly (an inactive agent still
@@ -5245,11 +5322,13 @@ BEGIN
   IF v_changed THEN
     INSERT INTO allgres_private.policy_history (
       agent_id, generation, system_prompt, max_steps, max_retries, llm_config,
-      max_concurrent_tasks, max_turn_seconds, max_delegation_depth, max_session_tasks
+      max_concurrent_tasks, max_turn_seconds, max_delegation_depth, max_session_tasks,
+      success_rate_at_change
     ) VALUES (
       p_row.agent_id, p_row.generation, p_row.system_prompt, p_row.max_steps,
       p_row.max_retries, p_row.llm_config, p_row.max_concurrent_tasks, p_row.max_turn_seconds,
-      p_row.max_delegation_depth, p_row.max_session_tasks
+      p_row.max_delegation_depth, p_row.max_session_tasks,
+      allgres_private.agent_recent_success_rate(p_row.agent_id, 20)
     );
   END IF;
 
@@ -5426,6 +5505,64 @@ BEGIN
     p_agent_id, h.system_prompt, h.max_steps, h.max_retries, h.llm_config,
     h.max_concurrent_tasks, h.max_turn_seconds, h.max_turn_seconds IS NULL,
     h.max_delegation_depth, h.max_session_tasks
+  );
+END;
+$fn$;
+
+-- Roadmap item 7: "did the last change to this agent actually help" as a
+-- real, computed verdict, not something an operator (or self_improve) has
+-- to eyeball two numbers to answer. Compares the agent's current
+-- allgres_private.agent_recent_success_rate against the success_rate_at_change
+-- fn_set_policy stamped onto the most recent policy_history row -- i.e.
+-- "how it's doing now" vs "how it was doing right before the last change
+-- replaced whatever came before it." 'insufficient_data' (not a false
+-- 'unchanged') whenever either side has no evaluable tasks yet -- a
+-- verdict should never be manufactured from an absence of data.
+CREATE OR REPLACE FUNCTION allgres_public.fn_evaluate_last_change(p_agent_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_current numeric;
+  v_before numeric;
+  v_gen int;
+  v_changed_at timestamptz;
+  v_verdict text;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id) THEN
+    RAISE EXCEPTION 'agent not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_current := allgres_private.agent_recent_success_rate(p_agent_id, 20);
+
+  SELECT success_rate_at_change, generation, changed_at
+  INTO v_before, v_gen, v_changed_at
+  FROM allgres_private.policy_history
+  WHERE agent_id = p_agent_id
+  ORDER BY generation DESC
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    v_verdict := 'no_change_recorded_yet';
+  ELSIF v_before IS NULL OR v_current IS NULL THEN
+    v_verdict := 'insufficient_data';
+  ELSIF v_current > v_before THEN
+    v_verdict := 'improved';
+  ELSIF v_current < v_before THEN
+    v_verdict := 'regressed';
+  ELSE
+    v_verdict := 'unchanged';
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'verdict', v_verdict,
+    'current_success_rate', v_current,
+    'success_rate_before_last_change', v_before,
+    'compared_to_generation', v_gen,
+    'last_changed_at', v_changed_at
   );
 END;
 $fn$;
@@ -7505,7 +7642,8 @@ UPDATE allgres_private.llm_providers SET response_format_json_object = false WHE
 
 INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
 VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks'),
-       ('allgres_public.v_system_health'), ('allgres_public.v_permission_audit')
+       ('allgres_public.v_system_health'), ('allgres_public.v_permission_audit'),
+       ('allgres_public.v_agent_health')
 ON CONFLICT DO NOTHING;
 
 DO $seed$
@@ -7817,6 +7955,12 @@ $prompt$,
   -- extension) -- aimed specifically at cost/efficiency (a shorter prompt,
   -- a cheaper model, a lower max_tokens) backed by this agent's own
   -- execution_logs cost stats, never at what the target agent does.
+  -- Roadmap item 7 (evaluation-gated self-improvement): also reads
+  -- allgres_public.v_agent_health -- a real completed/failed ratio, not
+  -- just cost -- so a change is judged by whether the target got cheaper
+  -- *without* the agent actually doing worse afterward, and this agent can
+  -- check fn_evaluate_last_change on its own past target before proposing
+  -- again, instead of assuming its last proposal already helped.
   IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'self_improve') THEN
     DECLARE v_agent uuid;
     BEGIN
@@ -7827,8 +7971,15 @@ $prompt$,
 execution_logs cost stats (steps per task, tokens per step, wall-clock time)
 and its current system_prompt/llm_config. Look for waste: a prompt padded
 with content that never changes the outcome, a model/max_tokens larger than
-the task needs, a step pattern that could be shorter. Reply with one JSON
-object only:
+the task needs, a step pattern that could be shorter. Before proposing,
+execute_sql against allgres_public.v_agent_health for the target agent's
+recent_success_rate -- a change that makes it cheaper but noticeably less
+successful is not an improvement, do not propose it. If you previously
+changed this same agent, you can also check whether that change actually
+helped: call the same evaluation this platform already tracks for it
+(success_rate_before_last_change on that view, or ask an operator to run
+fn_evaluate_last_change) before proposing another change on top of it.
+Reply with one JSON object only:
 {"action":"propose_change","target_agent_id":"...","changes":{"system_prompt":"...","llm_config":{...}},"reason":"..."}
 Never change what the target agent is supposed to accomplish -- only how
 cheaply it gets there. If you find nothing worth changing, use final_answer
@@ -7837,8 +7988,20 @@ $prompt$,
           max_steps = 6,
           updated_at = now()
       WHERE agent_id = v_agent;
+      INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+      VALUES (v_agent, 'view', 'allgres_public.v_agent_health')
+      ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
     END;
   END IF;
+
+  -- health_monitor already reads v_system_health for the cluster as a
+  -- whole; v_agent_health is the same idea per-agent, so it belongs to the
+  -- same diagnostic surface -- granted here rather than only at creation
+  -- time above, so an existing install picks it up on its next apply too.
+  INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+  SELECT agent_id, 'view', 'allgres_public.v_agent_health'
+  FROM allgres_private.agents WHERE name = 'health_monitor'
+  ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
 END
 $seed$;
 
@@ -7969,6 +8132,9 @@ DECLARE
   v_mem_gc int;
   v_new_agent uuid;
   v_conn uuid;
+  v_rate numeric;
+  v_eval_child_name text;
+  v_sid2 uuid;
   v_root_id uuid;
   v_creator_id uuid;
   v_fixer_id uuid;
@@ -9673,6 +9839,102 @@ BEGIN
   ok := ok AND n_logs = 0;
   PERFORM set_config('allgres.agent_id', '', true);
   v := v || jsonb_build_array(jsonb_build_object('name', 'maintenance_views_enforce_permission', 'ok', ok));
+
+  -- Roadmap item 7 (evaluation-gated self-improvement): v_agent_health is
+  -- the same permission-gated shape v_system_health/v_permission_audit
+  -- just proved, per-agent instead of a single aggregate row -- reuses
+  -- v_prov_agent (health_monitor, granted at seed time) and v_agent
+  -- (ungranted) from the block just above.
+  PERFORM set_config('allgres.agent_id', v_prov_agent::text, true);
+  SELECT count(*) INTO n_logs FROM allgres_public.v_agent_health;
+  ok := n_logs > 0;
+  PERFORM set_config('allgres.agent_id', v_agent::text, true);
+  SELECT count(*) INTO n_logs FROM allgres_public.v_agent_health;
+  ok := ok AND n_logs = 0;
+  PERFORM set_config('allgres.agent_id', '', true);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'v_agent_health_enforces_permission', 'ok', ok));
+
+  ok := allgres_private.agent_has_permission(
+    (SELECT agent_id FROM allgres_private.agents WHERE name = 'self_improve'),
+    'view', 'allgres_public.v_agent_health'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'self_improve_is_granted_v_agent_health', 'ok', ok));
+
+  -- allgres_private.agent_recent_success_rate: NULL (not zero) with no
+  -- evaluable tasks yet, a real ratio once some exist, scoped to root-level
+  -- tasks only (a delegated child must never count toward the delegating
+  -- agent's own rate -- it reflects whoever it was delegated *to*). The
+  -- function also excludes goal LIKE 'selftest%' sessions (the same
+  -- exclusion every operator-facing count in this file already applies to
+  -- fn_selftest's own debris -- see its comment), so proving the *counted*
+  -- case needs a fixture session/task that does NOT carry that prefix.
+  -- Rather than drive that through fn_create_session (which unconditionally
+  -- writes an execution_logs row, and that trigger's append-only rule would
+  -- then block ever deleting it -- the reason every other fixture agent in
+  -- this file is left deactivated forever instead of removed), the fixture
+  -- tasks below are inserted directly and never touch execution_logs at
+  -- all, so they can be hard-deleted afterward and leave nothing for an
+  -- operator to ever see.
+  INSERT INTO allgres_private.agents (name)
+    VALUES ('selftest_eval_agent_' || substr(md5(random()::text), 1, 8))
+    RETURNING agent_id INTO v_new_agent;
+  v_eval_child_name := 'selftest_eval_child_' || substr(md5(random()::text), 1, 8);
+  INSERT INTO allgres_private.agents (name)
+    VALUES (v_eval_child_name)
+    RETURNING agent_id INTO v_deleg_a;
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'agent', v_eval_child_name);
+
+  ok := allgres_private.agent_recent_success_rate(v_new_agent, 20) IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'agent_recent_success_rate_null_with_no_tasks', 'ok', ok));
+
+  v_sid := gen_random_uuid();
+  INSERT INTO allgres_private.sessions (session_id, agent_id, goal, status)
+    VALUES (v_sid, v_new_agent, 'eval fixture (selftest): one completed root task', 'open');
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status)
+    VALUES (v_sid, v_new_agent, 'completed') RETURNING task_id INTO v_tid;
+  -- A delegated child under a different agent, parented to the task above --
+  -- its own failure must not move v_new_agent's rate at all.
+  INSERT INTO allgres_private.tasks (session_id, agent_id, parent_task_id, status)
+    VALUES (v_sid, v_deleg_a, v_tid, 'failed') RETURNING task_id INTO v_deleg_b;
+  v_rate := allgres_private.agent_recent_success_rate(v_new_agent, 20);
+  ok := v_rate = 1.0;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'agent_recent_success_rate_ignores_delegated_children', 'ok', ok));
+
+  -- policy_history.success_rate_at_change: a real snapshot taken at the
+  -- moment of change, while there is evaluable data (the one completed task
+  -- above).
+  PERFORM allgres_public.fn_set_policy(v_new_agent, 'selftest eval prompt v2');
+  ok := (SELECT success_rate_at_change FROM allgres_private.policy_history WHERE agent_id = v_new_agent ORDER BY generation DESC LIMIT 1) = 1.0;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'policy_history_snapshots_success_rate_on_a_real_change', 'ok', ok));
+
+  -- fn_evaluate_last_change: 'unchanged' immediately after (the same one
+  -- completed task, nothing new since), 'regressed' once a failing task
+  -- follows, 'no_change_recorded_yet' for an agent that has never had a
+  -- policy change at all.
+  r := allgres_public.fn_evaluate_last_change(v_new_agent);
+  ok := (r->>'verdict') = 'unchanged';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_unchanged', 'ok', ok));
+
+  v_sid2 := gen_random_uuid();
+  INSERT INTO allgres_private.sessions (session_id, agent_id, goal, status)
+    VALUES (v_sid2, v_new_agent, 'eval fixture (selftest): one failed root task', 'open');
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status)
+    VALUES (v_sid2, v_new_agent, 'failed');
+  r := allgres_public.fn_evaluate_last_change(v_new_agent);
+  ok := (r->>'verdict') = 'regressed';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_regressed', 'ok', ok));
+
+  r := allgres_public.fn_evaluate_last_change(v_deleg_a);
+  ok := (r->>'verdict') = 'no_change_recorded_yet';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_no_change_recorded_yet', 'ok', ok));
+
+  -- None of this touched execution_logs, so unlike every other fixture
+  -- agent in this file it can be removed outright instead of merely
+  -- deactivated -- policies/policy_history/permissions cascade off the
+  -- agents delete.
+  DELETE FROM allgres_private.tasks WHERE session_id IN (v_sid, v_sid2);
+  DELETE FROM allgres_private.sessions WHERE session_id IN (v_sid, v_sid2);
+  DELETE FROM allgres_private.agents WHERE agent_id IN (v_new_agent, v_deleg_a);
 
   -- 29. Operator audit log (README, "Operator audit log"): a consequential
   --     dashboard_rpc action writes exactly one row, with the self-
@@ -11499,7 +11761,7 @@ BEGIN
         FROM (
           SELECT version_id, generation, system_prompt, max_steps, max_retries,
                  llm_config, max_concurrent_tasks, max_turn_seconds,
-                 max_delegation_depth, max_session_tasks, changed_at
+                 max_delegation_depth, max_session_tasks, success_rate_at_change, changed_at
           FROM allgres_private.policy_history
           WHERE agent_id = (p_request->>'agent_id')::uuid
         ) q
@@ -11513,6 +11775,13 @@ BEGIN
       RETURN allgres_public.fn_rollback_policy(
         (p_request->>'agent_id')::uuid, (p_request->>'generation')::int
       );
+
+    -- Roadmap item 7: "did the last change to this agent actually help" as
+    -- a real computed verdict (allgres_public.fn_evaluate_last_change's own
+    -- comment). Read-only, open the same way policy.history already is --
+    -- an operator reviewing an agent's own history, not a mutation.
+    WHEN 'agents.evaluate' THEN
+      RETURN allgres_public.fn_evaluate_last_change((p_request->>'agent_id')::uuid);
 
     -- Optional filters: agent_id (one agent's proposals) and status (e.g.
     -- 'pending' for an inbox view); neither is required, so this also

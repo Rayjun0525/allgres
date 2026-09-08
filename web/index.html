@@ -209,7 +209,7 @@ ${isNew?'':`<div class="grid2"><div class="field"><label>Max steps</label><input
 <div class="field"><label><input type="checkbox" id="aActive" ${a.is_active?'checked':''}> Active</label></div>
 ${a.is_system?`<div class="field"><label>Autonomy level ${a.parent_name?`<span class="muted">(system agent, child of ${esc(a.parent_name)})</span>`:'<span class="muted">(root system agent)</span>'}</label><select class="select" id="aAutonomy"><option value="admin_approval"${a.autonomy_level==='admin_approval'?' selected':''}>admin_approval -- every action queued for an admin</option><option value="self_approve"${a.autonomy_level==='self_approve'?' selected':''}>self_approve -- applies immediately, may still ask when unsure</option><option value="auto"${a.autonomy_level==='auto'?' selected':''}>auto -- always applies immediately</option></select></div>`:''}
 ${agentConfigFields(a)}
-<div class="field"><div class="row"><label style="margin:0">Permissions</label><span class="spacer"></span><span class="muted mono" style="font-size:11px">v${esc(a.generation||1)}</span><button class="btn small" id="viewProposals">Proposals</button><button class="btn small" id="viewHistory">History</button><button class="btn small" id="viewAssigned">Assigned users</button></div>
+<div class="field"><div class="row"><label style="margin:0">Permissions</label><span class="spacer"></span><span class="muted mono" style="font-size:11px">v${esc(a.generation||1)}</span><button class="btn small" id="viewProposals">Proposals</button><button class="btn small" id="viewHistory">History</button><button class="btn small" id="evalHealth">Evaluate last change</button><button class="btn small" id="viewAssigned">Assigned users</button></div>
 <div id="permList">${(a.permissions||[]).map(p=>`<div class="row" style="padding:4px 0"><span class="mono" style="font-size:12px">${esc(p.type)}: ${esc(p.ref)}</span><span class="spacer"></span><button class="btn danger small revokeP" data-type="${esc(p.type)}" data-ref="${esc(p.ref)}">Revoke</button></div>`).join('')||'<div class="muted" style="font-size:12px">No permissions granted.</div>'}</div>
 <div class="row" style="margin-top:8px"><select class="select" id="permType" style="max-width:130px"><option value="view">view</option><option value="tool">tool</option><option value="agent">agent</option><option value="http_host">http_host</option><option value="procedure">procedure</option></select><input class="input" id="permRef" placeholder="resource ref" list="permRefOptions"><datalist id="permRefOptions"></datalist><button class="btn" id="grantP">Grant</button></div>
 </div>`}
@@ -221,6 +221,7 @@ ${agentConfigFields(a)}
     $('#grantP').onclick=async()=>{try{await rpc('permissions.grant',{agent_id:a.agent_id,type:$('#permType').value,ref:$('#permRef').value});closeModal();toast('Granted');agents()}catch(e){toast(e.message)}};
     document.querySelectorAll('.revokeP').forEach(b=>b.onclick=async()=>{try{await rpc('permissions.revoke',{agent_id:a.agent_id,type:b.dataset.type,ref:b.dataset.ref});closeModal();toast('Revoked');agents()}catch(e){toast(e.message)}});
     $('#viewHistory').onclick=async()=>{try{const h=await rpc('policy.history',{agent_id:a.agent_id});historyModal(a.agent_id,h.history||[])}catch(e){toast(e.message)}};
+    $('#evalHealth').onclick=async()=>{try{const r=await rpc('agents.evaluate',{agent_id:a.agent_id});evaluateModal(r)}catch(e){toast(e.message)}};
     $('#viewProposals').onclick=()=>{state.proposalAgentFilter=a.agent_id;state.page='Approvals';state.approvalsTab='Proposals';closeModal();nav();loadPage()};
     $('#viewAssigned').onclick=()=>assignedUsersModal(a.agent_id);
   }
@@ -254,12 +255,30 @@ function assignedUsersModal(agentId){
 }
 function historyModal(agentId,history){
   $('#modal').classList.remove('hidden');
-  $('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>Policy history</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div>${history.length?history.map(h=>`<div class="listrow"><div class="row"><b>v${esc(h.generation)}</b><span class="spacer"></span><span class="mono muted" style="font-size:11px">${esc(h.changed_at)}</span><button class="btn small rollbackV" data-gen="${esc(h.generation)}">Rollback to this version</button></div><div class="mono" style="font-size:12px;margin-top:4px;white-space:pre-wrap">${esc((h.system_prompt||'').slice(0,220))}${(h.system_prompt||'').length>220?'…':''}</div><div class="muted" style="font-size:11px;margin-top:4px">max_steps ${esc(h.max_steps)} · max_retries ${esc(h.max_retries)} · concurrent ${esc(h.max_concurrent_tasks)} · turn_secs ${h.max_turn_seconds??'∞'} · deleg_depth ${esc(h.max_delegation_depth)} · session_tasks ${esc(h.max_session_tasks)}</div></div>`).join(''):'<div class="muted">No prior versions -- nothing has changed since this agent was created.</div>'}</div>`;
+  $('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>Policy history</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div>${history.length?history.map(h=>`<div class="listrow"><div class="row"><b>v${esc(h.generation)}</b><span class="spacer"></span><span class="mono muted" style="font-size:11px">${esc(h.changed_at)}</span><button class="btn small rollbackV" data-gen="${esc(h.generation)}">Rollback to this version</button></div><div class="mono" style="font-size:12px;margin-top:4px;white-space:pre-wrap">${esc((h.system_prompt||'').slice(0,220))}${(h.system_prompt||'').length>220?'…':''}</div><div class="muted" style="font-size:11px;margin-top:4px">max_steps ${esc(h.max_steps)} · max_retries ${esc(h.max_retries)} · concurrent ${esc(h.max_concurrent_tasks)} · turn_secs ${h.max_turn_seconds??'∞'} · deleg_depth ${esc(h.max_delegation_depth)} · session_tasks ${esc(h.max_session_tasks)}</div><div class="muted" style="font-size:11px;margin-top:2px">success rate at change: ${h.success_rate_at_change==null?'no evaluable data yet':esc(h.success_rate_at_change)}</div></div>`).join(''):'<div class="muted">No prior versions -- nothing has changed since this agent was created.</div>'}</div>`;
   $('#closeM').onclick=closeModal;
   document.querySelectorAll('.rollbackV').forEach(b=>b.onclick=async()=>{
     if(!confirm('Roll back to v'+b.dataset.gen+'? This restores that version\'s settings as a new version -- it does not delete history.'))return;
     try{await rpc('policy.rollback',{agent_id:agentId,generation:+b.dataset.gen});closeModal();toast('Rolled back');agents()}catch(e){toast(e.message)}
   });
+}
+// Roadmap item 7: fn_evaluate_last_change surfaced as a read-only verdict --
+// whether this agent's own recent completed/failed ratio is better, worse,
+// or the same as it was right before its last policy change. No action
+// here rolls anything back automatically; this is purely something for an
+// operator (or a future self_improve turn) to read and decide from.
+function evaluateModal(r){
+  $('#modal').classList.remove('hidden');
+  const color={improved:'var(--accent)',regressed:'var(--bad)'}[r.verdict]||'var(--muted)';
+  $('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>Evaluate last change</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div>
+<div class="field"><span style="font-size:14px;font-weight:600;color:${color}">${esc(r.verdict)}</span></div>
+<div class="muted" style="font-size:12px;line-height:1.6">
+current success rate: ${r.current_success_rate??'no evaluable data yet'}<br>
+success rate before that change: ${r.success_rate_before_last_change??'no evaluable data yet'}<br>
+compared to generation: ${r.compared_to_generation??'—'}<br>
+last changed at: ${r.last_changed_at?esc(r.last_changed_at):'—'}
+</div></div>`;
+  $('#closeM').onclick=closeModal;
 }
 function closeModal(){$('#modal').classList.add('hidden');$('#modal').innerHTML=''}
 
