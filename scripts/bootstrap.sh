@@ -2,12 +2,15 @@
 # The one install flow README.md's "Install flow" section documents end to
 # end: build/pull the image, bring the container up on its own named data
 # volume, wait for it to actually be healthy, make sure a first admin
-# account exists, then prove the install actually works by running one real
-# agent task through to completion -- not just that the container started.
-# That last step doubles as "Provider 연결 검증" (provider connection
+# account exists, then prove the install actually works by running real
+# agent tasks through to completion -- not just that the container started.
+# The first run doubles as "Provider 연결 검증" (provider connection
 # verification): a task can only reach 'completed' if the agent's
-# configured provider genuinely answered, so a green run here is the same
-# round trip a real (non-mock) provider would need to pass.
+# configured provider genuinely answered. The second and third runs, around
+# a real agents.update config change and model swap, are roadmap item 9's
+# "설정 변경, 모델 교체" (config change, model swap) scenarios -- proving
+# those don't just get accepted by the API but actually still let a task
+# complete afterward, not only exercised at the fn_selftest/SQL level.
 #
 # Requires: docker compose (this is the container path -- scripts/backup_drill.sh
 # and scripts/fault_injection_drill.sh are the bare-metal ones). If
@@ -17,7 +20,7 @@
 # directly (the same one-liner used throughout this project's own
 # development, `psql -c "SELECT fn_create_user(...)"`) so the flow is
 # provable with zero configuration. ALLGRES_ENABLE_MOCK=1 (docker-compose.yml's
-# own default) is what makes the final task actually complete out of the
+# own default) is what makes every run below actually complete out of the
 # box; point AGENT_NAME at a real, working agent to prove a real provider.
 set -euo pipefail
 
@@ -69,30 +72,51 @@ agent_id=$(curl -fsS "${HDR[@]}" "$BASE/api/v1/rpc" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); a=[x for x in d['agents'] if x['name']=='$AGENT_NAME' and x['is_active']]; print(a[0]['agent_id'] if a else '')")
 [[ -n "$agent_id" ]] || { echo "no active agent named '$AGENT_NAME' -- configure one and set AGENT_NAME"; exit 1; }
 
-echo "==> Running one real task against it (install completion criterion)"
-run=$(curl -fsS "${HDR[@]}" "$BASE/api/v1/rpc" \
-  -d "{\"action\":\"run\",\"agent_id\":\"$agent_id\",\"goal\":\"bootstrap install check\",\"session_token\":\"$session_token\"}")
-session_id=$(python3 -c "import json,sys; print(json.load(sys.stdin)['session_id'])" <<<"$run")
-[[ -n "$session_id" && "$session_id" != "None" ]] || { echo "run failed: $run"; exit 1; }
+# Runs one real task and blocks until it leaves 'open'; echoes the final
+# session status. Reused for the install check itself and for proving a
+# config change / model swap didn't break execution afterward.
+run_to_completion() {
+  local goal="$1"
+  local run status get
+  run=$(curl -fsS "${HDR[@]}" "$BASE/api/v1/rpc" \
+    -d "{\"action\":\"run\",\"agent_id\":\"$agent_id\",\"goal\":\"$goal\",\"session_token\":\"$session_token\"}")
+  local session_id
+  session_id=$(python3 -c "import json,sys; print(json.load(sys.stdin)['session_id'])" <<<"$run")
+  [[ -n "$session_id" && "$session_id" != "None" ]] || { echo "run failed: $run" >&2; echo "error"; return; }
+  status="open"
+  for _ in $(seq 1 60); do
+    get=$(curl -fsS "${HDR[@]}" "$BASE/api/v1/rpc" \
+      -d "{\"action\":\"sessions.get\",\"session_id\":\"$session_id\",\"session_token\":\"$session_token\"}")
+    status=$(python3 -c "import json,sys; print(json.load(sys.stdin)['session']['status'])" <<<"$get")
+    [[ "$status" == "open" ]] || break
+    sleep 1
+  done
+  echo "$status"
+}
 
-echo "==> Waiting for it to complete"
-status="open"
-for _ in $(seq 1 60); do
-  get=$(curl -fsS "${HDR[@]}" "$BASE/api/v1/rpc" \
-    -d "{\"action\":\"sessions.get\",\"session_id\":\"$session_id\",\"session_token\":\"$session_token\"}")
-  status=$(python3 -c "import json,sys; print(json.load(sys.stdin)['session']['status'])" <<<"$get")
-  [[ "$status" == "open" ]] || break
-  sleep 1
-done
+echo "==> Running one real task against it (install completion criterion)"
+status1=$(run_to_completion "bootstrap install check")
+
+echo "==> Changing config (max_steps) and swapping the model, then running again"
+curl -fsS "${HDR[@]}" "$BASE/api/v1/rpc" \
+  -d "{\"action\":\"agents.update\",\"agent_id\":\"$agent_id\",\"session_token\":\"$session_token\",\"max_steps\":9,\"llm_config\":{\"provider\":\"allgres_mock\",\"model\":\"allgres-mock-bootstrap-check\",\"temperature\":0,\"max_tokens\":128}}" \
+  >/dev/null
+after_update=$(curl -fsS "${HDR[@]}" "$BASE/api/v1/rpc" \
+  -d "{\"action\":\"agents.list\",\"session_token\":\"$session_token\"}" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); a=[x for x in d['agents'] if x['agent_id']=='$agent_id'][0]; print(a['max_steps'], a['llm_config'].get('model'))")
+read -r new_max_steps new_model <<<"$after_update"
+[[ "$new_max_steps" == "9" && "$new_model" == "allgres-mock-bootstrap-check" ]] \
+  || { echo "FAIL: config change / model swap did not persist (got: $after_update)"; exit 1; }
+status2=$(run_to_completion "bootstrap config-change check")
 
 if [[ -n "${ALLGRES_BOOTSTRAP_ADMIN_USER:-}" ]]; then :; else
   docker compose exec -T allgres psql -U postgres -d postgres -tAc \
     "DELETE FROM allgres_private.web_sessions WHERE user_id IN (SELECT user_id FROM allgres_private.users WHERE username = '$ADMIN_USER'); DELETE FROM allgres_private.users WHERE username = '$ADMIN_USER';" >/dev/null
 fi
 
-if [[ "$status" == "completed" ]]; then
-  echo "PASS: install verified -- a real agent task ran through $AGENT_NAME's configured provider and completed."
+if [[ "$status1" == "completed" && "$status2" == "completed" ]]; then
+  echo "PASS: install verified -- a real agent task ran through $AGENT_NAME's configured provider and completed, a real config change (max_steps) and model swap persisted, and a task still completed afterward."
 else
-  echo "FAIL: task ended in status '$status' instead of 'completed' -- see: $get"
+  echo "FAIL: initial run ended in '$status1', post-config-change run ended in '$status2' (both must be 'completed')"
   exit 1
 fi
