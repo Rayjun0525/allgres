@@ -9128,6 +9128,20 @@ BEGIN
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
     v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_get_needs_admin_once_accounts_exist', 'ok', ok));
 
+    -- tasks.list/logs.list (same admin-only audience, reached through a
+    -- Rust GET route whose session_token comes from a header instead of a
+    -- request body -- api_route's own comment explains why not a query
+    -- string). Exercised at the dashboard_rpc level, same as the pair
+    -- above: the header-vs-body plumbing is Rust's own concern, already
+    -- covered by that file's unit tests.
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'tasks.list'));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'tasks_list_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'logs.list'));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'logs_list_needs_admin_once_accounts_exist', 'ok', ok));
+
     -- Setting a key to JSON null clears it back to the reader's own coded
     -- default rather than leaving a stray {"probe":2} on a real seeded
     -- agent.
@@ -10565,6 +10579,11 @@ BEGIN
     -- execution_logs' append-only trigger forbids it even for this
     -- function's owner, so they are hidden here instead).
     WHEN 'tasks.list' THEN
+      -- Admin-only monitoring surface, same audience as sessions.list --
+      -- reached via a Rust-side GET route with no request body, so its
+      -- session_token comes from a header instead (see api_route's own
+      -- comment on the Tasks/Logs routes for why not a query string).
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'tasks', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.updated_at DESC)
         FROM (
@@ -10581,6 +10600,7 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'logs.list' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'logs', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
         FROM (

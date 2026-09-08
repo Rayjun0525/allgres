@@ -83,6 +83,13 @@ function setSessTok(v){v?sessionStorage.setItem('allgres_session_token',v):sessi
 async function api(path,opt={}){
   opt.headers={...(opt.headers||{}),'Content-Type':'application/json','X-Allgres-Client':'dashboard'};
   if(tok())opt.headers['Authorization']='Bearer '+tok();
+  // A GET route (tasks.list/logs.list) carries no body for session_token to
+  // ride in -- a header instead of a query string, so the token never lands
+  // in a URL (server logs, browser history, Referer). Harmless to also send
+  // on every other api() call; the legacy POST routes already put
+  // session_token in their own JSON body, so the server just ignores this
+  // header there.
+  if(sessTok())opt.headers['X-Allgres-Session']=sessTok();
   const r=await fetch(path,opt);
   if(r.status===401){askToken();throw new Error('unauthorized')}
   const j=await r.json();
