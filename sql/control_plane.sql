@@ -470,6 +470,48 @@ CREATE TABLE IF NOT EXISTS allgres_private.permissions (
   UNIQUE (agent_id, resource_type, resource_ref)
 );
 
+-- 'procedure' (roadmap item 4, see allgres_private.procedures below): an
+-- existing install's CREATE TABLE IF NOT EXISTS above never re-runs once
+-- the table exists, so its original CHECK has to be widened here instead --
+-- same upgrade shape outbound_calls_kind_check already used for 'embedding'.
+ALTER TABLE allgres_private.permissions DROP CONSTRAINT IF EXISTS permissions_resource_type_check;
+ALTER TABLE allgres_private.permissions ADD CONSTRAINT permissions_resource_type_check
+  CHECK (resource_type IN ('view', 'tool', 'agent', 'http_host', 'procedure'));
+
+-- Roadmap item 4: a named, versioned, reusable procedure an operator (or,
+-- in a later slice, an approved agent proposal) curates once and any
+-- granted agent can draw on every turn -- distinct from agent_memories,
+-- which is private to one agent, unversioned (overwritten by eviction, not
+-- history), and never explicitly shared. content is free text: whatever
+-- shape of "how to do X" the operator finds useful (a checklist, a SQL
+-- template, a delegation plan) -- nothing here parses or executes it.
+-- generation/is_active live on the row itself, snapshotted into
+-- procedure_history only on an actual content change -- the exact same
+-- shape allgres_private.policies/policy_history already uses for an
+-- agent's own policy (see fn_set_policy's own comment on why: "only ever a
+-- new version that happens to match an old one," never a rewrite of what
+-- was already recorded).
+CREATE TABLE IF NOT EXISTS allgres_private.procedures (
+  procedure_id  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL UNIQUE,
+  content       text NOT NULL,
+  generation    int NOT NULL DEFAULT 1,
+  is_active     boolean NOT NULL DEFAULT true,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS allgres_private.procedure_history (
+  version_id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  procedure_id  uuid NOT NULL REFERENCES allgres_private.procedures(procedure_id) ON DELETE CASCADE,
+  generation    int NOT NULL,
+  content       text NOT NULL,
+  changed_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (procedure_id, generation)
+);
+CREATE INDEX IF NOT EXISTS procedure_history_procedure_idx
+  ON allgres_private.procedure_history (procedure_id, generation DESC);
+
 -- Every permission check in this file (call_tool's tool/http_host grants,
 -- delegate's target-agent grant, execute_sql's view grant via
 -- agent_may_read/fn_validate_sql below) goes through this one function
@@ -2797,6 +2839,7 @@ DECLARE
   v_cfg jsonb;
   v_memories jsonb;
   v_memory_ids uuid[];
+  v_procedures jsonb;
   v_task_ids uuid[];
   v_compacted_before timestamptz;
   v_summary_text text;
@@ -2900,6 +2943,20 @@ BEGIN
     WHERE memory_id = ANY(v_memory_ids);
   END IF;
 
+  -- Roadmap item 4: reusable procedures (allgres_private.procedures), the
+  -- same inheritance-aware permission check every other resource_type
+  -- already goes through (agent_permission_refs) -- an operator curates and
+  -- versions these once, any agent explicitly granted one (or inheriting it
+  -- via its parent chain, same as a system agent's tool/view grants) sees
+  -- its current content every turn. Unlike memory this is not ranked or
+  -- capped: a deliberately small, shared, curated set, not per-agent noise
+  -- that grows on its own.
+  SELECT COALESCE(jsonb_agg(jsonb_build_object('name', pr.name, 'content', pr.content) ORDER BY pr.name), '[]'::jsonb)
+  INTO v_procedures
+  FROM allgres_private.procedures pr
+  WHERE pr.is_active
+    AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'));
+
   -- Bounds come from the database, not from worker code, so revoking a
   -- Project mode (item 42): this session's project, if any, may narrow the
   -- agent with a preset -- appended after the agent's own effective prompt,
@@ -2932,6 +2989,9 @@ BEGIN
       || E' Use it when you learn a durable fact, preference, or instruction, not for routine intermediate results.'
       || CASE WHEN v_memories = '[]'::jsonb THEN ''
               ELSE E'\n\n# memory (your own past recollections, most important first)\n' || v_memories::text
+         END
+      || CASE WHEN v_procedures = '[]'::jsonb THEN ''
+              ELSE E'\n\n# procedures (reusable, curated by an operator -- follow these when they apply)\n' || v_procedures::text
          END
     )
   );
@@ -5217,6 +5277,101 @@ BEGIN
 END;
 $fn$;
 
+-- ---------------------------------------------------------------------------
+-- Roadmap item 4: procedures -- see allgres_private.procedures' own comment.
+-- Same create/set/rollback shape as fn_create_provider/fn_set_policy/
+-- fn_rollback_policy on purpose: this is the same "named row, versioned,
+-- only actually snapshotted on a real change" problem with a different
+-- consumer (a grantable, agent-recallable text blob instead of a provider
+-- endpoint or an agent's own policy).
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_procedure(p_name text, p_content text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF NULLIF(trim(p_name), '') IS NULL THEN
+    RAISE EXCEPTION 'procedure name is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NULLIF(trim(p_content), '') IS NULL THEN
+    RAISE EXCEPTION 'procedure content is required' USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO allgres_private.procedures (name, content)
+  VALUES (trim(p_name), p_content)
+  RETURNING procedure_id INTO v_id;
+  RETURN jsonb_build_object('ok', true, 'procedure_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_procedure(
+  p_procedure_id uuid,
+  p_content text DEFAULT NULL,
+  p_enabled boolean DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  p_row allgres_private.procedures%ROWTYPE;
+  v_content text;
+  v_changed boolean;
+BEGIN
+  SELECT * INTO p_row FROM allgres_private.procedures WHERE procedure_id = p_procedure_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'procedure not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_content := COALESCE(NULLIF(p_content, ''), p_row.content);
+  v_changed := v_content IS DISTINCT FROM p_row.content;
+
+  IF v_changed THEN
+    INSERT INTO allgres_private.procedure_history (procedure_id, generation, content)
+    VALUES (p_row.procedure_id, p_row.generation, p_row.content);
+  END IF;
+
+  UPDATE allgres_private.procedures
+  SET content = v_content,
+      is_active = COALESCE(p_enabled, is_active),
+      generation = generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
+      updated_at = now()
+  WHERE procedure_id = p_procedure_id;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'generation', p_row.generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
+    'changed', v_changed
+  );
+END;
+$fn$;
+
+-- Same shape as fn_rollback_policy: never a mutation of procedure_history,
+-- only ever a new version (via fn_set_procedure) that happens to match an
+-- old one.
+CREATE OR REPLACE FUNCTION allgres_public.fn_rollback_procedure(p_procedure_id uuid, p_generation int)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  h allgres_private.procedure_history%ROWTYPE;
+BEGIN
+  SELECT * INTO h FROM allgres_private.procedure_history
+  WHERE procedure_id = p_procedure_id AND generation = p_generation;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_rollback_procedure: no history for that procedure at generation %', p_generation
+      USING ERRCODE = 'P0001';
+  END IF;
+  RETURN allgres_public.fn_set_procedure(p_procedure_id, h.content, NULL);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_grant_permission(
   p_agent_id uuid, p_type text, p_ref text
 ) RETURNS jsonb
@@ -7390,6 +7545,8 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.agent_memories', '')
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.audit_log', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connections', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connection_secrets', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedures', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_history', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
@@ -7979,6 +8136,82 @@ BEGIN
     WHERE agent_id = v_agent AND resource_type = 'http_host' AND resource_ref = 'selftest.invalid'
   );
   v := v || jsonb_build_array(jsonb_build_object('name', 'revoke_permission_removes_row', 'ok', ok));
+
+  -- Roadmap item 4: allgres_private.procedures -- a named, versioned,
+  -- reusable "how to do X" any agent granted a matching 'procedure'
+  -- permission sees in its own prompt every turn. Same versioning shape as
+  -- fn_set_policy (only an actual content change snapshots history and
+  -- bumps generation), same rollback shape as fn_rollback_policy (a new
+  -- version, never a rewrite).
+  DELETE FROM allgres_private.procedure_history WHERE procedure_id IN (
+    SELECT procedure_id FROM allgres_private.procedures WHERE name = 'selftest_procedure'
+  );
+  DELETE FROM allgres_private.procedures WHERE name = 'selftest_procedure';
+  r := allgres_public.fn_create_procedure('selftest_procedure', 'selftest v1: do the thing carefully');
+  ok := (r->>'ok')::boolean;
+  v_call := (r->>'procedure_id')::uuid;
+  ok := ok AND (SELECT generation FROM allgres_private.procedures WHERE procedure_id = v_call) = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_procedure_starts_at_generation_one', 'ok', ok));
+
+  sub := allgres_public.fn_set_procedure(v_call, NULL, NULL);
+  ok := (sub->>'changed')::boolean IS FALSE
+    AND (SELECT generation FROM allgres_private.procedures WHERE procedure_id = v_call) = 1
+    AND NOT EXISTS (SELECT 1 FROM allgres_private.procedure_history WHERE procedure_id = v_call);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_procedure_noop_does_not_version', 'ok', ok));
+
+  sub := allgres_public.fn_set_procedure(v_call, 'selftest v2: do the thing carefully, then verify', NULL);
+  ok := (sub->>'changed')::boolean IS TRUE
+    AND (sub->>'generation')::int = 2
+    AND (SELECT content FROM allgres_private.procedures WHERE procedure_id = v_call) LIKE '%then verify%'
+    AND (SELECT content FROM allgres_private.procedure_history WHERE procedure_id = v_call AND generation = 1)
+        = 'selftest v1: do the thing carefully';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_procedure_versions_on_real_change', 'ok', ok));
+
+  sub := allgres_public.fn_rollback_procedure(v_call, 1);
+  ok := (sub->>'generation')::int = 3
+    AND (SELECT content FROM allgres_private.procedures WHERE procedure_id = v_call)
+        = 'selftest v1: do the thing carefully'
+    AND (SELECT count(*) FROM allgres_private.procedure_history WHERE procedure_id = v_call) = 2;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_rollback_procedure_restores_via_a_new_version', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_rollback_procedure(v_call, 99);
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_rollback_procedure_rejects_unknown_generation', 'ok', ok));
+
+  -- Recall: gated by the same agent_permission_refs check as a view/tool
+  -- grant, and inherited through a parent chain the same way (not
+  -- re-tested here -- system_agent_inherits_root_permission already proves
+  -- the underlying mechanism for a different resource_type).
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest procedure recall')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') NOT LIKE '%# procedures%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_hidden_from_prompt_without_permission', 'ok', ok));
+
+  PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', 'selftest_procedure');
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') LIKE '%# procedures%'
+    AND (spec->'messages'->0->>'content') LIKE '%selftest v1: do the thing carefully%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_shown_in_prompt_once_granted', 'ok', ok));
+  PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
+
+  -- Disabled (is_active = false) never shows even with a grant -- the same
+  -- "operator can pull a bad one without deleting its history" property
+  -- is_enabled already gives an llm_provider.
+  PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', 'selftest_procedure');
+  PERFORM allgres_public.fn_set_procedure(v_call, NULL, false);
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') NOT LIKE '%# procedures%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'disabled_procedure_hidden_even_with_permission', 'ok', ok));
+  PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
+  DELETE FROM allgres_private.procedure_history WHERE procedure_id = v_call;
+  DELETE FROM allgres_private.procedures WHERE procedure_id = v_call;
 
   -- 19. fn_set_policy only versions on a real change.  A no-op call (every
   --     param NULL/false) must not bump generation or write history --
@@ -9508,6 +9741,13 @@ BEGIN
     v := v || jsonb_build_array(jsonb_build_object('name', 'connections_create_needs_admin_once_accounts_exist', 'ok', ok));
 
     sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'procedures.create', 'name', 'selftest_should_not_exist_procedure', 'content', 'x'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.procedures WHERE name = 'selftest_should_not_exist_procedure');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'procedures_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'allowlist.add', 'ref', 'allgres_public.v_should_not_be_added'
     ));
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true
@@ -10529,6 +10769,7 @@ BEGIN
     'projects.create', 'projects.update', 'sessions.cancel',
     'memories.create', 'memories.remove', 'provider.update', 'provider.create',
     'connections.create', 'connections.update', 'connections.delete',
+    'procedures.create', 'procedures.update', 'procedures.rollback',
     'providers.oauth_callback', 'approvals.decide', 'fixes.decide',
     'users.create', 'users.set_active', 'users.set_role', 'assignments.set', 'assignments.toggle'
   ]) THEN
@@ -10841,6 +11082,9 @@ BEGIN
         'tools', '["http_get", "http_request"]'::jsonb,
         'agents', COALESCE((
           SELECT jsonb_agg(name ORDER BY name) FROM allgres_private.agents WHERE is_active
+        ), '[]'::jsonb),
+        'procedures', COALESCE((
+          SELECT jsonb_agg(name ORDER BY name) FROM allgres_private.procedures WHERE is_active
         ), '[]'::jsonb),
         'http_hosts', 'free text -- any hostname the outbound guard allows'
       );
@@ -11441,6 +11685,58 @@ BEGIN
     WHEN 'connections.delete' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_delete_connection((p_request->>'connection_id')::uuid);
+
+    -- Roadmap item 4: reusable procedures (see allgres_private.procedures'
+    -- own comment). Listing is open the same way settings.get/allowlist.list
+    -- are -- a shared, curated library, not per-agent data -- only
+    -- create/update/rollback are admin-gated, matching provider.create/
+    -- policy.rollback.
+    WHEN 'procedures.list' THEN
+      RETURN jsonb_build_object('ok', true, 'procedures', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'procedure_id', p.procedure_id, 'name', p.name, 'content', p.content,
+          'generation', p.generation, 'is_active', p.is_active,
+          'created_at', p.created_at, 'updated_at', p.updated_at
+        ) ORDER BY p.name)
+        FROM allgres_private.procedures p
+      ), '[]'::jsonb));
+
+    WHEN 'procedures.get' THEN
+      v_id := (p_request->>'procedure_id')::uuid;
+      RETURN jsonb_build_object(
+        'ok', true,
+        'procedure', (
+          SELECT jsonb_build_object(
+            'procedure_id', p.procedure_id, 'name', p.name, 'content', p.content,
+            'generation', p.generation, 'is_active', p.is_active
+          )
+          FROM allgres_private.procedures p WHERE p.procedure_id = v_id
+        ),
+        'history', COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'generation', h.generation, 'content', h.content, 'changed_at', h.changed_at
+          ) ORDER BY h.generation DESC)
+          FROM allgres_private.procedure_history h WHERE h.procedure_id = v_id
+        ), '[]'::jsonb)
+      );
+
+    WHEN 'procedures.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_create_procedure(p_request->>'name', p_request->>'content');
+
+    WHEN 'procedures.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_set_procedure(
+        (p_request->>'procedure_id')::uuid,
+        NULLIF(p_request->>'content', ''),
+        CASE WHEN p_request ? 'is_active' THEN (p_request->>'is_active')::boolean ELSE NULL END
+      );
+
+    WHEN 'procedures.rollback' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_rollback_procedure(
+        (p_request->>'procedure_id')::uuid, (p_request->>'generation')::int
+      );
 
     -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
     -- fn_oauth_start only ever returns a redirect_url and a state, neither
