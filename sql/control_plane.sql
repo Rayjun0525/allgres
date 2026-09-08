@@ -1455,6 +1455,34 @@ CREATE TABLE IF NOT EXISTS allgres_private.oauth_states (
   created_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- Roadmap item 2: a named external HTTP endpoint an operator configures once
+-- (base_url + how to authenticate), so the 'http_request' tool can send an
+-- authenticated call without an agent ever seeing, choosing, or supplying a
+-- credential itself. base_url is fixed at configuration time and is the only
+-- host a stored credential may ever be sent to -- an agent using a
+-- connection supplies a relative path, never a full URL (enforced in
+-- fn_next_step's call_tool handling, not here); this is the same
+-- no-per-caller-redirect shape llm_providers.base_url already enforces for
+-- an agent's own llm_config (see sanitize_llm_config).
+CREATE TABLE IF NOT EXISTS allgres_private.api_connections (
+  connection_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name                  text NOT NULL UNIQUE,
+  base_url              text NOT NULL,
+  auth_kind             text NOT NULL DEFAULT 'none'
+                          CHECK (auth_kind IN ('none', 'authorization', 'x-api-key')),
+  allow_private_network boolean NOT NULL DEFAULT false,
+  is_enabled            boolean NOT NULL DEFAULT true,
+  created_at            timestamptz NOT NULL DEFAULT now(),
+  updated_at            timestamptz NOT NULL DEFAULT now()
+);
+
+-- Never returned by list functions, same as llm_secrets -- operator writes
+-- via fn_set_connection_secret only.
+CREATE TABLE IF NOT EXISTS allgres_private.api_connection_secrets (
+  connection_id  uuid PRIMARY KEY REFERENCES allgres_private.api_connections(connection_id) ON DELETE CASCADE,
+  api_key        text
+);
+
 CREATE TABLE IF NOT EXISTS allgres_private.outbound_calls (
   call_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id          uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
@@ -1506,6 +1534,20 @@ ALTER TABLE allgres_private.outbound_calls
 ALTER TABLE allgres_private.outbound_calls
   ADD COLUMN IF NOT EXISTS provider_id uuid REFERENCES allgres_private.llm_providers(provider_id),
   ADD COLUMN IF NOT EXISTS auth_kind text CHECK (auth_kind IS NULL OR auth_kind IN ('authorization', 'x-api-key'));
+
+-- The HTTP method the worker actually sends. Always 'GET' before this column
+-- existed (the only shape 'llm'/'oauth' calls ever needed a verb for, and
+-- 'tool' meant http_get); the 'http_request' tool is what first needed
+-- anything else. Same credential-at-claim-time boundary as provider_id
+-- above, for a stored allgres_private.api_connections credential instead of
+-- an llm_providers one -- request_headers never holds the decrypted key,
+-- fn_claim_outbound resolves it from connection_id at claim time. Both are
+-- NULL unless the tool call named a connection.
+ALTER TABLE allgres_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS method text NOT NULL DEFAULT 'GET'
+    CHECK (method IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE'));
+ALTER TABLE allgres_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS connection_id uuid REFERENCES allgres_private.api_connections(connection_id);
 
 CREATE INDEX IF NOT EXISTS outbound_ready_idx
   ON allgres_private.outbound_calls (created_at)
@@ -2327,6 +2369,21 @@ AS $fn$
   WHERE provider_id = p_provider_id
 $fn$;
 
+-- Same shape as provider_secret, for allgres_private.api_connections. Used
+-- only by fn_claim_outbound, at claim time -- never at queue time, which is
+-- what keeps it out of outbound_calls.request_headers.
+CREATE OR REPLACE FUNCTION allgres_private.connection_secret(p_connection_id uuid)
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  SELECT allgres_private.decrypt_secret(api_key)
+  FROM allgres_private.api_connection_secrets
+  WHERE connection_id = p_connection_id
+$fn$;
+
 -- ---------------------------------------------------------------------------
 -- 6. SQL sandbox.
 --
@@ -3009,6 +3066,13 @@ DECLARE
   v_mem_result jsonb;
   v_created jsonb;
   v_provider allgres_private.llm_providers%ROWTYPE;
+  v_method text;
+  v_conn_name text;
+  v_conn allgres_private.api_connections%ROWTYPE;
+  v_conn_auth text;
+  v_path text;
+  v_req_headers jsonb;
+  v_req_body jsonb;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -3170,7 +3234,7 @@ BEGIN
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
-    IF v_tool <> 'http_get' THEN
+    IF v_tool NOT IN ('http_get', 'http_request') THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'unknown_tool', 'tool', v_tool)
@@ -3181,8 +3245,86 @@ BEGIN
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
-    v_url := v_args->>'url';
-    v_reason := allgres_private.check_outbound_url(v_url, false);
+    v_conn := NULL;
+    v_conn_auth := NULL;
+    v_req_body := '{}'::jsonb;
+
+    IF v_tool = 'http_get' THEN
+      v_method := 'GET';
+      v_url := v_args->>'url';
+      v_req_headers := jsonb_build_object('accept', 'application/json, text/plain, */*');
+    ELSE
+      -- 'http_request': method/headers/body, and an optional named
+      -- allgres_private.api_connections credential -- see that table's own
+      -- comment for why a connection's own base_url is the only host its
+      -- credential may ever reach.
+      v_method := upper(COALESCE(NULLIF(trim(v_args->>'method'), ''), 'GET'));
+      IF v_method NOT IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE') THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'unsupported_http_method', 'method', v_args->>'method')
+        );
+        UPDATE allgres_private.tasks
+        SET step_count = step_count + 1, updated_at = now()
+        WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+
+      v_conn_name := NULLIF(trim(v_args->>'connection'), '');
+      IF v_conn_name IS NOT NULL THEN
+        SELECT * INTO v_conn FROM allgres_private.api_connections
+        WHERE name = v_conn_name AND is_enabled;
+        IF NOT FOUND THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'unknown_connection', 'connection', v_conn_name)
+          );
+          UPDATE allgres_private.tasks
+          SET step_count = step_count + 1, updated_at = now()
+          WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
+
+        -- Never a full URL here: a stored connection's credential may only
+        -- ever be sent to its own fixed base_url, so the agent supplies a
+        -- path relative to it, never a host of its own choosing.
+        v_path := COALESCE(v_args->>'path', '');
+        IF v_path ~* '^[a-zA-Z][a-zA-Z0-9+.-]*://' THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'connection_path_must_be_relative', 'path', v_path)
+          );
+          UPDATE allgres_private.tasks
+          SET step_count = step_count + 1, updated_at = now()
+          WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
+        v_url := rtrim(v_conn.base_url, '/') || '/' || ltrim(v_path, '/');
+        v_conn_auth := NULLIF(v_conn.auth_kind, 'none');
+      ELSE
+        v_url := v_args->>'url';
+      END IF;
+
+      -- Headers an agent may set itself: string values only, and never the
+      -- header a connection's credential is injected into at claim time
+      -- (fn_claim_outbound) -- letting an agent set Authorization/x-api-key
+      -- here would either be silently overwritten by the real credential or,
+      -- with no connection at all, be exactly the plaintext-secret-in-a-row
+      -- shape this design keeps out of outbound_calls to begin with.
+      SELECT COALESCE(jsonb_object_agg(lower(kv.key), kv.value), '{}'::jsonb)
+      INTO v_req_headers
+      FROM jsonb_each_text(
+        CASE WHEN jsonb_typeof(v_args->'headers') = 'object' THEN v_args->'headers' ELSE '{}'::jsonb END
+      ) AS kv(key, value)
+      WHERE lower(kv.key) NOT IN ('authorization', 'x-api-key', 'host', 'content-length');
+      v_req_headers := v_req_headers || jsonb_build_object('accept', 'application/json, text/plain, */*');
+
+      IF v_method IN ('POST', 'PUT', 'PATCH') THEN
+        v_req_body := CASE WHEN jsonb_typeof(v_args->'body') IS NOT NULL THEN v_args->'body' ELSE '{}'::jsonb END;
+      END IF;
+    END IF;
+
+    v_reason := allgres_private.check_outbound_url(v_url, COALESCE(v_conn.allow_private_network, false));
     IF v_reason IS NOT NULL THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
@@ -3208,11 +3350,11 @@ BEGIN
     END IF;
 
     INSERT INTO allgres_private.outbound_calls (
-      task_id, kind, tool, url, request_headers, request_body, status
+      task_id, kind, tool, url, method, request_headers, request_body, status,
+      allow_private, connection_id, auth_kind
     ) VALUES (
-      p_task_id, 'tool', v_tool, v_url,
-      jsonb_build_object('accept', 'application/json, text/plain, */*'),
-      '{}'::jsonb, 'queued'
+      p_task_id, 'tool', v_tool, v_url, v_method, v_req_headers, v_req_body, 'queued',
+      COALESCE(v_conn.allow_private_network, false), v_conn.connection_id, v_conn_auth
     ) RETURNING call_id INTO v_call;
 
     UPDATE allgres_private.tasks
@@ -3938,8 +4080,8 @@ BEGIN
   -- not -- fn_complete_outbound already discards its result in that case,
   -- but by then the request has left the process.
   FOR r IN
-    SELECT o.call_id, o.task_id, o.kind, o.tool, o.url, o.request_headers, o.request_body,
-           o.allow_private, o.provider_id, o.auth_kind, p.name AS provider_name
+    SELECT o.call_id, o.task_id, o.kind, o.tool, o.url, o.method, o.request_headers, o.request_body,
+           o.allow_private, o.provider_id, o.connection_id, o.auth_kind, p.name AS provider_name
     FROM allgres_private.outbound_calls o
     JOIN allgres_private.tasks t ON t.task_id = o.task_id
     LEFT JOIN allgres_private.llm_providers p ON p.provider_id = o.provider_id
@@ -3969,6 +4111,16 @@ BEGIN
         r.auth_kind,
         CASE WHEN r.auth_kind = 'x-api-key' THEN v_key ELSE 'Bearer ' || v_key END
       );
+    -- Same injection, for an 'http_request' tool call routed through a
+    -- stored allgres_private.api_connections credential instead of an LLM
+    -- provider's. No xai/grok-shaped fallback here -- that quirk belongs to
+    -- the LLM path alone (see its own comment above).
+    ELSIF r.auth_kind IS NOT NULL AND r.connection_id IS NOT NULL THEN
+      v_key := COALESCE(allgres_private.connection_secret(r.connection_id), '');
+      v_headers := v_headers || jsonb_build_object(
+        r.auth_kind,
+        CASE WHEN r.auth_kind = 'x-api-key' THEN v_key ELSE 'Bearer ' || v_key END
+      );
     END IF;
 
     v_out := v_out || jsonb_build_array(jsonb_build_object(
@@ -3977,6 +4129,7 @@ BEGIN
       'kind', r.kind,
       'tool', r.tool,
       'url', r.url,
+      'method', r.method,
       'headers', v_headers,
       'body', r.request_body,
       'allow_private', r.allow_private
@@ -5414,6 +5567,156 @@ BEGIN
       SET oauth_client_secret = EXCLUDED.oauth_client_secret;
   END IF;
 
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- Roadmap item 2: generic authenticated HTTP connections, for the
+-- 'http_request' tool (see fn_next_step's call_tool handling and
+-- fn_claim_outbound below). Same create/set/set_secret shape as
+-- fn_create_provider/fn_set_provider/fn_set_provider_secret, deliberately --
+-- this is the same credential-storage problem (a named endpoint plus an
+-- optional bearer/api-key secret, never returned by any list action) with a
+-- different consumer.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_connection(
+  p_name text,
+  p_base_url text,
+  p_auth_kind text DEFAULT 'none',
+  p_api_key text DEFAULT NULL,
+  p_allow_private_network boolean DEFAULT false
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_id uuid;
+  v_url text;
+  v_reason text;
+  v_auth text := COALESCE(NULLIF(trim(p_auth_kind), ''), 'none');
+BEGIN
+  IF NULLIF(trim(p_name), '') IS NULL THEN
+    RAISE EXCEPTION 'connection name is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_auth NOT IN ('none', 'authorization', 'x-api-key') THEN
+    RAISE EXCEPTION 'invalid connection auth_kind: %', v_auth USING ERRCODE = 'P0001';
+  END IF;
+
+  v_url := rtrim(NULLIF(trim(p_base_url), ''), '/');
+  IF v_url IS NULL THEN
+    RAISE EXCEPTION 'connection base_url is required' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_reason := allgres_private.check_outbound_url(v_url, COALESCE(p_allow_private_network, false));
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'connection endpoint rejected: % (%)', v_reason, v_url
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  INSERT INTO allgres_private.api_connections
+    (name, base_url, auth_kind, is_enabled, allow_private_network)
+  VALUES (trim(p_name), v_url, v_auth, true, COALESCE(p_allow_private_network, false))
+  RETURNING connection_id INTO v_id;
+
+  IF NULLIF(p_api_key, '') IS NOT NULL THEN
+    PERFORM allgres_public.fn_set_connection_secret(v_id, p_api_key);
+  END IF;
+
+  RETURN jsonb_build_object('ok', true, 'connection_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_connection(
+  p_connection_id uuid,
+  p_base_url text DEFAULT NULL,
+  p_auth_kind text DEFAULT NULL,
+  p_enabled boolean DEFAULT NULL,
+  p_allow_private_network boolean DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_allow boolean;
+  v_url   text;
+  v_auth  text;
+  v_reason text;
+BEGIN
+  SELECT COALESCE(p_allow_private_network, allow_private_network),
+         rtrim(COALESCE(NULLIF(p_base_url, ''), base_url), '/'),
+         COALESCE(NULLIF(p_auth_kind, ''), auth_kind)
+  INTO v_allow, v_url, v_auth
+  FROM allgres_private.api_connections
+  WHERE connection_id = p_connection_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'connection not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_auth NOT IN ('none', 'authorization', 'x-api-key') THEN
+    RAISE EXCEPTION 'invalid connection auth_kind: %', v_auth USING ERRCODE = 'P0001';
+  END IF;
+
+  v_reason := allgres_private.check_outbound_url(v_url, v_allow);
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'connection endpoint rejected: % (%)', v_reason, v_url
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  UPDATE allgres_private.api_connections
+  SET base_url = v_url,
+      auth_kind = v_auth,
+      is_enabled = COALESCE(p_enabled, is_enabled),
+      allow_private_network = v_allow,
+      updated_at = now()
+  WHERE connection_id = p_connection_id;
+
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_connection_secret(p_connection_id uuid, p_api_key text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  INSERT INTO allgres_private.api_connection_secrets (connection_id, api_key)
+  VALUES (p_connection_id, allgres_private.encrypt_secret(NULLIF(p_api_key, '')))
+  ON CONFLICT (connection_id) DO UPDATE
+    SET api_key = COALESCE(
+          allgres_private.encrypt_secret(NULLIF(p_api_key, '')),
+          allgres_private.api_connection_secrets.api_key
+        );
+  RETURN jsonb_build_object(
+    'ok', true,
+    'has_secret', true,
+    'storage', allgres_private.secret_storage_mode()
+  );
+END;
+$fn$;
+
+-- No FK cascades onto anything an agent turn depends on for its own history
+-- (outbound_calls.connection_id has no ON DELETE behaviour, so a real call
+-- row referencing this connection blocks the delete -- same shape as an
+-- agent with real sessions/tasks). An operator retiring a connection that
+-- was actually used keeps it around disabled (fn_set_connection, is_enabled
+-- = false) instead.
+CREATE OR REPLACE FUNCTION allgres_public.fn_delete_connection(p_connection_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.api_connections WHERE connection_id = p_connection_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'connection not found' USING ERRCODE = 'P0001';
+  END IF;
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -7085,6 +7388,8 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agent_memories', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.audit_log', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connections', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connection_secrets', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
@@ -7134,6 +7439,7 @@ DECLARE
   v_high_mem uuid;
   v_mem_gc int;
   v_new_agent uuid;
+  v_conn uuid;
   v_root_id uuid;
   v_creator_id uuid;
   v_fixer_id uuid;
@@ -8193,6 +8499,178 @@ BEGIN
   );
   DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider';
 
+  -- Roadmap item 2: allgres_private.api_connections + the 'http_request'
+  -- tool -- a named external endpoint with a stored credential, so an agent
+  -- can make an authenticated call (not just http_get's bare GET) without
+  -- ever seeing the secret itself. Same claim-time injection shape already
+  -- proven above (25f) for an LLM provider's api_key.
+  DELETE FROM allgres_private.outbound_calls WHERE connection_id IN (
+    SELECT connection_id FROM allgres_private.api_connections WHERE name = 'selftest_conn'
+  );
+  DELETE FROM allgres_private.api_connections WHERE name = 'selftest_conn';
+  r := allgres_public.fn_create_connection('selftest_conn', 'https://selftest.invalid/api',
+    'authorization', 'selftest-conn-key', false);
+  ok := (r->>'ok')::boolean;
+  v_conn := (r->>'connection_id')::uuid;
+  ok := ok AND allgres_private.connection_secret(v_conn) = 'selftest-conn-key';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_connection_stores_working_secret', 'ok', ok));
+
+  sub := allgres.dashboard_rpc(jsonb_build_object('action', 'connections.list'));
+  ok := (sub->'connections')::text NOT LIKE '%selftest-conn-key%'
+    AND (sub->'connections')::text LIKE '%selftest_conn%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'connections_list_never_exposes_secret', 'ok', ok));
+
+  -- A dedicated fixture agent, reused across reruns (like several agents
+  -- above): once it makes a real call_tool turn it has real execution_logs,
+  -- which the append-only trigger forbids ever deleting -- so this can only
+  -- ever be reactivated, never recreated, on a later run.
+  SELECT agent_id INTO v_new_agent FROM allgres_private.agents WHERE name = 'selftest_httpreq_agent';
+  IF v_new_agent IS NULL THEN
+    v_new_agent := (allgres_public.fn_create_agent('selftest_httpreq_agent')->>'agent_id')::uuid;
+  END IF;
+  UPDATE allgres_private.agents SET is_active = true WHERE agent_id = v_new_agent;
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'tool', 'http_request');
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'http_host', 'selftest.invalid');
+
+  v_sid := (allgres_public.fn_create_session(v_new_agent, 'selftest http_request via connection')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'post', 'connection', 'selftest_conn', 'path', 'widgets',
+        'body', jsonb_build_object('x', 1))
+    )
+  ));
+  -- Looked up by the call_id call_tool itself returned, not "the newest
+  -- row" -- every fn_submit_result call in this whole test block runs in
+  -- the same transaction, so created_at ties across them and an ORDER BY
+  -- created_at is not a reliable tiebreaker once more than one row exists.
+  v_call := (comp->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call;
+  ok := (r->>'url') = 'https://selftest.invalid/api/widgets'
+    AND (r->>'method') = 'POST'
+    AND (r->>'auth_kind') = 'authorization'
+    AND (r->>'connection_id') = v_conn::text
+    AND (r->'request_body') = jsonb_build_object('x', 1);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_via_connection_resolves_relative_path', 'ok', ok));
+
+  -- Never a full URL when a connection is named: the whole point of a
+  -- stored credential is that it can only ever reach its own base_url.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'connection', 'selftest_conn', 'path', 'https://evil.invalid/steal')
+    )
+  ));
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := (comp->>'action') = 'continue' AND (r->>'reason') = 'connection_path_must_be_relative';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_connection_rejects_absolute_path', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'TRACE', 'url', 'https://selftest.invalid/x')
+    )
+  ));
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := (comp->>'action') = 'continue' AND (r->>'reason') = 'unsupported_http_method';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_rejects_unsupported_method', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'connection', 'selftest_conn_does_not_exist', 'path', 'x')
+    )
+  ));
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := (comp->>'action') = 'continue' AND (r->>'reason') = 'unknown_connection';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_rejects_unknown_connection', 'ok', ok));
+
+  -- An agent-supplied Authorization header on a direct (no-connection) call
+  -- is stripped, not honoured -- it would otherwise be exactly the
+  -- plaintext-secret-in-a-row shape this design keeps out of outbound_calls.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'url', 'https://selftest.invalid/y',
+        'headers', jsonb_build_object('authorization', 'sneaky', 'x-custom', 'keep'))
+    )
+  ));
+  v_call := (comp->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call;
+  ok := (r->'request_headers'->>'x-custom') = 'keep'
+    AND NOT (r->'request_headers' ? 'authorization')
+    AND (r->>'connection_id') IS NULL AND (r->>'auth_kind') IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_direct_url_strips_agent_supplied_auth_header', 'ok', ok));
+
+  -- 'tool' permission is per-tool-name, not a blanket "may call call_tool":
+  -- holding http_get does not imply http_request, and vice versa.
+  PERFORM allgres_public.fn_revoke_permission(v_new_agent, 'tool', 'http_request');
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'url', 'https://selftest.invalid/z')
+    )
+  ));
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := (comp->>'action') = 'continue' AND (r->>'reason') = 'tool_not_permitted';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_needs_tool_permission_distinct_from_http_get', 'ok', ok));
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'tool', 'http_request');
+
+  -- http_get itself must come out exactly as before this tool was added:
+  -- method GET, no connection, no body.
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'tool', 'http_get');
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_get',
+      'args', jsonb_build_object('url', 'https://selftest.invalid/legacy')
+    )
+  ));
+  v_call := (comp->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call;
+  ok := (r->>'method') = 'GET' AND (r->>'connection_id') IS NULL AND (r->'request_body') = '{}'::jsonb;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_get_unchanged_by_http_request_addition', 'ok', ok));
+
+  -- The credential itself: never in request_headers at queue time (already
+  -- implied above by connection_id being the only thing recorded), and
+  -- actually injected, decrypted, by fn_claim_outbound at claim time.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'connection', 'selftest_conn', 'path', 'ping')
+    )
+  ));
+  v_call := (comp->>'call_id')::uuid;
+  claim := allgres_public.fn_claim_outbound(10);
+  SELECT x INTO r FROM jsonb_array_elements(claim->'calls') x WHERE x->>'call_id' = v_call::text;
+  ok := (r->'headers'->>'authorization') = 'Bearer selftest-conn-key';
+  PERFORM allgres_public.fn_complete_outbound(v_call, 200, '{}');
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_claim_outbound_injects_connection_secret', 'ok', ok));
+
+  -- No FK cascade from outbound_calls.connection_id (see that column's own
+  -- comment): a connection a real call still references cannot be deleted
+  -- out from under it.
+  BEGIN
+    PERFORM allgres_public.fn_delete_connection(v_conn);
+    ok := false;
+  EXCEPTION WHEN foreign_key_violation THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'connection_delete_blocked_while_outbound_calls_reference_it', 'ok', ok));
+
+  DELETE FROM allgres_private.outbound_calls WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_delete_connection(v_conn);
+  UPDATE allgres_private.agents SET is_active = false WHERE agent_id = v_new_agent;
+
   -- 26. OAuth token exchange, queued rather than handed back to the caller
   --     (see KNOWN_ISSUES.md, "a second-round external review of items 18
   --     and 19": fn_oauth_token_request used to decrypt the client secret
@@ -9022,6 +9500,14 @@ BEGIN
     v := v || jsonb_build_array(jsonb_build_object('name', 'provider_create_needs_admin_once_accounts_exist', 'ok', ok));
 
     sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'connections.create', 'name', 'selftest_should_not_exist_connection',
+      'base_url', 'https://selftest.invalid'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.api_connections WHERE name = 'selftest_should_not_exist_connection');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'connections_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'allowlist.add', 'ref', 'allgres_public.v_should_not_be_added'
     ));
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true
@@ -9827,6 +10313,8 @@ REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.oauth_client_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION allgres_private.oauth_client_secret(uuid) FROM worker;
+REVOKE EXECUTE ON FUNCTION allgres_private.connection_secret(uuid) FROM operator;
+REVOKE EXECUTE ON FUNCTION allgres_private.connection_secret(uuid) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.decrypt_secret(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION allgres_private.encrypt_secret(text) FROM PUBLIC;
 
@@ -9944,6 +10432,7 @@ BEGIN
     'permissions.grant', 'permissions.revoke', 'allowlist.add', 'allowlist.remove',
     'projects.create', 'projects.update', 'sessions.cancel',
     'memories.create', 'memories.remove', 'provider.update', 'provider.create',
+    'connections.create', 'connections.update', 'connections.delete',
     'providers.oauth_callback', 'approvals.decide', 'fixes.decide',
     'users.create', 'users.set_active', 'users.set_role', 'assignments.set', 'assignments.toggle'
   ]) THEN
@@ -10253,7 +10742,7 @@ BEGIN
           SELECT jsonb_agg(schemaname || '.' || viewname ORDER BY viewname)
           FROM pg_catalog.pg_views WHERE schemaname = 'allgres_public'
         ), '[]'::jsonb),
-        'tools', '["http_get"]'::jsonb,
+        'tools', '["http_get", "http_request"]'::jsonb,
         'agents', COALESCE((
           SELECT jsonb_agg(name ORDER BY name) FROM allgres_private.agents WHERE is_active
         ), '[]'::jsonb),
@@ -10724,6 +11213,57 @@ BEGIN
         NULLIF(p_request->>'embedding_model',''),
         COALESCE((p_request->>'response_format_json_object')::boolean, true)
       );
+
+    -- Roadmap item 2: named external HTTP endpoints the 'http_request' tool
+    -- can call with a stored credential (see allgres_private.api_connections'
+    -- own comment). Never returns api_key -- only has_secret, the same as
+    -- settings.get for llm_providers.
+    WHEN 'connections.list' THEN
+      RETURN jsonb_build_object('ok', true, 'connections', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'connection_id', c.connection_id,
+          'name', c.name,
+          'base_url', c.base_url,
+          'auth_kind', c.auth_kind,
+          'is_enabled', c.is_enabled,
+          'allow_private_network', c.allow_private_network,
+          'has_secret', EXISTS (
+            SELECT 1 FROM allgres_private.api_connection_secrets s
+            WHERE s.connection_id = c.connection_id AND NULLIF(s.api_key, '') IS NOT NULL
+          )
+        ) ORDER BY c.name)
+        FROM allgres_private.api_connections c
+      ), '[]'::jsonb));
+
+    WHEN 'connections.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_create_connection(
+        p_request->>'name',
+        p_request->>'base_url',
+        COALESCE(NULLIF(p_request->>'auth_kind',''), 'none'),
+        NULLIF(p_request->>'api_key',''),
+        COALESCE((p_request->>'allow_private_network')::boolean, false)
+      );
+
+    WHEN 'connections.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      v_id := (p_request->>'connection_id')::uuid;
+      PERFORM allgres_public.fn_set_connection(
+        v_id,
+        NULLIF(p_request->>'base_url',''),
+        NULLIF(p_request->>'auth_kind',''),
+        CASE WHEN p_request ? 'is_enabled' THEN (p_request->>'is_enabled')::boolean ELSE NULL END,
+        CASE WHEN p_request ? 'allow_private_network'
+             THEN (p_request->>'allow_private_network')::boolean ELSE NULL END
+      );
+      IF NULLIF(p_request->>'api_key','') IS NOT NULL THEN
+        PERFORM allgres_public.fn_set_connection_secret(v_id, p_request->>'api_key');
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'connection_id', v_id);
+
+    WHEN 'connections.delete' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_delete_connection((p_request->>'connection_id')::uuid);
 
     -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
     -- fn_oauth_start only ever returns a redirect_url and a state, neither

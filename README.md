@@ -585,8 +585,8 @@ source IPs; it is one layer, not a substitute for a real token.
 
 ### Outbound requests (SSRF)
 
-One guard covers every outbound path — the LLM endpoint, the `http_get` tool,
-and the OAuth token exchange:
+One guard covers every outbound path — the LLM endpoint, the `http_get` and
+`http_request` tools, and the OAuth token exchange:
 
 - `https` only, unless the provider is explicitly marked
   `allow_private_network`;
@@ -596,7 +596,16 @@ and the OAuth token exchange:
 - URLs containing `userinfo@host` are rejected outright rather than parsed;
 - the HTTP client follows **zero** redirects, so an allowlisted host cannot
   redirect into an internal one;
-- `http_get` additionally requires a per-agent `http_host` permission;
+- `http_get`/`http_request` additionally require a per-agent `http_host`
+  permission for the target host;
+- `http_request` adds method (GET/POST/PUT/PATCH/DELETE), headers, and a
+  body, plus an optional named `allgres_private.api_connections` credential
+  (Settings → API connections). A connection's secret is resolved and
+  injected only at claim time, the same as an LLM provider's api_key — it is
+  never written into `outbound_calls.request_headers`. When a connection is
+  named, the agent supplies a path relative to that connection's own
+  `base_url`, never a full URL, so a stored credential can never be sent to
+  a host the agent chooses;
 - every one of these checks so far is against the URL's host **string**,
   which says nothing about where DNS actually points it: a hostname that
   resolves to a public address when the agent's request is validated can

@@ -997,15 +997,40 @@ fn perform_http(call: &Value) -> (i32, String) {
     );
 
     let outcome = if kind == "tool" {
-        let mut req = agent.get(url);
-        if let Some(h) = headers {
-            for (k, v) in h {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+        // http_get always queued "GET" here (the column defaults to it); the
+        // 'http_request' tool is the first caller that ever queues anything
+        // else. GET/DELETE take no body (ureq's WithoutBody builder has no
+        // send_json at all); POST/PUT/PATCH always send one, defaulting to
+        // an empty JSON object when the SQL layer didn't attach a real body.
+        let method = call.get("method").and_then(Value::as_str).unwrap_or("GET").to_ascii_uppercase();
+        match method.as_str() {
+            "POST" | "PUT" | "PATCH" => {
+                let mut req = match method.as_str() {
+                    "POST" => agent.post(url),
+                    "PUT" => agent.put(url),
+                    _ => agent.patch(url),
+                };
+                if let Some(h) = headers {
+                    for (k, v) in h {
+                        if let Some(s) = v.as_str() {
+                            req = req.header(k, s);
+                        }
+                    }
                 }
+                req.send_json(&body)
+            }
+            _ => {
+                let mut req = if method == "DELETE" { agent.delete(url) } else { agent.get(url) };
+                if let Some(h) = headers {
+                    for (k, v) in h {
+                        if let Some(s) = v.as_str() {
+                            req = req.header(k, s);
+                        }
+                    }
+                }
+                req.call()
             }
         }
-        req.call()
     } else if kind == "oauth" {
         // An OAuth token endpoint expects a standard form submission, not
         // JSON (RFC 6749 4.1.3). send_form sets its own content-type header
