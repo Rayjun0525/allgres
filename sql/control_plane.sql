@@ -7116,6 +7116,86 @@ BEGIN
 END;
 $fn$;
 
+-- These four used to be the only mutations in the whole file with no SQL
+-- entry point of their own -- their real INSERT/UPDATE/DELETE lived only
+-- inline inside dashboard_rpc's users.set_active/set_role/assignments.set/
+-- assignments.toggle branches, reachable only through the jsonb RPC
+-- envelope. Every other mutation dashboard_rpc exposes already has a plain
+-- function like this one behind it (fn_create_user just above,
+-- fn_grant_permission, fn_set_policy, ...) that an operator with direct
+-- database access can call the same way `psql -c "SELECT
+-- fn_create_user(...)"` already works, with no jsonb, no dashboard, no
+-- HTTP -- the whole point of a PostgreSQL-native control plane (see
+-- README's opening line). dashboard_rpc's own require_admin gate is
+-- unchanged; these carry no permission check themselves, exactly like
+-- fn_grant_permission/fn_revoke_permission just above -- gating the web/API
+-- surface is dashboard_rpc's job, not something every SQL-native function
+-- underneath it should also have to reimplement for a caller already
+-- trusted with direct database access.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_user_active(p_user_id uuid, p_is_active boolean)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  UPDATE allgres_private.users SET is_active = p_is_active WHERE user_id = p_user_id;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_user_role(p_user_id uuid, p_role text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF p_role NOT IN ('admin', 'user') THEN
+    RAISE EXCEPTION 'invalid role: %', p_role USING ERRCODE = 'P0001';
+  END IF;
+  UPDATE allgres_private.users SET role = p_role WHERE user_id = p_user_id;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- Replaces the full assignment set for one user with the given agent_ids --
+-- simpler and less error-prone from the UI than incremental add/remove
+-- calls for what is always edited as one list there; see
+-- fn_set_user_assignment below for the single add/remove instead.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_user_assignments(p_user_id uuid, p_agent_ids uuid[])
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.user_agent_assignments WHERE user_id = p_user_id;
+  INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+  SELECT p_user_id, a FROM unnest(COALESCE(p_agent_ids, ARRAY[]::uuid[])) a;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_user_assignment(p_user_id uuid, p_agent_id uuid, p_assigned boolean)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF p_assigned THEN
+    INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+    VALUES (p_user_id, p_agent_id)
+    ON CONFLICT DO NOTHING;
+  ELSE
+    DELETE FROM allgres_private.user_agent_assignments
+    WHERE user_id = p_user_id AND agent_id = p_agent_id;
+  END IF;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
 -- Resolves a bearer token to the user it belongs to, or a NULL row if the
 -- token is missing, unknown, expired, or the account was deactivated since
 -- the token was issued. Touches last_seen_at only on a hit, so a wall of
@@ -8135,6 +8215,7 @@ DECLARE
   v_rate numeric;
   v_eval_child_name text;
   v_sid2 uuid;
+  v_direct_sql_user uuid;
   v_root_id uuid;
   v_creator_id uuid;
   v_fixer_id uuid;
@@ -10929,6 +11010,55 @@ BEGIN
       'agent_id', v_sys_target, 'assigned', false
     ));
 
+    -- fn_set_user_active/fn_set_user_role/fn_set_user_assignments/
+    -- fn_set_user_assignment: these four used to be the only mutations
+    -- dashboard_rpc exposed with no SQL entry point of their own (their real
+    -- INSERT/UPDATE/DELETE lived only inline inside the users.set_active/
+    -- set_role/assignments.set/assignments.toggle branches themselves,
+    -- reachable only through the jsonb RPC envelope) -- called directly
+    -- here, with no dashboard_rpc/jsonb involved at all, on a throwaway user
+    -- of their own rather than selftest_user/selftest_admin (many tests
+    -- below this point still depend on those two keeping their original
+    -- active/role state).
+    DELETE FROM allgres_private.users WHERE username = 'selftest_direct_sql_user';
+    v_direct_sql_user := (allgres_public.fn_create_user('selftest_direct_sql_user', 'selftest-direct-pw1', 'user')->>'user_id')::uuid;
+
+    PERFORM allgres_public.fn_set_user_active(v_direct_sql_user, false);
+    ok := NOT (SELECT is_active FROM allgres_private.users WHERE user_id = v_direct_sql_user);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_active_direct_sql_call', 'ok', ok));
+    PERFORM allgres_public.fn_set_user_active(v_direct_sql_user, true);
+
+    PERFORM allgres_public.fn_set_user_role(v_direct_sql_user, 'admin');
+    ok := (SELECT role FROM allgres_private.users WHERE user_id = v_direct_sql_user) = 'admin';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_role_direct_sql_call', 'ok', ok));
+    PERFORM allgres_public.fn_set_user_role(v_direct_sql_user, 'user');
+
+    BEGIN
+      PERFORM allgres_public.fn_set_user_role(v_direct_sql_user, 'not_a_real_role');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := true;
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_role_rejects_unknown_role', 'ok', ok));
+
+    PERFORM allgres_public.fn_set_user_assignments(v_direct_sql_user, ARRAY[v_sys_target]);
+    ok := (SELECT array_agg(agent_id) FROM allgres_private.user_agent_assignments WHERE user_id = v_direct_sql_user) = ARRAY[v_sys_target];
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_assignments_direct_sql_call', 'ok', ok));
+    -- A real full-replace-with-empty, the same edge case an empty
+    -- agent_ids array from the UI hits -- must clear, not leave stale rows.
+    PERFORM allgres_public.fn_set_user_assignments(v_direct_sql_user, ARRAY[]::uuid[]);
+    ok := NOT EXISTS (SELECT 1 FROM allgres_private.user_agent_assignments WHERE user_id = v_direct_sql_user);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_assignments_empty_array_clears', 'ok', ok));
+
+    PERFORM allgres_public.fn_set_user_assignment(v_direct_sql_user, v_sys_target, true);
+    ok := EXISTS (SELECT 1 FROM allgres_private.user_agent_assignments WHERE user_id = v_direct_sql_user AND agent_id = v_sys_target);
+    PERFORM allgres_public.fn_set_user_assignment(v_direct_sql_user, v_sys_target, false);
+    ok := ok AND NOT EXISTS (SELECT 1 FROM allgres_private.user_agent_assignments WHERE user_id = v_direct_sql_user AND agent_id = v_sys_target);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_assignment_direct_sql_call', 'ok', ok));
+
+    DELETE FROM allgres_private.web_sessions WHERE user_id = v_direct_sql_user;
+    DELETE FROM allgres_private.users WHERE user_id = v_direct_sql_user;
+
     -- Roadmap item 3: history.search unions three sources -- an agent's own
     -- explicit remember()s, a task's role='error' log entries (failures),
     -- and a completed session's final_answer (decisions) -- and links every
@@ -12032,29 +12162,23 @@ BEGIN
 
     WHEN 'users.set_active' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
-      UPDATE allgres_private.users SET is_active = (p_request->>'is_active')::boolean
-      WHERE user_id = (p_request->>'user_id')::uuid;
-      RETURN jsonb_build_object('ok', true);
+      RETURN allgres_public.fn_set_user_active(
+        (p_request->>'user_id')::uuid, (p_request->>'is_active')::boolean
+      );
 
     WHEN 'users.set_role' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
-      IF p_request->>'role' NOT IN ('admin', 'user') THEN
-        RAISE EXCEPTION 'invalid role: %', p_request->>'role' USING ERRCODE = 'P0001';
-      END IF;
-      UPDATE allgres_private.users SET role = p_request->>'role'
-      WHERE user_id = (p_request->>'user_id')::uuid;
-      RETURN jsonb_build_object('ok', true);
+      RETURN allgres_public.fn_set_user_role((p_request->>'user_id')::uuid, p_request->>'role');
 
     -- Replaces the full assignment set for one user with the given
     -- agent_ids array -- simpler and less error-prone from the UI than
     -- incremental add/remove calls for what is always edited as one list.
     WHEN 'assignments.set' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
-      v_id := (p_request->>'user_id')::uuid;
-      DELETE FROM allgres_private.user_agent_assignments WHERE user_id = v_id;
-      INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
-      SELECT v_id, (a)::uuid FROM jsonb_array_elements_text(COALESCE(p_request->'agent_ids', '[]'::jsonb)) a;
-      RETURN jsonb_build_object('ok', true);
+      RETURN allgres_public.fn_set_user_assignments(
+        (p_request->>'user_id')::uuid,
+        ARRAY(SELECT (a)::uuid FROM jsonb_array_elements_text(COALESCE(p_request->'agent_ids', '[]'::jsonb)) a)
+      );
 
     WHEN 'assignments.list' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
@@ -12078,15 +12202,9 @@ BEGIN
 
     WHEN 'assignments.toggle' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
-      IF (p_request->>'assigned')::boolean THEN
-        INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
-        VALUES ((p_request->>'user_id')::uuid, (p_request->>'agent_id')::uuid)
-        ON CONFLICT DO NOTHING;
-      ELSE
-        DELETE FROM allgres_private.user_agent_assignments
-        WHERE user_id = (p_request->>'user_id')::uuid AND agent_id = (p_request->>'agent_id')::uuid;
-      END IF;
-      RETURN jsonb_build_object('ok', true);
+      RETURN allgres_public.fn_set_user_assignment(
+        (p_request->>'user_id')::uuid, (p_request->>'agent_id')::uuid, (p_request->>'assigned')::boolean
+      );
 
     -- The agents a logged-in user may see at all: every active agent for an
     -- admin, only explicitly assigned ones for a regular user.
