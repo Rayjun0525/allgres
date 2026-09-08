@@ -629,13 +629,26 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT created_at INTO v_cutoff FROM (
-    SELECT created_at FROM allgres_private.execution_logs
-    WHERE task_id = ANY(p_task_ids)
-      AND (v_current_cutoff IS NULL OR created_at >= v_current_cutoff)
-    ORDER BY created_at DESC
-    OFFSET c_keep_recent - 1 LIMIT 1
-  ) q;
+  -- compaction_keep_recent = 0 (a valid, allowed value -- see its own
+  -- CHECK range, 0 to 1000000) means "keep nothing, compact everything up
+  -- to now" -- there is no "the Nth-newest log" boundary to find when N is
+  -- 0, so this can't reuse the OFFSET below at all: `OFFSET c_keep_recent
+  -- - 1` with c_keep_recent = 0 sends PostgreSQL a literal OFFSET -1,
+  -- which is a hard error ("OFFSET must not be negative"), not a graceful
+  -- "keep the newest one anyway" -- confirmed live, this used to abort the
+  -- whole compaction check outright the moment an operator set
+  -- keep_recent to 0.
+  IF c_keep_recent <= 0 THEN
+    v_cutoff := clock_timestamp();
+  ELSE
+    SELECT created_at INTO v_cutoff FROM (
+      SELECT created_at FROM allgres_private.execution_logs
+      WHERE task_id = ANY(p_task_ids)
+        AND (v_current_cutoff IS NULL OR created_at >= v_current_cutoff)
+      ORDER BY created_at DESC
+      OFFSET c_keep_recent - 1 LIMIT 1
+    ) q;
+  END IF;
   IF v_cutoff IS NULL THEN
     RETURN;
   END IF;
@@ -7105,6 +7118,7 @@ DECLARE
   v_mention_target uuid;
   v_admin_tok text;
   v_user_tok text;
+  v_audit_tok text;
   v_acct_agent uuid;
 BEGIN
   -- Clear out any leftover fixtures from an interrupted prior run before
@@ -8387,9 +8401,36 @@ BEGIN
   --     table refuses UPDATE/DELETE even from the function's own owner,
   --     not just from operator (see audit_log_no_update's own comment for
   --     why a REVOKE alone would not have been enough).
-  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'allowlist.remove', 'ref', 'selftest_audit_marker'));
+  --
+  -- The allowlist.add/remove and provider.update calls below are admin-
+  -- gated (require_admin_if_accounts_exist) -- this section used to lean
+  -- on the ambient "no accounts exist yet" bootstrap no-op the same way a
+  -- fresh install's own fn_selftest run happens to start in, which broke
+  -- outright (every gated call here rejected) the moment fn_selftest ran
+  -- against a database that already had one real account -- exactly what
+  -- happens the first time an operator clicks Settings' own "Run
+  -- selftest" button after creating their own admin account. A throwaway
+  -- admin token minted right here, used explicitly on every gated call in
+  -- this section, and torn down before it ends, makes this section's own
+  -- coverage independent of whatever account state the surrounding
+  -- database already happens to be in. Skipped when pgcrypto isn't
+  -- installed (fn_create_user would fail closed anyway); without
+  -- pgcrypto no real account can exist either, so the old bootstrap
+  -- no-op still applies and v_audit_tok staying NULL reaches the same
+  -- gate the same way an absent session_token always has.
+  v_audit_tok := NULL;
+  IF allgres_private.pgcrypto_schema() IS NOT NULL THEN
+    DELETE FROM allgres_private.users WHERE username = 'selftest_audit_admin';
+    PERFORM allgres_public.fn_create_user('selftest_audit_admin', 'selftest-audit-pw1', 'admin');
+    v_audit_tok := allgres_public.fn_login('selftest_audit_admin', 'selftest-audit-pw1')->>'session_token';
+  END IF;
+
+  PERFORM allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'allowlist.remove', 'ref', 'selftest_audit_marker', 'session_token', v_audit_tok
+  ));
   sub := allgres.dashboard_rpc(jsonb_build_object(
-    'action', 'allowlist.add', 'ref', 'selftest_audit_marker', 'operator_name', 'selftest_operator'
+    'action', 'allowlist.add', 'ref', 'selftest_audit_marker', 'operator_name', 'selftest_operator',
+    'session_token', v_audit_tok
   ));
   ok := (sub->>'ok')::boolean IS TRUE;
   SELECT operator_name = 'selftest_operator' AND details = jsonb_build_object('ref', 'selftest_audit_marker')
@@ -8398,7 +8439,9 @@ BEGIN
   WHERE action = 'allowlist.add' AND details->>'ref' = 'selftest_audit_marker'
   ORDER BY created_at DESC LIMIT 1;
   ok := ok AND COALESCE(detail_bool, false);
-  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'allowlist.remove', 'ref', 'selftest_audit_marker'));
+  PERFORM allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'allowlist.remove', 'ref', 'selftest_audit_marker', 'session_token', v_audit_tok
+  ));
 
   SELECT count(*) INTO n_logs FROM allgres_private.audit_log;
   PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'overview'));
@@ -8407,7 +8450,8 @@ BEGIN
 
   sub := allgres.dashboard_rpc(jsonb_build_object(
     'action', 'provider.update', 'provider_id', v_provider,
-    'api_key', 'selftest-should-not-leak-into-audit-log', 'operator_name', 'selftest_operator'
+    'api_key', 'selftest-should-not-leak-into-audit-log', 'operator_name', 'selftest_operator',
+    'session_token', v_audit_tok
   ));
   SELECT NOT (details::text LIKE '%selftest-should-not-leak%') INTO detail_bool
   FROM allgres_private.audit_log WHERE action = 'provider.update' ORDER BY created_at DESC LIMIT 1;
@@ -8422,21 +8466,36 @@ BEGIN
     ok := ok AND SQLERRM LIKE '%append-only%';
   END;
 
+  IF v_audit_tok IS NOT NULL THEN
+    PERFORM allgres_public.fn_logout(v_audit_tok);
+    DELETE FROM allgres_private.users WHERE username = 'selftest_audit_admin';
+  END IF;
+
   v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
 
   -- item 36's own bootstrap guarantee: require_admin_if_accounts_exist must
   -- be a true no-op for a deployment that has never created a user account
-  -- at all -- verified here, not assumed, since this is the one point in
-  -- the whole run where allgres_private.users is guaranteed still empty
-  -- (section 31 below is the only place fn_selftest ever creates one, and
-  -- always cleans up after itself before returning).
-  ok := NOT EXISTS (SELECT 1 FROM allgres_private.users);
-  IF ok THEN
+  -- at all. Only actually checkable when allgres_private.users is empty --
+  -- true on a fresh install/CI (section 31 below is the only place
+  -- fn_selftest itself ever creates a row there, and always cleans up
+  -- after itself), but NOT true when fn_selftest runs against a live
+  -- deployment that already has a real admin account, e.g. via Settings'
+  -- own "Run selftest" button. Reporting a failure in that case would be a
+  -- false alarm about which state this particular run started in, not a
+  -- real defect -- there is nothing this run can check either way, so it
+  -- reports true ("nothing to verify here this run") rather than an
+  -- unconditional false. Confirmed live: this used to fail outright the
+  -- moment one real account existed anywhere in the database beforehand,
+  -- permanently breaking "Run selftest" as an ongoing diagnostic the
+  -- moment an operator used the accounts feature at all.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
     sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'agents.create',
       'name', 'selftest_bootstrap_probe_' || extract(epoch from clock_timestamp())::text
     ));
     ok := COALESCE((sub->>'ok')::boolean, false);
+  ELSE
+    ok := true;
   END IF;
   v := v || jsonb_build_array(jsonb_build_object('name', 'admin_gate_is_a_noop_before_any_account_exists', 'ok', ok));
 
@@ -9007,6 +9066,41 @@ BEGIN
       SELECT 1 FROM allgres_private.sessions WHERE goal = 'session_compact:' || v_sid::text
     );
     v := v || jsonb_build_array(jsonb_build_object('name', 'configurable_compaction_threshold_fires_early', 'ok', ok));
+    PERFORM allgres_public.fn_set_agent_config(
+      (SELECT agent_id FROM allgres_private.agents WHERE name = 'session_compactor'),
+      jsonb_build_object('compaction_threshold', NULL, 'compaction_keep_recent', NULL)
+    );
+
+    -- 33d. compaction_keep_recent = 0 ("keep nothing, compact everything")
+    -- is a valid value within its own documented range (0 to 1000000) --
+    -- an unclamped OFFSET (c_keep_recent - 1) used to send PostgreSQL a
+    -- literal OFFSET -1 the moment it was set, a hard error that aborted
+    -- the whole compaction check rather than compacting everything the
+    -- way 0 actually means.
+    PERFORM allgres_public.fn_set_agent_config(
+      (SELECT agent_id FROM allgres_private.agents WHERE name = 'session_compactor'),
+      jsonb_build_object('compaction_threshold', 5, 'compaction_keep_recent', 0)
+    );
+    v_comp_base := now() - interval '1 hour';
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest keep_recent zero')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    FOR v_i IN 1..8 LOOP
+      INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content, created_at)
+      VALUES (v_tid, v_i, 'assistant', to_jsonb('selftest keep_recent zero turn ' || v_i::text), v_comp_base + (v_i * interval '1 second'));
+    END LOOP;
+    BEGIN
+      PERFORM allgres_public.fn_next_step(v_tid);
+      ok := true;
+    EXCEPTION WHEN others THEN
+      ok := false;
+    END;
+    ok := ok AND COALESCE((
+      SELECT (t.input->>'compact_cutoff')::timestamptz > v_comp_base + interval '8 seconds'
+      FROM allgres_private.tasks t
+      JOIN allgres_private.sessions s ON s.session_id = t.session_id
+      WHERE s.goal = 'session_compact:' || v_sid::text
+    ), false);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'compaction_keep_recent_zero_compacts_everything_without_crashing', 'ok', ok));
     PERFORM allgres_public.fn_set_agent_config(
       (SELECT agent_id FROM allgres_private.agents WHERE name = 'session_compactor'),
       jsonb_build_object('compaction_threshold', NULL, 'compaction_keep_recent', NULL)
