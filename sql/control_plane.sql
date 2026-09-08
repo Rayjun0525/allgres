@@ -6308,6 +6308,38 @@ BEGIN
 END;
 $fn$;
 
+-- The graceful counterpart require_admin_if_accounts_exist already is to
+-- require_admin, for the same reason: require_agent_access above has no
+-- bootstrap fallback (correct for chat/messenger/my_agents, which have
+-- required a real login since the day accounts existed at all), but
+-- applying it unconditionally to run/sessions.cancel/sessions.continue --
+-- older actions than the login system itself, part of the admin-facing
+-- Run/Sessions surface -- would break the single-operator, token-only
+-- deployment mode those have always worked in. This is a no-op while
+-- allgres_private.users is empty (checked fresh, not cached, same as
+-- require_admin_if_accounts_exist); once any account exists, it requires
+-- a real logged-in session AND (unless that session is an admin) that the
+-- session belongs to a user actually assigned to p_agent_id -- the two
+-- separate checks item 1 of the roadmap named: can this *user* reach this
+-- *agent* at all, kept apart from whether the *agent* may reach a given
+-- resource (agent_may_read/agent_has_permission, unrelated and untouched
+-- here). Before this fix, run/sessions.cancel/sessions.continue had no
+-- check whatsoever, at any account state -- any caller holding the shared
+-- dashboard token could run, cancel, or continue a session against any
+-- agent_id/session_id in the whole database, logged in or not, assigned
+-- or not.
+CREATE OR REPLACE FUNCTION allgres_private.require_agent_access_if_accounts_exist(p_token text, p_agent_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
+    RETURN;
+  END IF;
+  PERFORM allgres_private.require_agent_access(p_token, p_agent_id);
+END;
+$fn$;
+
 -- Project mode's own access check (item 42): a project is a valid chat
 -- target only once bound to an agent and active, and reaching it still
 -- goes through require_agent_access for that agent -- a regular user needs
@@ -8499,6 +8531,21 @@ BEGIN
   END IF;
   v := v || jsonb_build_array(jsonb_build_object('name', 'admin_gate_is_a_noop_before_any_account_exists', 'ok', ok));
 
+  -- Same bootstrap guarantee, for require_agent_access_if_accounts_exist
+  -- (roadmap item 1's run/sessions.* fix): `run` against any active agent
+  -- must still work with no session_token at all before any account
+  -- exists, the same single-operator token-only mode every other gate in
+  -- this file preserves.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'run', 'agent_id', v_agent::text, 'goal', 'selftest bootstrap run probe'
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+  ELSE
+    ok := true;
+  END IF;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'run_gate_is_a_noop_before_any_account_exists', 'ok', ok));
+
   -- 30. fn_continue_session: a session can be resumed with a follow-up
   --     message instead of only ever starting a brand new, contextless one
   --     (dashboard, "no way to chat"). The new turn is a new task, but
@@ -9001,6 +9048,86 @@ BEGIN
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
     v := v || jsonb_build_array(jsonb_build_object('name', 'bulk_set_model_needs_admin_once_accounts_exist', 'ok', ok));
 
+    -- run/sessions.cancel/sessions.continue/sessions.list/sessions.get
+    -- (roadmap item 1's own named gap): before this fix these five had no
+    -- session check whatsoever, at any account state -- any caller holding
+    -- the shared dashboard token could run, cancel, or continue a session
+    -- against, or simply list/read, any agent_id/session_id in the whole
+    -- database. Spot-checked here the same way the rest of this block
+    -- already is: not exhaustive, but exercising both halves item 1 asked
+    -- for. A fresh, dedicated agent for the "not assigned" cases -- not
+    -- v_sys_target, which visible_agent_ids_includes_assigned_target above
+    -- deliberately assigns to selftest_user already, and not v_acct_agent,
+    -- which selftest_user genuinely is assigned to.
+    DELETE FROM allgres_private.agents WHERE name = 'selftest_unassigned_target';
+    v_new_agent := (allgres_public.fn_create_agent('selftest_unassigned_target')->>'agent_id')::uuid;
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'run', 'agent_id', v_new_agent::text, 'goal', 'selftest should not run'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'run_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+
+    -- Logged in, but as a user with no assignment to this specific agent --
+    -- the per-agent assignment check itself, not just "any session token
+    -- at all".
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'run', 'agent_id', v_new_agent::text, 'goal', 'selftest should not run',
+      'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'run_rejects_user_not_assigned_to_this_agent', 'ok', ok));
+    DELETE FROM allgres_private.agents WHERE agent_id = v_new_agent;
+
+    -- Exercised on the gate function directly for the two success cases,
+    -- not through a real `run` -- v_acct_agent must stay deletable at this
+    -- function's own final cleanup below (no ON DELETE CASCADE from
+    -- sessions/tasks/execution_logs to agents, and execution_logs' own
+    -- append-only trigger means a real session/task chain, once created,
+    -- can never be removed again -- confirmed live: creating one here the
+    -- first time broke that cleanup's own DELETE with a FK violation).
+    -- v_sys_target has no such constraint (never deleted, sessions against
+    -- it already accumulate forever elsewhere in this file), so the two
+    -- rejection cases above still go through the real dashboard_rpc action.
+    BEGIN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(v_user_tok, v_acct_agent);
+      ok := true;
+    EXCEPTION WHEN others THEN
+      ok := false;
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'run_allows_assigned_user', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(v_admin_tok, v_sys_target);
+      ok := true;
+    EXCEPTION WHEN others THEN
+      ok := false;
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'run_allows_admin_on_any_agent', 'ok', ok));
+
+    v_sid := (allgres_public.fn_create_session(v_sys_target, 'selftest session scoping target')->>'session_id')::uuid;
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'sessions.continue', 'session_id', v_sid::text, 'message', 'should not be allowed',
+      'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_continue_rejects_unassigned_user', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'sessions.cancel', 'session_id', v_sid::text, 'reason', 'selftest cleanup',
+      'session_token', v_admin_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_cancel_allows_admin', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'sessions.list'));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_list_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'sessions.get', 'session_id', v_sid::text));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_get_needs_admin_once_accounts_exist', 'ok', ok));
+
     -- Setting a key to JSON null clears it back to the reader's own coded
     -- default rather than leaving a stray {"probe":2} on a real seeded
     -- agent.
@@ -9240,6 +9367,20 @@ BEGIN
     ));
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
     v := v || jsonb_build_array(jsonb_build_object('name', 'assignments_toggle_rejects_non_admin', 'ok', ok));
+
+    -- The rejected toggle above leaves the earlier assign(true) call's own
+    -- effect in place (it was rejected before doing anything, not
+    -- reverted) -- undo it via the admin session that can actually do so,
+    -- so selftest_user's assignment to v_sys_target doesn't silently
+    -- persist past this run into the next one. v_sys_target itself is
+    -- never deleted between runs, so an unreverted assignment here used to
+    -- accumulate forever, quietly invalidating any later test (in this run
+    -- or the next) that assumes selftest_user is *not* assigned to it.
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.toggle', 'session_token', v_admin_tok,
+      'user_id', (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'),
+      'agent_id', v_sys_target, 'assigned', false
+    ));
 
     -- 36. Overview's cluster monitoring (item 44): PostgreSQL version and
     -- this cluster's own pg_stat_activity counts (SQL-visible) alongside
@@ -10159,19 +10300,29 @@ BEGIN
       );
 
     WHEN 'run' THEN
+      v_id := (p_request->>'agent_id')::uuid;
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(p_request->>'session_token', v_id);
       RETURN allgres_public.fn_create_session(
-        (p_request->>'agent_id')::uuid,
+        v_id,
         p_request->>'goal',
         NULLIF(p_request->>'project_id', '')::uuid
       );
 
     WHEN 'sessions.cancel' THEN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(
+        p_request->>'session_token',
+        (SELECT agent_id FROM allgres_private.sessions WHERE session_id = (p_request->>'session_id')::uuid)
+      );
       RETURN allgres_public.fn_cancel_session(
         (p_request->>'session_id')::uuid,
         p_request->>'reason'
       );
 
     WHEN 'sessions.continue' THEN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(
+        p_request->>'session_token',
+        (SELECT agent_id FROM allgres_private.sessions WHERE session_id = (p_request->>'session_id')::uuid)
+      );
       RETURN allgres_public.fn_continue_session(
         (p_request->>'session_id')::uuid,
         p_request->>'message'
@@ -10354,6 +10505,11 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'sessions.list' THEN
+      -- Admin-only monitoring surface (no "Sessions" page exists for a
+      -- regular user -- README's own role list) with, until now, no check
+      -- at all: every session across every agent and every user, visible
+      -- to anyone holding the shared token regardless of login state.
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'sessions', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.started_at DESC)
         FROM (
@@ -10370,6 +10526,7 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'sessions.get' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'session_id')::uuid;
       IF NOT EXISTS (SELECT 1 FROM allgres_private.sessions WHERE session_id = v_id) THEN
         RETURN jsonb_build_object('ok', false, 'error', 'session_not_found');
