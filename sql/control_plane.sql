@@ -912,9 +912,18 @@ ALTER TABLE allgres_private.tasks
 -- the idempotent way to widen one -- CREATE TABLE IF NOT EXISTS won't touch
 -- an existing table, and there is no ALTER TABLE ... ADD VALUE for a plain
 -- CHECK the way there is for an enum type.
+-- 'waiting_children' (roadmap item 5): a task paused on await_children,
+-- exactly the same shape as 'waiting_human' -- excluded from
+-- fn_dispatch_tasks' own claim query (status IN ('queued','running') only),
+-- so it sits untouched until fn_watchdog's own sweep (see that function)
+-- finds every one of its children terminal and requeues it. Nothing here
+-- lives in worker memory: the dependency this represents (this task
+-- depends on its children finishing) is entirely a row in this table, so a
+-- worker or database restart loses none of it -- the next watchdog tick
+-- just finds the same row again.
 ALTER TABLE allgres_private.tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
 ALTER TABLE allgres_private.tasks ADD CONSTRAINT tasks_status_check CHECK (status IN
-  ('queued', 'running', 'completed', 'failed', 'waiting_human', 'cancelled'));
+  ('queued', 'running', 'completed', 'failed', 'waiting_human', 'cancelled', 'waiting_children'));
 
 CREATE INDEX IF NOT EXISTS tasks_ready_idx
   ON allgres_private.tasks (created_at)
@@ -1825,9 +1834,13 @@ Reply with a single JSON object, no markdown, no extra keys:
 {"action":"final_answer","answer":"..."}
 {"action":"execute_sql","sql":"SELECT ..."}
 {"action":"call_tool","tool":"...","args":{}}
-{"action":"delegate","agent_name":"...","input":{}}
+{"action":"delegate","agent_name":"...","input":{},"wait":false}
+{"action":"await_children"}
 {"action":"await_human","reason":"..."}
 SQL must be a single SELECT or WITH against schema-qualified views you were given.
+delegate's "wait" defaults to false (hand off and your turn ends); set it true to keep going instead of
+finishing, so you can delegate to more agents or later call await_children to pause until every agent you
+delegated to has finished, with what each one did visible on your next turn.
 $prompt$,
     -- Deliberately empty: a new agent has no provider/model until an
     -- operator configures one. Defaulting this to any real provider would
@@ -1966,7 +1979,7 @@ DECLARE
   v_answer text;
 BEGIN
   SELECT
-    count(*) FILTER (WHERE status IN ('queued', 'running', 'waiting_human')),
+    count(*) FILTER (WHERE status IN ('queued', 'running', 'waiting_human', 'waiting_children')),
     count(*) FILTER (WHERE status = 'failed')
   INTO v_open, v_failed
   FROM allgres_private.tasks
@@ -2074,7 +2087,7 @@ AS
     (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'queued') AS sql_queued,
     (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'in_flight') AS sql_in_flight,
     (SELECT count(*) FROM allgres_private.oauth_calls WHERE status = 'queued') AS oauth_queued,
-    (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued', 'running', 'waiting_human')) AS running_tasks,
+    (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued', 'running', 'waiting_human', 'waiting_children')) AS running_tasks,
     (SELECT count(*) FROM allgres_private.tasks WHERE status = 'failed' AND updated_at > now() - interval '24 hours') AS failed_tasks_24h,
     (SELECT count(*) FROM allgres_private.human_approvals WHERE status = 'pending') AS pending_approvals,
     (SELECT count(*) FROM allgres_private.agent_memories WHERE expires_at IS NOT NULL AND expires_at < now()) AS expired_memories_pending
@@ -2978,8 +2991,11 @@ BEGIN
       || v_views::text
       || E'\ntools: '
       || v_tools::text
-      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_human | propose_change | remember.'
+      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_children | await_human | propose_change | remember.'
       || E'\nFor numeric questions, execute_sql first. Do not invent keys.'
+      || E'\nawait_children: {"action":"await_children"} -- pauses this task until every task you have delegated'
+      || E' (however many, across however many turns) has finished; your next turn then sees what each one did.'
+      || E' Rejected if you have nothing pending to wait on.'
       || E'\npropose_change: {"action":"propose_change","changes":{"system_prompt":"..."},"reason":"..."}'
       || E' -- only system_prompt and llm_config.model/temperature/max_tokens may be proposed;'
       || E' an operator decides it later, it does not change your policy right now.'
@@ -3222,7 +3238,7 @@ BEGIN
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
     'final_answer', 'execute_sql', 'call_tool', 'delegate', 'search_agents', 'await_human', 'propose_change',
-    'remember', 'create_agent', 'propose_fix'
+    'remember', 'create_agent', 'propose_fix', 'await_children'
   ) THEN
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
@@ -3584,12 +3600,29 @@ BEGIN
       t.session_id, v_target, p_task_id, 'queued',
       COALESCE(v_parsed->'input', '{}'::jsonb), t.delegation_depth + 1
     ) RETURNING task_id INTO v_child;
-    UPDATE allgres_private.tasks
-    SET status = 'completed',
-        output = jsonb_build_object('child_task_id', v_child),
-        step_count = step_count + 1,
-        updated_at = now()
-    WHERE task_id = p_task_id;
+
+    -- Default (no "wait"): completely unchanged from before roadmap item 5
+    -- -- delegate is a one-shot hand-off, the parent's job ends the moment
+    -- the child is queued, and no caller of delegate written before this
+    -- (orchestrator's multi-mention routing, self_improve's cross-agent
+    -- proposals) is affected. "wait": true is the opt-in real dependency
+    -- edge: the parent stays 'running' instead of completing, so its next
+    -- turn can delegate again (fanning out to more children over further
+    -- turns, exactly like this one) or call the new await_children action
+    -- to actually pause until every child it has spawned so far is done --
+    -- see that action's own comment.
+    IF COALESCE((v_parsed->>'wait')::boolean, false) THEN
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+    ELSE
+      UPDATE allgres_private.tasks
+      SET status = 'completed',
+          output = jsonb_build_object('child_task_id', v_child),
+          step_count = step_count + 1,
+          updated_at = now()
+      WHERE task_id = p_task_id;
+    END IF;
     RETURN jsonb_build_object('action', 'continue', 'child_task_id', v_child);
   END IF;
 
@@ -3867,6 +3900,37 @@ BEGIN
     RETURN jsonb_build_object('action', 'wait');
   END IF;
 
+  -- Roadmap item 5: a real multi-agent task dependency edge. delegate
+  -- itself stays fire-and-forget (an agent may fan out to several
+  -- sub-agents across several turns, exactly as orchestrator already does
+  -- for parallel routing); await_children is the explicit synchronization
+  -- point -- pause until every one of this task's own children (however
+  -- many were delegated, across however many turns) reaches a terminal
+  -- state, then resume with what each one actually did. Rejected outright
+  -- when there is nothing to wait on, the same "don't let an agent block
+  -- itself on a mistake" reasoning search_agents_needs_query already
+  -- applies to a missing query.
+  IF v_action = 'await_children' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM allgres_private.tasks
+      WHERE parent_task_id = p_task_id AND status NOT IN ('completed', 'failed', 'cancelled')
+    ) THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'no_pending_children_to_await')
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    UPDATE allgres_private.tasks
+    SET status = 'waiting_children', step_count = step_count + 1, updated_at = now()
+    WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'wait');
+  END IF;
+
   RETURN jsonb_build_object('action', 'continue');
 END;
 $fn$;
@@ -4053,14 +4117,15 @@ BEGIN
     FOR UPDATE SKIP LOCKED
   LOOP
     -- max_concurrent_tasks caps how many of this agent's tasks may be
-    -- actively in a turn (running or waiting_human) at once; a 'queued' task
-    -- that hasn't started yet doesn't occupy a slot, it just waits longer.
-    -- Excluding t.task_id itself matters for a 'running' task continuing its
-    -- next turn: that's not a new slot, it already holds the one it's in.
+    -- actively in a turn (running, waiting_human, or waiting_children) at
+    -- once; a 'queued' task that hasn't started yet doesn't occupy a slot,
+    -- it just waits longer. Excluding t.task_id itself matters for a
+    -- 'running' task continuing its next turn: that's not a new slot, it
+    -- already holds the one it's in.
     IF (
       SELECT count(*) FROM allgres_private.tasks x
       WHERE x.agent_id = t.agent_id AND x.task_id <> t.task_id
-        AND x.status IN ('running', 'waiting_human')
+        AND x.status IN ('running', 'waiting_human', 'waiting_children')
     ) >= (SELECT max_concurrent_tasks FROM allgres_private.policies WHERE agent_id = t.agent_id) THEN
       CONTINUE;
     END IF;
@@ -4678,7 +4743,7 @@ BEGIN
     SELECT t.task_id, t.session_id, t.step_count
     FROM allgres_private.tasks t
     JOIN allgres_private.policies p USING (agent_id)
-    WHERE t.status IN ('running', 'waiting_human')
+    WHERE t.status IN ('running', 'waiting_human', 'waiting_children')
       AND p.max_turn_seconds IS NOT NULL
       AND t.started_at IS NOT NULL
       AND t.started_at < now() - make_interval(secs => p.max_turn_seconds)
@@ -4700,6 +4765,43 @@ BEGIN
     SET status = 'lost', updated_at = now()
     WHERE task_id = r.task_id AND status IN ('queued', 'in_flight');
     PERFORM allgres_private.maybe_complete_session(r.session_id);
+    n := n + 1;
+  END LOOP;
+
+  -- Roadmap item 5: the wake side of await_children. A task sitting in
+  -- 'waiting_children' resumes the moment every one of its own children
+  -- (parent_task_id = this task) has reached a terminal status -- checked
+  -- fresh on every tick, entirely from what is already in this table, so a
+  -- worker or database restart mid-wait loses nothing: the next tick just
+  -- finds the same row again. No timeout of its own here (unlike
+  -- human_approvals' expires_at above) -- a stuck child is caught by the
+  -- max_turn_seconds sweep just above, which applies to 'waiting_children'
+  -- exactly as it does to 'running'.
+  FOR r IN
+    SELECT t.task_id, t.step_count
+    FROM allgres_private.tasks t
+    WHERE t.status = 'waiting_children'
+      AND NOT EXISTS (
+        SELECT 1 FROM allgres_private.tasks c
+        WHERE c.parent_task_id = t.task_id
+          AND c.status NOT IN ('completed', 'failed', 'cancelled')
+      )
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    PERFORM allgres_private.append_log(
+      r.task_id, r.step_count + 1, 'tool',
+      jsonb_build_object('delegate_results', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'agent', ca.name, 'status', c.status, 'output', c.output, 'error', c.error
+        ) ORDER BY c.created_at)
+        FROM allgres_private.tasks c
+        JOIN allgres_private.agents ca ON ca.agent_id = c.agent_id
+        WHERE c.parent_task_id = r.task_id
+      ), '[]'::jsonb))
+    );
+    UPDATE allgres_private.tasks
+    SET status = 'queued', step_count = step_count + 1, updated_at = now()
+    WHERE task_id = r.task_id;
     n := n + 1;
   END LOOP;
 
@@ -5534,7 +5636,7 @@ BEGIN
   IF EXISTS (
     SELECT 1 FROM allgres_private.tasks
     WHERE session_id = p_session_id AND parent_task_id IS NULL
-      AND status IN ('queued', 'running', 'waiting_human')
+      AND status IN ('queued', 'running', 'waiting_human', 'waiting_children')
   ) THEN
     RAISE EXCEPTION 'this session has a turn still in progress -- wait for it to finish before sending another message'
       USING ERRCODE = 'P0001';
@@ -6344,7 +6446,8 @@ $fn$;
 
 -- The one control that was missing entirely: nothing could stop a runaway
 -- agent.  Cancels every open task in the session (queued/running/
--- waiting_human), rejects any pending approval so it doesn't linger, logs an
+-- waiting_human/waiting_children), rejects any pending approval so it
+-- doesn't linger, logs an
 -- operator message on each cancelled task so the thread shows why it stopped,
 -- and closes the session as 'cancelled' -- distinct from maybe_complete_session's
 -- 'completed'/'failed', which this deliberately bypasses: that function has
@@ -6367,7 +6470,7 @@ BEGIN
   FOR r IN
     SELECT task_id, step_count
     FROM allgres_private.tasks
-    WHERE session_id = p_session_id AND status IN ('queued', 'running', 'waiting_human')
+    WHERE session_id = p_session_id AND status IN ('queued', 'running', 'waiting_human', 'waiting_children')
     FOR UPDATE
   LOOP
     PERFORM allgres_private.append_log(r.task_id, r.step_count + 1, 'operator', to_jsonb(v_reason));
@@ -6487,7 +6590,7 @@ BEGIN
   FROM allgres_private.sessions s
   WHERE t.session_id = s.session_id
     AND s.goal LIKE 'selftest%'
-    AND t.status IN ('queued', 'running', 'waiting_human');
+    AND t.status IN ('queued', 'running', 'waiting_human', 'waiting_children');
   UPDATE allgres_private.sessions
   SET status = 'cancelled', completed_at = now()
   WHERE goal LIKE 'selftest%' AND status = 'open';
@@ -8387,6 +8490,20 @@ BEGIN
   ok := ok AND n_logs = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_expires_stale_task', 'ok', ok));
 
+  -- Roadmap item 5: max_turn_seconds reaches a task genuinely stuck in
+  -- 'waiting_children' the same way it reaches 'running'/'waiting_human' --
+  -- without this, a child that never finishes would let its parent wait
+  -- forever with no wall-clock bound at all.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest waiting_children_turn_timeout')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  UPDATE allgres_private.tasks
+  SET status = 'waiting_children', started_at = now() - interval '2 minutes'
+  WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_watchdog();
+  ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'failed';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_reaches_a_task_waiting_on_children', 'ok', ok));
+
   -- 22. A task still 'queued' -- e.g. held back by max_concurrent_tasks --
   --     has never run a turn, so started_at is still NULL for it and
   --     max_turn_seconds must leave it alone no matter how old created_at
@@ -8524,6 +8641,85 @@ BEGIN
   ok := ok AND (SELECT agent_id FROM allgres_private.tasks WHERE task_id = v_tid2) = v_deleg_b;
   ok := ok AND (SELECT delegation_depth FROM allgres_private.tasks WHERE task_id = v_tid2) = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'delegate_succeeds_within_budget', 'ok', ok));
+
+  -- Roadmap item 5: delegate's "wait" opt-in and await_children -- a real,
+  -- Postgres-resident multi-agent task dependency edge. Default delegate
+  -- (tested just above) is completely unchanged; this is the new path.
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest await_children_reject')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'await_children')
+  ));
+  ok := (sub->>'action') = 'continue'
+    AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'running';
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := ok AND (r->>'reason') = 'no_pending_children_to_await';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'await_children_rejects_with_no_pending_children', 'ok', ok));
+
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest delegate_wait_fan_out')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'delegate', 'agent_name', 'selftest_delegate_b', 'wait', true)
+  ));
+  v_tid2 := NULLIF(sub->>'child_task_id', '')::uuid;
+  ok := v_tid2 IS NOT NULL
+    AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'running';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'delegate_wait_true_keeps_parent_running_not_completed', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'await_children')
+  ));
+  ok := (sub->>'action') = 'wait'
+    AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'waiting_children';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'await_children_pauses_the_task', 'ok', ok));
+
+  -- A session must not look "done" while one of its tasks is genuinely
+  -- still waiting on its own children -- maybe_complete_session's own
+  -- open-task check.
+  ok := (SELECT status FROM allgres_private.sessions WHERE session_id = v_sid) = 'open';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'session_stays_open_while_a_task_awaits_children', 'ok', ok));
+
+  PERFORM allgres_public.fn_watchdog();
+  ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'waiting_children';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_does_not_wake_while_child_still_open', 'ok', ok));
+
+  PERFORM allgres_public.fn_next_step(v_tid2);
+  PERFORM allgres_public.fn_submit_result(v_tid2, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'selftest child result marker')
+  ));
+  PERFORM allgres_public.fn_watchdog();
+  ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'queued';
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid ORDER BY step_number DESC LIMIT 1;
+  ok := ok AND (r->'delegate_results')::text LIKE '%selftest child result marker%'
+    AND (r->'delegate_results'->0->>'agent') = 'selftest_delegate_b'
+    AND (r->'delegate_results'->0->>'status') = 'completed';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_wakes_parent_once_child_completes_with_results', 'ok', ok));
+
+  -- fn_cancel_session must reach a task genuinely stuck in
+  -- 'waiting_children' too, not just queued/running/waiting_human.
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest cancel_while_awaiting_children')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'delegate', 'agent_name', 'selftest_delegate_b', 'wait', true)
+  ));
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'await_children')
+  ));
+  ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'waiting_children';
+  PERFORM allgres_public.fn_cancel_session(v_sid, 'selftest cancel test');
+  ok := ok AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'cancelled';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'cancel_session_cancels_a_task_waiting_on_children', 'ok', ok));
 
   -- 25. build_llm_http fails closed on an unconfigured/disabled provider
   --     instead of silently substituting whichever other enabled provider
@@ -10796,7 +10992,7 @@ BEGIN
         'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active),
         'running_tasks', (
           SELECT count(*) FROM allgres_private.tasks t JOIN allgres_private.sessions s USING (session_id)
-          WHERE t.status IN ('queued','running','waiting_human') AND s.goal NOT LIKE 'selftest%'
+          WHERE t.status IN ('queued','running','waiting_human','waiting_children') AND s.goal NOT LIKE 'selftest%'
         ),
         'queued_outbound', (
           SELECT count(*) FROM allgres_private.outbound_calls o

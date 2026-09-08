@@ -484,6 +484,39 @@ only from Settings' Users section — the reverse direction of the same
 `user_agent_assignments` table, one pair at a time rather than replacing a
 user's whole list.
 
+## Task dependencies
+
+Roadmap item 5: `delegate` on its own is a one-shot, fire-and-forget hand-off
+— the moment a child task is queued, the parent task completes. That is
+still the default, unchanged, and is exactly what orchestrator's own
+multi-mention routing and self_improve's cross-agent proposals already rely
+on. `delegate` also now accepts `"wait": true`: instead of completing, the
+parent stays `running`, so its very next turn can delegate again (fanning
+out to more agents) or call the new `await_children` action — which pauses
+the task (`waiting_children`) until *every* task it has delegated, however
+many, reaches a terminal state, then resumes with what each one actually
+did (agent, status, output, error) appended to its own log. `await_children`
+is rejected outright if there is nothing pending to wait on.
+
+This is a real dependency edge, not a worker-memory illusion: the only
+state involved is `tasks.status = 'waiting_children'` and the ordinary
+`parent_task_id` link every delegated task already has. The wake side lives
+in `fn_watchdog` (already polled every tick) as a plain re-scan — "is any
+task `waiting_children` whose children are now all done" — so a worker or
+database restart mid-wait loses nothing; the next tick just finds the same
+row again. A `waiting_children` task counts toward `max_concurrent_tasks`
+and `max_turn_seconds` exactly like `running`/`waiting_human` do (a child
+that never finishes does not let its parent wait forever), and
+`fn_cancel_session` reaches it the same way too.
+
+Deliberately not in this slice: a single `delegate` call still spawns
+exactly one child, so a genuine fan-out to several agents at once takes
+several `wait: true` delegate calls across several of the parent's own
+turns before the one `await_children`, not one call naming a list of
+targets; and there is no dedicated dashboard view of the dependency graph
+itself yet — a paused task and its children are visible today the same way
+any other task is, through Audit → Sessions/Tasks.
+
 ## Semantic delegate search
 
 `delegate` has always required an agent to already know the exact
