@@ -19,13 +19,27 @@ services:
       ALLGRES_ENABLE_MOCK: ${ALLGRES_ENABLE_MOCK:-1}
       # Encrypts provider API keys at rest (needs pgcrypto, which the image has).
       ALLGRES_SECRET_KEY: ${ALLGRES_SECRET_KEY:-}
+      # Optional first-admin bootstrap (see 002-bootstrap-admin.sh and README,
+      # "Install flow"). Only takes effect on the very first boot of a new
+      # $PGDATA -- unset by default, so nothing changes unless both are set.
+      ALLGRES_BOOTSTRAP_ADMIN_USER: ${ALLGRES_BOOTSTRAP_ADMIN_USER:-}
+      ALLGRES_BOOTSTRAP_ADMIN_PASSWORD: ${ALLGRES_BOOTSTRAP_ADMIN_PASSWORD:-}
     ports:
       # Loopback only.  Change to "8088:8088" only behind a reverse proxy that
       # terminates TLS and authenticates.
       - "127.0.0.1:5432:5432"
       - "127.0.0.1:8088:8088"
+    volumes:
+      # Named, not anonymous: `docker compose down` (without -v) keeps this
+      # across a rebuild, `docker volume ls`/`inspect` can find it, and a
+      # physical backup (README, "Backup and restore") has a real mount point
+      # to read from instead of a volume nothing but Compose itself can name.
+      - allgres_pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 3s
       retries: 20
+
+volumes:
+  allgres_pgdata:

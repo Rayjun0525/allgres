@@ -125,6 +125,43 @@ curl http://127.0.0.1:8088/healthz
 ./scripts/smoke.sh      # full smoke + end-to-end + security checks
 ```
 
+## Install flow
+
+The pre-built image, an explicit named data volume, production-leaning
+defaults, first-admin creation, and a real provider round trip are one
+flow, not five separate steps an operator has to assemble by hand:
+
+```bash
+docker compose up -d --build       # allgres_pgdata is a named volume (docker-compose.yml),
+                                    # not an anonymous one -- `docker volume ls` finds it,
+                                    # and `docker compose down` (without -v) keeps it.
+./scripts/bootstrap.sh             # waits for healthy, makes sure a first admin exists,
+                                    # then runs one real agent task through to completion
+```
+
+`scripts/bootstrap.sh` is the install's actual completion criterion: a
+container reporting healthy only means PostgreSQL accepted a connection,
+not that an agent can do anything. Set `ALLGRES_BOOTSTRAP_ADMIN_USER`/
+`ALLGRES_BOOTSTRAP_ADMIN_PASSWORD` (read by `002-bootstrap-admin.sh`,
+which only ever runs once, the first time `$PGDATA` is initialized) to
+have a real admin ready to log in as when the container first comes up;
+leave them unset and the script proves the same flow with its own
+throwaway admin instead — either way, the same one-liner this project's
+own development has relied on all along (`psql -c "SELECT
+fn_create_user(...)"`) is still exactly what happens under the hood, just
+scripted instead of typed by hand. The final step — logging in, listing agents, running one
+(`AGENT_NAME`, default `analyst`) to a real goal, and polling until it
+reaches `completed` — is also the only real way to verify a *non-mock*
+provider actually works end to end: a task can only reach `completed` if
+the agent's configured provider genuinely answered, so pointing
+`AGENT_NAME` at an agent using a real provider turns this same script into
+that provider's connection check, not a separate one to run by hand.
+
+See [Extension installation](#extension-installation) for a bare-metal
+(non-Docker) install and version upgrades, and [Backup and
+restore](#backup-and-restore) for both backup strategies — both apply
+identically whichever way the extension got installed.
+
 ## Architecture
 
 ```text
@@ -1043,7 +1080,22 @@ extension does that a generic `pg_dump` would otherwise miss silently:
 cargo pgrx test --features pg17   # Rust unit tests (request parsing, auth, parse-tree reader)
 ./scripts/smoke.sh                # container smoke, end-to-end, and security checks
 psql -c "SELECT allgres_public.fn_selftest()"
+./scripts/bootstrap.sh            # install completion: a real agent task runs to 'completed'
 ```
+
+`fn_selftest` is a live diagnostic, not a fresh-install-only check: every
+fixture it creates is either uniquely named and hard-deleted before it
+returns, or left behind deactivated and hidden from every operator-facing
+listing by `goal LIKE 'selftest%'` (see `selftest_fixtures_hidden_not_deleted`
+in `sql/control_plane.sql`) — the same convention real accounts, real
+agents, real policy history, and real queued work all already rely on not
+being disturbed by. Run it against a database that has been in production
+for months exactly the same way as right after `CREATE EXTENSION allgres`;
+nothing in it assumes an empty install, an exact row count anywhere in the
+schema, or that no admin account exists yet (confirmed live: a full
+`fn_selftest()` pass with a real admin account, and real agent/session/task
+history already in the database, both taken before every commit that
+touches `sql/control_plane.sql`).
 
 `scripts/fault_injection_drill.sh` is a separate, runnable drill (bare-metal,
 like `scripts/backup_drill.sh`) that sends a real `SIGKILL` to the real
