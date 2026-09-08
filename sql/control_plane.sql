@@ -9882,6 +9882,102 @@ BEGIN
       'agent_id', v_sys_target, 'assigned', false
     ));
 
+    -- Roadmap item 3: history.search unions three sources -- an agent's own
+    -- explicit remember()s, a task's role='error' log entries (failures),
+    -- and a completed session's final_answer (decisions) -- and links every
+    -- result back to the session/task it came from. Scoped the same way
+    -- proposals.list/fixes.list are, and the same fix now applied to
+    -- memories.list below: it had no v_scope check at all before this, the
+    -- one listing on this table that hadn't picked up that pattern.
+    DELETE FROM allgres_private.agent_memories WHERE agent_id = v_sys_target;
+    PERFORM allgres_private.write_memory(
+      v_sys_target, 'selftest history marker mem 9f3a', 'semantic', '0.8', NULL, NULL
+    );
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_admin_tok, 'query', 'history marker mem 9f3a'
+    ));
+    ok := (sub->'results')::text LIKE '%history marker mem 9f3a%'
+      AND (sub->'results')::text LIKE '%"source": "memory"%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_search_finds_a_memory_as_admin', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'history.search', 'session_token', v_admin_tok, 'query', ''));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_search_requires_query', 'ok', ok));
+
+    -- v_sys_target is unassigned again right above this point -- a regular
+    -- user must see neither its memory nor it via memories.list.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_user_tok, 'query', 'history marker mem 9f3a'
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false) AND sub->'results' = '[]'::jsonb;
+    r := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.list', 'session_token', v_user_tok, 'agent_id', v_sys_target::text
+    ));
+    ok := ok AND r->'memories' = '[]'::jsonb;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_and_memories_hide_unassigned_agent_from_regular_user', 'ok', ok));
+
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.toggle', 'session_token', v_admin_tok,
+      'user_id', (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'),
+      'agent_id', v_sys_target, 'assigned', true
+    ));
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_user_tok, 'query', 'history marker mem 9f3a'
+    ));
+    r := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.list', 'session_token', v_user_tok, 'agent_id', v_sys_target::text
+    ));
+    ok := (sub->'results')::text LIKE '%history marker mem 9f3a%'
+      AND (r->'memories')::text LIKE '%history marker mem 9f3a%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_and_memories_show_assigned_agent_to_regular_user', 'ok', ok));
+
+    -- Restored to unassigned so a later run (or a later test in this same
+    -- run) that assumes v_sys_target starts unassigned still holds.
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.toggle', 'session_token', v_admin_tok,
+      'user_id', (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'),
+      'agent_id', v_sys_target, 'assigned', false
+    ));
+    DELETE FROM allgres_private.agent_memories WHERE agent_id = v_sys_target;
+
+    -- A failure/decision fixture with a goal that does NOT start with
+    -- 'selftest' -- that prefix is what every operator-facing listing
+    -- (history.search included) hides on purpose (selftest_fixtures_hidden_
+    -- not_deleted, above), so a 'selftest ...' goal here would make its own
+    -- matches invisible to the very search being tested. Reused by goal
+    -- across reruns, the same way selftest_httpreq_agent is reused by name,
+    -- since its real execution_logs can never be hard-deleted afterward.
+    SELECT s.session_id, t.task_id INTO v_sid, v_tid
+    FROM allgres_private.sessions s
+    JOIN allgres_private.tasks t ON t.session_id = s.session_id
+    WHERE s.agent_id = v_agent AND s.goal = 'history_search_test_fixture'
+    LIMIT 1;
+    IF v_sid IS NULL THEN
+      v_sid := (allgres_public.fn_create_session(v_agent, 'history_search_test_fixture')->>'session_id')::uuid;
+      SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+      PERFORM allgres_public.fn_next_step(v_tid);
+      PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+        'type', 'llm_response', 'content', '{}',
+        'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'selftest history marker decision 7c2e')
+      ));
+      PERFORM allgres_private.append_log(v_tid, 999, 'error', jsonb_build_object('message', 'selftest history marker failure 4b1d'));
+    END IF;
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_admin_tok, 'query', 'history marker decision 7c2e'
+    ));
+    ok := (sub->'results')::text LIKE '%"source": "decision"%'
+      AND (sub->'results')::text LIKE '%history marker decision 7c2e%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_search_finds_a_session_decision', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_admin_tok, 'query', 'history marker failure 4b1d'
+    ));
+    ok := (sub->'results')::text LIKE '%"source": "failure"%'
+      AND (sub->'results')::text LIKE '%history marker failure 4b1d%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_search_finds_a_task_failure', 'ok', ok));
+
     -- 36. Overview's cluster monitoring (item 44): PostgreSQL version and
     -- this cluster's own pg_stat_activity counts (SQL-visible) alongside
     -- native_host_stats (OS-level CPU load/memory, not SQL-visible at
@@ -11108,6 +11204,12 @@ BEGIN
     -- Optional agent_id filter, the same shape tasks.list's own optional
     -- limit uses: present -> scoped, absent -> every agent's memories.
     WHEN 'memories.list' THEN
+      -- Scoped the same way proposals.list/fixes.list are: NULL (admin) sees
+      -- every agent's memories, a regular user only their assigned agents'
+      -- -- this was reachable for any agent_id before, regardless of who was
+      -- asking, the one listing on this table that hadn't picked up the
+      -- v_scope pattern already applied elsewhere.
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'memories', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.importance DESC, q.created_at DESC)
         FROM (
@@ -11116,8 +11218,9 @@ BEGIN
                  m.created_at, m.last_accessed_at, m.expires_at
           FROM allgres_private.agent_memories m
           JOIN allgres_private.agents a USING (agent_id)
-          WHERE NULLIF(p_request->>'agent_id', '') IS NULL
-             OR m.agent_id = (p_request->>'agent_id')::uuid
+          WHERE (NULLIF(p_request->>'agent_id', '') IS NULL
+             OR m.agent_id = (p_request->>'agent_id')::uuid)
+            AND (v_scope IS NULL OR m.agent_id = ANY(v_scope))
           ORDER BY m.importance DESC, m.created_at DESC
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
         ) q
@@ -11135,6 +11238,80 @@ BEGIN
 
     WHEN 'memories.remove' THEN
       RETURN allgres_public.fn_forget((p_request->>'memory_id')::uuid);
+
+    -- Roadmap item 3: search past work/decisions/failures, instead of only
+    -- ever seeing an agent's most-important-first memory list or paging
+    -- through raw execution logs one session at a time. Three sources,
+    -- unioned and ordered by recency, each linking back to the session/task
+    -- it came from so the dashboard can jump straight to it:
+    --   memory   -- an agent's own explicit `remember`s
+    --   failure  -- a task's role='error' log entries
+    --   decision -- a completed session's final_answer
+    -- `simple` (not `english`) tsvector config: this content is as likely to
+    -- be Korean as English, and `simple` only lowercases/tokenizes, it does
+    -- not assume an English stemmer -- ORed with a plain ILIKE substring
+    -- match so a short query or one stemming can't help still finds
+    -- something. Scoped exactly like memories.list above; p_agent_id/
+    -- p_project_id (a session's project) narrow further when given.
+    WHEN 'history.search' THEN
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
+      IF NULLIF(trim(p_request->>'query'), '') IS NULL THEN
+        RETURN jsonb_build_object('ok', false, 'error', 'query_required');
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'results', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
+        FROM (
+          SELECT * FROM (
+            SELECT 'memory' AS source, m.memory_id AS ref_id, m.agent_id, a.name AS agent,
+                   m.source_session_id AS session_id, m.source_task_id AS task_id,
+                   m.memory_type AS kind, left(m.content, 400) AS snippet, m.created_at
+            FROM allgres_private.agent_memories m
+            JOIN allgres_private.agents a USING (agent_id)
+            LEFT JOIN allgres_private.sessions se ON se.session_id = m.source_session_id
+            WHERE (to_tsvector('simple', m.content) @@ plainto_tsquery('simple', p_request->>'query')
+                   OR m.content ILIKE '%' || (p_request->>'query') || '%')
+              AND (v_scope IS NULL OR m.agent_id = ANY(v_scope))
+              AND (NULLIF(p_request->>'agent_id', '') IS NULL OR m.agent_id = (p_request->>'agent_id')::uuid)
+              AND (NULLIF(p_request->>'project_id', '') IS NULL OR se.project_id = (p_request->>'project_id')::uuid)
+              AND COALESCE(se.goal, '') NOT LIKE 'selftest%'
+
+            UNION ALL
+
+            SELECT 'failure' AS source, l.log_id AS ref_id, t.agent_id, a.name AS agent,
+                   t.session_id, l.task_id, 'error' AS kind,
+                   left(l.content::text, 400) AS snippet, l.created_at
+            FROM allgres_private.execution_logs l
+            JOIN allgres_private.tasks t ON t.task_id = l.task_id
+            JOIN allgres_private.agents a ON a.agent_id = t.agent_id
+            JOIN allgres_private.sessions se ON se.session_id = t.session_id
+            WHERE l.role = 'error'
+              AND (to_tsvector('simple', l.content::text) @@ plainto_tsquery('simple', p_request->>'query')
+                   OR l.content::text ILIKE '%' || (p_request->>'query') || '%')
+              AND (v_scope IS NULL OR t.agent_id = ANY(v_scope))
+              AND (NULLIF(p_request->>'agent_id', '') IS NULL OR t.agent_id = (p_request->>'agent_id')::uuid)
+              AND (NULLIF(p_request->>'project_id', '') IS NULL OR se.project_id = (p_request->>'project_id')::uuid)
+              AND se.goal NOT LIKE 'selftest%'
+
+            UNION ALL
+
+            SELECT 'decision' AS source, se.session_id AS ref_id, se.agent_id, a.name AS agent,
+                   se.session_id, NULL::uuid AS task_id, se.status AS kind,
+                   left(se.final_answer, 400) AS snippet,
+                   COALESCE(se.completed_at, se.started_at) AS created_at
+            FROM allgres_private.sessions se
+            JOIN allgres_private.agents a ON a.agent_id = se.agent_id
+            WHERE se.final_answer IS NOT NULL
+              AND (to_tsvector('simple', se.final_answer) @@ plainto_tsquery('simple', p_request->>'query')
+                   OR se.final_answer ILIKE '%' || (p_request->>'query') || '%')
+              AND (v_scope IS NULL OR se.agent_id = ANY(v_scope))
+              AND (NULLIF(p_request->>'agent_id', '') IS NULL OR se.agent_id = (p_request->>'agent_id')::uuid)
+              AND (NULLIF(p_request->>'project_id', '') IS NULL OR se.project_id = (p_request->>'project_id')::uuid)
+              AND se.goal NOT LIKE 'selftest%'
+          ) u
+          ORDER BY u.created_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 30), 1), 200)
+        ) q
+      ), '[]'::jsonb));
 
     WHEN 'audit.list' THEN
       RETURN jsonb_build_object('ok', true, 'entries', COALESCE((

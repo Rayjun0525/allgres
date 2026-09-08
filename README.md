@@ -244,6 +244,16 @@ dashboard page (`fn_remember`/`fn_forget`, exposed as `memories.create`/
 telling it something once rather than waiting for it to learn the fact
 itself.
 
+The same page's **Search history** panel (`history.search`) searches past
+work, decisions, and failures across three sources at once — an agent's own
+explicit memories, a task's `role='error'` log entries, and a completed
+session's `final_answer` — and every result links back to the session/task
+it came from. It is a plain PostgreSQL text search (`tsvector`/`ILIKE`, the
+`simple` config so it works on non-English content too), not a vector
+search, and is scoped exactly like `memories.list`: a regular user sees only
+their own assigned agents' history, an admin sees everything, and either can
+narrow further to one agent or one project.
+
 Deliberately not in this slice: semantic (embedding/vector) search — recall
 is importance/recency ranking over structured rows only, no `pgvector`
 dependency; an explicit `recall` action for an agent to query beyond what is
