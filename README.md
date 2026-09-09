@@ -125,6 +125,50 @@ curl http://127.0.0.1:8088/healthz
 ./scripts/smoke.sh      # full smoke + end-to-end + security checks
 ```
 
+## Install flow
+
+The pre-built image, an explicit named data volume, production-leaning
+defaults, first-admin creation, and a real provider round trip are one
+flow, not five separate steps an operator has to assemble by hand:
+
+```bash
+docker compose up -d --build       # allgres_pgdata is a named volume (docker-compose.yml),
+                                    # not an anonymous one -- `docker volume ls` finds it,
+                                    # and `docker compose down` (without -v) keeps it.
+./scripts/bootstrap.sh             # waits for healthy, makes sure a first admin exists,
+                                    # then runs one real agent task through to completion
+```
+
+`scripts/bootstrap.sh` is the install's actual completion criterion: a
+container reporting healthy only means PostgreSQL accepted a connection,
+not that an agent can do anything. Set `ALLGRES_BOOTSTRAP_ADMIN_USER`/
+`ALLGRES_BOOTSTRAP_ADMIN_PASSWORD` (read by `002-bootstrap-admin.sh`,
+which only ever runs once, the first time `$PGDATA` is initialized) to
+have a real admin ready to log in as when the container first comes up;
+leave them unset and the script proves the same flow with its own
+throwaway admin instead — either way, the same one-liner this project's
+own development has relied on all along (`psql -c "SELECT
+fn_create_user(...)"`) is still exactly what happens under the hood, just
+scripted instead of typed by hand. The final step — logging in, listing agents, running one
+(`AGENT_NAME`, default `analyst`) to a real goal, and polling until it
+reaches `completed` — is also the only real way to verify a *non-mock*
+provider actually works end to end: a task can only reach `completed` if
+the agent's configured provider genuinely answered, so pointing
+`AGENT_NAME` at an agent using a real provider turns this same script into
+that provider's connection check, not a separate one to run by hand.
+The script then goes further than a bare install check: it makes a real
+`agents.update` config change (`max_steps`) and swaps the agent's model,
+confirms both actually persisted, and runs a second real task afterward to
+prove the changed config didn't break execution — roadmap item 9's
+"설정 변경, 모델 교체" (config change, model swap) scenarios, exercised over
+real HTTP with a real session token, not only at the `fn_selftest`/SQL
+level.
+
+See [Extension installation](#extension-installation) for a bare-metal
+(non-Docker) install and version upgrades, and [Backup and
+restore](#backup-and-restore) for both backup strategies — both apply
+identically whichever way the extension got installed.
+
 ## Architecture
 
 ```text
@@ -149,6 +193,33 @@ queues, retries, audit logs, and dashboard operations remain in PostgreSQL.
 Outbound HTTP runs on pool threads, so the SPI thread stays free for the
 dashboard: an in-flight LLM call no longer blocks `/api/v1/*`. All SQL issued
 from Rust uses bound parameters; nothing concatenates a value into a statement.
+
+### Everything the dashboard does, `psql` can do too
+
+`allgres.dashboard_rpc(jsonb)` is the *only* thing the web layer calls into
+PostgreSQL for — the browser and `/api/v1/*` are one client of it, not a
+privileged one. Every mutation it exposes is a thin, gate-then-delegate
+wrapper around a plain PL/pgSQL function (`fn_create_agent`,
+`fn_set_policy`, `fn_create_provider`, `fn_grant_permission`,
+`fn_set_user_active`, ...) that takes typed arguments, not a jsonb request
+body — the same function an operator can call directly from `psql` with no
+HTTP, no dashboard, and no JSON in sight, exactly the way this project's
+own development creates its very first admin account
+(`psql -c "SELECT fn_create_user(...)"`, see [Install
+flow](#install-flow)). `dashboard_rpc`'s own job is strictly session
+resolution, admin gating, and the operator audit log entry — never logic a
+direct SQL caller would be missing out on. A handful of mutations
+(`users.set_active`/`set_role`, a user's agent assignments) used to be the
+exception, with their real `UPDATE`/`INSERT`/`DELETE` written inline in
+`dashboard_rpc` itself and reachable only through the jsonb envelope;
+`fn_set_user_active`/`fn_set_user_role`/`fn_set_user_assignments`/
+`fn_set_user_assignment` closed that gap, each verified live with a plain
+`SELECT` and no `dashboard_rpc` call anywhere in the session. Read-only
+listings (`agents.list`, `sessions.list`, `overview`, ...) are the one
+deliberate exception to "wrapped in a function": they're ad hoc queries
+shaped for the API response, and an operator wanting the same data via SQL
+can just query the underlying tables directly — that's more SQL-native
+than calling a read wrapper, not less.
 
 ## The SQL sandbox
 
@@ -244,6 +315,16 @@ dashboard page (`fn_remember`/`fn_forget`, exposed as `memories.create`/
 telling it something once rather than waiting for it to learn the fact
 itself.
 
+The same page's **Search history** panel (`history.search`) searches past
+work, decisions, and failures across three sources at once — an agent's own
+explicit memories, a task's `role='error'` log entries, and a completed
+session's `final_answer` — and every result links back to the session/task
+it came from. It is a plain PostgreSQL text search (`tsvector`/`ILIKE`, the
+`simple` config so it works on non-English content too), not a vector
+search, and is scoped exactly like `memories.list`: a regular user sees only
+their own assigned agents' history, an admin sees everything, and either can
+narrow further to one agent or one project.
+
 Deliberately not in this slice: semantic (embedding/vector) search — recall
 is importance/recency ranking over structured rows only, no `pgvector`
 dependency; an explicit `recall` action for an agent to query beyond what is
@@ -252,6 +333,37 @@ already injected automatically; and row-level security on
 `SECURITY DEFINER` function's own `agent_id` parameter rather than Postgres
 RLS (see "Per-agent roles" below for the one place RLS is actually used
 today).
+
+## Procedures
+
+Roadmap item 4: a **procedure** (`allgres_private.procedures`) is a named,
+versioned, reusable "how to do X" an operator curates once from the
+**Settings → Procedures** panel — free text: a checklist, a SQL template, a
+delegation plan, whatever shape is useful. It is distinct from a memory in
+every way that matters here: shared rather than private to one agent,
+explicitly granted rather than automatically written, and versioned —
+`fn_set_procedure` snapshots the previous content into `procedure_history`
+only on an actual change (the same "only a real change bumps generation"
+rule `fn_set_policy` already applies to an agent's own policy), and
+`fn_rollback_procedure` restores a past version by creating a *new* one
+that happens to match it, the same non-destructive shape `fn_rollback_policy`
+uses — nothing is ever overwritten in place.
+
+An agent sees a procedure's current content in its own prompt, on every
+turn, only once granted the matching permission — `resource_type =
+'procedure'`, `resource_ref = '<name>'` — through the exact same
+`agent_has_permission`/`agent_permission_refs` machinery (inheritance
+through a system agent's parent chain included) that already gates a view
+or a tool. A disabled procedure (`is_active = false`) never shows even to
+an agent holding the grant, the same way a disabled `llm_providers` row
+stops being reachable without losing its history.
+
+Deliberately not in this slice: no agent-authored procedures yet — an
+operator is the only one who can create, edit, or roll one back today.
+Letting an agent *propose* a new or improved procedure (through the same
+admin_approval/self_approve/auto autonomy-level flow `propose_change`
+already gives an agent for its own policy) is real future work, not done
+here.
 
 ## Maintenance agents
 
@@ -443,6 +555,127 @@ only from Settings' Users section — the reverse direction of the same
 `user_agent_assignments` table, one pair at a time rather than replacing a
 user's whole list.
 
+## Task dependencies
+
+Roadmap item 5: `delegate` on its own is a one-shot, fire-and-forget hand-off
+— the moment a child task is queued, the parent task completes. That is
+still the default, unchanged, and is exactly what orchestrator's own
+multi-mention routing and self_improve's cross-agent proposals already rely
+on. `delegate` also now accepts `"wait": true`: instead of completing, the
+parent stays `running`, so its very next turn can delegate again (fanning
+out to more agents) or call the new `await_children` action — which pauses
+the task (`waiting_children`) until *every* task it has delegated, however
+many, reaches a terminal state, then resumes with what each one actually
+did (agent, status, output, error) appended to its own log. `await_children`
+is rejected outright if there is nothing pending to wait on.
+
+This is a real dependency edge, not a worker-memory illusion: the only
+state involved is `tasks.status = 'waiting_children'` and the ordinary
+`parent_task_id` link every delegated task already has. The wake side lives
+in `fn_watchdog` (already polled every tick) as a plain re-scan — "is any
+task `waiting_children` whose children are now all done" — so a worker or
+database restart mid-wait loses nothing; the next tick just finds the same
+row again. A `waiting_children` task counts toward `max_concurrent_tasks`
+and `max_turn_seconds` exactly like `running`/`waiting_human` do (a child
+that never finishes does not let its parent wait forever), and
+`fn_cancel_session` reaches it the same way too.
+
+Deliberately not in this slice: a single `delegate` call still spawns
+exactly one child, so a genuine fan-out to several agents at once takes
+several `wait: true` delegate calls across several of the parent's own
+turns before the one `await_children`, not one call naming a list of
+targets; and there is no dedicated dashboard view of the dependency graph
+itself yet — a paused task and its children are visible today the same way
+any other task is, through Audit → Sessions/Tasks.
+
+## Schedules
+
+Roadmap item 6: a schedule (Settings → Schedules) runs an agent against a
+goal on a recurring interval — each firing calls `fn_create_session` exactly
+as if an operator had typed the goal in by hand, so a fired run is an
+ordinary session, visible and inspectable the same way any other one is
+(Audit → Sessions). Firing is a plain `next_run_at <= now()` poll
+(`fn_run_schedules`, called from `fn_pump` alongside `fn_watchdog`/
+`fn_dispatch_tasks`) — no `pg_cron` or other external scheduler, and no
+state held in worker memory, so a worker or database restart between ticks
+loses nothing: the next tick just finds the same due row. A schedule that
+missed several intervals (the extension was down, or simply never got a
+tick) fires once to catch up, never in a burst — `next_run_at` is always
+recomputed as `now() + interval_seconds`, never by walking forward in fixed
+steps from where it was.
+
+A schedule's own `name`/`goal` plus its `run_count`/`last_run_at`/
+`last_session_id` *are* the durable long-term-goal-tracking record — how
+many times has this actually been checked on, most recently when, against
+which session — queryable in PostgreSQL like everything else here, not a
+separate concept kept anywhere else. Two independent, optional stop
+conditions — `max_runs` (a run budget) and `ends_at` (a wall-clock deadline)
+— are enforced on every tick, not only at create time: a schedule that
+reaches either is deactivated (`is_active = false`) rather than fired one
+run past the limit. `schedules.run_now` fires one immediately regardless of
+`next_run_at`, still subject to both stop conditions — the closest thing in
+this slice to a genuinely event-driven trigger (an operator, or an external
+system calling the same RPC action, is the "event").
+
+Deliberately not in this slice: a real *cost*-based stop condition (a
+dollar or token budget) — nothing in this codebase parses token usage out
+of an LLM response or prices a provider/model today, so a cost cap would
+only ever compare against a number nothing populates; and a genuinely
+event/webhook-triggered schedule (fired by an external condition, not a
+timer or a manual call) — `schedules.run_now` covers the manual case today,
+a real inbound trigger is future work.
+
+## Evaluation-gated self-improvement
+
+Roadmap item 7: every prior slice let `self_improve` (or an operator)
+change an agent's policy, but nothing ever recorded whether that change
+actually helped. `agent_recent_success_rate(agent_id, limit=20)` is the
+underlying signal — the completed/failed ratio over an agent's most recent
+root-level tasks only (`parent_task_id IS NULL`), so a delegated child's own
+outcome never blurs the delegating agent's own score, and it deliberately
+returns `NULL` (not `0`) when there is no evaluable data yet, so a brand
+new agent is never read as "0% success." It also excludes any session whose
+`goal LIKE 'selftest%'`, the same convention every other operator-facing
+count in this file already applies to `fn_selftest`'s own fixtures.
+
+`fn_set_policy` now stamps every archived version with this rate, in
+`policy_history.success_rate_at_change`, at the exact moment it is
+overwritten — so "how was this agent actually doing right before this
+change was made" is a real historical fact attached to that row, not
+something recomputed later from a moving window. `fn_evaluate_last_change
+(agent_id)` compares that snapshot against the agent's *current* rate and
+returns one of five verdicts: `improved`, `regressed`, `unchanged`,
+`insufficient_data` (either side is `NULL`), or `no_change_recorded_yet`
+(the agent has never had a policy change at all). `v_agent_health` is the
+same permission-gated shape as `v_system_health`, one row per agent
+instead of a single aggregate, and `self_improve` is granted read access
+to it by default (both at seed time and, for an existing install, via an
+unconditional grant so upgrading picks it up too). `self_improve`'s system
+prompt now points it at both `v_agent_health` and `fn_evaluate_last_change`
+so it can check the outcome of its own prior proposals before making a new
+one.
+
+Both are exposed read-only, the same way `policy.history` already is:
+`dashboard_rpc` action `agents.evaluate` (wraps `fn_evaluate_last_change`
+directly) and the extended `policy.history` output (`success_rate_at_change`
+per version). The Agents page's edit modal has a new "Evaluate last
+change" button next to History that shows the verdict and both rates, and
+the History modal itself now shows each version's `success_rate_at_change`
+inline.
+
+Deliberately not in this slice: a mechanical block on `self_improve`
+proposing a change (e.g. refusing a new proposal until the last one shows
+`improved`) — `self_improve`'s stated purpose is token/time cost, not
+correctness, and a hard gate on that basis would be enforcing something
+this feature was never meant to guarantee. This makes a change's outcome
+*evaluable*, not automatically enforced: no automatic rollback on
+`regressed` either, only a computed verdict for a human, or a future
+`self_improve` turn reading its own history, to act on. A real cost-based
+signal (tokens or dollars per change) is the same deferred item Schedules
+above already named — nothing in this codebase prices a provider or parses
+token usage out of a response yet, so a cost dimension here would only
+ever compare against a number nothing populates.
+
 ## Semantic delegate search
 
 `delegate` has always required an agent to already know the exact
@@ -585,8 +818,8 @@ source IPs; it is one layer, not a substitute for a real token.
 
 ### Outbound requests (SSRF)
 
-One guard covers every outbound path — the LLM endpoint, the `http_get` tool,
-and the OAuth token exchange:
+One guard covers every outbound path — the LLM endpoint, the `http_get` and
+`http_request` tools, and the OAuth token exchange:
 
 - `https` only, unless the provider is explicitly marked
   `allow_private_network`;
@@ -596,7 +829,16 @@ and the OAuth token exchange:
 - URLs containing `userinfo@host` are rejected outright rather than parsed;
 - the HTTP client follows **zero** redirects, so an allowlisted host cannot
   redirect into an internal one;
-- `http_get` additionally requires a per-agent `http_host` permission;
+- `http_get`/`http_request` additionally require a per-agent `http_host`
+  permission for the target host;
+- `http_request` adds method (GET/POST/PUT/PATCH/DELETE), headers, and a
+  body, plus an optional named `allgres_private.api_connections` credential
+  (Settings → API connections). A connection's secret is resolved and
+  injected only at claim time, the same as an LLM provider's api_key — it is
+  never written into `outbound_calls.request_headers`. When a connection is
+  named, the agent supplies a path relative to that connection's own
+  `base_url`, never a full URL, so a stored credential can never be sent to
+  a host the agent chooses;
 - every one of these checks so far is against the URL's host **string**,
   which says nothing about where DNS actually points it: a hostname that
   resolves to a public address when the agent's request is validated can
@@ -872,7 +1114,22 @@ extension does that a generic `pg_dump` would otherwise miss silently:
 cargo pgrx test --features pg17   # Rust unit tests (request parsing, auth, parse-tree reader)
 ./scripts/smoke.sh                # container smoke, end-to-end, and security checks
 psql -c "SELECT allgres_public.fn_selftest()"
+./scripts/bootstrap.sh            # install completion: a real agent task runs to 'completed'
 ```
+
+`fn_selftest` is a live diagnostic, not a fresh-install-only check: every
+fixture it creates is either uniquely named and hard-deleted before it
+returns, or left behind deactivated and hidden from every operator-facing
+listing by `goal LIKE 'selftest%'` (see `selftest_fixtures_hidden_not_deleted`
+in `sql/control_plane.sql`) — the same convention real accounts, real
+agents, real policy history, and real queued work all already rely on not
+being disturbed by. Run it against a database that has been in production
+for months exactly the same way as right after `CREATE EXTENSION allgres`;
+nothing in it assumes an empty install, an exact row count anywhere in the
+schema, or that no admin account exists yet (confirmed live: a full
+`fn_selftest()` pass with a real admin account, and real agent/session/task
+history already in the database, both taken before every commit that
+touches `sql/control_plane.sql`).
 
 `scripts/fault_injection_drill.sh` is a separate, runnable drill (bare-metal,
 like `scripts/backup_drill.sh`) that sends a real `SIGKILL` to the real
@@ -881,8 +1138,26 @@ call are genuinely in flight, and proves the whole claim → crash → recovery
 → `fn_watchdog` reclaim → automatic retry → completion cycle happens on its
 own — not a `fn_selftest` case, since that would need a SQL function to kill
 its own OS process. It kills and restarts the entire instance it is pointed
-at, on purpose; never run it against anything serving real traffic. See
-KNOWN_ISSUES.md, item 26.
+at, on purpose; never run it against anything serving real traffic — a
+GitHub-hosted CI runner is exactly the disposable instance this warning
+allows, so `fault-injection-drill` in `.github/workflows/ci.yml` runs it on
+every push, covering roadmap item 9's "재시작, 재시도" (restart, retry)
+scenarios the same way `docker-smoke` covers "계정 생성 후 사용, 설정 변경,
+모델 교체" (account-creation-then-use, config change, model swap) via
+`scripts/bootstrap.sh`. See KNOWN_ISSUES.md, item 26.
+
+The one named scenario deliberately not automated: "업그레이드" (upgrade).
+`scripts/gen-upgrade.sh` and `ALTER EXTENSION ... UPDATE` are real and
+manually verified (KNOWN_ISSUES.md, item 18), but there is currently no
+real *next* version to upgrade the checked-in schema to — the version was
+deliberately reset to `0.1.0` with no release ever shipped under it (see
+KNOWN_ISSUES.md's own note on version numbers), so a CI job exercising
+"upgrade" today would have to invent a fake target version and compare
+against it, the same faking-a-metric-with-no-real-data problem this
+project has refused elsewhere (see [Evaluation-gated
+self-improvement](#evaluation-gated-self-improvement)'s own deferred-scope
+note). This becomes real, automatable CI coverage the moment an actual
+version is released and a second one begins development against it.
 
 ## License
 

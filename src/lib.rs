@@ -997,15 +997,40 @@ fn perform_http(call: &Value) -> (i32, String) {
     );
 
     let outcome = if kind == "tool" {
-        let mut req = agent.get(url);
-        if let Some(h) = headers {
-            for (k, v) in h {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+        // http_get always queued "GET" here (the column defaults to it); the
+        // 'http_request' tool is the first caller that ever queues anything
+        // else. GET/DELETE take no body (ureq's WithoutBody builder has no
+        // send_json at all); POST/PUT/PATCH always send one, defaulting to
+        // an empty JSON object when the SQL layer didn't attach a real body.
+        let method = call.get("method").and_then(Value::as_str).unwrap_or("GET").to_ascii_uppercase();
+        match method.as_str() {
+            "POST" | "PUT" | "PATCH" => {
+                let mut req = match method.as_str() {
+                    "POST" => agent.post(url),
+                    "PUT" => agent.put(url),
+                    _ => agent.patch(url),
+                };
+                if let Some(h) = headers {
+                    for (k, v) in h {
+                        if let Some(s) = v.as_str() {
+                            req = req.header(k, s);
+                        }
+                    }
                 }
+                req.send_json(&body)
+            }
+            _ => {
+                let mut req = if method == "DELETE" { agent.delete(url) } else { agent.get(url) };
+                if let Some(h) = headers {
+                    for (k, v) in h {
+                        if let Some(s) = v.as_str() {
+                            req = req.header(k, s);
+                        }
+                    }
+                }
+                req.call()
             }
         }
-        req.call()
     } else if kind == "oauth" {
         // An OAuth token endpoint expects a standard form submission, not
         // JSON (RFC 6749 4.1.3). send_form sets its own content-type header
@@ -1700,8 +1725,22 @@ fn api_route(cfg: &WebConfig, r: &HttpRequest) -> Option<Value> {
             b["action"] = json!("run");
             Some(rpc(cfg, &b))
         }
-        ("GET", "/api/v1/tasks") => Some(rpc(cfg, &json!({"action": "tasks.list", "limit": 200}))),
-        ("GET", "/api/v1/logs") => Some(rpc(cfg, &json!({"action": "logs.list", "limit": 250}))),
+        // Both admin-only monitoring views (dashboard_rpc gates them with
+        // require_admin_if_accounts_exist). Unlike the POST-based legacy
+        // routes above, a GET here carries no body for the browser to put
+        // session_token in -- read from a header instead of a query
+        // string, which would otherwise land the token in server access
+        // logs, browser history, and the Referer header, the same
+        // long-lived-credential-in-a-URL concern /api/v1/events' own
+        // ticket system exists to avoid.
+        ("GET", "/api/v1/tasks") => Some(rpc(cfg, &json!({
+            "action": "tasks.list", "limit": 200,
+            "session_token": r.header("x-allgres-session")
+        }))),
+        ("GET", "/api/v1/logs") => Some(rpc(cfg, &json!({
+            "action": "logs.list", "limit": 250,
+            "session_token": r.header("x-allgres-session")
+        }))),
         ("GET", "/api/v1/settings") => Some(rpc(cfg, &json!({"action": "settings.get"}))),
         ("POST", "/api/v1/selftest") => Some(rpc(cfg, &json!({"action": "selftest"}))),
         ("POST", "/api/v1/settings/provider") => {

@@ -37,6 +37,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends postgresql-17-p
 RUN printf "shared_preload_libraries = 'allgres'\n" > /etc/postgresql-allgres.conf
 COPY docker-entrypoint-allgres.sh /usr/local/bin/docker-entrypoint-allgres.sh
 COPY 001-create-extension.sql /docker-entrypoint-initdb.d/001-create-extension.sql
+COPY 002-bootstrap-admin.sh /docker-entrypoint-initdb.d/002-bootstrap-admin.sh
+RUN chmod +x /docker-entrypoint-initdb.d/002-bootstrap-admin.sh
 COPY tests /opt/allgres/tests
 RUN chmod +x /usr/local/bin/docker-entrypoint-allgres.sh
 ENTRYPOINT ["docker-entrypoint-allgres.sh"]

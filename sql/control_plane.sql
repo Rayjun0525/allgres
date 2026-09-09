@@ -458,6 +458,20 @@ ALTER TABLE allgres_private.policy_history
   ADD COLUMN IF NOT EXISTS max_delegation_depth int NOT NULL DEFAULT 5,
   ADD COLUMN IF NOT EXISTS max_session_tasks int NOT NULL DEFAULT 100;
 
+-- Roadmap item 7: evaluation-gated self-improvement. Every archived version
+-- is stamped with how the agent was actually doing (its own recent
+-- completed/failed ratio, see allgres_private.agent_recent_success_rate)
+-- right before it was replaced -- populated by fn_set_policy at the exact
+-- moment a version is overwritten, alongside the row's other now-historical
+-- fields. NULL means no evaluable data existed yet (a brand-new agent's
+-- very first change), not zero -- never treated as "0% success" by
+-- fn_evaluate_last_change below. This is what turns "self_improve proposed
+-- a change" into something a later turn (or an operator) can actually
+-- check the outcome of, instead of trusting a proposal was good on its own
+-- say-so.
+ALTER TABLE allgres_private.policy_history
+  ADD COLUMN IF NOT EXISTS success_rate_at_change numeric;
+
 CREATE INDEX IF NOT EXISTS policy_history_agent_idx
   ON allgres_private.policy_history (agent_id, generation DESC);
 
@@ -469,6 +483,48 @@ CREATE TABLE IF NOT EXISTS allgres_private.permissions (
   granted_at    timestamptz NOT NULL DEFAULT now(),
   UNIQUE (agent_id, resource_type, resource_ref)
 );
+
+-- 'procedure' (roadmap item 4, see allgres_private.procedures below): an
+-- existing install's CREATE TABLE IF NOT EXISTS above never re-runs once
+-- the table exists, so its original CHECK has to be widened here instead --
+-- same upgrade shape outbound_calls_kind_check already used for 'embedding'.
+ALTER TABLE allgres_private.permissions DROP CONSTRAINT IF EXISTS permissions_resource_type_check;
+ALTER TABLE allgres_private.permissions ADD CONSTRAINT permissions_resource_type_check
+  CHECK (resource_type IN ('view', 'tool', 'agent', 'http_host', 'procedure'));
+
+-- Roadmap item 4: a named, versioned, reusable procedure an operator (or,
+-- in a later slice, an approved agent proposal) curates once and any
+-- granted agent can draw on every turn -- distinct from agent_memories,
+-- which is private to one agent, unversioned (overwritten by eviction, not
+-- history), and never explicitly shared. content is free text: whatever
+-- shape of "how to do X" the operator finds useful (a checklist, a SQL
+-- template, a delegation plan) -- nothing here parses or executes it.
+-- generation/is_active live on the row itself, snapshotted into
+-- procedure_history only on an actual content change -- the exact same
+-- shape allgres_private.policies/policy_history already uses for an
+-- agent's own policy (see fn_set_policy's own comment on why: "only ever a
+-- new version that happens to match an old one," never a rewrite of what
+-- was already recorded).
+CREATE TABLE IF NOT EXISTS allgres_private.procedures (
+  procedure_id  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL UNIQUE,
+  content       text NOT NULL,
+  generation    int NOT NULL DEFAULT 1,
+  is_active     boolean NOT NULL DEFAULT true,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS allgres_private.procedure_history (
+  version_id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  procedure_id  uuid NOT NULL REFERENCES allgres_private.procedures(procedure_id) ON DELETE CASCADE,
+  generation    int NOT NULL,
+  content       text NOT NULL,
+  changed_at    timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (procedure_id, generation)
+);
+CREATE INDEX IF NOT EXISTS procedure_history_procedure_idx
+  ON allgres_private.procedure_history (procedure_id, generation DESC);
 
 -- Every permission check in this file (call_tool's tool/http_host grants,
 -- delegate's target-agent grant, execute_sql's view grant via
@@ -629,13 +685,26 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT created_at INTO v_cutoff FROM (
-    SELECT created_at FROM allgres_private.execution_logs
-    WHERE task_id = ANY(p_task_ids)
-      AND (v_current_cutoff IS NULL OR created_at >= v_current_cutoff)
-    ORDER BY created_at DESC
-    OFFSET c_keep_recent - 1 LIMIT 1
-  ) q;
+  -- compaction_keep_recent = 0 (a valid, allowed value -- see its own
+  -- CHECK range, 0 to 1000000) means "keep nothing, compact everything up
+  -- to now" -- there is no "the Nth-newest log" boundary to find when N is
+  -- 0, so this can't reuse the OFFSET below at all: `OFFSET c_keep_recent
+  -- - 1` with c_keep_recent = 0 sends PostgreSQL a literal OFFSET -1,
+  -- which is a hard error ("OFFSET must not be negative"), not a graceful
+  -- "keep the newest one anyway" -- confirmed live, this used to abort the
+  -- whole compaction check outright the moment an operator set
+  -- keep_recent to 0.
+  IF c_keep_recent <= 0 THEN
+    v_cutoff := clock_timestamp();
+  ELSE
+    SELECT created_at INTO v_cutoff FROM (
+      SELECT created_at FROM allgres_private.execution_logs
+      WHERE task_id = ANY(p_task_ids)
+        AND (v_current_cutoff IS NULL OR created_at >= v_current_cutoff)
+      ORDER BY created_at DESC
+      OFFSET c_keep_recent - 1 LIMIT 1
+    ) q;
+  END IF;
   IF v_cutoff IS NULL THEN
     RETURN;
   END IF;
@@ -819,6 +888,49 @@ CREATE INDEX IF NOT EXISTS sessions_project_idx
   ON allgres_private.sessions (project_id, started_at DESC)
   WHERE project_id IS NOT NULL;
 
+-- Roadmap item 6: schedule/event-driven execution tied to long-term goal
+-- tracking. A schedule *is* the durable goal-tracking record, not a
+-- separate concept bolted alongside one: its name and goal text describe
+-- what is being pursued, and run_count/last_run_at/last_session_id are the
+-- actual history of checking on it over time -- "how many times has this
+-- run, most recently when, against which session" -- queryable in
+-- PostgreSQL like everything else here, not held anywhere in worker memory.
+-- Firing is a plain now() >= next_run_at poll (fn_run_schedules, called
+-- from fn_pump alongside fn_watchdog/fn_dispatch_tasks), not pg_cron or any
+-- external scheduler -- one less extension dependency, and the same
+-- restart-survives-for-free property every other queue in this file
+-- already has: state is a row, not a timer running somewhere.
+--
+-- Two independent stop conditions, both optional: max_runs (a run budget)
+-- and ends_at (a wall-clock deadline) -- fn_run_schedules auto-deactivates
+-- a schedule that has hit either, so "still is_active" itself means
+-- "still eligible to fire," not just "was never turned off." A real
+-- *cost*-based stop condition (a dollar or token budget) is deliberately
+-- not here: nothing in this codebase parses token usage out of an LLM
+-- response or prices a provider/model today, so a cost cap here would only
+-- ever compare against a number nothing ever populates. That is real
+-- follow-up work, not something to fake with an unenforced column.
+CREATE TABLE IF NOT EXISTS allgres_private.schedules (
+  schedule_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name             text NOT NULL UNIQUE,
+  agent_id         uuid NOT NULL REFERENCES allgres_private.agents(agent_id) ON DELETE CASCADE,
+  goal             text NOT NULL,
+  interval_seconds int NOT NULL CHECK (interval_seconds > 0),
+  next_run_at      timestamptz NOT NULL,
+  is_active        boolean NOT NULL DEFAULT true,
+  max_runs         int CHECK (max_runs IS NULL OR max_runs > 0),
+  run_count        int NOT NULL DEFAULT 0,
+  ends_at          timestamptz,
+  last_run_at      timestamptz,
+  last_session_id  uuid REFERENCES allgres_private.sessions(session_id),
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS schedules_due_idx
+  ON allgres_private.schedules (next_run_at)
+  WHERE is_active;
+
 CREATE TABLE IF NOT EXISTS allgres_private.tasks (
   task_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   session_id      uuid NOT NULL REFERENCES allgres_private.sessions(session_id),
@@ -857,9 +969,18 @@ ALTER TABLE allgres_private.tasks
 -- the idempotent way to widen one -- CREATE TABLE IF NOT EXISTS won't touch
 -- an existing table, and there is no ALTER TABLE ... ADD VALUE for a plain
 -- CHECK the way there is for an enum type.
+-- 'waiting_children' (roadmap item 5): a task paused on await_children,
+-- exactly the same shape as 'waiting_human' -- excluded from
+-- fn_dispatch_tasks' own claim query (status IN ('queued','running') only),
+-- so it sits untouched until fn_watchdog's own sweep (see that function)
+-- finds every one of its children terminal and requeues it. Nothing here
+-- lives in worker memory: the dependency this represents (this task
+-- depends on its children finishing) is entirely a row in this table, so a
+-- worker or database restart loses none of it -- the next watchdog tick
+-- just finds the same row again.
 ALTER TABLE allgres_private.tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
 ALTER TABLE allgres_private.tasks ADD CONSTRAINT tasks_status_check CHECK (status IN
-  ('queued', 'running', 'completed', 'failed', 'waiting_human', 'cancelled'));
+  ('queued', 'running', 'completed', 'failed', 'waiting_human', 'cancelled', 'waiting_children'));
 
 CREATE INDEX IF NOT EXISTS tasks_ready_idx
   ON allgres_private.tasks (created_at)
@@ -1193,6 +1314,30 @@ ALTER TABLE allgres_private.llm_providers
   ADD CONSTRAINT llm_providers_embedding_needs_model_check
     CHECK (purpose <> 'embedding' OR NULLIF(trim(embedding_model), '') IS NOT NULL);
 
+-- Whether this provider's OpenAI-compat /chat/completions call may include
+-- `response_format: {"type":"json_object"}` -- real OpenAI (and most hosted
+-- openai_compat services) accept it and it measurably improves this file's
+-- own "reply with one JSON object only" contract; a number of locally-run
+-- openai_compat servers do not (confirmed live against LM Studio: HTTP 400,
+-- "'response_format.type' must be 'json_schema' or 'text'"). This used to
+-- be a single hardcoded `v_prov.name <> 'ollama'` check inside
+-- build_llm_http -- true for every provider except the one literally
+-- *named* 'ollama', including any other operator-added local server (LM
+-- Studio, llama.cpp's own server, vLLM, ...) that shares the exact same
+-- restriction under a different name. A real per-provider column instead,
+-- defaulting to true (unchanged behavior for every existing provider except
+-- the seeded 'ollama' row, retroactively flipped below), settable from the
+-- provider create/edit form.
+ALTER TABLE allgres_private.llm_providers
+  ADD COLUMN IF NOT EXISTS response_format_json_object boolean NOT NULL DEFAULT true;
+-- The retroactive UPDATE for the seeded 'ollama' row lives just after that
+-- row's own INSERT further down this file, not here -- on a fresh install
+-- this ALTER runs before that INSERT ever creates the row, so an UPDATE
+-- here would silently match zero rows and the seed would keep the column's
+-- 'true' default instead (confirmed live: exactly this ordering bug, caught
+-- by fn_selftest's own seeded_ollama_provider_still_omits_response_format
+-- case failing on a fresh install).
+
 -- Everything below (agent-identity embeddings, semantic delegate search, and
 -- later memory recall) is an optional feature layered on top of a plain
 -- PostgreSQL install, never a hard dependency the way pgcrypto effectively
@@ -1418,6 +1563,34 @@ CREATE TABLE IF NOT EXISTS allgres_private.oauth_states (
   created_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- Roadmap item 2: a named external HTTP endpoint an operator configures once
+-- (base_url + how to authenticate), so the 'http_request' tool can send an
+-- authenticated call without an agent ever seeing, choosing, or supplying a
+-- credential itself. base_url is fixed at configuration time and is the only
+-- host a stored credential may ever be sent to -- an agent using a
+-- connection supplies a relative path, never a full URL (enforced in
+-- fn_next_step's call_tool handling, not here); this is the same
+-- no-per-caller-redirect shape llm_providers.base_url already enforces for
+-- an agent's own llm_config (see sanitize_llm_config).
+CREATE TABLE IF NOT EXISTS allgres_private.api_connections (
+  connection_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name                  text NOT NULL UNIQUE,
+  base_url              text NOT NULL,
+  auth_kind             text NOT NULL DEFAULT 'none'
+                          CHECK (auth_kind IN ('none', 'authorization', 'x-api-key')),
+  allow_private_network boolean NOT NULL DEFAULT false,
+  is_enabled            boolean NOT NULL DEFAULT true,
+  created_at            timestamptz NOT NULL DEFAULT now(),
+  updated_at            timestamptz NOT NULL DEFAULT now()
+);
+
+-- Never returned by list functions, same as llm_secrets -- operator writes
+-- via fn_set_connection_secret only.
+CREATE TABLE IF NOT EXISTS allgres_private.api_connection_secrets (
+  connection_id  uuid PRIMARY KEY REFERENCES allgres_private.api_connections(connection_id) ON DELETE CASCADE,
+  api_key        text
+);
+
 CREATE TABLE IF NOT EXISTS allgres_private.outbound_calls (
   call_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id          uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
@@ -1469,6 +1642,20 @@ ALTER TABLE allgres_private.outbound_calls
 ALTER TABLE allgres_private.outbound_calls
   ADD COLUMN IF NOT EXISTS provider_id uuid REFERENCES allgres_private.llm_providers(provider_id),
   ADD COLUMN IF NOT EXISTS auth_kind text CHECK (auth_kind IS NULL OR auth_kind IN ('authorization', 'x-api-key'));
+
+-- The HTTP method the worker actually sends. Always 'GET' before this column
+-- existed (the only shape 'llm'/'oauth' calls ever needed a verb for, and
+-- 'tool' meant http_get); the 'http_request' tool is what first needed
+-- anything else. Same credential-at-claim-time boundary as provider_id
+-- above, for a stored allgres_private.api_connections credential instead of
+-- an llm_providers one -- request_headers never holds the decrypted key,
+-- fn_claim_outbound resolves it from connection_id at claim time. Both are
+-- NULL unless the tool call named a connection.
+ALTER TABLE allgres_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS method text NOT NULL DEFAULT 'GET'
+    CHECK (method IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE'));
+ALTER TABLE allgres_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS connection_id uuid REFERENCES allgres_private.api_connections(connection_id);
 
 CREATE INDEX IF NOT EXISTS outbound_ready_idx
   ON allgres_private.outbound_calls (created_at)
@@ -1704,9 +1891,13 @@ Reply with a single JSON object, no markdown, no extra keys:
 {"action":"final_answer","answer":"..."}
 {"action":"execute_sql","sql":"SELECT ..."}
 {"action":"call_tool","tool":"...","args":{}}
-{"action":"delegate","agent_name":"...","input":{}}
+{"action":"delegate","agent_name":"...","input":{},"wait":false}
+{"action":"await_children"}
 {"action":"await_human","reason":"..."}
 SQL must be a single SELECT or WITH against schema-qualified views you were given.
+delegate's "wait" defaults to false (hand off and your turn ends); set it true to keep going instead of
+finishing, so you can delegate to more agents or later call await_children to pause until every agent you
+delegated to has finished, with what each one did visible on your next turn.
 $prompt$,
     -- Deliberately empty: a new agent has no provider/model until an
     -- operator configures one. Defaulting this to any real provider would
@@ -1845,7 +2036,7 @@ DECLARE
   v_answer text;
 BEGIN
   SELECT
-    count(*) FILTER (WHERE status IN ('queued', 'running', 'waiting_human')),
+    count(*) FILTER (WHERE status IN ('queued', 'running', 'waiting_human', 'waiting_children')),
     count(*) FILTER (WHERE status = 'failed')
   INTO v_open, v_failed
   FROM allgres_private.tasks
@@ -1876,6 +2067,43 @@ BEGIN
     WHERE session_id = p_session_id AND status = 'open';
   END IF;
 END;
+$fn$;
+
+-- Roadmap item 7: the one evaluation signal this slice computes -- an
+-- agent's own recent completed-vs-failed ratio, over its last p_limit
+-- root-level tasks (parent_task_id IS NULL: a delegated child reflects
+-- whatever agent it was delegated *to*, not this one, and counting it here
+-- would blur the two; the same root-level distinction fn_next_step's own
+-- message assembly already draws). Deliberately not a lifetime average --
+-- an agent that was bad for its first 500 tasks and has been solid for its
+-- last 20 should read as solid, not dragged down by history a since-fixed
+-- problem no longer reflects. selftest's own fixture sessions are excluded
+-- the same way every operator-facing count already excludes them
+-- (goal LIKE 'selftest%'). NULL (not zero) when there is no evaluable data
+-- yet -- a brand-new agent, or one whose only tasks are still open -- so a
+-- caller can tell "nothing to judge yet" from "judged and found wanting."
+CREATE OR REPLACE FUNCTION allgres_private.agent_recent_success_rate(p_agent_id uuid, p_limit int DEFAULT 20)
+RETURNS numeric
+LANGUAGE sql
+STABLE
+AS $fn$
+  SELECT CASE WHEN count(*) FILTER (WHERE q.status IN ('completed', 'failed')) = 0 THEN NULL
+    ELSE round(
+      count(*) FILTER (WHERE q.status = 'completed')::numeric
+        / count(*) FILTER (WHERE q.status IN ('completed', 'failed')),
+      3
+    )
+  END
+  FROM (
+    SELECT t.status
+    FROM allgres_private.tasks t
+    JOIN allgres_private.sessions s ON s.session_id = t.session_id
+    WHERE t.agent_id = p_agent_id
+      AND t.parent_task_id IS NULL
+      AND s.goal NOT LIKE 'selftest%'
+    ORDER BY t.created_at DESC
+    LIMIT GREATEST(1, COALESCE(p_limit, 20))
+  ) q
 $fn$;
 
 -- Authorisation for agent-visible views lives in the views, so it holds even if
@@ -1953,11 +2181,37 @@ AS
     (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'queued') AS sql_queued,
     (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'in_flight') AS sql_in_flight,
     (SELECT count(*) FROM allgres_private.oauth_calls WHERE status = 'queued') AS oauth_queued,
-    (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued', 'running', 'waiting_human')) AS running_tasks,
+    (SELECT count(*) FROM allgres_private.tasks WHERE status IN ('queued', 'running', 'waiting_human', 'waiting_children')) AS running_tasks,
     (SELECT count(*) FROM allgres_private.tasks WHERE status = 'failed' AND updated_at > now() - interval '24 hours') AS failed_tasks_24h,
     (SELECT count(*) FROM allgres_private.human_approvals WHERE status = 'pending') AS pending_approvals,
     (SELECT count(*) FROM allgres_private.agent_memories WHERE expires_at IS NOT NULL AND expires_at < now()) AS expired_memories_pending
   WHERE allgres_private.agent_may_read('allgres_public.v_system_health', allgres_private.current_agent_id());
+
+-- Roadmap item 7: per-agent evaluation data (allgres_private.
+-- agent_recent_success_rate's own comment explains the metric itself).
+-- Same permission-gated shape as v_system_health -- an agent without the
+-- grant sees zero rows -- but per-row rather than a single aggregate, since
+-- this describes each agent individually, the comparison self_improve (or
+-- an operator) actually needs before proposing or judging a change.
+CREATE OR REPLACE VIEW allgres_public.v_agent_health
+  WITH (security_barrier = true)
+AS
+  SELECT
+    a.agent_id,
+    a.name,
+    p.generation,
+    allgres_private.agent_recent_success_rate(a.agent_id, 20) AS recent_success_rate,
+    (
+      SELECT h.success_rate_at_change
+      FROM allgres_private.policy_history h
+      WHERE h.agent_id = a.agent_id
+      ORDER BY h.generation DESC
+      LIMIT 1
+    ) AS success_rate_before_last_change
+  FROM allgres_private.agents a
+  JOIN allgres_private.policies p USING (agent_id)
+  WHERE a.is_active
+    AND allgres_private.agent_may_read('allgres_public.v_agent_health', allgres_private.current_agent_id());
 
 -- One row per (agent, resource) grant -- the full permission matrix a
 -- security-auditor agent needs to spot an anomaly (an inactive agent still
@@ -2288,6 +2542,21 @@ AS $fn$
   SELECT allgres_private.decrypt_secret(oauth_client_secret)
   FROM allgres_private.llm_secrets
   WHERE provider_id = p_provider_id
+$fn$;
+
+-- Same shape as provider_secret, for allgres_private.api_connections. Used
+-- only by fn_claim_outbound, at claim time -- never at queue time, which is
+-- what keeps it out of outbound_calls.request_headers.
+CREATE OR REPLACE FUNCTION allgres_private.connection_secret(p_connection_id uuid)
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  SELECT allgres_private.decrypt_secret(api_key)
+  FROM allgres_private.api_connection_secrets
+  WHERE connection_id = p_connection_id
 $fn$;
 
 -- ---------------------------------------------------------------------------
@@ -2703,6 +2972,7 @@ DECLARE
   v_cfg jsonb;
   v_memories jsonb;
   v_memory_ids uuid[];
+  v_procedures jsonb;
   v_task_ids uuid[];
   v_compacted_before timestamptz;
   v_summary_text text;
@@ -2806,6 +3076,20 @@ BEGIN
     WHERE memory_id = ANY(v_memory_ids);
   END IF;
 
+  -- Roadmap item 4: reusable procedures (allgres_private.procedures), the
+  -- same inheritance-aware permission check every other resource_type
+  -- already goes through (agent_permission_refs) -- an operator curates and
+  -- versions these once, any agent explicitly granted one (or inheriting it
+  -- via its parent chain, same as a system agent's tool/view grants) sees
+  -- its current content every turn. Unlike memory this is not ranked or
+  -- capped: a deliberately small, shared, curated set, not per-agent noise
+  -- that grows on its own.
+  SELECT COALESCE(jsonb_agg(jsonb_build_object('name', pr.name, 'content', pr.content) ORDER BY pr.name), '[]'::jsonb)
+  INTO v_procedures
+  FROM allgres_private.procedures pr
+  WHERE pr.is_active
+    AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'));
+
   -- Bounds come from the database, not from worker code, so revoking a
   -- Project mode (item 42): this session's project, if any, may narrow the
   -- agent with a preset -- appended after the agent's own effective prompt,
@@ -2827,8 +3111,11 @@ BEGIN
       || v_views::text
       || E'\ntools: '
       || v_tools::text
-      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_human | propose_change | remember.'
+      || E'\nPick action from final_answer | execute_sql | call_tool | delegate | await_children | await_human | propose_change | remember.'
       || E'\nFor numeric questions, execute_sql first. Do not invent keys.'
+      || E'\nawait_children: {"action":"await_children"} -- pauses this task until every task you have delegated'
+      || E' (however many, across however many turns) has finished; your next turn then sees what each one did.'
+      || E' Rejected if you have nothing pending to wait on.'
       || E'\npropose_change: {"action":"propose_change","changes":{"system_prompt":"..."},"reason":"..."}'
       || E' -- only system_prompt and llm_config.model/temperature/max_tokens may be proposed;'
       || E' an operator decides it later, it does not change your policy right now.'
@@ -2838,6 +3125,9 @@ BEGIN
       || E' Use it when you learn a durable fact, preference, or instruction, not for routine intermediate results.'
       || CASE WHEN v_memories = '[]'::jsonb THEN ''
               ELSE E'\n\n# memory (your own past recollections, most important first)\n' || v_memories::text
+         END
+      || CASE WHEN v_procedures = '[]'::jsonb THEN ''
+              ELSE E'\n\n# procedures (reusable, curated by an operator -- follow these when they apply)\n' || v_procedures::text
          END
     )
   );
@@ -2972,6 +3262,13 @@ DECLARE
   v_mem_result jsonb;
   v_created jsonb;
   v_provider allgres_private.llm_providers%ROWTYPE;
+  v_method text;
+  v_conn_name text;
+  v_conn allgres_private.api_connections%ROWTYPE;
+  v_conn_auth text;
+  v_path text;
+  v_req_headers jsonb;
+  v_req_body jsonb;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -3061,7 +3358,7 @@ BEGIN
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
     'final_answer', 'execute_sql', 'call_tool', 'delegate', 'search_agents', 'await_human', 'propose_change',
-    'remember', 'create_agent', 'propose_fix'
+    'remember', 'create_agent', 'propose_fix', 'await_children'
   ) THEN
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
@@ -3133,7 +3430,7 @@ BEGIN
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
-    IF v_tool <> 'http_get' THEN
+    IF v_tool NOT IN ('http_get', 'http_request') THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'unknown_tool', 'tool', v_tool)
@@ -3144,8 +3441,86 @@ BEGIN
       RETURN jsonb_build_object('action', 'continue');
     END IF;
 
-    v_url := v_args->>'url';
-    v_reason := allgres_private.check_outbound_url(v_url, false);
+    v_conn := NULL;
+    v_conn_auth := NULL;
+    v_req_body := '{}'::jsonb;
+
+    IF v_tool = 'http_get' THEN
+      v_method := 'GET';
+      v_url := v_args->>'url';
+      v_req_headers := jsonb_build_object('accept', 'application/json, text/plain, */*');
+    ELSE
+      -- 'http_request': method/headers/body, and an optional named
+      -- allgres_private.api_connections credential -- see that table's own
+      -- comment for why a connection's own base_url is the only host its
+      -- credential may ever reach.
+      v_method := upper(COALESCE(NULLIF(trim(v_args->>'method'), ''), 'GET'));
+      IF v_method NOT IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE') THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'unsupported_http_method', 'method', v_args->>'method')
+        );
+        UPDATE allgres_private.tasks
+        SET step_count = step_count + 1, updated_at = now()
+        WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+
+      v_conn_name := NULLIF(trim(v_args->>'connection'), '');
+      IF v_conn_name IS NOT NULL THEN
+        SELECT * INTO v_conn FROM allgres_private.api_connections
+        WHERE name = v_conn_name AND is_enabled;
+        IF NOT FOUND THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'unknown_connection', 'connection', v_conn_name)
+          );
+          UPDATE allgres_private.tasks
+          SET step_count = step_count + 1, updated_at = now()
+          WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
+
+        -- Never a full URL here: a stored connection's credential may only
+        -- ever be sent to its own fixed base_url, so the agent supplies a
+        -- path relative to it, never a host of its own choosing.
+        v_path := COALESCE(v_args->>'path', '');
+        IF v_path ~* '^[a-zA-Z][a-zA-Z0-9+.-]*://' THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'connection_path_must_be_relative', 'path', v_path)
+          );
+          UPDATE allgres_private.tasks
+          SET step_count = step_count + 1, updated_at = now()
+          WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
+        v_url := rtrim(v_conn.base_url, '/') || '/' || ltrim(v_path, '/');
+        v_conn_auth := NULLIF(v_conn.auth_kind, 'none');
+      ELSE
+        v_url := v_args->>'url';
+      END IF;
+
+      -- Headers an agent may set itself: string values only, and never the
+      -- header a connection's credential is injected into at claim time
+      -- (fn_claim_outbound) -- letting an agent set Authorization/x-api-key
+      -- here would either be silently overwritten by the real credential or,
+      -- with no connection at all, be exactly the plaintext-secret-in-a-row
+      -- shape this design keeps out of outbound_calls to begin with.
+      SELECT COALESCE(jsonb_object_agg(lower(kv.key), kv.value), '{}'::jsonb)
+      INTO v_req_headers
+      FROM jsonb_each_text(
+        CASE WHEN jsonb_typeof(v_args->'headers') = 'object' THEN v_args->'headers' ELSE '{}'::jsonb END
+      ) AS kv(key, value)
+      WHERE lower(kv.key) NOT IN ('authorization', 'x-api-key', 'host', 'content-length');
+      v_req_headers := v_req_headers || jsonb_build_object('accept', 'application/json, text/plain, */*');
+
+      IF v_method IN ('POST', 'PUT', 'PATCH') THEN
+        v_req_body := CASE WHEN jsonb_typeof(v_args->'body') IS NOT NULL THEN v_args->'body' ELSE '{}'::jsonb END;
+      END IF;
+    END IF;
+
+    v_reason := allgres_private.check_outbound_url(v_url, COALESCE(v_conn.allow_private_network, false));
     IF v_reason IS NOT NULL THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
@@ -3171,11 +3546,11 @@ BEGIN
     END IF;
 
     INSERT INTO allgres_private.outbound_calls (
-      task_id, kind, tool, url, request_headers, request_body, status
+      task_id, kind, tool, url, method, request_headers, request_body, status,
+      allow_private, connection_id, auth_kind
     ) VALUES (
-      p_task_id, 'tool', v_tool, v_url,
-      jsonb_build_object('accept', 'application/json, text/plain, */*'),
-      '{}'::jsonb, 'queued'
+      p_task_id, 'tool', v_tool, v_url, v_method, v_req_headers, v_req_body, 'queued',
+      COALESCE(v_conn.allow_private_network, false), v_conn.connection_id, v_conn_auth
     ) RETURNING call_id INTO v_call;
 
     UPDATE allgres_private.tasks
@@ -3345,12 +3720,29 @@ BEGIN
       t.session_id, v_target, p_task_id, 'queued',
       COALESCE(v_parsed->'input', '{}'::jsonb), t.delegation_depth + 1
     ) RETURNING task_id INTO v_child;
-    UPDATE allgres_private.tasks
-    SET status = 'completed',
-        output = jsonb_build_object('child_task_id', v_child),
-        step_count = step_count + 1,
-        updated_at = now()
-    WHERE task_id = p_task_id;
+
+    -- Default (no "wait"): completely unchanged from before roadmap item 5
+    -- -- delegate is a one-shot hand-off, the parent's job ends the moment
+    -- the child is queued, and no caller of delegate written before this
+    -- (orchestrator's multi-mention routing, self_improve's cross-agent
+    -- proposals) is affected. "wait": true is the opt-in real dependency
+    -- edge: the parent stays 'running' instead of completing, so its next
+    -- turn can delegate again (fanning out to more children over further
+    -- turns, exactly like this one) or call the new await_children action
+    -- to actually pause until every child it has spawned so far is done --
+    -- see that action's own comment.
+    IF COALESCE((v_parsed->>'wait')::boolean, false) THEN
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+    ELSE
+      UPDATE allgres_private.tasks
+      SET status = 'completed',
+          output = jsonb_build_object('child_task_id', v_child),
+          step_count = step_count + 1,
+          updated_at = now()
+      WHERE task_id = p_task_id;
+    END IF;
     RETURN jsonb_build_object('action', 'continue', 'child_task_id', v_child);
   END IF;
 
@@ -3628,6 +4020,37 @@ BEGIN
     RETURN jsonb_build_object('action', 'wait');
   END IF;
 
+  -- Roadmap item 5: a real multi-agent task dependency edge. delegate
+  -- itself stays fire-and-forget (an agent may fan out to several
+  -- sub-agents across several turns, exactly as orchestrator already does
+  -- for parallel routing); await_children is the explicit synchronization
+  -- point -- pause until every one of this task's own children (however
+  -- many were delegated, across however many turns) reaches a terminal
+  -- state, then resume with what each one actually did. Rejected outright
+  -- when there is nothing to wait on, the same "don't let an agent block
+  -- itself on a mistake" reasoning search_agents_needs_query already
+  -- applies to a missing query.
+  IF v_action = 'await_children' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM allgres_private.tasks
+      WHERE parent_task_id = p_task_id AND status NOT IN ('completed', 'failed', 'cancelled')
+    ) THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'no_pending_children_to_await')
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    UPDATE allgres_private.tasks
+    SET status = 'waiting_children', step_count = step_count + 1, updated_at = now()
+    WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'wait');
+  END IF;
+
   RETURN jsonb_build_object('action', 'continue');
 END;
 $fn$;
@@ -3752,8 +4175,9 @@ BEGIN
       'temperature', COALESCE((v_cfg->>'temperature')::float, 0.2),
       'max_tokens', COALESCE((v_cfg->>'max_tokens')::int, 1024)
     );
-    -- Ollama rejects response_format; everything else parses better with it.
-    IF v_prov.name <> 'ollama' THEN
+    -- Per-provider, not a name check -- see response_format_json_object's
+    -- own comment on allgres_private.llm_providers.
+    IF v_prov.response_format_json_object THEN
       v_body := v_body || jsonb_build_object(
         'response_format', jsonb_build_object('type', 'json_object')
       );
@@ -3813,14 +4237,15 @@ BEGIN
     FOR UPDATE SKIP LOCKED
   LOOP
     -- max_concurrent_tasks caps how many of this agent's tasks may be
-    -- actively in a turn (running or waiting_human) at once; a 'queued' task
-    -- that hasn't started yet doesn't occupy a slot, it just waits longer.
-    -- Excluding t.task_id itself matters for a 'running' task continuing its
-    -- next turn: that's not a new slot, it already holds the one it's in.
+    -- actively in a turn (running, waiting_human, or waiting_children) at
+    -- once; a 'queued' task that hasn't started yet doesn't occupy a slot,
+    -- it just waits longer. Excluding t.task_id itself matters for a
+    -- 'running' task continuing its next turn: that's not a new slot, it
+    -- already holds the one it's in.
     IF (
       SELECT count(*) FROM allgres_private.tasks x
       WHERE x.agent_id = t.agent_id AND x.task_id <> t.task_id
-        AND x.status IN ('running', 'waiting_human')
+        AND x.status IN ('running', 'waiting_human', 'waiting_children')
     ) >= (SELECT max_concurrent_tasks FROM allgres_private.policies WHERE agent_id = t.agent_id) THEN
       CONTINUE;
     END IF;
@@ -3900,8 +4325,8 @@ BEGIN
   -- not -- fn_complete_outbound already discards its result in that case,
   -- but by then the request has left the process.
   FOR r IN
-    SELECT o.call_id, o.task_id, o.kind, o.tool, o.url, o.request_headers, o.request_body,
-           o.allow_private, o.provider_id, o.auth_kind, p.name AS provider_name
+    SELECT o.call_id, o.task_id, o.kind, o.tool, o.url, o.method, o.request_headers, o.request_body,
+           o.allow_private, o.provider_id, o.connection_id, o.auth_kind, p.name AS provider_name
     FROM allgres_private.outbound_calls o
     JOIN allgres_private.tasks t ON t.task_id = o.task_id
     LEFT JOIN allgres_private.llm_providers p ON p.provider_id = o.provider_id
@@ -3931,6 +4356,16 @@ BEGIN
         r.auth_kind,
         CASE WHEN r.auth_kind = 'x-api-key' THEN v_key ELSE 'Bearer ' || v_key END
       );
+    -- Same injection, for an 'http_request' tool call routed through a
+    -- stored allgres_private.api_connections credential instead of an LLM
+    -- provider's. No xai/grok-shaped fallback here -- that quirk belongs to
+    -- the LLM path alone (see its own comment above).
+    ELSIF r.auth_kind IS NOT NULL AND r.connection_id IS NOT NULL THEN
+      v_key := COALESCE(allgres_private.connection_secret(r.connection_id), '');
+      v_headers := v_headers || jsonb_build_object(
+        r.auth_kind,
+        CASE WHEN r.auth_kind = 'x-api-key' THEN v_key ELSE 'Bearer ' || v_key END
+      );
     END IF;
 
     v_out := v_out || jsonb_build_array(jsonb_build_object(
@@ -3939,6 +4374,7 @@ BEGIN
       'kind', r.kind,
       'tool', r.tool,
       'url', r.url,
+      'method', r.method,
       'headers', v_headers,
       'body', r.request_body,
       'allow_private', r.allow_private
@@ -4132,6 +4568,24 @@ BEGIN
       END IF;
     END IF;
   ELSIF p_status IS NULL OR p_status >= 400 OR p_status < 200 THEN
+    -- Auto-detect a provider that rejects response_format outright (a real
+    -- local-server incompatibility, not a hypothetical -- confirmed live
+    -- against LM Studio) instead of leaving an operator to notice the same
+    -- HTTP 400 and flip response_format_json_object's own checkbox by
+    -- hand. This flips it here, at the moment the error is first seen, on
+    -- the row's real provider_id; the task's own next retry (already
+    -- happening on its own via the normal max_retries path -- nothing
+    -- extra queued or requeued from here) calls build_llm_http fresh, the
+    -- same as any other retry, which reads this column live and simply
+    -- stops sending the field. A narrow signature match on p_status and
+    -- the exact phrase this specific rejection uses, not "any 400 means
+    -- turn it off" -- an unrelated 400 (a bad API key, a context-length
+    -- error, ...) must never touch this column.
+    IF p_status = 400 AND p_body ILIKE '%response_format.type%' THEN
+      UPDATE allgres_private.llm_providers
+      SET response_format_json_object = false
+      WHERE provider_id = c.provider_id AND response_format_json_object;
+    END IF;
     v_payload := jsonb_build_object(
       'type', 'error',
       'message', 'llm http ' || COALESCE(p_status::text, '0') || ': ' || left(COALESCE(p_body, ''), 2000)
@@ -4409,7 +4863,7 @@ BEGIN
     SELECT t.task_id, t.session_id, t.step_count
     FROM allgres_private.tasks t
     JOIN allgres_private.policies p USING (agent_id)
-    WHERE t.status IN ('running', 'waiting_human')
+    WHERE t.status IN ('running', 'waiting_human', 'waiting_children')
       AND p.max_turn_seconds IS NOT NULL
       AND t.started_at IS NOT NULL
       AND t.started_at < now() - make_interval(secs => p.max_turn_seconds)
@@ -4431,6 +4885,43 @@ BEGIN
     SET status = 'lost', updated_at = now()
     WHERE task_id = r.task_id AND status IN ('queued', 'in_flight');
     PERFORM allgres_private.maybe_complete_session(r.session_id);
+    n := n + 1;
+  END LOOP;
+
+  -- Roadmap item 5: the wake side of await_children. A task sitting in
+  -- 'waiting_children' resumes the moment every one of its own children
+  -- (parent_task_id = this task) has reached a terminal status -- checked
+  -- fresh on every tick, entirely from what is already in this table, so a
+  -- worker or database restart mid-wait loses nothing: the next tick just
+  -- finds the same row again. No timeout of its own here (unlike
+  -- human_approvals' expires_at above) -- a stuck child is caught by the
+  -- max_turn_seconds sweep just above, which applies to 'waiting_children'
+  -- exactly as it does to 'running'.
+  FOR r IN
+    SELECT t.task_id, t.step_count
+    FROM allgres_private.tasks t
+    WHERE t.status = 'waiting_children'
+      AND NOT EXISTS (
+        SELECT 1 FROM allgres_private.tasks c
+        WHERE c.parent_task_id = t.task_id
+          AND c.status NOT IN ('completed', 'failed', 'cancelled')
+      )
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    PERFORM allgres_private.append_log(
+      r.task_id, r.step_count + 1, 'tool',
+      jsonb_build_object('delegate_results', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'agent', ca.name, 'status', c.status, 'output', c.output, 'error', c.error
+        ) ORDER BY c.created_at)
+        FROM allgres_private.tasks c
+        JOIN allgres_private.agents ca ON ca.agent_id = c.agent_id
+        WHERE c.parent_task_id = r.task_id
+      ), '[]'::jsonb))
+    );
+    UPDATE allgres_private.tasks
+    SET status = 'queued', step_count = step_count + 1, updated_at = now()
+    WHERE task_id = r.task_id;
     n := n + 1;
   END LOOP;
 
@@ -4459,15 +4950,23 @@ DECLARE
   w jsonb;
   s jsonb;
   o jsonb;
+  sc jsonb;
 BEGIN
   -- Does not perform HTTP or run sandboxed SQL.  Caller claims queued rows
   -- AFTER this commits.
   w := allgres_public.fn_watchdog();
+  -- Roadmap item 6: due schedules fire before dispatch, so a session (and
+  -- its first queued task) a schedule creates this very tick is picked up
+  -- by the same fn_dispatch_tasks call right below, not left waiting a
+  -- full extra tick.
+  sc := allgres_public.fn_run_schedules();
   d := allgres_public.fn_dispatch_tasks();
   c := allgres_public.fn_claim_outbound(4, p_fallback_key);
   s := allgres_public.fn_claim_sql(4);
   o := allgres_public.fn_claim_oauth(4);
-  RETURN jsonb_build_object('watchdog', w, 'dispatch', d, 'claim', c, 'claim_sql', s, 'claim_oauth', o);
+  RETURN jsonb_build_object(
+    'watchdog', w, 'schedules', sc, 'dispatch', d, 'claim', c, 'claim_sql', s, 'claim_oauth', o
+  );
 END;
 $fn$;
 
@@ -4823,11 +5322,13 @@ BEGIN
   IF v_changed THEN
     INSERT INTO allgres_private.policy_history (
       agent_id, generation, system_prompt, max_steps, max_retries, llm_config,
-      max_concurrent_tasks, max_turn_seconds, max_delegation_depth, max_session_tasks
+      max_concurrent_tasks, max_turn_seconds, max_delegation_depth, max_session_tasks,
+      success_rate_at_change
     ) VALUES (
       p_row.agent_id, p_row.generation, p_row.system_prompt, p_row.max_steps,
       p_row.max_retries, p_row.llm_config, p_row.max_concurrent_tasks, p_row.max_turn_seconds,
-      p_row.max_delegation_depth, p_row.max_session_tasks
+      p_row.max_delegation_depth, p_row.max_session_tasks,
+      allgres_private.agent_recent_success_rate(p_row.agent_id, 20)
     );
   END IF;
 
@@ -4849,6 +5350,52 @@ BEGIN
     'generation', p_row.generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
     'changed', v_changed
   );
+END;
+$fn$;
+
+-- Bulk-set every active agent's provider/model in one call, reusing
+-- fn_set_policy's own merge (a per-agent system_prompt/max_steps/etc. is
+-- left untouched -- only llm_config.provider/model change) rather than a
+-- silent global fallback an agent with nothing configured would ever
+-- reach on its own: README has said from early on that "there is no
+-- fallback provider or model name baked in anywhere" and that stays true
+-- here too -- this is one explicit, admin-initiated write touching every
+-- row at once, the same as if an operator had opened each agent's editor
+-- and typed the same two fields in, not a standing default new agents
+-- inherit later. System agents are included -- they run turns the same
+-- way any other agent does and would otherwise be the one thing this
+-- can't reach in one pass.
+CREATE OR REPLACE FUNCTION allgres_public.fn_bulk_set_model(
+  p_provider text,
+  p_model text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  v_agent record;
+  v_count int := 0;
+BEGIN
+  IF NULLIF(trim(p_provider), '') IS NULL OR NULLIF(trim(p_model), '') IS NULL THEN
+    RAISE EXCEPTION 'provider and model are both required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM allgres_private.llm_providers WHERE name = p_provider AND is_enabled
+  ) THEN
+    RAISE EXCEPTION 'llm provider "%" is not configured or not enabled', p_provider
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  FOR v_agent IN SELECT agent_id FROM allgres_private.agents WHERE is_active LOOP
+    PERFORM allgres_public.fn_set_policy(
+      v_agent.agent_id, NULL, NULL, NULL,
+      jsonb_build_object('provider', p_provider, 'model', p_model)
+    );
+    v_count := v_count + 1;
+  END LOOP;
+
+  RETURN jsonb_build_object('ok', true, 'updated_count', v_count);
 END;
 $fn$;
 
@@ -4959,6 +5506,159 @@ BEGIN
     h.max_concurrent_tasks, h.max_turn_seconds, h.max_turn_seconds IS NULL,
     h.max_delegation_depth, h.max_session_tasks
   );
+END;
+$fn$;
+
+-- Roadmap item 7: "did the last change to this agent actually help" as a
+-- real, computed verdict, not something an operator (or self_improve) has
+-- to eyeball two numbers to answer. Compares the agent's current
+-- allgres_private.agent_recent_success_rate against the success_rate_at_change
+-- fn_set_policy stamped onto the most recent policy_history row -- i.e.
+-- "how it's doing now" vs "how it was doing right before the last change
+-- replaced whatever came before it." 'insufficient_data' (not a false
+-- 'unchanged') whenever either side has no evaluable tasks yet -- a
+-- verdict should never be manufactured from an absence of data.
+CREATE OR REPLACE FUNCTION allgres_public.fn_evaluate_last_change(p_agent_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_current numeric;
+  v_before numeric;
+  v_gen int;
+  v_changed_at timestamptz;
+  v_verdict text;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id) THEN
+    RAISE EXCEPTION 'agent not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_current := allgres_private.agent_recent_success_rate(p_agent_id, 20);
+
+  SELECT success_rate_at_change, generation, changed_at
+  INTO v_before, v_gen, v_changed_at
+  FROM allgres_private.policy_history
+  WHERE agent_id = p_agent_id
+  ORDER BY generation DESC
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    v_verdict := 'no_change_recorded_yet';
+  ELSIF v_before IS NULL OR v_current IS NULL THEN
+    v_verdict := 'insufficient_data';
+  ELSIF v_current > v_before THEN
+    v_verdict := 'improved';
+  ELSIF v_current < v_before THEN
+    v_verdict := 'regressed';
+  ELSE
+    v_verdict := 'unchanged';
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'verdict', v_verdict,
+    'current_success_rate', v_current,
+    'success_rate_before_last_change', v_before,
+    'compared_to_generation', v_gen,
+    'last_changed_at', v_changed_at
+  );
+END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- Roadmap item 4: procedures -- see allgres_private.procedures' own comment.
+-- Same create/set/rollback shape as fn_create_provider/fn_set_policy/
+-- fn_rollback_policy on purpose: this is the same "named row, versioned,
+-- only actually snapshotted on a real change" problem with a different
+-- consumer (a grantable, agent-recallable text blob instead of a provider
+-- endpoint or an agent's own policy).
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_procedure(p_name text, p_content text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF NULLIF(trim(p_name), '') IS NULL THEN
+    RAISE EXCEPTION 'procedure name is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NULLIF(trim(p_content), '') IS NULL THEN
+    RAISE EXCEPTION 'procedure content is required' USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO allgres_private.procedures (name, content)
+  VALUES (trim(p_name), p_content)
+  RETURNING procedure_id INTO v_id;
+  RETURN jsonb_build_object('ok', true, 'procedure_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_procedure(
+  p_procedure_id uuid,
+  p_content text DEFAULT NULL,
+  p_enabled boolean DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  p_row allgres_private.procedures%ROWTYPE;
+  v_content text;
+  v_changed boolean;
+BEGIN
+  SELECT * INTO p_row FROM allgres_private.procedures WHERE procedure_id = p_procedure_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'procedure not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_content := COALESCE(NULLIF(p_content, ''), p_row.content);
+  v_changed := v_content IS DISTINCT FROM p_row.content;
+
+  IF v_changed THEN
+    INSERT INTO allgres_private.procedure_history (procedure_id, generation, content)
+    VALUES (p_row.procedure_id, p_row.generation, p_row.content);
+  END IF;
+
+  UPDATE allgres_private.procedures
+  SET content = v_content,
+      is_active = COALESCE(p_enabled, is_active),
+      generation = generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
+      updated_at = now()
+  WHERE procedure_id = p_procedure_id;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'generation', p_row.generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
+    'changed', v_changed
+  );
+END;
+$fn$;
+
+-- Same shape as fn_rollback_policy: never a mutation of procedure_history,
+-- only ever a new version (via fn_set_procedure) that happens to match an
+-- old one.
+CREATE OR REPLACE FUNCTION allgres_public.fn_rollback_procedure(p_procedure_id uuid, p_generation int)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  h allgres_private.procedure_history%ROWTYPE;
+BEGIN
+  SELECT * INTO h FROM allgres_private.procedure_history
+  WHERE procedure_id = p_procedure_id AND generation = p_generation;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_rollback_procedure: no history for that procedure at generation %', p_generation
+      USING ERRCODE = 'P0001';
+  END IF;
+  RETURN allgres_public.fn_set_procedure(p_procedure_id, h.content, NULL);
 END;
 $fn$;
 
@@ -5124,7 +5824,7 @@ BEGIN
   IF EXISTS (
     SELECT 1 FROM allgres_private.tasks
     WHERE session_id = p_session_id AND parent_task_id IS NULL
-      AND status IN ('queued', 'running', 'waiting_human')
+      AND status IN ('queued', 'running', 'waiting_human', 'waiting_children')
   ) THEN
     RAISE EXCEPTION 'this session has a turn still in progress -- wait for it to finish before sending another message'
       USING ERRCODE = 'P0001';
@@ -5143,6 +5843,223 @@ BEGIN
   VALUES (v_tid, 0, 'user', to_jsonb(btrim(p_message)));
 
   RETURN jsonb_build_object('ok', true, 'session_id', p_session_id, 'task_id', v_tid);
+END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- Roadmap item 6: schedules -- see allgres_private.schedules' own comment.
+-- Same create/set/delete shape as fn_create_connection/fn_set_connection on
+-- purpose: a named, operator-managed row with its own lifecycle.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_schedule(
+  p_name text,
+  p_agent_id uuid,
+  p_goal text,
+  p_interval_seconds int,
+  p_max_runs int DEFAULT NULL,
+  p_ends_at timestamptz DEFAULT NULL,
+  p_start_at timestamptz DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF NULLIF(trim(p_name), '') IS NULL THEN
+    RAISE EXCEPTION 'schedule name is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NULLIF(trim(p_goal), '') IS NULL THEN
+    RAISE EXCEPTION 'schedule goal is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_active) THEN
+    RAISE EXCEPTION 'agent inactive or missing' USING ERRCODE = 'P0001';
+  END IF;
+  IF COALESCE(p_interval_seconds, 0) <= 0 THEN
+    RAISE EXCEPTION 'interval_seconds must be a positive number of seconds' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_max_runs IS NOT NULL AND p_max_runs <= 0 THEN
+    RAISE EXCEPTION 'max_runs must be a positive number' USING ERRCODE = 'P0001';
+  END IF;
+
+  INSERT INTO allgres_private.schedules (name, agent_id, goal, interval_seconds, next_run_at, max_runs, ends_at)
+  VALUES (trim(p_name), p_agent_id, trim(p_goal), p_interval_seconds, COALESCE(p_start_at, now()), p_max_runs, p_ends_at)
+  RETURNING schedule_id INTO v_id;
+  RETURN jsonb_build_object('ok', true, 'schedule_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_schedule(
+  p_schedule_id uuid,
+  p_goal text DEFAULT NULL,
+  p_interval_seconds int DEFAULT NULL,
+  p_is_active boolean DEFAULT NULL,
+  p_max_runs int DEFAULT NULL,
+  p_clear_max_runs boolean DEFAULT false,
+  p_ends_at timestamptz DEFAULT NULL,
+  p_clear_ends_at boolean DEFAULT false
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  s allgres_private.schedules%ROWTYPE;
+BEGIN
+  SELECT * INTO s FROM allgres_private.schedules WHERE schedule_id = p_schedule_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_interval_seconds IS NOT NULL AND p_interval_seconds <= 0 THEN
+    RAISE EXCEPTION 'interval_seconds must be a positive number of seconds' USING ERRCODE = 'P0001';
+  END IF;
+
+  UPDATE allgres_private.schedules
+  SET goal = COALESCE(NULLIF(p_goal, ''), goal),
+      interval_seconds = COALESCE(p_interval_seconds, interval_seconds),
+      is_active = COALESCE(p_is_active, is_active),
+      max_runs = CASE WHEN p_clear_max_runs THEN NULL ELSE COALESCE(p_max_runs, max_runs) END,
+      ends_at = CASE WHEN p_clear_ends_at THEN NULL ELSE COALESCE(p_ends_at, ends_at) END,
+      updated_at = now()
+  WHERE schedule_id = p_schedule_id;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- No FK cascade onto a schedule from anything that must survive it (a past
+-- run's own session stands on its own once created -- see last_session_id's
+-- ON DELETE default, no action, matching how a delegated task outlives a
+-- deleted parent nowhere in this file either). Deleting a schedule only
+-- ever removes the row that decides whether it fires again; every session
+-- it already created stays exactly as it was.
+CREATE OR REPLACE FUNCTION allgres_public.fn_delete_schedule(p_schedule_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.schedules WHERE schedule_id = p_schedule_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule not found' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- The firing sweep, called from fn_pump every tick alongside fn_watchdog/
+-- fn_dispatch_tasks -- entirely a poll against next_run_at, no external
+-- scheduler and nothing held in worker memory, so a restart between ticks
+-- loses nothing: the next tick just finds the same due row again. Always
+-- reschedules from *now*, never by walking next_run_at forward in
+-- interval_seconds steps -- a schedule that missed several intervals while
+-- the extension was down (or simply never got a tick) fires once to catch
+-- up, not N times in a burst.
+CREATE OR REPLACE FUNCTION allgres_public.fn_run_schedules()
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_created jsonb;
+  n int := 0;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT schedule_id, agent_id, goal, interval_seconds, max_runs, run_count, ends_at
+    FROM allgres_private.schedules
+    WHERE is_active AND next_run_at <= now()
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    -- A stop condition reached between ticks (an operator lowering max_runs,
+    -- or ends_at simply arriving) is honoured here too, not only at create/
+    -- set time -- deactivate and skip firing rather than run one more time
+    -- past the limit.
+    IF (r.max_runs IS NOT NULL AND r.run_count >= r.max_runs)
+       OR (r.ends_at IS NOT NULL AND r.ends_at <= now()) THEN
+      UPDATE allgres_private.schedules SET is_active = false, updated_at = now()
+      WHERE schedule_id = r.schedule_id;
+      CONTINUE;
+    END IF;
+
+    BEGIN
+      v_created := allgres_public.fn_create_session(r.agent_id, r.goal);
+    EXCEPTION WHEN others THEN
+      -- The agent went inactive, or some other transient failure -- push
+      -- next_run_at forward anyway so a permanently-broken schedule cannot
+      -- spin every tick forever; the operator sees run_count stay behind
+      -- what elapsed time would predict and can investigate.
+      RAISE WARNING 'fn_run_schedules: fn_create_session failed for schedule %: %', r.schedule_id, SQLERRM;
+      UPDATE allgres_private.schedules
+      SET next_run_at = now() + make_interval(secs => r.interval_seconds),
+          updated_at = now()
+      WHERE schedule_id = r.schedule_id;
+      CONTINUE;
+    END;
+
+    UPDATE allgres_private.schedules
+    SET run_count = run_count + 1,
+        last_run_at = now(),
+        last_session_id = (v_created->>'session_id')::uuid,
+        next_run_at = now() + make_interval(secs => interval_seconds),
+        is_active = NOT (
+          (max_runs IS NOT NULL AND run_count + 1 >= max_runs)
+          OR (ends_at IS NOT NULL AND ends_at <= now())
+        ),
+        updated_at = now()
+    WHERE schedule_id = r.schedule_id;
+    n := n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('fired', n);
+END;
+$fn$;
+
+-- Fires one schedule immediately -- an operator's "run it now" button, or
+-- an external system's own event hitting this through dashboard_rpc
+-- ('schedules.run_now'), the closest this slice comes to genuinely
+-- event-driven execution (see README, "Task dependencies" -- the same
+-- deferred-scope note applies here: a real condition/webhook-triggered
+-- schedule is future work, not this). Bypasses next_run_at, but never a
+-- stop condition: a schedule that has already hit max_runs/ends_at (or is
+-- simply paused) cannot be forced past that by this either.
+CREATE OR REPLACE FUNCTION allgres_public.fn_run_schedule_now(p_schedule_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  s allgres_private.schedules%ROWTYPE;
+  v_created jsonb;
+BEGIN
+  SELECT * INTO s FROM allgres_private.schedules WHERE schedule_id = p_schedule_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT s.is_active THEN
+    RAISE EXCEPTION 'schedule is not active' USING ERRCODE = 'P0001';
+  END IF;
+  IF (s.max_runs IS NOT NULL AND s.run_count >= s.max_runs) OR (s.ends_at IS NOT NULL AND s.ends_at <= now()) THEN
+    RAISE EXCEPTION 'schedule has already reached a stop condition' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_created := allgres_public.fn_create_session(s.agent_id, s.goal);
+
+  UPDATE allgres_private.schedules
+  SET run_count = run_count + 1,
+      last_run_at = now(),
+      last_session_id = (v_created->>'session_id')::uuid,
+      is_active = NOT (
+        (max_runs IS NOT NULL AND run_count + 1 >= max_runs)
+        OR (ends_at IS NOT NULL AND ends_at <= now())
+      ),
+      updated_at = now()
+  WHERE schedule_id = p_schedule_id;
+  RETURN v_created;
 END;
 $fn$;
 
@@ -5181,7 +6098,8 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_create_provider(
   p_api_key text DEFAULT NULL,
   p_allow_private_network boolean DEFAULT false,
   p_purpose text DEFAULT 'chat',
-  p_embedding_model text DEFAULT NULL
+  p_embedding_model text DEFAULT NULL,
+  p_response_format_json_object boolean DEFAULT true
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -5226,9 +6144,10 @@ BEGIN
   END IF;
 
   INSERT INTO allgres_private.llm_providers
-    (name, kind, base_url, is_enabled, allow_private_network, purpose, embedding_model)
+    (name, kind, base_url, is_enabled, allow_private_network, purpose, embedding_model,
+     response_format_json_object)
   VALUES (trim(p_name), p_kind, v_url, true, COALESCE(p_allow_private_network, false),
-          v_purpose, NULLIF(trim(p_embedding_model), ''))
+          v_purpose, NULLIF(trim(p_embedding_model), ''), COALESCE(p_response_format_json_object, true))
   RETURNING provider_id INTO v_id;
 
   IF NULLIF(p_api_key, '') IS NOT NULL THEN
@@ -5248,7 +6167,8 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_set_provider(
   p_oauth_token_url text DEFAULT NULL,
   p_oauth_client_id text DEFAULT NULL,
   p_oauth_client_secret text DEFAULT NULL,
-  p_embedding_model text DEFAULT NULL
+  p_embedding_model text DEFAULT NULL,
+  p_response_format_json_object boolean DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -5298,7 +6218,8 @@ BEGIN
     oauth_auth_url = COALESCE(p_oauth_auth_url, oauth_auth_url),
     oauth_token_url = COALESCE(p_oauth_token_url, oauth_token_url),
     oauth_client_id = COALESCE(p_oauth_client_id, oauth_client_id),
-    embedding_model = COALESCE(NULLIF(trim(p_embedding_model), ''), embedding_model)
+    embedding_model = COALESCE(NULLIF(trim(p_embedding_model), ''), embedding_model),
+    response_format_json_object = COALESCE(p_response_format_json_object, response_format_json_object)
   WHERE provider_id = p_provider_id;
 
   IF p_oauth_client_secret IS NOT NULL AND p_oauth_client_secret <> '' THEN
@@ -5308,6 +6229,156 @@ BEGIN
       SET oauth_client_secret = EXCLUDED.oauth_client_secret;
   END IF;
 
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- ---------------------------------------------------------------------------
+-- Roadmap item 2: generic authenticated HTTP connections, for the
+-- 'http_request' tool (see fn_next_step's call_tool handling and
+-- fn_claim_outbound below). Same create/set/set_secret shape as
+-- fn_create_provider/fn_set_provider/fn_set_provider_secret, deliberately --
+-- this is the same credential-storage problem (a named endpoint plus an
+-- optional bearer/api-key secret, never returned by any list action) with a
+-- different consumer.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_connection(
+  p_name text,
+  p_base_url text,
+  p_auth_kind text DEFAULT 'none',
+  p_api_key text DEFAULT NULL,
+  p_allow_private_network boolean DEFAULT false
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_id uuid;
+  v_url text;
+  v_reason text;
+  v_auth text := COALESCE(NULLIF(trim(p_auth_kind), ''), 'none');
+BEGIN
+  IF NULLIF(trim(p_name), '') IS NULL THEN
+    RAISE EXCEPTION 'connection name is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_auth NOT IN ('none', 'authorization', 'x-api-key') THEN
+    RAISE EXCEPTION 'invalid connection auth_kind: %', v_auth USING ERRCODE = 'P0001';
+  END IF;
+
+  v_url := rtrim(NULLIF(trim(p_base_url), ''), '/');
+  IF v_url IS NULL THEN
+    RAISE EXCEPTION 'connection base_url is required' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_reason := allgres_private.check_outbound_url(v_url, COALESCE(p_allow_private_network, false));
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'connection endpoint rejected: % (%)', v_reason, v_url
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  INSERT INTO allgres_private.api_connections
+    (name, base_url, auth_kind, is_enabled, allow_private_network)
+  VALUES (trim(p_name), v_url, v_auth, true, COALESCE(p_allow_private_network, false))
+  RETURNING connection_id INTO v_id;
+
+  IF NULLIF(p_api_key, '') IS NOT NULL THEN
+    PERFORM allgres_public.fn_set_connection_secret(v_id, p_api_key);
+  END IF;
+
+  RETURN jsonb_build_object('ok', true, 'connection_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_connection(
+  p_connection_id uuid,
+  p_base_url text DEFAULT NULL,
+  p_auth_kind text DEFAULT NULL,
+  p_enabled boolean DEFAULT NULL,
+  p_allow_private_network boolean DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_allow boolean;
+  v_url   text;
+  v_auth  text;
+  v_reason text;
+BEGIN
+  SELECT COALESCE(p_allow_private_network, allow_private_network),
+         rtrim(COALESCE(NULLIF(p_base_url, ''), base_url), '/'),
+         COALESCE(NULLIF(p_auth_kind, ''), auth_kind)
+  INTO v_allow, v_url, v_auth
+  FROM allgres_private.api_connections
+  WHERE connection_id = p_connection_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'connection not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_auth NOT IN ('none', 'authorization', 'x-api-key') THEN
+    RAISE EXCEPTION 'invalid connection auth_kind: %', v_auth USING ERRCODE = 'P0001';
+  END IF;
+
+  v_reason := allgres_private.check_outbound_url(v_url, v_allow);
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'connection endpoint rejected: % (%)', v_reason, v_url
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  UPDATE allgres_private.api_connections
+  SET base_url = v_url,
+      auth_kind = v_auth,
+      is_enabled = COALESCE(p_enabled, is_enabled),
+      allow_private_network = v_allow,
+      updated_at = now()
+  WHERE connection_id = p_connection_id;
+
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_connection_secret(p_connection_id uuid, p_api_key text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  INSERT INTO allgres_private.api_connection_secrets (connection_id, api_key)
+  VALUES (p_connection_id, allgres_private.encrypt_secret(NULLIF(p_api_key, '')))
+  ON CONFLICT (connection_id) DO UPDATE
+    SET api_key = COALESCE(
+          allgres_private.encrypt_secret(NULLIF(p_api_key, '')),
+          allgres_private.api_connection_secrets.api_key
+        );
+  RETURN jsonb_build_object(
+    'ok', true,
+    'has_secret', true,
+    'storage', allgres_private.secret_storage_mode()
+  );
+END;
+$fn$;
+
+-- No FK cascades onto anything an agent turn depends on for its own history
+-- (outbound_calls.connection_id has no ON DELETE behaviour, so a real call
+-- row referencing this connection blocks the delete -- same shape as an
+-- agent with real sessions/tasks). An operator retiring a connection that
+-- was actually used keeps it around disabled (fn_set_connection, is_enabled
+-- = false) instead.
+CREATE OR REPLACE FUNCTION allgres_public.fn_delete_connection(p_connection_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.api_connections WHERE connection_id = p_connection_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'connection not found' USING ERRCODE = 'P0001';
+  END IF;
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -5780,7 +6851,8 @@ $fn$;
 
 -- The one control that was missing entirely: nothing could stop a runaway
 -- agent.  Cancels every open task in the session (queued/running/
--- waiting_human), rejects any pending approval so it doesn't linger, logs an
+-- waiting_human/waiting_children), rejects any pending approval so it
+-- doesn't linger, logs an
 -- operator message on each cancelled task so the thread shows why it stopped,
 -- and closes the session as 'cancelled' -- distinct from maybe_complete_session's
 -- 'completed'/'failed', which this deliberately bypasses: that function has
@@ -5803,7 +6875,7 @@ BEGIN
   FOR r IN
     SELECT task_id, step_count
     FROM allgres_private.tasks
-    WHERE session_id = p_session_id AND status IN ('queued', 'running', 'waiting_human')
+    WHERE session_id = p_session_id AND status IN ('queued', 'running', 'waiting_human', 'waiting_children')
     FOR UPDATE
   LOOP
     PERFORM allgres_private.append_log(r.task_id, r.step_count + 1, 'operator', to_jsonb(v_reason));
@@ -5923,7 +6995,7 @@ BEGIN
   FROM allgres_private.sessions s
   WHERE t.session_id = s.session_id
     AND s.goal LIKE 'selftest%'
-    AND t.status IN ('queued', 'running', 'waiting_human');
+    AND t.status IN ('queued', 'running', 'waiting_human', 'waiting_children');
   UPDATE allgres_private.sessions
   SET status = 'cancelled', completed_at = now()
   WHERE goal LIKE 'selftest%' AND status = 'open';
@@ -6040,6 +7112,86 @@ SET search_path = allgres_private, pg_temp
 AS $fn$
 BEGIN
   DELETE FROM allgres_private.web_sessions WHERE session_token = p_session_token;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- These four used to be the only mutations in the whole file with no SQL
+-- entry point of their own -- their real INSERT/UPDATE/DELETE lived only
+-- inline inside dashboard_rpc's users.set_active/set_role/assignments.set/
+-- assignments.toggle branches, reachable only through the jsonb RPC
+-- envelope. Every other mutation dashboard_rpc exposes already has a plain
+-- function like this one behind it (fn_create_user just above,
+-- fn_grant_permission, fn_set_policy, ...) that an operator with direct
+-- database access can call the same way `psql -c "SELECT
+-- fn_create_user(...)"` already works, with no jsonb, no dashboard, no
+-- HTTP -- the whole point of a PostgreSQL-native control plane (see
+-- README's opening line). dashboard_rpc's own require_admin gate is
+-- unchanged; these carry no permission check themselves, exactly like
+-- fn_grant_permission/fn_revoke_permission just above -- gating the web/API
+-- surface is dashboard_rpc's job, not something every SQL-native function
+-- underneath it should also have to reimplement for a caller already
+-- trusted with direct database access.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_user_active(p_user_id uuid, p_is_active boolean)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  UPDATE allgres_private.users SET is_active = p_is_active WHERE user_id = p_user_id;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_user_role(p_user_id uuid, p_role text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF p_role NOT IN ('admin', 'user') THEN
+    RAISE EXCEPTION 'invalid role: %', p_role USING ERRCODE = 'P0001';
+  END IF;
+  UPDATE allgres_private.users SET role = p_role WHERE user_id = p_user_id;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- Replaces the full assignment set for one user with the given agent_ids --
+-- simpler and less error-prone from the UI than incremental add/remove
+-- calls for what is always edited as one list there; see
+-- fn_set_user_assignment below for the single add/remove instead.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_user_assignments(p_user_id uuid, p_agent_ids uuid[])
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.user_agent_assignments WHERE user_id = p_user_id;
+  INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+  SELECT p_user_id, a FROM unnest(COALESCE(p_agent_ids, ARRAY[]::uuid[])) a;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_user_assignment(p_user_id uuid, p_agent_id uuid, p_assigned boolean)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF p_assigned THEN
+    INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
+    VALUES (p_user_id, p_agent_id)
+    ON CONFLICT DO NOTHING;
+  ELSE
+    DELETE FROM allgres_private.user_agent_assignments
+    WHERE user_id = p_user_id AND agent_id = p_agent_id;
+  END IF;
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -6199,6 +7351,38 @@ BEGIN
     RAISE EXCEPTION 'agent not assigned to this user' USING ERRCODE = 'P0001';
   END IF;
   RETURN u;
+END;
+$fn$;
+
+-- The graceful counterpart require_admin_if_accounts_exist already is to
+-- require_admin, for the same reason: require_agent_access above has no
+-- bootstrap fallback (correct for chat/messenger/my_agents, which have
+-- required a real login since the day accounts existed at all), but
+-- applying it unconditionally to run/sessions.cancel/sessions.continue --
+-- older actions than the login system itself, part of the admin-facing
+-- Run/Sessions surface -- would break the single-operator, token-only
+-- deployment mode those have always worked in. This is a no-op while
+-- allgres_private.users is empty (checked fresh, not cached, same as
+-- require_admin_if_accounts_exist); once any account exists, it requires
+-- a real logged-in session AND (unless that session is an admin) that the
+-- session belongs to a user actually assigned to p_agent_id -- the two
+-- separate checks item 1 of the roadmap named: can this *user* reach this
+-- *agent* at all, kept apart from whether the *agent* may reach a given
+-- resource (agent_may_read/agent_has_permission, unrelated and untouched
+-- here). Before this fix, run/sessions.cancel/sessions.continue had no
+-- check whatsoever, at any account state -- any caller holding the shared
+-- dashboard token could run, cancel, or continue a session against any
+-- agent_id/session_id in the whole database, logged in or not, assigned
+-- or not.
+CREATE OR REPLACE FUNCTION allgres_private.require_agent_access_if_accounts_exist(p_token text, p_agent_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
+    RETURN;
+  END IF;
+  PERFORM allgres_private.require_agent_access(p_token, p_agent_id);
 END;
 $fn$;
 
@@ -6525,9 +7709,21 @@ VALUES
   ('93ad5476-8d3a-4443-8b98-f50b6d1d4fbc', 'openai_compat', 'openai_compat', 'https://api.openai.com/v1',  true,  false)
 ON CONFLICT (name) DO NOTHING;
 
+-- response_format_json_object's own retroactive fix (its column comment
+-- above explains why): must run after the INSERT above, whether that
+-- INSERT just created the row (fresh install) or found it already there
+-- and did nothing (ON CONFLICT DO NOTHING, an existing install) -- either
+-- way the row exists by the time this runs, unlike the ALTER TABLE far
+-- above it. Unconditional on every re-run of this file, not gated by
+-- whether the row was just inserted, so an install that already had the
+-- pre-fix default overwritten some other way is also corrected the next
+-- time control_plane.sql is applied.
+UPDATE allgres_private.llm_providers SET response_format_json_object = false WHERE name = 'ollama';
+
 INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
 VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks'),
-       ('allgres_public.v_system_health'), ('allgres_public.v_permission_audit')
+       ('allgres_public.v_system_health'), ('allgres_public.v_permission_audit'),
+       ('allgres_public.v_agent_health')
 ON CONFLICT DO NOTHING;
 
 DO $seed$
@@ -6581,6 +7777,39 @@ $prompt$,
       ('incheon', 'ARB-3', 1920.00, DATE '2026-08-07'),
       ('busan',   'ARB-2',  275.25, DATE '2026-08-12')
     ) AS s(region, sku, amount, sold_on);
+  END IF;
+END
+$seed$;
+
+-- A second, deliberately plain demo agent for the Chat page's own "General"
+-- tab: item 39's own follow-up to that tab always needing an agent picked
+-- from a dropdown first, reported live as friction an operator (or a
+-- regular user with exactly one thing they want to talk to) shouldn't have
+-- to deal with just to say hello. Unlike 'analyst' it holds no view/tool
+-- permissions and no demo data -- a plain conversational partner, not a
+-- data-query one -- so its own prompt only ever offers final_answer/
+-- await_human, never execute_sql/call_tool.
+DO $seed$
+DECLARE
+  v_agent uuid;
+BEGIN
+  SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'general';
+
+  IF v_agent IS NULL THEN
+    INSERT INTO allgres_private.agents (name) VALUES ('general') RETURNING agent_id INTO v_agent;
+
+    UPDATE allgres_private.policies
+    SET system_prompt = $prompt$You are a helpful, general-purpose conversational assistant. Reply with one JSON object only. No markdown, no prose.
+
+Allowed:
+{"action":"final_answer","answer":"..."}
+{"action":"await_human","reason":"..."}
+
+Have a normal, friendly conversation. When you have a reply, emit final_answer with your answer as plain text.
+$prompt$,
+        -- Deliberately no llm_config here, same reason as 'analyst' above.
+        updated_at = now()
+    WHERE agent_id = v_agent;
   END IF;
 END
 $seed$;
@@ -6806,6 +8035,12 @@ $prompt$,
   -- extension) -- aimed specifically at cost/efficiency (a shorter prompt,
   -- a cheaper model, a lower max_tokens) backed by this agent's own
   -- execution_logs cost stats, never at what the target agent does.
+  -- Roadmap item 7 (evaluation-gated self-improvement): also reads
+  -- allgres_public.v_agent_health -- a real completed/failed ratio, not
+  -- just cost -- so a change is judged by whether the target got cheaper
+  -- *without* the agent actually doing worse afterward, and this agent can
+  -- check fn_evaluate_last_change on its own past target before proposing
+  -- again, instead of assuming its last proposal already helped.
   IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'self_improve') THEN
     DECLARE v_agent uuid;
     BEGIN
@@ -6816,8 +8051,15 @@ $prompt$,
 execution_logs cost stats (steps per task, tokens per step, wall-clock time)
 and its current system_prompt/llm_config. Look for waste: a prompt padded
 with content that never changes the outcome, a model/max_tokens larger than
-the task needs, a step pattern that could be shorter. Reply with one JSON
-object only:
+the task needs, a step pattern that could be shorter. Before proposing,
+execute_sql against allgres_public.v_agent_health for the target agent's
+recent_success_rate -- a change that makes it cheaper but noticeably less
+successful is not an improvement, do not propose it. If you previously
+changed this same agent, you can also check whether that change actually
+helped: call the same evaluation this platform already tracks for it
+(success_rate_before_last_change on that view, or ask an operator to run
+fn_evaluate_last_change) before proposing another change on top of it.
+Reply with one JSON object only:
 {"action":"propose_change","target_agent_id":"...","changes":{"system_prompt":"...","llm_config":{...}},"reason":"..."}
 Never change what the target agent is supposed to accomplish -- only how
 cheaply it gets there. If you find nothing worth changing, use final_answer
@@ -6826,8 +8068,20 @@ $prompt$,
           max_steps = 6,
           updated_at = now()
       WHERE agent_id = v_agent;
+      INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+      VALUES (v_agent, 'view', 'allgres_public.v_agent_health')
+      ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
     END;
   END IF;
+
+  -- health_monitor already reads v_system_health for the cluster as a
+  -- whole; v_agent_health is the same idea per-agent, so it belongs to the
+  -- same diagnostic surface -- granted here rather than only at creation
+  -- time above, so an existing install picks it up on its next apply too.
+  INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+  SELECT agent_id, 'view', 'allgres_public.v_agent_health'
+  FROM allgres_private.agents WHERE name = 'health_monitor'
+  ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
 END
 $seed$;
 
@@ -6851,7 +8105,7 @@ $seed$;
 --
 -- Tables with no seed rows at all dump unconditionally. The tables section
 -- 10 above seeds (llm_providers, sql_sandbox_allowlist, and
--- agents/policies/permissions for the built-in 'analyst' and
+-- agents/policies/permissions for the built-in 'analyst', 'general', and
 -- 'health_monitor' agents plus the six is_system=true system agents from
 -- 10a-2, plus demo_sales for 'analyst' alone)
 -- exclude exactly those seeded rows: the extension script recreates them
@@ -6878,11 +8132,11 @@ $seed$;
 -- ---------------------------------------------------------------------------
 
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agents',
-  $cfgdump$WHERE NOT (name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
+  $cfgdump$WHERE NOT (name IN ('analyst', 'health_monitor', 'general') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.policies',
-  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor', 'general') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.permissions',
-  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor') OR is_system)$cfgdump$);
+  $cfgdump$WHERE agent_id NOT IN (SELECT agent_id FROM allgres_private.agents WHERE name IN ('analyst', 'health_monitor', 'general') OR is_system)$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.demo_sales',
   $cfgdump$WHERE agent_id <> (SELECT agent_id FROM allgres_private.agents WHERE name = 'analyst')$cfgdump$);
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_providers',
@@ -6903,6 +8157,11 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agent_memories', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.audit_log', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connections', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connection_secrets', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedures', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_history', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.schedules', '');
 
 -- ---------------------------------------------------------------------------
 -- 11. Selftest.  Spec section 10 invariants, runnable from the console.
@@ -6952,6 +8211,11 @@ DECLARE
   v_high_mem uuid;
   v_mem_gc int;
   v_new_agent uuid;
+  v_conn uuid;
+  v_rate numeric;
+  v_eval_child_name text;
+  v_sid2 uuid;
+  v_direct_sql_user uuid;
   v_root_id uuid;
   v_creator_id uuid;
   v_fixer_id uuid;
@@ -6968,6 +8232,7 @@ DECLARE
   v_mention_target uuid;
   v_admin_tok text;
   v_user_tok text;
+  v_audit_tok text;
   v_acct_agent uuid;
 BEGIN
   -- Clear out any leftover fixtures from an interrupted prior run before
@@ -7491,6 +8756,82 @@ BEGIN
   );
   v := v || jsonb_build_array(jsonb_build_object('name', 'revoke_permission_removes_row', 'ok', ok));
 
+  -- Roadmap item 4: allgres_private.procedures -- a named, versioned,
+  -- reusable "how to do X" any agent granted a matching 'procedure'
+  -- permission sees in its own prompt every turn. Same versioning shape as
+  -- fn_set_policy (only an actual content change snapshots history and
+  -- bumps generation), same rollback shape as fn_rollback_policy (a new
+  -- version, never a rewrite).
+  DELETE FROM allgres_private.procedure_history WHERE procedure_id IN (
+    SELECT procedure_id FROM allgres_private.procedures WHERE name = 'selftest_procedure'
+  );
+  DELETE FROM allgres_private.procedures WHERE name = 'selftest_procedure';
+  r := allgres_public.fn_create_procedure('selftest_procedure', 'selftest v1: do the thing carefully');
+  ok := (r->>'ok')::boolean;
+  v_call := (r->>'procedure_id')::uuid;
+  ok := ok AND (SELECT generation FROM allgres_private.procedures WHERE procedure_id = v_call) = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_procedure_starts_at_generation_one', 'ok', ok));
+
+  sub := allgres_public.fn_set_procedure(v_call, NULL, NULL);
+  ok := (sub->>'changed')::boolean IS FALSE
+    AND (SELECT generation FROM allgres_private.procedures WHERE procedure_id = v_call) = 1
+    AND NOT EXISTS (SELECT 1 FROM allgres_private.procedure_history WHERE procedure_id = v_call);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_procedure_noop_does_not_version', 'ok', ok));
+
+  sub := allgres_public.fn_set_procedure(v_call, 'selftest v2: do the thing carefully, then verify', NULL);
+  ok := (sub->>'changed')::boolean IS TRUE
+    AND (sub->>'generation')::int = 2
+    AND (SELECT content FROM allgres_private.procedures WHERE procedure_id = v_call) LIKE '%then verify%'
+    AND (SELECT content FROM allgres_private.procedure_history WHERE procedure_id = v_call AND generation = 1)
+        = 'selftest v1: do the thing carefully';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_procedure_versions_on_real_change', 'ok', ok));
+
+  sub := allgres_public.fn_rollback_procedure(v_call, 1);
+  ok := (sub->>'generation')::int = 3
+    AND (SELECT content FROM allgres_private.procedures WHERE procedure_id = v_call)
+        = 'selftest v1: do the thing carefully'
+    AND (SELECT count(*) FROM allgres_private.procedure_history WHERE procedure_id = v_call) = 2;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_rollback_procedure_restores_via_a_new_version', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_rollback_procedure(v_call, 99);
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_rollback_procedure_rejects_unknown_generation', 'ok', ok));
+
+  -- Recall: gated by the same agent_permission_refs check as a view/tool
+  -- grant, and inherited through a parent chain the same way (not
+  -- re-tested here -- system_agent_inherits_root_permission already proves
+  -- the underlying mechanism for a different resource_type).
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest procedure recall')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') NOT LIKE '%# procedures%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_hidden_from_prompt_without_permission', 'ok', ok));
+
+  PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', 'selftest_procedure');
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') LIKE '%# procedures%'
+    AND (spec->'messages'->0->>'content') LIKE '%selftest v1: do the thing carefully%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_shown_in_prompt_once_granted', 'ok', ok));
+  PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
+
+  -- Disabled (is_active = false) never shows even with a grant -- the same
+  -- "operator can pull a bad one without deleting its history" property
+  -- is_enabled already gives an llm_provider.
+  PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', 'selftest_procedure');
+  PERFORM allgres_public.fn_set_procedure(v_call, NULL, false);
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') NOT LIKE '%# procedures%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'disabled_procedure_hidden_even_with_permission', 'ok', ok));
+  PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
+  DELETE FROM allgres_private.procedure_history WHERE procedure_id = v_call;
+  DELETE FROM allgres_private.procedures WHERE procedure_id = v_call;
+
   -- 19. fn_set_policy only versions on a real change.  A no-op call (every
   --     param NULL/false) must not bump generation or write history --
   --     agents.update calls this on every save, e.g. just flipping
@@ -7665,6 +9006,20 @@ BEGIN
   ok := ok AND n_logs = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_expires_stale_task', 'ok', ok));
 
+  -- Roadmap item 5: max_turn_seconds reaches a task genuinely stuck in
+  -- 'waiting_children' the same way it reaches 'running'/'waiting_human' --
+  -- without this, a child that never finishes would let its parent wait
+  -- forever with no wall-clock bound at all.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest waiting_children_turn_timeout')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  UPDATE allgres_private.tasks
+  SET status = 'waiting_children', started_at = now() - interval '2 minutes'
+  WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_watchdog();
+  ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'failed';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'max_turn_seconds_reaches_a_task_waiting_on_children', 'ok', ok));
+
   -- 22. A task still 'queued' -- e.g. held back by max_concurrent_tasks --
   --     has never run a turn, so started_at is still NULL for it and
   --     max_turn_seconds must leave it alone no matter how old created_at
@@ -7803,6 +9158,157 @@ BEGIN
   ok := ok AND (SELECT delegation_depth FROM allgres_private.tasks WHERE task_id = v_tid2) = 1;
   v := v || jsonb_build_array(jsonb_build_object('name', 'delegate_succeeds_within_budget', 'ok', ok));
 
+  -- Roadmap item 5: delegate's "wait" opt-in and await_children -- a real,
+  -- Postgres-resident multi-agent task dependency edge. Default delegate
+  -- (tested just above) is completely unchanged; this is the new path.
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest await_children_reject')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'await_children')
+  ));
+  ok := (sub->>'action') = 'continue'
+    AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'running';
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := ok AND (r->>'reason') = 'no_pending_children_to_await';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'await_children_rejects_with_no_pending_children', 'ok', ok));
+
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest delegate_wait_fan_out')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'delegate', 'agent_name', 'selftest_delegate_b', 'wait', true)
+  ));
+  v_tid2 := NULLIF(sub->>'child_task_id', '')::uuid;
+  ok := v_tid2 IS NOT NULL
+    AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'running';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'delegate_wait_true_keeps_parent_running_not_completed', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'await_children')
+  ));
+  ok := (sub->>'action') = 'wait'
+    AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'waiting_children';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'await_children_pauses_the_task', 'ok', ok));
+
+  -- A session must not look "done" while one of its tasks is genuinely
+  -- still waiting on its own children -- maybe_complete_session's own
+  -- open-task check.
+  ok := (SELECT status FROM allgres_private.sessions WHERE session_id = v_sid) = 'open';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'session_stays_open_while_a_task_awaits_children', 'ok', ok));
+
+  PERFORM allgres_public.fn_watchdog();
+  ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'waiting_children';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_does_not_wake_while_child_still_open', 'ok', ok));
+
+  PERFORM allgres_public.fn_next_step(v_tid2);
+  PERFORM allgres_public.fn_submit_result(v_tid2, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'selftest child result marker')
+  ));
+  PERFORM allgres_public.fn_watchdog();
+  ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'queued';
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid ORDER BY step_number DESC LIMIT 1;
+  ok := ok AND (r->'delegate_results')::text LIKE '%selftest child result marker%'
+    AND (r->'delegate_results'->0->>'agent') = 'selftest_delegate_b'
+    AND (r->'delegate_results'->0->>'status') = 'completed';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_wakes_parent_once_child_completes_with_results', 'ok', ok));
+
+  -- fn_cancel_session must reach a task genuinely stuck in
+  -- 'waiting_children' too, not just queued/running/waiting_human.
+  v_sid := (allgres_public.fn_create_session(v_deleg_a, 'selftest cancel_while_awaiting_children')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'delegate', 'agent_name', 'selftest_delegate_b', 'wait', true)
+  ));
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}',
+    'parsed', jsonb_build_object('action', 'await_children')
+  ));
+  ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'waiting_children';
+  PERFORM allgres_public.fn_cancel_session(v_sid, 'selftest cancel test');
+  ok := ok AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_tid) = 'cancelled';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'cancel_session_cancels_a_task_waiting_on_children', 'ok', ok));
+
+  -- Roadmap item 6: schedules -- see allgres_private.schedules' own
+  -- comment. Exercises the exact function fn_pump calls (fn_run_schedules),
+  -- not a substitute.
+  DELETE FROM allgres_private.schedules WHERE name = 'selftest_schedule';
+  r := allgres_public.fn_create_schedule(
+    'selftest_schedule', v_agent, 'selftest schedule goal', 3600, NULL, NULL, now() - interval '1 minute'
+  );
+  ok := (r->>'ok')::boolean;
+  v_call := (r->>'schedule_id')::uuid;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_schedule_starts_due', 'ok', ok));
+
+  sub := allgres_public.fn_run_schedules();
+  ok := COALESCE((sub->>'fired')::int, 0) >= 1
+    AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 1
+    AND (SELECT last_session_id FROM allgres_private.schedules WHERE schedule_id = v_call) IS NOT NULL
+    AND (SELECT next_run_at FROM allgres_private.schedules WHERE schedule_id = v_call) > now();
+  ok := ok AND EXISTS (
+    SELECT 1 FROM allgres_private.sessions
+    WHERE session_id = (SELECT last_session_id FROM allgres_private.schedules WHERE schedule_id = v_call)
+      AND goal = 'selftest schedule goal'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_run_schedules_fires_a_due_schedule_and_creates_a_session', 'ok', ok));
+
+  PERFORM allgres_public.fn_run_schedules();
+  ok := (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_run_schedules_does_not_fire_before_next_run_at', 'ok', ok));
+
+  r := allgres_public.fn_run_schedule_now(v_call);
+  ok := (r->>'ok')::boolean
+    AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 2;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_run_schedule_now_bypasses_next_run_at', 'ok', ok));
+
+  -- max_runs reached mid-flight (an operator lowering it, or simply
+  -- accumulating runs) is honoured the next time the schedule would
+  -- actually fire, not only at create/set time -- deactivated, not fired
+  -- one run past the budget.
+  UPDATE allgres_private.schedules SET max_runs = 2, next_run_at = now() - interval '1 minute' WHERE schedule_id = v_call;
+  sub := allgres_public.fn_run_schedules();
+  ok := COALESCE((sub->>'fired')::int, 0) = 0
+    AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 2
+    AND (SELECT is_active FROM allgres_private.schedules WHERE schedule_id = v_call) IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'schedule_deactivates_on_reaching_max_runs', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_run_schedule_now(v_call);
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_run_schedule_now_rejects_an_inactive_schedule', 'ok', ok));
+
+  -- ends_at is an independent stop condition, same auto-deactivate.
+  UPDATE allgres_private.schedules
+  SET is_active = true, max_runs = NULL, ends_at = now() - interval '1 minute',
+      next_run_at = now() - interval '1 minute'
+  WHERE schedule_id = v_call;
+  sub := allgres_public.fn_run_schedules();
+  ok := COALESCE((sub->>'fired')::int, 0) = 0
+    AND (SELECT is_active FROM allgres_private.schedules WHERE schedule_id = v_call) IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'schedule_deactivates_on_reaching_ends_at', 'ok', ok));
+
+  -- A paused (is_active=false) schedule never fires, no matter how overdue.
+  UPDATE allgres_private.schedules
+  SET is_active = false, ends_at = NULL, next_run_at = now() - interval '1 minute'
+  WHERE schedule_id = v_call;
+  sub := allgres_public.fn_run_schedules();
+  ok := COALESCE((sub->>'fired')::int, 0) = 0
+    AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 2;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'inactive_schedule_never_fires', 'ok', ok));
+
+  DELETE FROM allgres_private.schedules WHERE schedule_id = v_call;
+
   -- 25. build_llm_http fails closed on an unconfigured/disabled provider
   --     instead of silently substituting whichever other enabled provider
   --     sorted first by name -- an external review caught the old
@@ -7871,10 +9377,316 @@ BEGIN
   END;
   v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_provider_rejects_ssrf_url', 'ok', ok));
 
+  -- 25e. response_format_json_object (item 37's own fix): a per-provider
+  -- flag replacing what used to be a single `v_prov.name <> 'ollama'` check
+  -- inside build_llm_http -- confirmed live against a real LM Studio
+  -- instance, which rejects response_format outright (HTTP 400) the same
+  -- way Ollama's own openai_compat endpoint always has, under a name
+  -- nothing in that old check ever recognized. Default true (unchanged
+  -- behavior for selftest_new_provider above and every other existing
+  -- provider); an operator can turn it off per provider, exercised here by
+  -- checking build_llm_http's actual request body, not just the stored
+  -- column.
+  r := allgres_public.fn_create_provider('selftest_no_json_mode', 'openai_compat',
+    'https://selftest.invalid/v1', NULL, false, 'chat', NULL, false);
+  ok := (r->>'ok')::boolean;
+  spec := allgres_private.build_llm_http(jsonb_build_object(
+    'llm_config', jsonb_build_object('provider', 'selftest_no_json_mode', 'model', 'x'),
+    'messages', '[]'::jsonb
+  ));
+  ok := ok AND NOT (spec->'body' ? 'response_format');
+  v := v || jsonb_build_array(jsonb_build_object('name', 'response_format_json_object_false_omits_it', 'ok', ok));
+
+  spec := allgres_private.build_llm_http(jsonb_build_object(
+    'llm_config', jsonb_build_object('provider', 'selftest_new_provider', 'model', 'x'),
+    'messages', '[]'::jsonb
+  ));
+  ok := (spec->'body'->'response_format'->>'type') = 'json_object';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'response_format_json_object_true_by_default', 'ok', ok));
+
+  -- The migration's own retroactive fix, not just the new column's default:
+  -- the seeded 'ollama' row must still come out false after this file's own
+  -- ALTER TABLE/UPDATE runs, exactly matching what the old name check used
+  -- to give it.
+  ok := (SELECT response_format_json_object FROM allgres_private.llm_providers WHERE name = 'ollama') IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'seeded_ollama_provider_still_omits_response_format', 'ok', ok));
+
+  -- 25f. fn_complete_outbound's own auto-detect for the same rejection,
+  -- so an operator never has to notice the HTTP 400 and flip the checkbox
+  -- by hand -- a synthetic outbound_calls row stands in for one
+  -- fn_dispatch_tasks would have queued, same technique as
+  -- complete_outbound_fences_stale_result above.
+  r := allgres_public.fn_create_provider('selftest_autodetect_provider', 'openai_compat',
+    'https://selftest.invalid/v1');
+  v_provider := (r->>'provider_id')::uuid;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest response_format autodetect')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status, provider_id)
+  VALUES (v_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', 'in_flight', v_provider)
+  RETURNING call_id INTO v_call;
+  PERFORM allgres_public.fn_complete_outbound(v_call, 400,
+    '{"error":"''response_format.type'' must be ''json_schema'' or ''text''"}');
+  ok := (SELECT response_format_json_object FROM allgres_private.llm_providers WHERE provider_id = v_provider) IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'response_format_rejection_autodetected_and_disabled', 'ok', ok));
+
+  -- A narrow signature match, not "any 400 turns it off" -- an unrelated
+  -- failure (bad key, context length, ...) must never touch the column.
+  r := allgres_public.fn_create_provider('selftest_autodetect_unrelated', 'openai_compat',
+    'https://selftest.invalid/v1');
+  v_provider := (r->>'provider_id')::uuid;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status, provider_id)
+  VALUES (v_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', 'in_flight', v_provider)
+  RETURNING call_id INTO v_call;
+  PERFORM allgres_public.fn_complete_outbound(v_call, 400, '{"error":"context length exceeded"}');
+  ok := (SELECT response_format_json_object FROM allgres_private.llm_providers WHERE provider_id = v_provider);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'unrelated_400_does_not_disable_response_format', 'ok', ok));
+
+  DELETE FROM allgres_private.outbound_calls WHERE provider_id IN (
+    SELECT provider_id FROM allgres_private.llm_providers
+    WHERE name IN ('selftest_no_json_mode', 'selftest_autodetect_provider', 'selftest_autodetect_unrelated')
+  );
+  DELETE FROM allgres_private.llm_providers WHERE name IN
+    ('selftest_no_json_mode', 'selftest_autodetect_provider', 'selftest_autodetect_unrelated');
+
+  -- 25g0. The 'general' demo agent (item 39's own follow-up): seeded
+  -- active, no llm_config picked for it yet (same reason as 'analyst'),
+  -- and no view/tool permissions -- a plain conversational partner, unlike
+  -- 'analyst', which is deliberately a data-query one. Checked here, before
+  -- fn_bulk_set_model below runs against every active agent including this
+  -- one -- that would otherwise give this its own llm_config and make the
+  -- "still unconfigured" half of this assertion fail on nothing but test
+  -- ordering.
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.agents a JOIN allgres_private.policies p USING (agent_id)
+    WHERE a.name = 'general' AND a.is_active AND p.llm_config = '{}'::jsonb
+  );
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.permissions
+    WHERE agent_id = (SELECT agent_id FROM allgres_private.agents WHERE name = 'general')
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'general_agent_seeded_plain_and_unconfigured', 'ok', ok));
+
+  -- 25g. fn_bulk_set_model: one call sets llm_config.provider/model on
+  -- every active agent, reusing fn_set_policy's own merge (nothing else on
+  -- any of those policies changes) rather than a hand-rolled UPDATE that
+  -- would bypass policy_history/generation the way every other agent
+  -- mutation in this file goes through.
+  -- fn_bulk_set_model is deliberately "every active agent", so exercising
+  -- it for real -- not against some carved-out subset -- means every real
+  -- seeded agent's llm_config changes too. Snapshotted here and restored
+  -- below before this function returns, the same idempotence-on-rerun
+  -- requirement every other fixture in this file already meets (a second
+  -- fn_selftest call on the same database must see the same starting
+  -- state, not one already bulk-set from the first run).
+  CREATE TEMP TABLE IF NOT EXISTS _selftest_bulk_snapshot (agent_id uuid PRIMARY KEY, llm_config jsonb);
+  DELETE FROM _selftest_bulk_snapshot;
+  INSERT INTO _selftest_bulk_snapshot
+  SELECT agent_id, llm_config FROM allgres_private.policies
+  WHERE agent_id IN (SELECT agent_id FROM allgres_private.agents WHERE is_active);
+
+  DELETE FROM allgres_private.agents WHERE name IN ('selftest_bulk_agent_a', 'selftest_bulk_agent_b');
+  INSERT INTO allgres_private.agents (name) VALUES ('selftest_bulk_agent_a'), ('selftest_bulk_agent_b');
+  r := allgres_public.fn_create_provider('selftest_bulk_provider', 'openai_compat', 'https://selftest.invalid/v1');
+  comp := allgres_public.fn_bulk_set_model('selftest_bulk_provider', 'selftest-model-x');
+  ok := COALESCE((comp->>'ok')::boolean, false) AND COALESCE((comp->>'updated_count')::int, 0) >= 2;
+  ok := ok AND NOT EXISTS (
+    SELECT 1 FROM allgres_private.agents a JOIN allgres_private.policies p USING (agent_id)
+    WHERE a.name IN ('selftest_bulk_agent_a', 'selftest_bulk_agent_b')
+      AND (p.llm_config->>'provider' <> 'selftest_bulk_provider' OR p.llm_config->>'model' <> 'selftest-model-x')
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_bulk_set_model_updates_every_active_agent', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_bulk_set_model('selftest_nonexistent_provider_xyz', 'x');
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%is not configured or not enabled%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_bulk_set_model_rejects_unknown_provider', 'ok', ok));
+
+  UPDATE allgres_private.policies p SET llm_config = s.llm_config
+  FROM _selftest_bulk_snapshot s WHERE p.agent_id = s.agent_id;
+  DROP TABLE _selftest_bulk_snapshot;
+
+  DELETE FROM allgres_private.agents WHERE name IN ('selftest_bulk_agent_a', 'selftest_bulk_agent_b');
+  DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_bulk_provider';
+
   DELETE FROM allgres_private.llm_secrets WHERE provider_id IN (
     SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider'
   );
   DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_new_provider';
+
+  -- Roadmap item 2: allgres_private.api_connections + the 'http_request'
+  -- tool -- a named external endpoint with a stored credential, so an agent
+  -- can make an authenticated call (not just http_get's bare GET) without
+  -- ever seeing the secret itself. Same claim-time injection shape already
+  -- proven above (25f) for an LLM provider's api_key.
+  DELETE FROM allgres_private.outbound_calls WHERE connection_id IN (
+    SELECT connection_id FROM allgres_private.api_connections WHERE name = 'selftest_conn'
+  );
+  DELETE FROM allgres_private.api_connections WHERE name = 'selftest_conn';
+  r := allgres_public.fn_create_connection('selftest_conn', 'https://selftest.invalid/api',
+    'authorization', 'selftest-conn-key', false);
+  ok := (r->>'ok')::boolean;
+  v_conn := (r->>'connection_id')::uuid;
+  ok := ok AND allgres_private.connection_secret(v_conn) = 'selftest-conn-key';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_create_connection_stores_working_secret', 'ok', ok));
+
+  sub := allgres.dashboard_rpc(jsonb_build_object('action', 'connections.list'));
+  ok := (sub->'connections')::text NOT LIKE '%selftest-conn-key%'
+    AND (sub->'connections')::text LIKE '%selftest_conn%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'connections_list_never_exposes_secret', 'ok', ok));
+
+  -- A dedicated fixture agent, reused across reruns (like several agents
+  -- above): once it makes a real call_tool turn it has real execution_logs,
+  -- which the append-only trigger forbids ever deleting -- so this can only
+  -- ever be reactivated, never recreated, on a later run.
+  SELECT agent_id INTO v_new_agent FROM allgres_private.agents WHERE name = 'selftest_httpreq_agent';
+  IF v_new_agent IS NULL THEN
+    v_new_agent := (allgres_public.fn_create_agent('selftest_httpreq_agent')->>'agent_id')::uuid;
+  END IF;
+  UPDATE allgres_private.agents SET is_active = true WHERE agent_id = v_new_agent;
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'tool', 'http_request');
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'http_host', 'selftest.invalid');
+
+  v_sid := (allgres_public.fn_create_session(v_new_agent, 'selftest http_request via connection')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'post', 'connection', 'selftest_conn', 'path', 'widgets',
+        'body', jsonb_build_object('x', 1))
+    )
+  ));
+  -- Looked up by the call_id call_tool itself returned, not "the newest
+  -- row" -- every fn_submit_result call in this whole test block runs in
+  -- the same transaction, so created_at ties across them and an ORDER BY
+  -- created_at is not a reliable tiebreaker once more than one row exists.
+  v_call := (comp->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call;
+  ok := (r->>'url') = 'https://selftest.invalid/api/widgets'
+    AND (r->>'method') = 'POST'
+    AND (r->>'auth_kind') = 'authorization'
+    AND (r->>'connection_id') = v_conn::text
+    AND (r->'request_body') = jsonb_build_object('x', 1);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_via_connection_resolves_relative_path', 'ok', ok));
+
+  -- Never a full URL when a connection is named: the whole point of a
+  -- stored credential is that it can only ever reach its own base_url.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'connection', 'selftest_conn', 'path', 'https://evil.invalid/steal')
+    )
+  ));
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := (comp->>'action') = 'continue' AND (r->>'reason') = 'connection_path_must_be_relative';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_connection_rejects_absolute_path', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'TRACE', 'url', 'https://selftest.invalid/x')
+    )
+  ));
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := (comp->>'action') = 'continue' AND (r->>'reason') = 'unsupported_http_method';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_rejects_unsupported_method', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'connection', 'selftest_conn_does_not_exist', 'path', 'x')
+    )
+  ));
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := (comp->>'action') = 'continue' AND (r->>'reason') = 'unknown_connection';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_rejects_unknown_connection', 'ok', ok));
+
+  -- An agent-supplied Authorization header on a direct (no-connection) call
+  -- is stripped, not honoured -- it would otherwise be exactly the
+  -- plaintext-secret-in-a-row shape this design keeps out of outbound_calls.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'url', 'https://selftest.invalid/y',
+        'headers', jsonb_build_object('authorization', 'sneaky', 'x-custom', 'keep'))
+    )
+  ));
+  v_call := (comp->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call;
+  ok := (r->'request_headers'->>'x-custom') = 'keep'
+    AND NOT (r->'request_headers' ? 'authorization')
+    AND (r->>'connection_id') IS NULL AND (r->>'auth_kind') IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_direct_url_strips_agent_supplied_auth_header', 'ok', ok));
+
+  -- 'tool' permission is per-tool-name, not a blanket "may call call_tool":
+  -- holding http_get does not imply http_request, and vice versa.
+  PERFORM allgres_public.fn_revoke_permission(v_new_agent, 'tool', 'http_request');
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'url', 'https://selftest.invalid/z')
+    )
+  ));
+  SELECT content INTO r FROM allgres_private.execution_logs WHERE task_id = v_tid AND role = 'error' ORDER BY step_number DESC LIMIT 1;
+  ok := (comp->>'action') = 'continue' AND (r->>'reason') = 'tool_not_permitted';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_needs_tool_permission_distinct_from_http_get', 'ok', ok));
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'tool', 'http_request');
+
+  -- http_get itself must come out exactly as before this tool was added:
+  -- method GET, no connection, no body.
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'tool', 'http_get');
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_get',
+      'args', jsonb_build_object('url', 'https://selftest.invalid/legacy')
+    )
+  ));
+  v_call := (comp->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call;
+  ok := (r->>'method') = 'GET' AND (r->>'connection_id') IS NULL AND (r->'request_body') = '{}'::jsonb;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_get_unchanged_by_http_request_addition', 'ok', ok));
+
+  -- The credential itself: never in request_headers at queue time (already
+  -- implied above by connection_id being the only thing recorded), and
+  -- actually injected, decrypted, by fn_claim_outbound at claim time.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'connection', 'selftest_conn', 'path', 'ping')
+    )
+  ));
+  v_call := (comp->>'call_id')::uuid;
+  claim := allgres_public.fn_claim_outbound(10);
+  SELECT x INTO r FROM jsonb_array_elements(claim->'calls') x WHERE x->>'call_id' = v_call::text;
+  ok := (r->'headers'->>'authorization') = 'Bearer selftest-conn-key';
+  PERFORM allgres_public.fn_complete_outbound(v_call, 200, '{}');
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_claim_outbound_injects_connection_secret', 'ok', ok));
+
+  -- No FK cascade from outbound_calls.connection_id (see that column's own
+  -- comment): a connection a real call still references cannot be deleted
+  -- out from under it.
+  BEGIN
+    PERFORM allgres_public.fn_delete_connection(v_conn);
+    ok := false;
+  EXCEPTION WHEN foreign_key_violation THEN
+    ok := true;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'connection_delete_blocked_while_outbound_calls_reference_it', 'ok', ok));
+
+  DELETE FROM allgres_private.outbound_calls WHERE task_id = v_tid;
+  PERFORM allgres_public.fn_delete_connection(v_conn);
+  UPDATE allgres_private.agents SET is_active = false WHERE agent_id = v_new_agent;
 
   -- 26. OAuth token exchange, queued rather than handed back to the caller
   --     (see KNOWN_ISSUES.md, "a second-round external review of items 18
@@ -8109,6 +9921,102 @@ BEGIN
   PERFORM set_config('allgres.agent_id', '', true);
   v := v || jsonb_build_array(jsonb_build_object('name', 'maintenance_views_enforce_permission', 'ok', ok));
 
+  -- Roadmap item 7 (evaluation-gated self-improvement): v_agent_health is
+  -- the same permission-gated shape v_system_health/v_permission_audit
+  -- just proved, per-agent instead of a single aggregate row -- reuses
+  -- v_prov_agent (health_monitor, granted at seed time) and v_agent
+  -- (ungranted) from the block just above.
+  PERFORM set_config('allgres.agent_id', v_prov_agent::text, true);
+  SELECT count(*) INTO n_logs FROM allgres_public.v_agent_health;
+  ok := n_logs > 0;
+  PERFORM set_config('allgres.agent_id', v_agent::text, true);
+  SELECT count(*) INTO n_logs FROM allgres_public.v_agent_health;
+  ok := ok AND n_logs = 0;
+  PERFORM set_config('allgres.agent_id', '', true);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'v_agent_health_enforces_permission', 'ok', ok));
+
+  ok := allgres_private.agent_has_permission(
+    (SELECT agent_id FROM allgres_private.agents WHERE name = 'self_improve'),
+    'view', 'allgres_public.v_agent_health'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'self_improve_is_granted_v_agent_health', 'ok', ok));
+
+  -- allgres_private.agent_recent_success_rate: NULL (not zero) with no
+  -- evaluable tasks yet, a real ratio once some exist, scoped to root-level
+  -- tasks only (a delegated child must never count toward the delegating
+  -- agent's own rate -- it reflects whoever it was delegated *to*). The
+  -- function also excludes goal LIKE 'selftest%' sessions (the same
+  -- exclusion every operator-facing count in this file already applies to
+  -- fn_selftest's own debris -- see its comment), so proving the *counted*
+  -- case needs a fixture session/task that does NOT carry that prefix.
+  -- Rather than drive that through fn_create_session (which unconditionally
+  -- writes an execution_logs row, and that trigger's append-only rule would
+  -- then block ever deleting it -- the reason every other fixture agent in
+  -- this file is left deactivated forever instead of removed), the fixture
+  -- tasks below are inserted directly and never touch execution_logs at
+  -- all, so they can be hard-deleted afterward and leave nothing for an
+  -- operator to ever see.
+  INSERT INTO allgres_private.agents (name)
+    VALUES ('selftest_eval_agent_' || substr(md5(random()::text), 1, 8))
+    RETURNING agent_id INTO v_new_agent;
+  v_eval_child_name := 'selftest_eval_child_' || substr(md5(random()::text), 1, 8);
+  INSERT INTO allgres_private.agents (name)
+    VALUES (v_eval_child_name)
+    RETURNING agent_id INTO v_deleg_a;
+  PERFORM allgres_public.fn_grant_permission(v_new_agent, 'agent', v_eval_child_name);
+
+  ok := allgres_private.agent_recent_success_rate(v_new_agent, 20) IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'agent_recent_success_rate_null_with_no_tasks', 'ok', ok));
+
+  v_sid := gen_random_uuid();
+  INSERT INTO allgres_private.sessions (session_id, agent_id, goal, status)
+    VALUES (v_sid, v_new_agent, 'eval fixture (selftest): one completed root task', 'open');
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status)
+    VALUES (v_sid, v_new_agent, 'completed') RETURNING task_id INTO v_tid;
+  -- A delegated child under a different agent, parented to the task above --
+  -- its own failure must not move v_new_agent's rate at all.
+  INSERT INTO allgres_private.tasks (session_id, agent_id, parent_task_id, status)
+    VALUES (v_sid, v_deleg_a, v_tid, 'failed') RETURNING task_id INTO v_deleg_b;
+  v_rate := allgres_private.agent_recent_success_rate(v_new_agent, 20);
+  ok := v_rate = 1.0;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'agent_recent_success_rate_ignores_delegated_children', 'ok', ok));
+
+  -- policy_history.success_rate_at_change: a real snapshot taken at the
+  -- moment of change, while there is evaluable data (the one completed task
+  -- above).
+  PERFORM allgres_public.fn_set_policy(v_new_agent, 'selftest eval prompt v2');
+  ok := (SELECT success_rate_at_change FROM allgres_private.policy_history WHERE agent_id = v_new_agent ORDER BY generation DESC LIMIT 1) = 1.0;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'policy_history_snapshots_success_rate_on_a_real_change', 'ok', ok));
+
+  -- fn_evaluate_last_change: 'unchanged' immediately after (the same one
+  -- completed task, nothing new since), 'regressed' once a failing task
+  -- follows, 'no_change_recorded_yet' for an agent that has never had a
+  -- policy change at all.
+  r := allgres_public.fn_evaluate_last_change(v_new_agent);
+  ok := (r->>'verdict') = 'unchanged';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_unchanged', 'ok', ok));
+
+  v_sid2 := gen_random_uuid();
+  INSERT INTO allgres_private.sessions (session_id, agent_id, goal, status)
+    VALUES (v_sid2, v_new_agent, 'eval fixture (selftest): one failed root task', 'open');
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status)
+    VALUES (v_sid2, v_new_agent, 'failed');
+  r := allgres_public.fn_evaluate_last_change(v_new_agent);
+  ok := (r->>'verdict') = 'regressed';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_regressed', 'ok', ok));
+
+  r := allgres_public.fn_evaluate_last_change(v_deleg_a);
+  ok := (r->>'verdict') = 'no_change_recorded_yet';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_no_change_recorded_yet', 'ok', ok));
+
+  -- None of this touched execution_logs, so unlike every other fixture
+  -- agent in this file it can be removed outright instead of merely
+  -- deactivated -- policies/policy_history/permissions cascade off the
+  -- agents delete.
+  DELETE FROM allgres_private.tasks WHERE session_id IN (v_sid, v_sid2);
+  DELETE FROM allgres_private.sessions WHERE session_id IN (v_sid, v_sid2);
+  DELETE FROM allgres_private.agents WHERE agent_id IN (v_new_agent, v_deleg_a);
+
   -- 29. Operator audit log (README, "Operator audit log"): a consequential
   --     dashboard_rpc action writes exactly one row, with the self-
   --     reported operator_name and (for an action carrying one) no
@@ -8116,9 +10024,36 @@ BEGIN
   --     table refuses UPDATE/DELETE even from the function's own owner,
   --     not just from operator (see audit_log_no_update's own comment for
   --     why a REVOKE alone would not have been enough).
-  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'allowlist.remove', 'ref', 'selftest_audit_marker'));
+  --
+  -- The allowlist.add/remove and provider.update calls below are admin-
+  -- gated (require_admin_if_accounts_exist) -- this section used to lean
+  -- on the ambient "no accounts exist yet" bootstrap no-op the same way a
+  -- fresh install's own fn_selftest run happens to start in, which broke
+  -- outright (every gated call here rejected) the moment fn_selftest ran
+  -- against a database that already had one real account -- exactly what
+  -- happens the first time an operator clicks Settings' own "Run
+  -- selftest" button after creating their own admin account. A throwaway
+  -- admin token minted right here, used explicitly on every gated call in
+  -- this section, and torn down before it ends, makes this section's own
+  -- coverage independent of whatever account state the surrounding
+  -- database already happens to be in. Skipped when pgcrypto isn't
+  -- installed (fn_create_user would fail closed anyway); without
+  -- pgcrypto no real account can exist either, so the old bootstrap
+  -- no-op still applies and v_audit_tok staying NULL reaches the same
+  -- gate the same way an absent session_token always has.
+  v_audit_tok := NULL;
+  IF allgres_private.pgcrypto_schema() IS NOT NULL THEN
+    DELETE FROM allgres_private.users WHERE username = 'selftest_audit_admin';
+    PERFORM allgres_public.fn_create_user('selftest_audit_admin', 'selftest-audit-pw1', 'admin');
+    v_audit_tok := allgres_public.fn_login('selftest_audit_admin', 'selftest-audit-pw1')->>'session_token';
+  END IF;
+
+  PERFORM allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'allowlist.remove', 'ref', 'selftest_audit_marker', 'session_token', v_audit_tok
+  ));
   sub := allgres.dashboard_rpc(jsonb_build_object(
-    'action', 'allowlist.add', 'ref', 'selftest_audit_marker', 'operator_name', 'selftest_operator'
+    'action', 'allowlist.add', 'ref', 'selftest_audit_marker', 'operator_name', 'selftest_operator',
+    'session_token', v_audit_tok
   ));
   ok := (sub->>'ok')::boolean IS TRUE;
   SELECT operator_name = 'selftest_operator' AND details = jsonb_build_object('ref', 'selftest_audit_marker')
@@ -8127,7 +10062,9 @@ BEGIN
   WHERE action = 'allowlist.add' AND details->>'ref' = 'selftest_audit_marker'
   ORDER BY created_at DESC LIMIT 1;
   ok := ok AND COALESCE(detail_bool, false);
-  PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'allowlist.remove', 'ref', 'selftest_audit_marker'));
+  PERFORM allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'allowlist.remove', 'ref', 'selftest_audit_marker', 'session_token', v_audit_tok
+  ));
 
   SELECT count(*) INTO n_logs FROM allgres_private.audit_log;
   PERFORM allgres.dashboard_rpc(jsonb_build_object('action', 'overview'));
@@ -8136,7 +10073,8 @@ BEGIN
 
   sub := allgres.dashboard_rpc(jsonb_build_object(
     'action', 'provider.update', 'provider_id', v_provider,
-    'api_key', 'selftest-should-not-leak-into-audit-log', 'operator_name', 'selftest_operator'
+    'api_key', 'selftest-should-not-leak-into-audit-log', 'operator_name', 'selftest_operator',
+    'session_token', v_audit_tok
   ));
   SELECT NOT (details::text LIKE '%selftest-should-not-leak%') INTO detail_bool
   FROM allgres_private.audit_log WHERE action = 'provider.update' ORDER BY created_at DESC LIMIT 1;
@@ -8151,23 +10089,53 @@ BEGIN
     ok := ok AND SQLERRM LIKE '%append-only%';
   END;
 
+  IF v_audit_tok IS NOT NULL THEN
+    PERFORM allgres_public.fn_logout(v_audit_tok);
+    DELETE FROM allgres_private.users WHERE username = 'selftest_audit_admin';
+  END IF;
+
   v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
 
   -- item 36's own bootstrap guarantee: require_admin_if_accounts_exist must
   -- be a true no-op for a deployment that has never created a user account
-  -- at all -- verified here, not assumed, since this is the one point in
-  -- the whole run where allgres_private.users is guaranteed still empty
-  -- (section 31 below is the only place fn_selftest ever creates one, and
-  -- always cleans up after itself before returning).
-  ok := NOT EXISTS (SELECT 1 FROM allgres_private.users);
-  IF ok THEN
+  -- at all. Only actually checkable when allgres_private.users is empty --
+  -- true on a fresh install/CI (section 31 below is the only place
+  -- fn_selftest itself ever creates a row there, and always cleans up
+  -- after itself), but NOT true when fn_selftest runs against a live
+  -- deployment that already has a real admin account, e.g. via Settings'
+  -- own "Run selftest" button. Reporting a failure in that case would be a
+  -- false alarm about which state this particular run started in, not a
+  -- real defect -- there is nothing this run can check either way, so it
+  -- reports true ("nothing to verify here this run") rather than an
+  -- unconditional false. Confirmed live: this used to fail outright the
+  -- moment one real account existed anywhere in the database beforehand,
+  -- permanently breaking "Run selftest" as an ongoing diagnostic the
+  -- moment an operator used the accounts feature at all.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
     sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'agents.create',
       'name', 'selftest_bootstrap_probe_' || extract(epoch from clock_timestamp())::text
     ));
     ok := COALESCE((sub->>'ok')::boolean, false);
+  ELSE
+    ok := true;
   END IF;
   v := v || jsonb_build_array(jsonb_build_object('name', 'admin_gate_is_a_noop_before_any_account_exists', 'ok', ok));
+
+  -- Same bootstrap guarantee, for require_agent_access_if_accounts_exist
+  -- (roadmap item 1's run/sessions.* fix): `run` against any active agent
+  -- must still work with no session_token at all before any account
+  -- exists, the same single-operator token-only mode every other gate in
+  -- this file preserves.
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'run', 'agent_id', v_agent::text, 'goal', 'selftest bootstrap run probe'
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+  ELSE
+    ok := true;
+  END IF;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'run_gate_is_a_noop_before_any_account_exists', 'ok', ok));
 
   -- 30. fn_continue_session: a session can be resumed with a follow-up
   --     message instead of only ever starting a brand new, contextless one
@@ -8645,6 +10613,29 @@ BEGIN
     v := v || jsonb_build_array(jsonb_build_object('name', 'provider_create_needs_admin_once_accounts_exist', 'ok', ok));
 
     sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'connections.create', 'name', 'selftest_should_not_exist_connection',
+      'base_url', 'https://selftest.invalid'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.api_connections WHERE name = 'selftest_should_not_exist_connection');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'connections_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'procedures.create', 'name', 'selftest_should_not_exist_procedure', 'content', 'x'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.procedures WHERE name = 'selftest_should_not_exist_procedure');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'procedures_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'schedules.create', 'name', 'selftest_should_not_exist_schedule',
+      'agent_id', v_agent::text, 'goal', 'x', 'interval_seconds', 3600
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.schedules WHERE name = 'selftest_should_not_exist_schedule');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'schedules_create_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'allowlist.add', 'ref', 'allgres_public.v_should_not_be_added'
     ));
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true
@@ -8661,6 +10652,109 @@ BEGIN
     -- itself is what this case is for.
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
     v := v || jsonb_build_array(jsonb_build_object('name', 'permissions_grant_needs_admin_once_accounts_exist', 'ok', ok));
+
+    -- Same gate, for the new bulk provider/model action: touches every
+    -- active agent at once, so it needs the admin session at least as much
+    -- as any single-agent action above does.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.bulk_set_model', 'provider', 'analyst', 'model', 'should-not-apply'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'bulk_set_model_needs_admin_once_accounts_exist', 'ok', ok));
+
+    -- run/sessions.cancel/sessions.continue/sessions.list/sessions.get
+    -- (roadmap item 1's own named gap): before this fix these five had no
+    -- session check whatsoever, at any account state -- any caller holding
+    -- the shared dashboard token could run, cancel, or continue a session
+    -- against, or simply list/read, any agent_id/session_id in the whole
+    -- database. Spot-checked here the same way the rest of this block
+    -- already is: not exhaustive, but exercising both halves item 1 asked
+    -- for. A fresh, dedicated agent for the "not assigned" cases -- not
+    -- v_sys_target, which visible_agent_ids_includes_assigned_target above
+    -- deliberately assigns to selftest_user already, and not v_acct_agent,
+    -- which selftest_user genuinely is assigned to.
+    DELETE FROM allgres_private.agents WHERE name = 'selftest_unassigned_target';
+    v_new_agent := (allgres_public.fn_create_agent('selftest_unassigned_target')->>'agent_id')::uuid;
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'run', 'agent_id', v_new_agent::text, 'goal', 'selftest should not run'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'run_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+
+    -- Logged in, but as a user with no assignment to this specific agent --
+    -- the per-agent assignment check itself, not just "any session token
+    -- at all".
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'run', 'agent_id', v_new_agent::text, 'goal', 'selftest should not run',
+      'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'run_rejects_user_not_assigned_to_this_agent', 'ok', ok));
+    DELETE FROM allgres_private.agents WHERE agent_id = v_new_agent;
+
+    -- Exercised on the gate function directly for the two success cases,
+    -- not through a real `run` -- v_acct_agent must stay deletable at this
+    -- function's own final cleanup below (no ON DELETE CASCADE from
+    -- sessions/tasks/execution_logs to agents, and execution_logs' own
+    -- append-only trigger means a real session/task chain, once created,
+    -- can never be removed again -- confirmed live: creating one here the
+    -- first time broke that cleanup's own DELETE with a FK violation).
+    -- v_sys_target has no such constraint (never deleted, sessions against
+    -- it already accumulate forever elsewhere in this file), so the two
+    -- rejection cases above still go through the real dashboard_rpc action.
+    BEGIN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(v_user_tok, v_acct_agent);
+      ok := true;
+    EXCEPTION WHEN others THEN
+      ok := false;
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'run_allows_assigned_user', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(v_admin_tok, v_sys_target);
+      ok := true;
+    EXCEPTION WHEN others THEN
+      ok := false;
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'run_allows_admin_on_any_agent', 'ok', ok));
+
+    v_sid := (allgres_public.fn_create_session(v_sys_target, 'selftest session scoping target')->>'session_id')::uuid;
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'sessions.continue', 'session_id', v_sid::text, 'message', 'should not be allowed',
+      'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_continue_rejects_unassigned_user', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'sessions.cancel', 'session_id', v_sid::text, 'reason', 'selftest cleanup',
+      'session_token', v_admin_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_cancel_allows_admin', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'sessions.list'));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_list_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'sessions.get', 'session_id', v_sid::text));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'sessions_get_needs_admin_once_accounts_exist', 'ok', ok));
+
+    -- tasks.list/logs.list (same admin-only audience, reached through a
+    -- Rust GET route whose session_token comes from a header instead of a
+    -- request body -- api_route's own comment explains why not a query
+    -- string). Exercised at the dashboard_rpc level, same as the pair
+    -- above: the header-vs-body plumbing is Rust's own concern, already
+    -- covered by that file's unit tests.
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'tasks.list'));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'tasks_list_needs_admin_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'logs.list'));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'logs_list_needs_admin_once_accounts_exist', 'ok', ok));
 
     -- Setting a key to JSON null clears it back to the reader's own coded
     -- default rather than leaving a stray {"probe":2} on a real seeded
@@ -8727,6 +10821,41 @@ BEGIN
       SELECT 1 FROM allgres_private.sessions WHERE goal = 'session_compact:' || v_sid::text
     );
     v := v || jsonb_build_array(jsonb_build_object('name', 'configurable_compaction_threshold_fires_early', 'ok', ok));
+    PERFORM allgres_public.fn_set_agent_config(
+      (SELECT agent_id FROM allgres_private.agents WHERE name = 'session_compactor'),
+      jsonb_build_object('compaction_threshold', NULL, 'compaction_keep_recent', NULL)
+    );
+
+    -- 33d. compaction_keep_recent = 0 ("keep nothing, compact everything")
+    -- is a valid value within its own documented range (0 to 1000000) --
+    -- an unclamped OFFSET (c_keep_recent - 1) used to send PostgreSQL a
+    -- literal OFFSET -1 the moment it was set, a hard error that aborted
+    -- the whole compaction check rather than compacting everything the
+    -- way 0 actually means.
+    PERFORM allgres_public.fn_set_agent_config(
+      (SELECT agent_id FROM allgres_private.agents WHERE name = 'session_compactor'),
+      jsonb_build_object('compaction_threshold', 5, 'compaction_keep_recent', 0)
+    );
+    v_comp_base := now() - interval '1 hour';
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest keep_recent zero')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    FOR v_i IN 1..8 LOOP
+      INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content, created_at)
+      VALUES (v_tid, v_i, 'assistant', to_jsonb('selftest keep_recent zero turn ' || v_i::text), v_comp_base + (v_i * interval '1 second'));
+    END LOOP;
+    BEGIN
+      PERFORM allgres_public.fn_next_step(v_tid);
+      ok := true;
+    EXCEPTION WHEN others THEN
+      ok := false;
+    END;
+    ok := ok AND COALESCE((
+      SELECT (t.input->>'compact_cutoff')::timestamptz > v_comp_base + interval '8 seconds'
+      FROM allgres_private.tasks t
+      JOIN allgres_private.sessions s ON s.session_id = t.session_id
+      WHERE s.goal = 'session_compact:' || v_sid::text
+    ), false);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'compaction_keep_recent_zero_compacts_everything_without_crashing', 'ok', ok));
     PERFORM allgres_public.fn_set_agent_config(
       (SELECT agent_id FROM allgres_private.agents WHERE name = 'session_compactor'),
       jsonb_build_object('compaction_threshold', NULL, 'compaction_keep_recent', NULL)
@@ -8866,6 +10995,165 @@ BEGIN
     ));
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
     v := v || jsonb_build_array(jsonb_build_object('name', 'assignments_toggle_rejects_non_admin', 'ok', ok));
+
+    -- The rejected toggle above leaves the earlier assign(true) call's own
+    -- effect in place (it was rejected before doing anything, not
+    -- reverted) -- undo it via the admin session that can actually do so,
+    -- so selftest_user's assignment to v_sys_target doesn't silently
+    -- persist past this run into the next one. v_sys_target itself is
+    -- never deleted between runs, so an unreverted assignment here used to
+    -- accumulate forever, quietly invalidating any later test (in this run
+    -- or the next) that assumes selftest_user is *not* assigned to it.
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.toggle', 'session_token', v_admin_tok,
+      'user_id', (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'),
+      'agent_id', v_sys_target, 'assigned', false
+    ));
+
+    -- fn_set_user_active/fn_set_user_role/fn_set_user_assignments/
+    -- fn_set_user_assignment: these four used to be the only mutations
+    -- dashboard_rpc exposed with no SQL entry point of their own (their real
+    -- INSERT/UPDATE/DELETE lived only inline inside the users.set_active/
+    -- set_role/assignments.set/assignments.toggle branches themselves,
+    -- reachable only through the jsonb RPC envelope) -- called directly
+    -- here, with no dashboard_rpc/jsonb involved at all, on a throwaway user
+    -- of their own rather than selftest_user/selftest_admin (many tests
+    -- below this point still depend on those two keeping their original
+    -- active/role state).
+    DELETE FROM allgres_private.users WHERE username = 'selftest_direct_sql_user';
+    v_direct_sql_user := (allgres_public.fn_create_user('selftest_direct_sql_user', 'selftest-direct-pw1', 'user')->>'user_id')::uuid;
+
+    PERFORM allgres_public.fn_set_user_active(v_direct_sql_user, false);
+    ok := NOT (SELECT is_active FROM allgres_private.users WHERE user_id = v_direct_sql_user);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_active_direct_sql_call', 'ok', ok));
+    PERFORM allgres_public.fn_set_user_active(v_direct_sql_user, true);
+
+    PERFORM allgres_public.fn_set_user_role(v_direct_sql_user, 'admin');
+    ok := (SELECT role FROM allgres_private.users WHERE user_id = v_direct_sql_user) = 'admin';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_role_direct_sql_call', 'ok', ok));
+    PERFORM allgres_public.fn_set_user_role(v_direct_sql_user, 'user');
+
+    BEGIN
+      PERFORM allgres_public.fn_set_user_role(v_direct_sql_user, 'not_a_real_role');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := true;
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_role_rejects_unknown_role', 'ok', ok));
+
+    PERFORM allgres_public.fn_set_user_assignments(v_direct_sql_user, ARRAY[v_sys_target]);
+    ok := (SELECT array_agg(agent_id) FROM allgres_private.user_agent_assignments WHERE user_id = v_direct_sql_user) = ARRAY[v_sys_target];
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_assignments_direct_sql_call', 'ok', ok));
+    -- A real full-replace-with-empty, the same edge case an empty
+    -- agent_ids array from the UI hits -- must clear, not leave stale rows.
+    PERFORM allgres_public.fn_set_user_assignments(v_direct_sql_user, ARRAY[]::uuid[]);
+    ok := NOT EXISTS (SELECT 1 FROM allgres_private.user_agent_assignments WHERE user_id = v_direct_sql_user);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_assignments_empty_array_clears', 'ok', ok));
+
+    PERFORM allgres_public.fn_set_user_assignment(v_direct_sql_user, v_sys_target, true);
+    ok := EXISTS (SELECT 1 FROM allgres_private.user_agent_assignments WHERE user_id = v_direct_sql_user AND agent_id = v_sys_target);
+    PERFORM allgres_public.fn_set_user_assignment(v_direct_sql_user, v_sys_target, false);
+    ok := ok AND NOT EXISTS (SELECT 1 FROM allgres_private.user_agent_assignments WHERE user_id = v_direct_sql_user AND agent_id = v_sys_target);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_set_user_assignment_direct_sql_call', 'ok', ok));
+
+    DELETE FROM allgres_private.web_sessions WHERE user_id = v_direct_sql_user;
+    DELETE FROM allgres_private.users WHERE user_id = v_direct_sql_user;
+
+    -- Roadmap item 3: history.search unions three sources -- an agent's own
+    -- explicit remember()s, a task's role='error' log entries (failures),
+    -- and a completed session's final_answer (decisions) -- and links every
+    -- result back to the session/task it came from. Scoped the same way
+    -- proposals.list/fixes.list are, and the same fix now applied to
+    -- memories.list below: it had no v_scope check at all before this, the
+    -- one listing on this table that hadn't picked up that pattern.
+    DELETE FROM allgres_private.agent_memories WHERE agent_id = v_sys_target;
+    PERFORM allgres_private.write_memory(
+      v_sys_target, 'selftest history marker mem 9f3a', 'semantic', '0.8', NULL, NULL
+    );
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_admin_tok, 'query', 'history marker mem 9f3a'
+    ));
+    ok := (sub->'results')::text LIKE '%history marker mem 9f3a%'
+      AND (sub->'results')::text LIKE '%"source": "memory"%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_search_finds_a_memory_as_admin', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'history.search', 'session_token', v_admin_tok, 'query', ''));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_search_requires_query', 'ok', ok));
+
+    -- v_sys_target is unassigned again right above this point -- a regular
+    -- user must see neither its memory nor it via memories.list.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_user_tok, 'query', 'history marker mem 9f3a'
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false) AND sub->'results' = '[]'::jsonb;
+    r := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.list', 'session_token', v_user_tok, 'agent_id', v_sys_target::text
+    ));
+    ok := ok AND r->'memories' = '[]'::jsonb;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_and_memories_hide_unassigned_agent_from_regular_user', 'ok', ok));
+
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.toggle', 'session_token', v_admin_tok,
+      'user_id', (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'),
+      'agent_id', v_sys_target, 'assigned', true
+    ));
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_user_tok, 'query', 'history marker mem 9f3a'
+    ));
+    r := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.list', 'session_token', v_user_tok, 'agent_id', v_sys_target::text
+    ));
+    ok := (sub->'results')::text LIKE '%history marker mem 9f3a%'
+      AND (r->'memories')::text LIKE '%history marker mem 9f3a%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_and_memories_show_assigned_agent_to_regular_user', 'ok', ok));
+
+    -- Restored to unassigned so a later run (or a later test in this same
+    -- run) that assumes v_sys_target starts unassigned still holds.
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'assignments.toggle', 'session_token', v_admin_tok,
+      'user_id', (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user'),
+      'agent_id', v_sys_target, 'assigned', false
+    ));
+    DELETE FROM allgres_private.agent_memories WHERE agent_id = v_sys_target;
+
+    -- A failure/decision fixture with a goal that does NOT start with
+    -- 'selftest' -- that prefix is what every operator-facing listing
+    -- (history.search included) hides on purpose (selftest_fixtures_hidden_
+    -- not_deleted, above), so a 'selftest ...' goal here would make its own
+    -- matches invisible to the very search being tested. Reused by goal
+    -- across reruns, the same way selftest_httpreq_agent is reused by name,
+    -- since its real execution_logs can never be hard-deleted afterward.
+    SELECT s.session_id, t.task_id INTO v_sid, v_tid
+    FROM allgres_private.sessions s
+    JOIN allgres_private.tasks t ON t.session_id = s.session_id
+    WHERE s.agent_id = v_agent AND s.goal = 'history_search_test_fixture'
+    LIMIT 1;
+    IF v_sid IS NULL THEN
+      v_sid := (allgres_public.fn_create_session(v_agent, 'history_search_test_fixture')->>'session_id')::uuid;
+      SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+      PERFORM allgres_public.fn_next_step(v_tid);
+      PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+        'type', 'llm_response', 'content', '{}',
+        'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'selftest history marker decision 7c2e')
+      ));
+      PERFORM allgres_private.append_log(v_tid, 999, 'error', jsonb_build_object('message', 'selftest history marker failure 4b1d'));
+    END IF;
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_admin_tok, 'query', 'history marker decision 7c2e'
+    ));
+    ok := (sub->'results')::text LIKE '%"source": "decision"%'
+      AND (sub->'results')::text LIKE '%history marker decision 7c2e%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_search_finds_a_session_decision', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'history.search', 'session_token', v_admin_tok, 'query', 'history marker failure 4b1d'
+    ));
+    ok := (sub->'results')::text LIKE '%"source": "failure"%'
+      AND (sub->'results')::text LIKE '%history marker failure 4b1d%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'history_search_finds_a_task_failure', 'ok', ok));
 
     -- 36. Overview's cluster monitoring (item 44): PostgreSQL version and
     -- this cluster's own pg_stat_activity counts (SQL-visible) alongside
@@ -9222,6 +11510,7 @@ REVOKE ALL ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int,
 REVOKE ALL ON FUNCTION allgres_public.fn_claim_oauth(int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_watchdog(int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION allgres_public.fn_run_schedules() FROM PUBLIC;
 REVOKE ALL ON FUNCTION allgres_public.fn_selftest() FROM PUBLIC;
 
 -- fn_run_sandboxed_sql is SECURITY INVOKER and does not itself validate what
@@ -9244,6 +11533,7 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) TO w
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_agent_embedding(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_agent_embedding(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_run_schedules() TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
 
 -- current_agent_id() is deliberately SECURITY INVOKER, not DEFINER (see its
@@ -9298,6 +11588,8 @@ REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.oauth_client_secret(uuid) FROM operator;
 REVOKE EXECUTE ON FUNCTION allgres_private.oauth_client_secret(uuid) FROM worker;
+REVOKE EXECUTE ON FUNCTION allgres_private.connection_secret(uuid) FROM operator;
+REVOKE EXECUTE ON FUNCTION allgres_private.connection_secret(uuid) FROM worker;
 REVOKE EXECUTE ON FUNCTION allgres_private.decrypt_secret(text) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION allgres_private.encrypt_secret(text) FROM PUBLIC;
 
@@ -9415,6 +11707,9 @@ BEGIN
     'permissions.grant', 'permissions.revoke', 'allowlist.add', 'allowlist.remove',
     'projects.create', 'projects.update', 'sessions.cancel',
     'memories.create', 'memories.remove', 'provider.update', 'provider.create',
+    'connections.create', 'connections.update', 'connections.delete',
+    'procedures.create', 'procedures.update', 'procedures.rollback',
+    'schedules.create', 'schedules.update', 'schedules.delete', 'schedules.run_now',
     'providers.oauth_callback', 'approvals.decide', 'fixes.decide',
     'users.create', 'users.set_active', 'users.set_role', 'assignments.set', 'assignments.toggle'
   ]) THEN
@@ -9441,7 +11736,7 @@ BEGIN
         'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active),
         'running_tasks', (
           SELECT count(*) FROM allgres_private.tasks t JOIN allgres_private.sessions s USING (session_id)
-          WHERE t.status IN ('queued','running','waiting_human') AND s.goal NOT LIKE 'selftest%'
+          WHERE t.status IN ('queued','running','waiting_human','waiting_children') AND s.goal NOT LIKE 'selftest%'
         ),
         'queued_outbound', (
           SELECT count(*) FROM allgres_private.outbound_calls o
@@ -9544,6 +11839,10 @@ BEGIN
         (p_request->>'agent_id')::uuid, p_request->>'autonomy_level'
       );
 
+    WHEN 'agents.bulk_set_model' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_bulk_set_model(p_request->>'provider', p_request->>'model');
+
     WHEN 'agents.create' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_create_agent(p_request->>'name', p_request->>'system_prompt');
@@ -9592,7 +11891,7 @@ BEGIN
         FROM (
           SELECT version_id, generation, system_prompt, max_steps, max_retries,
                  llm_config, max_concurrent_tasks, max_turn_seconds,
-                 max_delegation_depth, max_session_tasks, changed_at
+                 max_delegation_depth, max_session_tasks, success_rate_at_change, changed_at
           FROM allgres_private.policy_history
           WHERE agent_id = (p_request->>'agent_id')::uuid
         ) q
@@ -9606,6 +11905,13 @@ BEGIN
       RETURN allgres_public.fn_rollback_policy(
         (p_request->>'agent_id')::uuid, (p_request->>'generation')::int
       );
+
+    -- Roadmap item 7: "did the last change to this agent actually help" as
+    -- a real computed verdict (allgres_public.fn_evaluate_last_change's own
+    -- comment). Read-only, open the same way policy.history already is --
+    -- an operator reviewing an agent's own history, not a mutation.
+    WHEN 'agents.evaluate' THEN
+      RETURN allgres_public.fn_evaluate_last_change((p_request->>'agent_id')::uuid);
 
     -- Optional filters: agent_id (one agent's proposals) and status (e.g.
     -- 'pending' for an inbox view); neither is required, so this also
@@ -9720,9 +12026,12 @@ BEGIN
           SELECT jsonb_agg(schemaname || '.' || viewname ORDER BY viewname)
           FROM pg_catalog.pg_views WHERE schemaname = 'allgres_public'
         ), '[]'::jsonb),
-        'tools', '["http_get"]'::jsonb,
+        'tools', '["http_get", "http_request"]'::jsonb,
         'agents', COALESCE((
           SELECT jsonb_agg(name ORDER BY name) FROM allgres_private.agents WHERE is_active
+        ), '[]'::jsonb),
+        'procedures', COALESCE((
+          SELECT jsonb_agg(name ORDER BY name) FROM allgres_private.procedures WHERE is_active
         ), '[]'::jsonb),
         'http_hosts', 'free text -- any hostname the outbound guard allows'
       );
@@ -9781,19 +12090,29 @@ BEGIN
       );
 
     WHEN 'run' THEN
+      v_id := (p_request->>'agent_id')::uuid;
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(p_request->>'session_token', v_id);
       RETURN allgres_public.fn_create_session(
-        (p_request->>'agent_id')::uuid,
+        v_id,
         p_request->>'goal',
         NULLIF(p_request->>'project_id', '')::uuid
       );
 
     WHEN 'sessions.cancel' THEN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(
+        p_request->>'session_token',
+        (SELECT agent_id FROM allgres_private.sessions WHERE session_id = (p_request->>'session_id')::uuid)
+      );
       RETURN allgres_public.fn_cancel_session(
         (p_request->>'session_id')::uuid,
         p_request->>'reason'
       );
 
     WHEN 'sessions.continue' THEN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(
+        p_request->>'session_token',
+        (SELECT agent_id FROM allgres_private.sessions WHERE session_id = (p_request->>'session_id')::uuid)
+      );
       RETURN allgres_public.fn_continue_session(
         (p_request->>'session_id')::uuid,
         p_request->>'message'
@@ -9843,29 +12162,23 @@ BEGIN
 
     WHEN 'users.set_active' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
-      UPDATE allgres_private.users SET is_active = (p_request->>'is_active')::boolean
-      WHERE user_id = (p_request->>'user_id')::uuid;
-      RETURN jsonb_build_object('ok', true);
+      RETURN allgres_public.fn_set_user_active(
+        (p_request->>'user_id')::uuid, (p_request->>'is_active')::boolean
+      );
 
     WHEN 'users.set_role' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
-      IF p_request->>'role' NOT IN ('admin', 'user') THEN
-        RAISE EXCEPTION 'invalid role: %', p_request->>'role' USING ERRCODE = 'P0001';
-      END IF;
-      UPDATE allgres_private.users SET role = p_request->>'role'
-      WHERE user_id = (p_request->>'user_id')::uuid;
-      RETURN jsonb_build_object('ok', true);
+      RETURN allgres_public.fn_set_user_role((p_request->>'user_id')::uuid, p_request->>'role');
 
     -- Replaces the full assignment set for one user with the given
     -- agent_ids array -- simpler and less error-prone from the UI than
     -- incremental add/remove calls for what is always edited as one list.
     WHEN 'assignments.set' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
-      v_id := (p_request->>'user_id')::uuid;
-      DELETE FROM allgres_private.user_agent_assignments WHERE user_id = v_id;
-      INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
-      SELECT v_id, (a)::uuid FROM jsonb_array_elements_text(COALESCE(p_request->'agent_ids', '[]'::jsonb)) a;
-      RETURN jsonb_build_object('ok', true);
+      RETURN allgres_public.fn_set_user_assignments(
+        (p_request->>'user_id')::uuid,
+        ARRAY(SELECT (a)::uuid FROM jsonb_array_elements_text(COALESCE(p_request->'agent_ids', '[]'::jsonb)) a)
+      );
 
     WHEN 'assignments.list' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
@@ -9889,15 +12202,9 @@ BEGIN
 
     WHEN 'assignments.toggle' THEN
       PERFORM allgres_private.require_admin(p_request->>'session_token');
-      IF (p_request->>'assigned')::boolean THEN
-        INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
-        VALUES ((p_request->>'user_id')::uuid, (p_request->>'agent_id')::uuid)
-        ON CONFLICT DO NOTHING;
-      ELSE
-        DELETE FROM allgres_private.user_agent_assignments
-        WHERE user_id = (p_request->>'user_id')::uuid AND agent_id = (p_request->>'agent_id')::uuid;
-      END IF;
-      RETURN jsonb_build_object('ok', true);
+      RETURN allgres_public.fn_set_user_assignment(
+        (p_request->>'user_id')::uuid, (p_request->>'agent_id')::uuid, (p_request->>'assigned')::boolean
+      );
 
     -- The agents a logged-in user may see at all: every active agent for an
     -- admin, only explicitly assigned ones for a regular user.
@@ -9976,6 +12283,11 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'sessions.list' THEN
+      -- Admin-only monitoring surface (no "Sessions" page exists for a
+      -- regular user -- README's own role list) with, until now, no check
+      -- at all: every session across every agent and every user, visible
+      -- to anyone holding the shared token regardless of login state.
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'sessions', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.started_at DESC)
         FROM (
@@ -9992,6 +12304,7 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'sessions.get' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'session_id')::uuid;
       IF NOT EXISTS (SELECT 1 FROM allgres_private.sessions WHERE session_id = v_id) THEN
         RETURN jsonb_build_object('ok', false, 'error', 'session_not_found');
@@ -10030,6 +12343,11 @@ BEGIN
     -- execution_logs' append-only trigger forbids it even for this
     -- function's owner, so they are hidden here instead).
     WHEN 'tasks.list' THEN
+      -- Admin-only monitoring surface, same audience as sessions.list --
+      -- reached via a Rust-side GET route with no request body, so its
+      -- session_token comes from a header instead (see api_route's own
+      -- comment on the Tasks/Logs routes for why not a query string).
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'tasks', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.updated_at DESC)
         FROM (
@@ -10046,6 +12364,7 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'logs.list' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'logs', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
         FROM (
@@ -10064,6 +12383,12 @@ BEGIN
     -- Optional agent_id filter, the same shape tasks.list's own optional
     -- limit uses: present -> scoped, absent -> every agent's memories.
     WHEN 'memories.list' THEN
+      -- Scoped the same way proposals.list/fixes.list are: NULL (admin) sees
+      -- every agent's memories, a regular user only their assigned agents'
+      -- -- this was reachable for any agent_id before, regardless of who was
+      -- asking, the one listing on this table that hadn't picked up the
+      -- v_scope pattern already applied elsewhere.
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'memories', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.importance DESC, q.created_at DESC)
         FROM (
@@ -10072,8 +12397,9 @@ BEGIN
                  m.created_at, m.last_accessed_at, m.expires_at
           FROM allgres_private.agent_memories m
           JOIN allgres_private.agents a USING (agent_id)
-          WHERE NULLIF(p_request->>'agent_id', '') IS NULL
-             OR m.agent_id = (p_request->>'agent_id')::uuid
+          WHERE (NULLIF(p_request->>'agent_id', '') IS NULL
+             OR m.agent_id = (p_request->>'agent_id')::uuid)
+            AND (v_scope IS NULL OR m.agent_id = ANY(v_scope))
           ORDER BY m.importance DESC, m.created_at DESC
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
         ) q
@@ -10091,6 +12417,80 @@ BEGIN
 
     WHEN 'memories.remove' THEN
       RETURN allgres_public.fn_forget((p_request->>'memory_id')::uuid);
+
+    -- Roadmap item 3: search past work/decisions/failures, instead of only
+    -- ever seeing an agent's most-important-first memory list or paging
+    -- through raw execution logs one session at a time. Three sources,
+    -- unioned and ordered by recency, each linking back to the session/task
+    -- it came from so the dashboard can jump straight to it:
+    --   memory   -- an agent's own explicit `remember`s
+    --   failure  -- a task's role='error' log entries
+    --   decision -- a completed session's final_answer
+    -- `simple` (not `english`) tsvector config: this content is as likely to
+    -- be Korean as English, and `simple` only lowercases/tokenizes, it does
+    -- not assume an English stemmer -- ORed with a plain ILIKE substring
+    -- match so a short query or one stemming can't help still finds
+    -- something. Scoped exactly like memories.list above; p_agent_id/
+    -- p_project_id (a session's project) narrow further when given.
+    WHEN 'history.search' THEN
+      v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
+      IF NULLIF(trim(p_request->>'query'), '') IS NULL THEN
+        RETURN jsonb_build_object('ok', false, 'error', 'query_required');
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'results', COALESCE((
+        SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
+        FROM (
+          SELECT * FROM (
+            SELECT 'memory' AS source, m.memory_id AS ref_id, m.agent_id, a.name AS agent,
+                   m.source_session_id AS session_id, m.source_task_id AS task_id,
+                   m.memory_type AS kind, left(m.content, 400) AS snippet, m.created_at
+            FROM allgres_private.agent_memories m
+            JOIN allgres_private.agents a USING (agent_id)
+            LEFT JOIN allgres_private.sessions se ON se.session_id = m.source_session_id
+            WHERE (to_tsvector('simple', m.content) @@ plainto_tsquery('simple', p_request->>'query')
+                   OR m.content ILIKE '%' || (p_request->>'query') || '%')
+              AND (v_scope IS NULL OR m.agent_id = ANY(v_scope))
+              AND (NULLIF(p_request->>'agent_id', '') IS NULL OR m.agent_id = (p_request->>'agent_id')::uuid)
+              AND (NULLIF(p_request->>'project_id', '') IS NULL OR se.project_id = (p_request->>'project_id')::uuid)
+              AND COALESCE(se.goal, '') NOT LIKE 'selftest%'
+
+            UNION ALL
+
+            SELECT 'failure' AS source, l.log_id AS ref_id, t.agent_id, a.name AS agent,
+                   t.session_id, l.task_id, 'error' AS kind,
+                   left(l.content::text, 400) AS snippet, l.created_at
+            FROM allgres_private.execution_logs l
+            JOIN allgres_private.tasks t ON t.task_id = l.task_id
+            JOIN allgres_private.agents a ON a.agent_id = t.agent_id
+            JOIN allgres_private.sessions se ON se.session_id = t.session_id
+            WHERE l.role = 'error'
+              AND (to_tsvector('simple', l.content::text) @@ plainto_tsquery('simple', p_request->>'query')
+                   OR l.content::text ILIKE '%' || (p_request->>'query') || '%')
+              AND (v_scope IS NULL OR t.agent_id = ANY(v_scope))
+              AND (NULLIF(p_request->>'agent_id', '') IS NULL OR t.agent_id = (p_request->>'agent_id')::uuid)
+              AND (NULLIF(p_request->>'project_id', '') IS NULL OR se.project_id = (p_request->>'project_id')::uuid)
+              AND se.goal NOT LIKE 'selftest%'
+
+            UNION ALL
+
+            SELECT 'decision' AS source, se.session_id AS ref_id, se.agent_id, a.name AS agent,
+                   se.session_id, NULL::uuid AS task_id, se.status AS kind,
+                   left(se.final_answer, 400) AS snippet,
+                   COALESCE(se.completed_at, se.started_at) AS created_at
+            FROM allgres_private.sessions se
+            JOIN allgres_private.agents a ON a.agent_id = se.agent_id
+            WHERE se.final_answer IS NOT NULL
+              AND (to_tsvector('simple', se.final_answer) @@ plainto_tsquery('simple', p_request->>'query')
+                   OR se.final_answer ILIKE '%' || (p_request->>'query') || '%')
+              AND (v_scope IS NULL OR se.agent_id = ANY(v_scope))
+              AND (NULLIF(p_request->>'agent_id', '') IS NULL OR se.agent_id = (p_request->>'agent_id')::uuid)
+              AND (NULLIF(p_request->>'project_id', '') IS NULL OR se.project_id = (p_request->>'project_id')::uuid)
+              AND se.goal NOT LIKE 'selftest%'
+          ) u
+          ORDER BY u.created_at DESC
+          LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 30), 1), 200)
+        ) q
+      ), '[]'::jsonb));
 
     WHEN 'audit.list' THEN
       RETURN jsonb_build_object('ok', true, 'entries', COALESCE((
@@ -10117,6 +12517,7 @@ BEGIN
             'base_url', p.base_url,
             'is_enabled', p.is_enabled,
             'allow_private_network', p.allow_private_network,
+            'response_format_json_object', p.response_format_json_object,
             'oauth_auth_url', p.oauth_auth_url,
             'oauth_token_url', p.oauth_token_url,
             'oauth_client_id', p.oauth_client_id,
@@ -10147,7 +12548,9 @@ BEGIN
         NULLIF(p_request->>'oauth_token_url',''),
         NULLIF(p_request->>'oauth_client_id',''),
         NULLIF(p_request->>'oauth_client_secret',''),
-        NULLIF(p_request->>'embedding_model','')
+        NULLIF(p_request->>'embedding_model',''),
+        CASE WHEN p_request ? 'response_format_json_object'
+             THEN (p_request->>'response_format_json_object')::boolean ELSE NULL END
       );
       IF NULLIF(p_request->>'api_key','') IS NOT NULL THEN
         PERFORM allgres_public.fn_set_provider_secret(v_id, p_request->>'api_key');
@@ -10163,8 +12566,163 @@ BEGIN
         NULLIF(p_request->>'api_key',''),
         COALESCE((p_request->>'allow_private_network')::boolean, false),
         COALESCE(NULLIF(p_request->>'purpose',''), 'chat'),
-        NULLIF(p_request->>'embedding_model','')
+        NULLIF(p_request->>'embedding_model',''),
+        COALESCE((p_request->>'response_format_json_object')::boolean, true)
       );
+
+    -- Roadmap item 2: named external HTTP endpoints the 'http_request' tool
+    -- can call with a stored credential (see allgres_private.api_connections'
+    -- own comment). Never returns api_key -- only has_secret, the same as
+    -- settings.get for llm_providers.
+    WHEN 'connections.list' THEN
+      RETURN jsonb_build_object('ok', true, 'connections', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'connection_id', c.connection_id,
+          'name', c.name,
+          'base_url', c.base_url,
+          'auth_kind', c.auth_kind,
+          'is_enabled', c.is_enabled,
+          'allow_private_network', c.allow_private_network,
+          'has_secret', EXISTS (
+            SELECT 1 FROM allgres_private.api_connection_secrets s
+            WHERE s.connection_id = c.connection_id AND NULLIF(s.api_key, '') IS NOT NULL
+          )
+        ) ORDER BY c.name)
+        FROM allgres_private.api_connections c
+      ), '[]'::jsonb));
+
+    WHEN 'connections.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_create_connection(
+        p_request->>'name',
+        p_request->>'base_url',
+        COALESCE(NULLIF(p_request->>'auth_kind',''), 'none'),
+        NULLIF(p_request->>'api_key',''),
+        COALESCE((p_request->>'allow_private_network')::boolean, false)
+      );
+
+    WHEN 'connections.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      v_id := (p_request->>'connection_id')::uuid;
+      PERFORM allgres_public.fn_set_connection(
+        v_id,
+        NULLIF(p_request->>'base_url',''),
+        NULLIF(p_request->>'auth_kind',''),
+        CASE WHEN p_request ? 'is_enabled' THEN (p_request->>'is_enabled')::boolean ELSE NULL END,
+        CASE WHEN p_request ? 'allow_private_network'
+             THEN (p_request->>'allow_private_network')::boolean ELSE NULL END
+      );
+      IF NULLIF(p_request->>'api_key','') IS NOT NULL THEN
+        PERFORM allgres_public.fn_set_connection_secret(v_id, p_request->>'api_key');
+      END IF;
+      RETURN jsonb_build_object('ok', true, 'connection_id', v_id);
+
+    WHEN 'connections.delete' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_delete_connection((p_request->>'connection_id')::uuid);
+
+    -- Roadmap item 4: reusable procedures (see allgres_private.procedures'
+    -- own comment). Listing is open the same way settings.get/allowlist.list
+    -- are -- a shared, curated library, not per-agent data -- only
+    -- create/update/rollback are admin-gated, matching provider.create/
+    -- policy.rollback.
+    WHEN 'procedures.list' THEN
+      RETURN jsonb_build_object('ok', true, 'procedures', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'procedure_id', p.procedure_id, 'name', p.name, 'content', p.content,
+          'generation', p.generation, 'is_active', p.is_active,
+          'created_at', p.created_at, 'updated_at', p.updated_at
+        ) ORDER BY p.name)
+        FROM allgres_private.procedures p
+      ), '[]'::jsonb));
+
+    WHEN 'procedures.get' THEN
+      v_id := (p_request->>'procedure_id')::uuid;
+      RETURN jsonb_build_object(
+        'ok', true,
+        'procedure', (
+          SELECT jsonb_build_object(
+            'procedure_id', p.procedure_id, 'name', p.name, 'content', p.content,
+            'generation', p.generation, 'is_active', p.is_active
+          )
+          FROM allgres_private.procedures p WHERE p.procedure_id = v_id
+        ),
+        'history', COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'generation', h.generation, 'content', h.content, 'changed_at', h.changed_at
+          ) ORDER BY h.generation DESC)
+          FROM allgres_private.procedure_history h WHERE h.procedure_id = v_id
+        ), '[]'::jsonb)
+      );
+
+    WHEN 'procedures.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_create_procedure(p_request->>'name', p_request->>'content');
+
+    WHEN 'procedures.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_set_procedure(
+        (p_request->>'procedure_id')::uuid,
+        NULLIF(p_request->>'content', ''),
+        CASE WHEN p_request ? 'is_active' THEN (p_request->>'is_active')::boolean ELSE NULL END
+      );
+
+    WHEN 'procedures.rollback' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_rollback_procedure(
+        (p_request->>'procedure_id')::uuid, (p_request->>'generation')::int
+      );
+
+    -- Roadmap item 6: schedule/event-driven execution (see
+    -- allgres_private.schedules' own comment). Listing is open, same as
+    -- procedures.list/connections.list -- a shared, operator-curated
+    -- surface; every mutation (including run_now, which actually creates a
+    -- session and so is consequential the same way sessions.cancel is) is
+    -- admin-gated once any account exists.
+    WHEN 'schedules.list' THEN
+      RETURN jsonb_build_object('ok', true, 'schedules', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'schedule_id', sc.schedule_id, 'name', sc.name, 'agent_id', sc.agent_id, 'agent', a.name,
+          'goal', sc.goal, 'interval_seconds', sc.interval_seconds, 'next_run_at', sc.next_run_at,
+          'is_active', sc.is_active, 'max_runs', sc.max_runs, 'run_count', sc.run_count,
+          'ends_at', sc.ends_at, 'last_run_at', sc.last_run_at, 'last_session_id', sc.last_session_id
+        ) ORDER BY sc.name)
+        FROM allgres_private.schedules sc
+        JOIN allgres_private.agents a USING (agent_id)
+      ), '[]'::jsonb));
+
+    WHEN 'schedules.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_create_schedule(
+        p_request->>'name',
+        (p_request->>'agent_id')::uuid,
+        p_request->>'goal',
+        (p_request->>'interval_seconds')::int,
+        NULLIF(p_request->>'max_runs', '')::int,
+        NULLIF(p_request->>'ends_at', '')::timestamptz,
+        NULLIF(p_request->>'start_at', '')::timestamptz
+      );
+
+    WHEN 'schedules.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_set_schedule(
+        (p_request->>'schedule_id')::uuid,
+        NULLIF(p_request->>'goal', ''),
+        NULLIF(p_request->>'interval_seconds', '')::int,
+        CASE WHEN p_request ? 'is_active' THEN (p_request->>'is_active')::boolean ELSE NULL END,
+        NULLIF(p_request->>'max_runs', '')::int,
+        COALESCE((p_request->>'clear_max_runs')::boolean, false),
+        NULLIF(p_request->>'ends_at', '')::timestamptz,
+        COALESCE((p_request->>'clear_ends_at')::boolean, false)
+      );
+
+    WHEN 'schedules.delete' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_delete_schedule((p_request->>'schedule_id')::uuid);
+
+    WHEN 'schedules.run_now' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_run_schedule_now((p_request->>'schedule_id')::uuid);
 
     -- Starts an OAuth authorization-code flow for a kind='oauth' provider:
     -- fn_oauth_start only ever returns a redirect_url and a state, neither
