@@ -1211,14 +1211,17 @@ CREATE EXTENSION allgres;
 
 ### Upgrades
 
-`sql/control_plane.sql`, `sql/selftest.sql`, and `sql/grants_and_facade.sql`
-(three files, always loaded together in that order — split out of what used
+`sql/control_plane.sql`, `sql/operator_agents_and_policies.sql`,
+`sql/operator_runtime_and_integrations.sql`,
+`sql/operator_accounts_and_chat.sql`, `sql/seed_data.sql`,
+`sql/selftest.sql`, and `sql/grants_and_facade.sql`
+(seven files, always loaded together in that order — split out of what used
 to be one file once it grew large enough to trip a real rustc compile-time
 limit; see KNOWN_ISSUES.md item 38) are idempotent — `CREATE OR REPLACE`,
 `IF NOT EXISTS`, `ON CONFLICT DO NOTHING`, create-only seeds (an upgrade
 never overwrites an edited prompt or policy), and explicit `DROP`s for
 anything whose signature or return type changed. `scripts/gen-upgrade.sh
-<from> <to>` concatenates all three, in that same order, into a versioned
+<from> <to>` concatenates all seven, in that same order, into a versioned
 upgrade script:
 
 ```bash
@@ -1262,7 +1265,8 @@ extension does that a generic `pg_dump` would otherwise miss silently:
   any database dump — restoring onto a fresh cluster needs
   `pg_dumpall --globals-only` applied first, or every agent's row-level
   isolation is gone even though the row data itself restored fine.
-- **Restore in two passes, not one.** `sql/control_plane.sql` registers
+- **Restore in two passes, not one.** `sql/control_plane.sql` and
+  `sql/seed_data.sql` register
   every table holding real operator/agent state via
   `pg_extension_config_dump()` (agents, sessions, tasks, policies and their
   history, permissions, projects, execution logs, human approvals, change
@@ -1306,8 +1310,10 @@ nothing in it assumes an empty install, an exact row count anywhere in the
 schema, or that no admin account exists yet (confirmed live: a full
 `fn_selftest()` pass with a real admin account, and real agent/session/task
 history already in the database, both taken before every commit that
-touches any of `sql/control_plane.sql`, `sql/selftest.sql`, or
-`sql/grants_and_facade.sql`).
+touches any of `sql/control_plane.sql`, `sql/operator_agents_and_policies.sql`,
+`sql/operator_runtime_and_integrations.sql`,
+`sql/operator_accounts_and_chat.sql`, `sql/seed_data.sql`,
+`sql/selftest.sql`, or `sql/grants_and_facade.sql`).
 
 `scripts/fault_injection_drill.sh` is a separate, runnable drill (bare-metal,
 like `scripts/backup_drill.sh`) that sends a real `SIGKILL` to the real

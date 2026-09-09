@@ -2909,10 +2909,13 @@ keeping single-extension deployment, "not urgent"). First worked around
 with `#![allow(long_running_const_eval)]` -- muting the lint, not fixing
 the growth, and said so explicitly at the time.
 
-Fixed for real the same day: the file's own existing structure already had
-14 clearly numbered sections with a documented dependency order, so no
-redesign was needed, only extraction along seams that already existed.
-Split into three files, always loaded together in this exact order:
+Fixed for real the same day, in two passes: the file's own existing
+structure already had 14 clearly numbered sections with a documented
+dependency order, so no redesign was needed, only extraction along seams
+that already existed.
+
+**Phase 1** split into three files, always loaded together in this exact
+order:
 
 - `sql/control_plane.sql` -- sections 1-10 (roles through seed data), ~8.8k
   lines, down from ~13.7k.
@@ -2925,15 +2928,15 @@ The real wrinkle, worth recording for the next split: `pgrx` allows only
 *one* `finalize`-marked `extension_sql_file!` in the whole crate (a second
 one is a hard build error, caught immediately) -- section 14's ownership
 pass is the one genuine "must run after literally everything" piece, so
-only `grants_and_facade.sql` carries `finalize`; the other two are "normal"
-position, ordered relative to each other with `requires = [...]` (pgrx's
-`name = "..."` / `requires = ["that name"]` pair), which pgrx enforces
-regardless of declaration order in `src/lib.rs`. `fn_selftest` itself
-needed no special handling to move: it is `LANGUAGE plpgsql`, so nothing
-inside its body is checked against the catalog until it is actually
-called, long after every file has finished loading -- the same forward-
-reference tolerance this codebase already relied on throughout one file.
-The one real cross-file dependency was `REVOKE ALL ON FUNCTION
+only `grants_and_facade.sql` carries `finalize`; the other files are
+"normal" position, ordered relative to each other with `requires = [...]`
+(pgrx's `name = "..."` / `requires = ["that name"]` pair), which pgrx
+enforces regardless of declaration order in `src/lib.rs`. `fn_selftest`
+itself needed no special handling to move: it is `LANGUAGE plpgsql`, so
+nothing inside its body is checked against the catalog until it is
+actually called, long after every file has finished loading -- the same
+forward-reference tolerance this codebase already relied on throughout one
+file. The one real cross-file dependency was `REVOKE ALL ON FUNCTION
 allgres_public.fn_selftest() FROM PUBLIC` living in the old section 12,
 which needs the function to already exist (a `REVOKE` is not deferred the
 way a plpgsql body reference is) -- moved into `selftest.sql` itself,
@@ -2941,24 +2944,53 @@ right after the function it revokes, so that file is fully self-contained
 and the cross-file ordering concern disappears entirely rather than being
 merely managed.
 
-`scripts/gen-upgrade.sh` (which used to `cat` `control_plane.sql` alone
-into every generated upgrade script) was the one other place the single-
-file assumption was baked in -- fixed to concatenate all three files, in
-the same order, so `ALTER EXTENSION ... UPDATE` keeps installing
-`fn_selftest`, every grant, and the dashboard facade, not just sections
-1-10.
+**Phase 2**, the same day: `sql/control_plane.sql` (still ~8.8k lines
+after phase 1) was still large enough to be the file most likely to trip
+the same lint again as it keeps growing, so section 9 (the operator API,
+~2.9k lines -- by far the largest remaining section) and section 10 (seed
+data) were split out too, along the same numbered-section seams:
 
-**Verified live**: fresh `CREATE EXTENSION` after the split, with the
+- `sql/operator_agents_and_policies.sql` -- section 9a: agents, projects,
+  policies, procedures, permissions, fixes.
+- `sql/operator_runtime_and_integrations.sql` -- section 9b: sessions,
+  schedules, providers, connections, OAuth, embeddings.
+- `sql/operator_accounts_and_chat.sql` -- section 9c: approvals, allowlist,
+  memories, accounts/auth, chat/messenger.
+- `sql/seed_data.sql` -- section 10 (seed data) and 10b (extension
+  configuration tables / `pg_extension_config_dump`).
+
+`sql/control_plane.sql` itself is now sections 1-8 only, ~5.4k lines.
+Seven files total now, chained with `requires` in their original numbered
+order (`control_plane` → `operator_agents_and_policies` →
+`operator_runtime_and_integrations` → `operator_accounts_and_chat` →
+`seed_data` → `selftest` → `grants_and_facade`, `finalize` still only on
+the last). All of section 9's split-out functions are `LANGUAGE plpgsql`
+same as `fn_selftest`, so the same forward-reference tolerance applies;
+section 10 turned out to have no real CREATE-time dependency on section 9
+at all (it never calls an operator-API function, only raw `INSERT`/`DO`
+blocks against tables sections 1-8 already created) despite being loaded
+after it to preserve original file position.
+
+`scripts/gen-upgrade.sh` (which used to `cat` `control_plane.sql` alone,
+then all three phase-1 files) was updated again to concatenate all seven
+files, in the same order, so `ALTER EXTENSION ... UPDATE` keeps installing
+every operator-API function, seed data, `fn_selftest`, every grant, and
+the dashboard facade -- not just sections 1-8.
+
+**Verified live**: fresh `CREATE EXTENSION` after each split, with the
 generated combined SQL inspected directly to confirm sections still land
-in the original order (1 → schema creation → 11 → 12 → 14); `fn_selftest`
-confirmed owned by `allgres_owner` (not left at its installing-superuser
-default) and confirmed to still have `PUBLIC`'s `EXECUTE` privilege
-revoked -- the two concrete things that would have silently broken had the
-`requires` chain been wrong, per the "Final ownership pass" comment's own
-account of exactly this failure mode happening once before, pre-split.
-`fn_selftest` run three times consecutively (252/252 each time, matching
-the pre-split count exactly) plus once more with a real admin account
-present, `tests/smoke.sql`, `tests/e2e_mock.sql`, and `cargo test` (30/30)
-all green. The build now succeeds with `#![allow(long_running_const_eval)]`
-removed entirely -- confirming this was the real fix, not a second mute
-alongside a smaller number.
+in the original order (1 → schema creation → 9a → 9b → 9c → 10 → 11 → 12 →
+14); representative functions from every new file (`fn_create_agent` from
+9a, `fn_create_session` from 9b, `fn_create_user` from 9c, `fn_selftest`
+from `selftest.sql`) confirmed owned by `allgres_owner` (not left at their
+installing-superuser default), and `fn_selftest` confirmed to still have
+`PUBLIC`'s `EXECUTE` privilege revoked -- the concrete things that would
+have silently broken had the `requires` chain been wrong anywhere along
+the seven-file chain, per the "Final ownership pass" comment's own account
+of exactly this failure mode happening once before, pre-split. After each
+phase: `fn_selftest` run three times consecutively (252/252 each time,
+matching the pre-split count exactly) plus once more with a real admin
+account present, `tests/smoke.sql`, `tests/e2e_mock.sql`, and `cargo test`
+(30/30) all green. The build now succeeds with
+`#![allow(long_running_const_eval)]` removed entirely -- confirming this
+was the real fix, not a second mute alongside a smaller number.
