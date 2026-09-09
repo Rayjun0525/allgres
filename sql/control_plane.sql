@@ -459,9 +459,9 @@ ALTER TABLE allgres_private.policy_history
   ADD COLUMN IF NOT EXISTS max_session_tasks int NOT NULL DEFAULT 100;
 
 -- Roadmap item 7: evaluation-gated self-improvement. Every archived version
--- is stamped with how the agent was actually doing (its own recent
--- completed/failed ratio, see allgres_private.agent_recent_success_rate)
--- right before it was replaced -- populated by fn_set_policy at the exact
+-- is stamped with how the agent was actually doing under exactly that
+-- version (see allgres_private.agent_success_rate_for_generation) right
+-- before it was replaced -- populated by fn_set_policy at the exact
 -- moment a version is overwritten, alongside the row's other now-historical
 -- fields. NULL means no evaluable data existed yet (a brand-new agent's
 -- very first change), not zero -- never treated as "0% success" by
@@ -962,6 +962,31 @@ ALTER TABLE allgres_private.tasks
 -- child row.
 ALTER TABLE allgres_private.tasks
   ADD COLUMN IF NOT EXISTS delegation_depth int NOT NULL DEFAULT 0;
+
+-- Which policy generation (allgres_private.policies.generation) was live
+-- when this root task was created -- stamped once, at INSERT time, by
+-- fn_create_session/fn_continue_session (the only two places that create
+-- a root-level task) and never touched again even if the policy changes
+-- again while the task is still running. This is what
+-- allgres_private.agent_success_rate_for_generation and
+-- fn_evaluate_last_change use to compare "how this agent did under policy
+-- N" against "how it's doing under policy N+1" -- an outside review
+-- pointed out that comparing whichever tasks happen to be most recent,
+-- with no regard for which policy they actually ran under, could smear a
+-- change's before/after outcomes together (a task queued right before a
+-- change and one queued right after, both in the same "recent 20" window)
+-- and call a regression an improvement, or vice versa, by accident. NULL
+-- for a task inserted before this column existed, or a delegated child
+-- (only root tasks are ever stamped -- a delegated child's outcome
+-- reflects whoever it was delegated *to*, never the delegating agent's
+-- own policy, the same reason agent_recent_success_rate already excludes
+-- them).
+ALTER TABLE allgres_private.tasks
+  ADD COLUMN IF NOT EXISTS policy_generation int;
+
+CREATE INDEX IF NOT EXISTS tasks_agent_policy_generation_idx
+  ON allgres_private.tasks (agent_id, policy_generation, created_at DESC)
+  WHERE parent_task_id IS NULL;
 
 -- 'cancelled' is distinct from 'failed': an operator stopping a task is a
 -- different signal than the agent's own logic giving up.  Unnamed CHECK
@@ -2171,6 +2196,44 @@ AS $fn$
     JOIN allgres_private.sessions s ON s.session_id = t.session_id
     WHERE t.agent_id = p_agent_id
       AND t.parent_task_id IS NULL
+      AND s.goal NOT LIKE 'selftest%'
+    ORDER BY t.created_at DESC
+    LIMIT GREATEST(1, COALESCE(p_limit, 20))
+  ) q
+$fn$;
+
+-- Same completed/failed ratio as agent_recent_success_rate above, scoped
+-- to exactly the root tasks that ran under one specific policy generation
+-- (tasks.policy_generation -- see that column's own comment) instead of
+-- "whichever N tasks happen to be most recent regardless of which policy
+-- produced them." fn_evaluate_last_change uses this for both sides of its
+-- before/after comparison so a change's real outcome is never smeared
+-- together with the policy it replaced (or the one that replaced it).
+-- Returns a NULL rate with sample_size = 0 for a generation with no
+-- evaluable root tasks yet -- never a manufactured 0%, same convention as
+-- agent_recent_success_rate.
+CREATE OR REPLACE FUNCTION allgres_private.agent_success_rate_for_generation(
+  p_agent_id uuid, p_generation int, p_limit int DEFAULT 20
+) RETURNS TABLE(rate numeric, sample_size int)
+LANGUAGE sql
+STABLE
+AS $fn$
+  SELECT
+    CASE WHEN count(*) FILTER (WHERE q.status IN ('completed', 'failed')) = 0 THEN NULL
+      ELSE round(
+        count(*) FILTER (WHERE q.status = 'completed')::numeric
+          / count(*) FILTER (WHERE q.status IN ('completed', 'failed')),
+        3
+      )
+    END,
+    count(*) FILTER (WHERE q.status IN ('completed', 'failed'))::int
+  FROM (
+    SELECT t.status
+    FROM allgres_private.tasks t
+    JOIN allgres_private.sessions s ON s.session_id = t.session_id
+    WHERE t.agent_id = p_agent_id
+      AND t.parent_task_id IS NULL
+      AND t.policy_generation = p_generation
       AND s.goal NOT LIKE 'selftest%'
     ORDER BY t.created_at DESC
     LIMIT GREATEST(1, COALESCE(p_limit, 20))
@@ -5406,7 +5469,7 @@ BEGIN
       p_row.agent_id, p_row.generation, p_row.system_prompt, p_row.max_steps,
       p_row.max_retries, p_row.llm_config, p_row.max_concurrent_tasks, p_row.max_turn_seconds,
       p_row.max_delegation_depth, p_row.max_session_tasks,
-      allgres_private.agent_recent_success_rate(p_row.agent_id, 20)
+      (SELECT rate FROM allgres_private.agent_success_rate_for_generation(p_row.agent_id, p_row.generation, 20))
     );
   END IF;
 
@@ -5605,57 +5668,82 @@ $fn$;
 
 -- Roadmap item 7: "did the last change to this agent actually help" as a
 -- real, computed verdict, not something an operator (or self_improve) has
--- to eyeball two numbers to answer. Compares the agent's current
--- allgres_private.agent_recent_success_rate against the success_rate_at_change
--- fn_set_policy stamped onto the most recent policy_history row -- i.e.
--- "how it's doing now" vs "how it was doing right before the last change
--- replaced whatever came before it." 'insufficient_data' (not a false
--- 'unchanged') whenever either side has no evaluable tasks yet -- a
--- verdict should never be manufactured from an absence of data.
-CREATE OR REPLACE FUNCTION allgres_public.fn_evaluate_last_change(p_agent_id uuid)
+-- to eyeball two numbers to answer. Compares the agent's success rate
+-- under its CURRENT policy generation against its rate under the
+-- immediately preceding one -- both computed live, right now, by
+-- allgres_private.agent_success_rate_for_generation, rather than the
+-- current generation's live rate against a frozen success_rate_at_change
+-- snapshot from whatever the "recent tasks" window happened to contain at
+-- change time. An outside review pointed out that "recent" is not the
+-- same question as "under this policy": a handful of tasks queued right
+-- before a change and a handful queued right after both landing in one
+-- undifferentiated window could call a regression an improvement (or vice
+-- versa) purely from which side of the boundary they happened to fall on.
+-- Isolating both sides by tasks.policy_generation closes that gap.
+--
+-- p_min_samples (default 5, floored at 1) is the second half of that same
+-- review finding: "completed" is a proxy for task throughput, not for
+-- correctness, and even that proxy is noisy on a handful of tasks. Either
+-- side short of this floor withholds a verdict ('insufficient_data')
+-- rather than call a real trend from what could just as easily be luck --
+-- this is a completion-rate signal, not a semantic judge of whether the
+-- agent's actual output was correct; see README, "Evaluation-gated
+-- self-improvement" for what a real per-task correctness judge would
+-- still need that this does not attempt.
+CREATE OR REPLACE FUNCTION allgres_public.fn_evaluate_last_change(p_agent_id uuid, p_min_samples int DEFAULT 5)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
-  v_current numeric;
-  v_before numeric;
   v_gen int;
   v_changed_at timestamptz;
+  v_current_rate numeric;
+  v_current_n int;
+  v_before_rate numeric;
+  v_before_n int;
+  v_min int := GREATEST(1, COALESCE(p_min_samples, 5));
   v_verdict text;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id) THEN
     RAISE EXCEPTION 'agent not found' USING ERRCODE = 'P0001';
   END IF;
 
-  v_current := allgres_private.agent_recent_success_rate(p_agent_id, 20);
+  SELECT generation INTO v_gen FROM allgres_private.policies WHERE agent_id = p_agent_id;
 
-  SELECT success_rate_at_change, generation, changed_at
-  INTO v_before, v_gen, v_changed_at
+  SELECT changed_at INTO v_changed_at
   FROM allgres_private.policy_history
-  WHERE agent_id = p_agent_id
-  ORDER BY generation DESC
-  LIMIT 1;
+  WHERE agent_id = p_agent_id AND generation = v_gen - 1;
 
   IF NOT FOUND THEN
     v_verdict := 'no_change_recorded_yet';
-  ELSIF v_before IS NULL OR v_current IS NULL THEN
-    v_verdict := 'insufficient_data';
-  ELSIF v_current > v_before THEN
-    v_verdict := 'improved';
-  ELSIF v_current < v_before THEN
-    v_verdict := 'regressed';
   ELSE
-    v_verdict := 'unchanged';
+    SELECT rate, sample_size INTO v_current_rate, v_current_n
+    FROM allgres_private.agent_success_rate_for_generation(p_agent_id, v_gen, 20);
+    SELECT rate, sample_size INTO v_before_rate, v_before_n
+    FROM allgres_private.agent_success_rate_for_generation(p_agent_id, v_gen - 1, 20);
+
+    IF COALESCE(v_current_n, 0) < v_min OR COALESCE(v_before_n, 0) < v_min THEN
+      v_verdict := 'insufficient_data';
+    ELSIF v_current_rate > v_before_rate THEN
+      v_verdict := 'improved';
+    ELSIF v_current_rate < v_before_rate THEN
+      v_verdict := 'regressed';
+    ELSE
+      v_verdict := 'unchanged';
+    END IF;
   END IF;
 
   RETURN jsonb_build_object(
     'ok', true,
     'verdict', v_verdict,
-    'current_success_rate', v_current,
-    'success_rate_before_last_change', v_before,
-    'compared_to_generation', v_gen,
+    'current_success_rate', v_current_rate,
+    'current_sample_size', COALESCE(v_current_n, 0),
+    'success_rate_before_last_change', v_before_rate,
+    'before_sample_size', COALESCE(v_before_n, 0),
+    'min_samples_required', v_min,
+    'compared_to_generation', v_gen - 1,
     'last_changed_at', v_changed_at
   );
 END;
@@ -5882,8 +5970,9 @@ BEGIN
   INSERT INTO allgres_private.sessions (agent_id, project_id, goal, status)
   VALUES (p_agent_id, p_project_id, btrim(p_goal), 'open')
   RETURNING session_id INTO v_sid;
-  INSERT INTO allgres_private.tasks (session_id, agent_id, status, input)
-  VALUES (v_sid, p_agent_id, 'queued', jsonb_build_object('goal', btrim(p_goal)))
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status, input, policy_generation)
+  VALUES (v_sid, p_agent_id, 'queued', jsonb_build_object('goal', btrim(p_goal)),
+          (SELECT generation FROM allgres_private.policies WHERE agent_id = p_agent_id))
   RETURNING task_id INTO v_tid;
   INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content)
   VALUES (v_tid, 0, 'user', to_jsonb(btrim(p_goal)));
@@ -5940,8 +6029,9 @@ BEGIN
   SET status = 'open', completed_at = NULL
   WHERE session_id = p_session_id;
 
-  INSERT INTO allgres_private.tasks (session_id, agent_id, status, input)
-  VALUES (p_session_id, s.agent_id, 'queued', jsonb_build_object('goal', btrim(p_message)))
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status, input, policy_generation)
+  VALUES (p_session_id, s.agent_id, 'queued', jsonb_build_object('goal', btrim(p_message)),
+          (SELECT generation FROM allgres_private.policies WHERE agent_id = s.agent_id))
   RETURNING task_id INTO v_tid;
   INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content)
   VALUES (v_tid, 0, 'user', to_jsonb(btrim(p_message)));
@@ -10154,46 +10244,71 @@ BEGIN
   ok := allgres_private.agent_recent_success_rate(v_new_agent, 20) IS NULL;
   v := v || jsonb_build_array(jsonb_build_object('name', 'agent_recent_success_rate_null_with_no_tasks', 'ok', ok));
 
+  -- Generation 1: one completed root task, explicitly stamped with the
+  -- agent's current (only) generation the same way fn_create_session
+  -- would -- plus a delegated child under a different agent, parented to
+  -- it, whose own failure must not move v_new_agent's rate at all.
   v_sid := gen_random_uuid();
   INSERT INTO allgres_private.sessions (session_id, agent_id, goal, status)
     VALUES (v_sid, v_new_agent, 'eval fixture (selftest): one completed root task', 'open');
-  INSERT INTO allgres_private.tasks (session_id, agent_id, status)
-    VALUES (v_sid, v_new_agent, 'completed') RETURNING task_id INTO v_tid;
-  -- A delegated child under a different agent, parented to the task above --
-  -- its own failure must not move v_new_agent's rate at all.
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status, policy_generation)
+    VALUES (v_sid, v_new_agent, 'completed', 1) RETURNING task_id INTO v_tid;
   INSERT INTO allgres_private.tasks (session_id, agent_id, parent_task_id, status)
     VALUES (v_sid, v_deleg_a, v_tid, 'failed') RETURNING task_id INTO v_deleg_b;
   v_rate := allgres_private.agent_recent_success_rate(v_new_agent, 20);
   ok := v_rate = 1.0;
   v := v || jsonb_build_array(jsonb_build_object('name', 'agent_recent_success_rate_ignores_delegated_children', 'ok', ok));
 
-  -- policy_history.success_rate_at_change: a real snapshot taken at the
-  -- moment of change, while there is evaluable data (the one completed task
-  -- above).
+  ok := (SELECT (rate, sample_size) = (1.0, 1) FROM allgres_private.agent_success_rate_for_generation(v_new_agent, 1, 20));
+  v := v || jsonb_build_array(jsonb_build_object('name', 'agent_success_rate_for_generation_scopes_to_that_generation', 'ok', ok));
+
+  r := allgres_public.fn_evaluate_last_change(v_new_agent);
+  ok := (r->>'verdict') = 'no_change_recorded_yet';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_no_change_recorded_yet', 'ok', ok));
+
+  -- policy_history.success_rate_at_change: a real snapshot of generation
+  -- 1's own tasks (not some other window), taken at the moment it is
+  -- replaced by generation 2.
   PERFORM allgres_public.fn_set_policy(v_new_agent, 'selftest eval prompt v2');
-  ok := (SELECT success_rate_at_change FROM allgres_private.policy_history WHERE agent_id = v_new_agent ORDER BY generation DESC LIMIT 1) = 1.0;
+  ok := (SELECT success_rate_at_change FROM allgres_private.policy_history WHERE agent_id = v_new_agent AND generation = 1) = 1.0;
   v := v || jsonb_build_array(jsonb_build_object('name', 'policy_history_snapshots_success_rate_on_a_real_change', 'ok', ok));
 
-  -- fn_evaluate_last_change: 'unchanged' immediately after (the same one
-  -- completed task, nothing new since), 'regressed' once a failing task
-  -- follows, 'no_change_recorded_yet' for an agent that has never had a
-  -- policy change at all.
+  -- Right after the change, generation 2 has zero tasks of its own yet --
+  -- an outside review's point exactly: this is not "unchanged", it is "no
+  -- data yet for the new policy", and fn_evaluate_last_change must say so
+  -- rather than compare an empty window to generation 1's rate.
   r := allgres_public.fn_evaluate_last_change(v_new_agent);
-  ok := (r->>'verdict') = 'unchanged';
-  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_unchanged', 'ok', ok));
+  ok := (r->>'verdict') = 'insufficient_data' AND (r->>'current_sample_size')::int = 0;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_insufficient_data_before_any_new_generation_task', 'ok', ok));
 
+  -- One failing root task lands under the NEW generation (2). With only
+  -- one sample on each side, the default sample-size floor (5) must still
+  -- withhold a verdict rather than call this "regressed" off one data
+  -- point per side.
   v_sid2 := gen_random_uuid();
   INSERT INTO allgres_private.sessions (session_id, agent_id, goal, status)
     VALUES (v_sid2, v_new_agent, 'eval fixture (selftest): one failed root task', 'open');
-  INSERT INTO allgres_private.tasks (session_id, agent_id, status)
-    VALUES (v_sid2, v_new_agent, 'failed');
+  INSERT INTO allgres_private.tasks (session_id, agent_id, status, policy_generation)
+    VALUES (v_sid2, v_new_agent, 'failed', 2);
   r := allgres_public.fn_evaluate_last_change(v_new_agent);
-  ok := (r->>'verdict') = 'regressed';
-  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_regressed', 'ok', ok));
+  ok := (r->>'verdict') = 'insufficient_data'
+    AND (r->>'current_sample_size')::int = 1 AND (r->>'before_sample_size')::int = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_withholds_verdict_below_min_samples', 'ok', ok));
+
+  -- The same comparison with an explicit lower floor gets a real verdict:
+  -- generation 2's one failure against generation 1's one success is a
+  -- real regression, correctly isolated to just those two generations'
+  -- own tasks -- proving the isolation itself, not just the sample-size
+  -- gate: an ungated (mixed-window) comparison would have averaged both
+  -- generations' tasks together into a flat 0.5 on both sides and missed
+  -- the regression entirely.
+  r := allgres_public.fn_evaluate_last_change(v_new_agent, 1);
+  ok := (r->>'verdict') = 'regressed' AND (r->>'compared_to_generation')::int = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_regressed_isolated_by_generation', 'ok', ok));
 
   r := allgres_public.fn_evaluate_last_change(v_deleg_a);
   ok := (r->>'verdict') = 'no_change_recorded_yet';
-  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_no_change_recorded_yet', 'ok', ok));
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_evaluate_last_change_reports_no_change_recorded_yet_for_a_fresh_agent', 'ok', ok));
 
   -- None of this touched execution_logs, so unlike every other fixture
   -- agent in this file it can be removed outright instead of merely
