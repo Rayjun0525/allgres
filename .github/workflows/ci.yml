@@ -117,6 +117,11 @@ jobs:
       - name: CREATE EXTENSION and run fn_selftest / smoke / e2e
         run: |
           sudo -u postgres psql -p "$PGPORT" -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION allgres;"
+          # pgcrypto is optional for allgres itself (README, "Runtime
+          # requirements") but the accounts system hard-requires it --
+          # fn_create_user raises if it's missing -- and the real-admin-
+          # account check below needs it to run at all.
+          sudo -u postgres psql -p "$PGPORT" -d postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
           # fn_selftest itself, on a fresh install -- this step's own name has
           # long claimed to run it, but only tests/smoke.sql and
           # tests/e2e_mock.sql below actually did; a real regression here
