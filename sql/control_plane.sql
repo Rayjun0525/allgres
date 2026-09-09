@@ -1557,10 +1557,39 @@ CREATE TABLE IF NOT EXISTS allgres_private.llm_secrets (
   expires_at          timestamptz
 );
 
+-- OAuth providers can use the original authorization-code redirect flow or
+-- an RFC 8628 device-code flow.  Device-code is what xAI exposes for a
+-- browser login that works from a headless/containerized Allgres worker.
+ALTER TABLE allgres_private.llm_providers
+  ADD COLUMN IF NOT EXISTS oauth_flow text NOT NULL DEFAULT 'authorization_code'
+    CHECK (oauth_flow IN ('authorization_code', 'device_code')),
+  ADD COLUMN IF NOT EXISTS oauth_device_url text;
+
 CREATE TABLE IF NOT EXISTS allgres_private.oauth_states (
   state        text PRIMARY KEY,
   provider_id  uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
   created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- The device_code is a short-lived bearer credential, so it receives the
+-- same encrypted-at-rest treatment as access/refresh tokens.  user_code and
+-- verification URLs are intentionally returned to the dashboard: they are
+-- the public instructions the operator must see to approve the login.
+CREATE TABLE IF NOT EXISTS allgres_private.oauth_device_sessions (
+  session_id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id               uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
+  device_code               text,
+  user_code                 text,
+  verification_uri          text,
+  verification_uri_complete text,
+  status                    text NOT NULL DEFAULT 'starting'
+                              CHECK (status IN ('starting','awaiting_user','connected','denied','expired','error')),
+  interval_seconds          int NOT NULL DEFAULT 5 CHECK (interval_seconds BETWEEN 1 AND 60),
+  expires_at                timestamptz,
+  next_poll_at              timestamptz,
+  error                     text,
+  created_at                timestamptz NOT NULL DEFAULT now(),
+  updated_at                timestamptz NOT NULL DEFAULT now()
 );
 
 -- Roadmap item 2: a named external HTTP endpoint an operator configures once
@@ -1691,6 +1720,12 @@ CREATE TABLE IF NOT EXISTS allgres_private.oauth_calls (
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE allgres_private.oauth_calls
+  ADD COLUMN IF NOT EXISTS operation text NOT NULL DEFAULT 'token_exchange'
+    CHECK (operation IN ('token_exchange','device_authorization','device_poll','refresh')),
+  ADD COLUMN IF NOT EXISTS device_session_id uuid
+    REFERENCES allgres_private.oauth_device_sessions(session_id) ON DELETE CASCADE;
 
 CREATE INDEX IF NOT EXISTS oauth_calls_ready_idx
   ON allgres_private.oauth_calls (created_at)
@@ -2523,7 +2558,10 @@ STABLE
 SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
-  SELECT allgres_private.decrypt_secret(api_key)
+  -- OAuth exchanges store an access_token rather than an api_key.  Keeping
+  -- the choice in this private claim-time helper means neither credential is
+  -- ever copied into outbound_calls or returned to the dashboard.
+  SELECT allgres_private.decrypt_secret(COALESCE(api_key, access_token))
   FROM allgres_private.llm_secrets
   WHERE provider_id = p_provider_id
 $fn$;
@@ -4331,6 +4369,14 @@ BEGIN
     JOIN allgres_private.tasks t ON t.task_id = o.task_id
     LEFT JOIN allgres_private.llm_providers p ON p.provider_id = o.provider_id
     WHERE o.status = 'queued' AND t.status = 'running'
+      -- Do not send an expired OAuth token. fn_claim_oauth runs on the same
+      -- worker loop and queues/claims its refresh; this LLM row remains
+      -- durable and becomes claimable as soon as the rotated token lands.
+      AND (p.kind IS DISTINCT FROM 'oauth' OR EXISTS (
+        SELECT 1 FROM allgres_private.llm_secrets s
+        WHERE s.provider_id=o.provider_id AND s.access_token IS NOT NULL
+          AND (s.expires_at IS NULL OR s.expires_at > now()+interval '30 seconds')
+      ))
     ORDER BY o.created_at
     FOR UPDATE OF o SKIP LOCKED
     LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
@@ -6383,6 +6429,154 @@ BEGIN
 END;
 $fn$;
 
+-- Starts an RFC 8628 device authorization request.  The worker performs the
+-- HTTP call; this function only creates durable state and queues it.
+CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_device_start(p_provider_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v allgres_private.llm_providers%ROWTYPE;
+  v_session uuid;
+  v_call uuid;
+  v_reason text;
+BEGIN
+  SELECT * INTO v FROM allgres_private.llm_providers WHERE provider_id = p_provider_id;
+  IF v.provider_id IS NULL OR v.kind <> 'oauth' OR v.oauth_flow <> 'device_code' THEN
+    RAISE EXCEPTION 'provider is not device-code oauth' USING ERRCODE = 'P0001';
+  END IF;
+  IF v.oauth_device_url IS NULL OR v.oauth_token_url IS NULL OR v.oauth_client_id IS NULL THEN
+    RAISE EXCEPTION 'device url / token url / client id missing' USING ERRCODE = 'P0001';
+  END IF;
+  v_reason := allgres_private.check_outbound_url(v.oauth_device_url, v.allow_private_network);
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'oauth device url rejected: %', v_reason USING ERRCODE = 'P0001';
+  END IF;
+
+  -- Serialize starts per provider so two dashboard clicks cannot leave two
+  -- live device codes racing to replace the same provider token.
+  PERFORM pg_advisory_xact_lock(hashtextextended(p_provider_id::text, 0));
+
+  -- Supersede unfinished attempts for the same provider.  Their device codes
+  -- are single-purpose and expire quickly; keeping them active would create
+  -- ambiguous status in the dashboard.
+  UPDATE allgres_private.oauth_calls
+  SET status='harvested', error='superseded by a newer login', updated_at=now()
+  WHERE device_session_id IN (
+    SELECT session_id FROM allgres_private.oauth_device_sessions
+    WHERE provider_id=p_provider_id AND status IN ('starting','awaiting_user')
+  ) AND status IN ('queued','in_flight');
+
+  UPDATE allgres_private.oauth_device_sessions
+  SET status = 'expired', error = 'superseded by a newer login', updated_at = now()
+  WHERE provider_id = p_provider_id AND status IN ('starting','awaiting_user');
+
+  INSERT INTO allgres_private.oauth_device_sessions(provider_id)
+  VALUES (p_provider_id) RETURNING session_id INTO v_session;
+
+  INSERT INTO allgres_private.oauth_calls
+    (provider_id, state, url, request_headers, request_body, allow_private,
+     status, operation, device_session_id)
+  VALUES (
+    p_provider_id, v_session::text, v.oauth_device_url,
+    jsonb_build_object('accept','application/json'),
+    jsonb_strip_nulls(jsonb_build_object('client_id',v.oauth_client_id,'scope',v.oauth_scope)),
+    v.allow_private_network, 'queued', 'device_authorization', v_session
+  ) RETURNING call_id INTO v_call;
+
+  RETURN jsonb_build_object('ok',true,'session_id',v_session,'call_id',v_call,'status','starting');
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_device_status(p_session_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  s allgres_private.oauth_device_sessions%ROWTYPE;
+BEGIN
+  SELECT * INTO s FROM allgres_private.oauth_device_sessions WHERE session_id = p_session_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'oauth device session not found' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_strip_nulls(jsonb_build_object(
+    'ok', true, 'session_id', s.session_id, 'provider_id', s.provider_id,
+    'status', s.status, 'user_code', s.user_code,
+    'verification_uri', s.verification_uri,
+    'verification_uri_complete', s.verification_uri_complete,
+    'expires_at', s.expires_at, 'error', s.error
+  ));
+END;
+$fn$;
+
+-- Called from fn_claim_oauth.  It turns due device polls and expiring access
+-- tokens into ordinary durable oauth_calls, with sensitive device/refresh
+-- credentials added only later at claim time.
+CREATE OR REPLACE FUNCTION allgres_private.queue_oauth_maintenance()
+RETURNS int
+LANGUAGE plpgsql
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  n int := 0;
+  m int := 0;
+BEGIN
+  UPDATE allgres_private.oauth_device_sessions
+  SET status='expired', error='device authorization expired', updated_at=now()
+  WHERE status='awaiting_user' AND expires_at <= now();
+
+  INSERT INTO allgres_private.oauth_calls
+    (provider_id,state,url,request_headers,request_body,allow_private,status,operation,device_session_id)
+  SELECT d.provider_id, d.session_id::text, p.oauth_token_url,
+         jsonb_build_object('accept','application/json'),
+         jsonb_build_object(
+           'grant_type','urn:ietf:params:oauth:grant-type:device_code',
+           'client_id',p.oauth_client_id
+         ),
+         p.allow_private_network,'queued','device_poll',d.session_id
+  FROM allgres_private.oauth_device_sessions d
+  JOIN allgres_private.llm_providers p USING(provider_id)
+  WHERE d.status='awaiting_user' AND d.expires_at > now()
+    AND COALESCE(d.next_poll_at,now()) <= now()
+    AND NOT EXISTS (
+      SELECT 1 FROM allgres_private.oauth_calls c
+      WHERE c.device_session_id=d.session_id AND c.operation='device_poll'
+        AND c.status IN ('queued','in_flight')
+    );
+  GET DIAGNOSTICS n = ROW_COUNT;
+
+  UPDATE allgres_private.oauth_device_sessions d
+  SET next_poll_at = now() + make_interval(secs=>d.interval_seconds), updated_at=now()
+  WHERE d.status='awaiting_user' AND d.expires_at > now()
+    AND COALESCE(d.next_poll_at,now()) <= now();
+
+  INSERT INTO allgres_private.oauth_calls
+    (provider_id,state,url,request_headers,request_body,allow_private,status,operation)
+  SELECT p.provider_id, replace(gen_random_uuid()::text,'-',''), p.oauth_token_url,
+         jsonb_build_object('accept','application/json'),
+         jsonb_build_object('grant_type','refresh_token','client_id',p.oauth_client_id),
+         p.allow_private_network,'queued','refresh'
+  FROM allgres_private.llm_providers p
+  JOIN allgres_private.llm_secrets s USING(provider_id)
+  WHERE p.kind='oauth' AND p.is_enabled
+    AND s.refresh_token IS NOT NULL
+    AND s.expires_at IS NOT NULL AND s.expires_at <= now()+interval '2 minutes'
+    AND NOT EXISTS (
+      SELECT 1 FROM allgres_private.oauth_calls c
+      WHERE c.provider_id=p.provider_id AND c.operation='refresh'
+        AND (c.status IN ('queued','in_flight')
+             OR c.created_at > now()-interval '30 seconds')
+    );
+  GET DIAGNOSTICS m = ROW_COUNT;
+  n := n + m;
+  RETURN n;
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_start(p_provider_id uuid, p_redirect text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -6397,6 +6591,9 @@ BEGIN
   SELECT * INTO v FROM allgres_private.llm_providers WHERE provider_id = p_provider_id;
   IF v.provider_id IS NULL OR v.kind <> 'oauth' THEN
     RAISE EXCEPTION 'provider is not oauth' USING ERRCODE = 'P0001';
+  END IF;
+  IF v.oauth_flow = 'device_code' THEN
+    RAISE EXCEPTION 'provider uses device-code oauth' USING ERRCODE = 'P0001';
   END IF;
   IF v.oauth_auth_url IS NULL OR v.oauth_client_id IS NULL THEN
     RAISE EXCEPTION 'oauth urls / client id missing' USING ERRCODE = 'P0001';
@@ -6500,10 +6697,14 @@ DECLARE
   v_out jsonb := '[]'::jsonb;
   v_n int := 0;
   v_secret text;
+  v_sensitive text;
+  v_body jsonb;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
+  PERFORM allgres_private.queue_oauth_maintenance();
   FOR r IN
-    SELECT call_id, provider_id, url, request_headers, request_body, allow_private
+    SELECT call_id, provider_id, url, request_headers, request_body, allow_private,
+           operation, device_session_id
     FROM allgres_private.oauth_calls
     WHERE status = 'queued'
     ORDER BY created_at
@@ -6515,11 +6716,26 @@ BEGIN
     WHERE call_id = r.call_id;
 
     v_secret := allgres_private.oauth_client_secret(r.provider_id);
+    v_body := r.request_body;
+    IF NULLIF(v_secret,'') IS NOT NULL THEN
+      v_body := v_body || jsonb_build_object('client_secret',v_secret);
+    END IF;
+    IF r.operation = 'device_poll' THEN
+      SELECT allgres_private.decrypt_secret(device_code) INTO v_sensitive
+      FROM allgres_private.oauth_device_sessions WHERE session_id=r.device_session_id;
+      v_body := v_body || jsonb_build_object('device_code',COALESCE(v_sensitive,''));
+    ELSIF r.operation = 'refresh' THEN
+      SELECT allgres_private.decrypt_secret(refresh_token) INTO v_sensitive
+      FROM allgres_private.llm_secrets WHERE provider_id=r.provider_id;
+      v_body := v_body || jsonb_build_object('refresh_token',COALESCE(v_sensitive,''));
+    END IF;
     v_out := v_out || jsonb_build_array(jsonb_build_object(
       'call_id', r.call_id,
+      'operation', r.operation,
+      'device_session_id', r.device_session_id,
       'url', r.url,
       'headers', r.request_headers,
-      'body', r.request_body || jsonb_build_object('client_secret', COALESCE(v_secret, '')),
+      'body', v_body,
       'allow_private', r.allow_private
     ));
     v_n := v_n + 1;
@@ -6564,7 +6780,73 @@ BEGIN
     RETURN jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status);
   END IF;
 
+  BEGIN
+    v_parsed := p_body::jsonb;
+  EXCEPTION WHEN others THEN
+    v_parsed := NULL;
+  END;
+
+  -- The first device-flow response contains instructions, not tokens.
+  IF c.operation = 'device_authorization' AND p_status BETWEEN 200 AND 299 THEN
+    IF NULLIF(v_parsed->>'device_code','') IS NULL
+       OR NULLIF(v_parsed->>'user_code','') IS NULL
+       OR NULLIF(v_parsed->>'verification_uri','') IS NULL THEN
+      UPDATE allgres_private.oauth_device_sessions
+      SET status='error', error='invalid device authorization response', updated_at=now()
+      WHERE session_id=c.device_session_id;
+    ELSE
+      UPDATE allgres_private.oauth_device_sessions
+      SET device_code=allgres_private.encrypt_secret(v_parsed->>'device_code'),
+          user_code=v_parsed->>'user_code',
+          verification_uri=v_parsed->>'verification_uri',
+          verification_uri_complete=NULLIF(v_parsed->>'verification_uri_complete',''),
+          interval_seconds=LEAST(GREATEST(CASE WHEN v_parsed->>'interval' ~ '^[0-9]{1,9}$'
+                                              THEN (v_parsed->>'interval')::int ELSE 5 END,1),60),
+          expires_at=now()+make_interval(secs=>CASE WHEN v_parsed->>'expires_in' ~ '^[0-9]{1,9}$'
+                                                    THEN (v_parsed->>'expires_in')::int ELSE 900 END),
+          next_poll_at=now()+make_interval(secs=>LEAST(GREATEST(
+            CASE WHEN v_parsed->>'interval' ~ '^[0-9]{1,9}$'
+                 THEN (v_parsed->>'interval')::int ELSE 5 END,1),60)),
+          status='awaiting_user', error=NULL, updated_at=now()
+      WHERE session_id=c.device_session_id;
+    END IF;
+    UPDATE allgres_private.oauth_calls
+    SET status='harvested', response_status=p_status, updated_at=now()
+    WHERE call_id=p_call_id;
+    RETURN jsonb_build_object('action','device_authorization_ready','session_id',c.device_session_id);
+  END IF;
+
+  -- RFC 8628 returns authorization_pending/slow_down as ordinary HTTP 400
+  -- responses.  They are progress states, not failed logins.
+  IF c.operation = 'device_poll' AND p_status >= 400 THEN
+    IF v_parsed->>'error' IN ('authorization_pending','slow_down') THEN
+      UPDATE allgres_private.oauth_device_sessions
+      SET interval_seconds=CASE WHEN v_parsed->>'error'='slow_down'
+                                THEN LEAST(interval_seconds+5,60) ELSE interval_seconds END,
+          next_poll_at=now()+make_interval(secs=>CASE WHEN v_parsed->>'error'='slow_down'
+                                THEN LEAST(interval_seconds+5,60) ELSE interval_seconds END),
+          updated_at=now()
+      WHERE session_id=c.device_session_id AND status='awaiting_user';
+      UPDATE allgres_private.oauth_calls
+      SET status='harvested', response_status=p_status, updated_at=now()
+      WHERE call_id=p_call_id;
+      RETURN jsonb_build_object('action','pending','reason',v_parsed->>'error');
+    END IF;
+    UPDATE allgres_private.oauth_device_sessions
+    SET status=CASE WHEN v_parsed->>'error'='access_denied' THEN 'denied'
+                    WHEN v_parsed->>'error'='expired_token' THEN 'expired' ELSE 'error' END,
+        error=left(COALESCE(v_parsed->>'error_description',v_parsed->>'error',p_body,''),500),
+        updated_at=now()
+    WHERE session_id=c.device_session_id;
+  END IF;
+
   IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+    IF c.operation = 'device_authorization' THEN
+      UPDATE allgres_private.oauth_device_sessions
+      SET status='error', error=left(COALESCE(v_parsed->>'error_description',v_parsed->>'error',p_body,''),500),
+          updated_at=now()
+      WHERE session_id=c.device_session_id;
+    END IF;
     UPDATE allgres_private.oauth_calls
     SET status = 'harvested', response_status = p_status,
         error = left(COALESCE(p_body, ''), 2000), updated_at = now()
@@ -6572,15 +6854,10 @@ BEGIN
     RETURN jsonb_build_object('action', 'error', 'status', p_status);
   END IF;
 
-  BEGIN
-    v_parsed := p_body::jsonb;
-  EXCEPTION WHEN others THEN
-    v_parsed := NULL;
-  END;
-
   v_access := NULLIF(v_parsed->>'access_token', '');
   v_refresh := NULLIF(v_parsed->>'refresh_token', '');
-  v_expires_in := NULLIF(v_parsed->>'expires_in', '')::int;
+  v_expires_in := CASE WHEN v_parsed->>'expires_in' ~ '^[0-9]{1,9}$'
+                       THEN (v_parsed->>'expires_in')::int END;
 
   IF v_access IS NULL THEN
     UPDATE allgres_private.oauth_calls
@@ -6605,6 +6882,12 @@ BEGIN
   UPDATE allgres_private.oauth_calls
   SET status = 'harvested', response_status = p_status, updated_at = now()
   WHERE call_id = p_call_id;
+
+  IF c.operation = 'device_poll' THEN
+    UPDATE allgres_private.oauth_device_sessions
+    SET status='connected', error=NULL, updated_at=now()
+    WHERE session_id=c.device_session_id;
+  END IF;
 
   RETURN jsonb_build_object('action', 'stored', 'provider_id', c.provider_id);
 END;
@@ -7709,6 +7992,23 @@ VALUES
   ('93ad5476-8d3a-4443-8b98-f50b6d1d4fbc', 'openai_compat', 'openai_compat', 'https://api.openai.com/v1',  true,  false)
 ON CONFLICT (name) DO NOTHING;
 
+-- Public-client device OAuth used by xAI's Grok CLI/Hermes-compatible login.
+-- The client id is not a secret; the issued device/access/refresh credentials
+-- are encrypted in llm_secrets/oauth_device_sessions and never listed.
+INSERT INTO allgres_private.llm_providers (
+  provider_id,name,kind,base_url,is_enabled,allow_private_network,
+  oauth_flow,oauth_device_url,oauth_token_url,oauth_client_id,oauth_scope
+) VALUES (
+  '98f88f1a-607d-4b54-b820-66dc40b70449','xai_oauth','oauth','https://api.x.ai/v1',true,false,
+  'device_code','https://auth.x.ai/oauth2/device/code','https://auth.x.ai/oauth2/token',
+  'b1a00492-073a-47ea-816f-4c329264a828',
+  'openid profile email offline_access grok-cli:access api:access'
+)
+ON CONFLICT (name) DO UPDATE SET
+  kind=EXCLUDED.kind, base_url=EXCLUDED.base_url, oauth_flow=EXCLUDED.oauth_flow,
+  oauth_device_url=EXCLUDED.oauth_device_url, oauth_token_url=EXCLUDED.oauth_token_url,
+  oauth_client_id=EXCLUDED.oauth_client_id, oauth_scope=EXCLUDED.oauth_scope;
+
 -- response_format_json_object's own retroactive fix (its column comment
 -- above explains why): must run after the INSERT above, whether that
 -- INSERT just created the row (fresh install) or found it already there
@@ -8155,6 +8455,7 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.outbound_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_calls', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_device_sessions', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agent_memories', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.audit_log', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connections', '');
@@ -8202,6 +8503,8 @@ DECLARE
   v_deleg_a uuid;
   v_deleg_b uuid;
   v_provider uuid;
+  v_device_provider uuid;
+  v_device_session uuid;
   v_state text;
   v_call2 uuid;
   detail_bool boolean;
@@ -9784,6 +10087,84 @@ BEGIN
 
   DELETE FROM allgres_private.oauth_calls WHERE provider_id = v_provider;
   DELETE FROM allgres_private.oauth_states WHERE provider_id = v_provider;
+
+  -- 26f. RFC 8628 device authorization: requesting a code queues the public
+  --      client request without persisting a device credential; completion
+  --      encrypts that credential and exposes only the operator-facing code.
+  INSERT INTO allgres_private.llm_providers
+    (name,kind,base_url,is_enabled,allow_private_network,oauth_flow,
+     oauth_device_url,oauth_token_url,oauth_client_id,oauth_scope)
+  VALUES ('selftest_device_oauth','oauth','https://selftest.invalid/v1',true,false,'device_code',
+          'https://selftest.invalid/device','https://selftest.invalid/token','public-client','openid offline_access')
+  ON CONFLICT(name) DO UPDATE SET oauth_flow='device_code',oauth_device_url=EXCLUDED.oauth_device_url,
+    oauth_token_url=EXCLUDED.oauth_token_url,oauth_client_id=EXCLUDED.oauth_client_id,
+    oauth_scope=EXCLUDED.oauth_scope
+  RETURNING provider_id INTO v_device_provider;
+  DELETE FROM allgres_private.oauth_calls WHERE provider_id=v_device_provider;
+  DELETE FROM allgres_private.oauth_device_sessions WHERE provider_id=v_device_provider;
+  sub := allgres_public.fn_oauth_device_start(v_device_provider);
+  v_device_session := (sub->>'session_id')::uuid;
+  v_call := (sub->>'call_id')::uuid;
+  SELECT NOT(request_body ? 'device_code') INTO ok
+  FROM allgres_private.oauth_calls WHERE call_id=v_call;
+  claim := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO r FROM jsonb_array_elements(claim->'calls') t(elem)
+  WHERE elem->>'call_id'=v_call::text;
+  ok := ok AND r->>'operation'='device_authorization'
+    AND r->'body'->>'client_id'='public-client'
+    AND NOT(r->'body' ? 'device_code');
+  comp := allgres_public.fn_complete_oauth(v_call,200,
+    '{"device_code":"secret-device-code","user_code":"ABCD-EFGH","verification_uri":"https://login.invalid/device","verification_uri_complete":"https://login.invalid/device?code=ABCD-EFGH","expires_in":900,"interval":5}');
+  ok := ok AND comp->>'action'='device_authorization_ready'
+    AND (allgres_public.fn_oauth_device_status(v_device_session)->>'status')='awaiting_user'
+    AND (allgres_public.fn_oauth_device_status(v_device_session)->>'user_code')='ABCD-EFGH';
+  SELECT ok AND device_code <> 'secret-device-code'
+    AND allgres_private.decrypt_secret(device_code)='secret-device-code' INTO ok
+  FROM allgres_private.oauth_device_sessions WHERE session_id=v_device_session;
+  v := v || jsonb_build_array(jsonb_build_object('name','oauth_device_code_is_queued_and_encrypted','ok',ok));
+
+  -- 26g. Polling is durable and authorization_pending is progress, not an
+  --      error.  The sensitive device code appears only in the worker claim.
+  UPDATE allgres_private.oauth_device_sessions SET next_poll_at=now() WHERE session_id=v_device_session;
+  claim := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO r FROM jsonb_array_elements(claim->'calls') t(elem)
+  WHERE elem->>'operation'='device_poll' AND elem->>'device_session_id'=v_device_session::text;
+  v_call := (r->>'call_id')::uuid;
+  ok := r->'body'->>'device_code'='secret-device-code'
+    AND NOT EXISTS(SELECT 1 FROM allgres_private.oauth_calls WHERE call_id=v_call AND request_body ? 'device_code');
+  comp := allgres_public.fn_complete_oauth(v_call,400,'{"error":"authorization_pending"}');
+  ok := ok AND comp->>'action'='pending'
+    AND (allgres_public.fn_oauth_device_status(v_device_session)->>'status')='awaiting_user';
+  v := v || jsonb_build_array(jsonb_build_object('name','oauth_device_poll_treats_pending_as_progress','ok',ok));
+
+  -- 26h. Approval stores the OAuth bearer, provider_secret selects it for
+  --      inference, and an expiring token queues a refresh with claim-time
+  --      refresh-token injection and rotation.
+  UPDATE allgres_private.oauth_device_sessions SET next_poll_at=now() WHERE session_id=v_device_session;
+  claim := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO r FROM jsonb_array_elements(claim->'calls') t(elem)
+  WHERE elem->>'operation'='device_poll' AND elem->>'device_session_id'=v_device_session::text;
+  v_call := (r->>'call_id')::uuid;
+  PERFORM allgres_public.fn_complete_oauth(v_call,200,
+    '{"access_token":"device-access","refresh_token":"device-refresh","expires_in":3600}');
+  ok := allgres_private.provider_secret(v_device_provider)='device-access'
+    AND (allgres_public.fn_oauth_device_status(v_device_session)->>'status')='connected';
+  UPDATE allgres_private.llm_secrets SET expires_at=now()+interval '10 seconds'
+  WHERE provider_id=v_device_provider;
+  claim := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO r FROM jsonb_array_elements(claim->'calls') t(elem)
+  WHERE elem->>'operation'='refresh' AND elem->'body'->>'refresh_token'='device-refresh';
+  v_call := (r->>'call_id')::uuid;
+  ok := ok AND v_call IS NOT NULL
+    AND NOT EXISTS(SELECT 1 FROM allgres_private.oauth_calls WHERE call_id=v_call AND request_body ? 'refresh_token');
+  PERFORM allgres_public.fn_complete_oauth(v_call,200,
+    '{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}');
+  ok := ok AND allgres_private.provider_secret(v_device_provider)='rotated-access';
+  v := v || jsonb_build_array(jsonb_build_object('name','oauth_device_tokens_refresh_and_feed_inference','ok',ok));
+
+  DELETE FROM allgres_private.oauth_calls WHERE provider_id=v_device_provider;
+  DELETE FROM allgres_private.oauth_device_sessions WHERE provider_id=v_device_provider;
+  DELETE FROM allgres_private.llm_secrets WHERE provider_id=v_device_provider;
 
   -- 27. Long-term agent memory (item 25). Starts from a clean slate for the
   --     analyst agent so the recall test below can assert on content, not
@@ -11710,7 +12091,7 @@ BEGIN
     'connections.create', 'connections.update', 'connections.delete',
     'procedures.create', 'procedures.update', 'procedures.rollback',
     'schedules.create', 'schedules.update', 'schedules.delete', 'schedules.run_now',
-    'providers.oauth_callback', 'approvals.decide', 'fixes.decide',
+    'providers.oauth_callback', 'providers.oauth_device_start', 'approvals.decide', 'fixes.decide',
     'users.create', 'users.set_active', 'users.set_role', 'assignments.set', 'assignments.toggle'
   ]) THEN
     INSERT INTO allgres_private.audit_log (operator_name, action, details)
@@ -12519,6 +12900,8 @@ BEGIN
             'allow_private_network', p.allow_private_network,
             'response_format_json_object', p.response_format_json_object,
             'oauth_auth_url', p.oauth_auth_url,
+            'oauth_flow', p.oauth_flow,
+            'oauth_device_url', p.oauth_device_url,
             'oauth_token_url', p.oauth_token_url,
             'oauth_client_id', p.oauth_client_id,
             'oauth_scope', p.oauth_scope,
@@ -12529,6 +12912,11 @@ BEGIN
                 OR NULLIF(s.access_token,'') IS NOT NULL
                 OR NULLIF(s.oauth_client_secret,'') IS NOT NULL
               )
+            ),
+            'oauth_connected', EXISTS (
+              SELECT 1 FROM allgres_private.llm_secrets s
+              WHERE s.provider_id=p.provider_id AND s.access_token IS NOT NULL
+                AND (s.expires_at IS NULL OR s.expires_at>now())
             )
           ) ORDER BY p.name)
           FROM allgres_private.llm_providers p
@@ -12731,6 +13119,14 @@ BEGIN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'provider_id')::uuid;
       RETURN allgres_public.fn_oauth_start(v_id, p_request->>'redirect');
+
+    WHEN 'providers.oauth_device_start' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_oauth_device_start((p_request->>'provider_id')::uuid);
+
+    WHEN 'providers.oauth_device_status' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_oauth_device_status((p_request->>'session_id')::uuid);
 
     -- Completes the flow: queues the token exchange (fn_oauth_token_request)
     -- rather than performing it inline, so the operator-facing return value

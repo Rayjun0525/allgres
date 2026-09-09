@@ -1,0 +1,7 @@
+services:
+  allgres:
+    network_mode: host
+    ports: !reset []
+    environment:
+      ALLGRES_HTTP_ADDR: 127.0.0.1:8088
+    command: ["postgres", "-c", "listen_addresses=127.0.0.1"]

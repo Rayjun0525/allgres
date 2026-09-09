@@ -53,12 +53,12 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   and a logical (`pg_dump`) backup/restore round-trip real data, including
   per-agent role identity. See [Upgrades](#upgrades) and [Backup and
   restore](#backup-and-restore).
-- **OAuth token exchange** — an operator connects a `kind='oauth'` provider
-  from Settings; the authorization-code exchange is queued and performed by
-  the runtime worker itself, the same claim-time-credential-injection shape
-  that already keeps an LLM provider's api_key out of any table (see
-  [Secrets at rest](#secrets-at-rest)) — never returned to the dashboard or
-  written anywhere in plaintext.
+- **OAuth login and token refresh** — an operator can connect a conventional
+  authorization-code provider or use the seeded `xai_oauth` provider's RFC
+  8628 device-code login (the same browser-account flow used by Hermes/Grok
+  CLI). Device approval is polled by the runtime worker, access and rotating
+  refresh tokens are encrypted at rest, credentials are injected only at
+  claim time, and expiring tokens refresh automatically.
 - **Long-term agent memory** — an agent can `remember` something worth
   recalling in a future session (a fact, a preference, an instruction);
   `fn_next_step` reads a bounded set of that agent's own memories, ranked by
@@ -88,9 +88,7 @@ Not yet built:
   alongside consequential actions, but that name is not authenticated, so
   "who was actually authorized to do this" stays unanswerable by design,
   only "who claimed it" is now on record.
-- Secret key rotation, and a token *refresh* flow (an expired OAuth access
-  token has to be reconnected from Settings; nothing calls `refresh_token`
-  automatically yet).
+- Secret key rotation.
 - Semantic memory search (an embedding column and vector similarity) —
   recall is importance/recency ranking only in this slice.
 
@@ -878,18 +876,22 @@ then in the worker's memory for the HTTP request it is used for — never in
 WAL, a physical backup, a PITR archive, a replica, or a plain `SELECT` on
 `outbound_calls`.
 
-OAuth's token exchange follows the identical shape, in its own queue table
-(`allgres_private.oauth_calls`) rather than `outbound_calls`, since it has no
-`task_id` to attach to — connecting a provider is an operator dashboard
-action, not an agent turn. `fn_oauth_token_request` (reachable as
-`providers.oauth_callback`) builds the token request and queues it without
-ever touching the provider's decrypted `oauth_client_secret`; only
-`fn_claim_oauth`, called by the runtime worker, resolves it and merges it
-into the response handed back over the RPC socket. The resulting
-`access_token`/`refresh_token` are encrypted straight into `llm_secrets` by
-`fn_complete_oauth`, which runs entirely inside the worker — the dashboard
-never sees the callback's authorization `code`, the client secret, or the
-issued tokens; it only ever polls `has_secret`.
+OAuth uses the same claim-time injection shape in its own queue table
+(`allgres_private.oauth_calls`). Authorization-code providers queue the code
+exchange through `providers.oauth_callback`. The seeded `xai_oauth` provider
+uses RFC 8628 device authorization: `providers.oauth_device_start` requests a
+user code, the dashboard displays xAI's verification link, and
+`providers.oauth_device_status` reports the worker's approval polling state.
+The worker also queues a refresh grant before an access token expires.
+
+The queue stores neither device codes nor refresh tokens in plaintext.
+`fn_claim_oauth` decrypts the short-lived credential only when the worker
+claims its HTTP request. `fn_complete_oauth` encrypts issued access and refresh
+tokens directly into `llm_secrets`; the dashboard sees only the user code,
+verification URL, and coarse connection state. Once connected, the access
+token is injected into xAI inference requests through the same path as a
+provider API key. An xAI account may still return `403` for inference if its
+subscription does not include API/Grok CLI access.
 
 ### Privileges
 
