@@ -13,8 +13,11 @@ putting it anywhere that matters.
 
 ## Status
 
-Implemented and verified (natively on PostgreSQL 16.15; see [Known
-limitations](#known-limitations) for what the PG17/Docker path still needs):
+Implemented and verified: natively against PostgreSQL 16, 17, and 18
+(`native-matrix` in CI, every push), and via the shipped Docker image
+(`docker-smoke` in CI: a real `docker compose build`, the full install flow
+end to end, and `scripts/smoke.sh`). See [Known
+limitations](#known-limitations) for what is genuinely still open.
 
 - **Agent control plane** — policy, permissions, delegation (bounded by a
   per-agent depth cap, an ancestor-cycle check, and a per-session total-task
@@ -71,23 +74,27 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   every agent's permission grants) and asked to report what it finds; a
   seeded example, `health_monitor`, ships read-only with both. See
   [Maintenance agents](#maintenance-agents).
-- **Operator audit log** — a self-reported operator name, sent with every
-  dashboard request, recorded append-only against every consequential
-  action (a permission grant, a decided approval or proposal, a policy
-  rollback, a cancelled session, and more). Answers "who claimed
-  responsibility for this," not "who was authorized" — see [Operator audit
-  log](#operator-audit-log) for exactly what that distinction means and
-  doesn't.
+- **Operator audit log** — every consequential mutating SQL function writes
+  its own append-only row (`agents.create`, a permission grant, a decided
+  approval or proposal, a policy rollback, a cancelled session, and more),
+  whether it was reached through the dashboard or called directly via SQL,
+  recording `origin` (`web`/`sql`), the real authenticated `db_role`, and —
+  only for a dashboard call — a self-reported `operator_name`. Answers "who
+  claimed responsibility for this," not "who was authorized" — see
+  [Operator audit log](#operator-audit-log) for exactly what that
+  distinction means and doesn't.
+- **Real accounts** — username/password login (`fn_login`/`fn_create_user`,
+  bcrypt via `pgcrypto`), `admin`/`user` roles, and per-user agent
+  assignment, layered on top of (not instead of) the dashboard's own shared
+  bearer token: creating even one account starts requiring a real admin
+  *session* for every action on the platform-configuration surface, on top
+  of the token. See [Exposure](#exposure) for exactly how the two layers
+  interact.
 
 Not yet built:
 
 - Helm charts, Kubernetes manifests, and CNPG dynamic loading — only a
   native install and `docker-compose` exist today.
-- Real per-operator identity/accounts — the dashboard still has one shared
-  token, not user accounts; the audit log records a self-reported name
-  alongside consequential actions, but that name is not authenticated, so
-  "who was actually authorized to do this" stays unanswerable by design,
-  only "who claimed it" is now on record.
 - Secret key rotation, and a token *refresh* flow (an expired OAuth access
   token has to be reconnected from Settings; nothing calls `refresh_token`
   automatically yet).
@@ -98,7 +105,8 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
 ## Runtime requirements
 
-- PostgreSQL 17+
+- PostgreSQL 16, 17, or 18 — all three are natively CI-verified on every
+  push (`native-matrix`); the Docker image ships PostgreSQL 17
 - `allgres` extension
 - `shared_preload_libraries = 'allgres'`
 - `pgcrypto` (optional, for encrypted provider secrets)
@@ -112,24 +120,41 @@ required at runtime.
 ## Docker
 
 ```bash
-docker compose down -v
-docker compose build --no-cache
-docker compose up
+docker compose up -d --build
 ```
 
-Then open <http://127.0.0.1:8088/>. Both published ports are bound to host
-loopback; see [Exposure](#exposure) before changing that.
+This builds the image locally from this repo's own `Dockerfile` (there is
+no published image to pull — `docker-compose.yml`'s `build: .` is the
+whole story) and starts it on its own named data volume. Then open
+<http://127.0.0.1:8088/>. Both published ports are bound to host loopback;
+see [Exposure](#exposure) before changing that.
 
 ```bash
 curl http://127.0.0.1:8088/healthz
 ./scripts/smoke.sh      # full smoke + end-to-end + security checks
 ```
 
+Forcing a clean rebuild (after changing the `Dockerfile` or `Cargo.toml`,
+or to rule out a stale layer) drops the data volume — only run this when
+you mean to discard whatever is in it:
+
+```bash
+docker compose down -v             # drops allgres_pgdata -- confirm you mean this
+docker compose build --no-cache
+docker compose up -d
+```
+
 ## Install flow
 
-The pre-built image, an explicit named data volume, production-leaning
-defaults, first-admin creation, and a real provider round trip are one
-flow, not five separate steps an operator has to assemble by hand:
+Building the image locally, starting it on an explicit named data volume,
+first-admin creation, and a real provider round trip are one flow, not
+four separate steps an operator has to assemble by hand. The defaults
+below (`docker-compose.yml`) are chosen so this works with zero
+configuration for a first run and local evaluation — `ALLGRES_ENABLE_MOCK`
+on, `ALLGRES_ALLOW_INSECURE_HTTP` set, no `ALLGRES_SECRET_KEY` — **none of
+that is a production posture**; see [Exposure](#exposure) and [Secrets at
+rest](#secrets-at-rest) for what to change before this ever serves real
+traffic or real provider keys.
 
 ```bash
 docker compose up -d --build       # allgres_pgdata is a named volume (docker-compose.yml),
@@ -812,9 +837,10 @@ name, a log's own content) — see KNOWN_ISSUES item 31 for the exact scope.
 
 ## Known limitations
 
-Outstanding gaps — the unverified Docker/PG17 build, secret key rotation, no
-automatic OAuth token refresh, and more — are tracked in
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
+Outstanding gaps — secret key rotation, no automatic OAuth token refresh,
+no per-task correctness judge behind [evaluation-gated
+self-improvement](#evaluation-gated-self-improvement), and more — are
+tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
 
 `allgres_public.fn_selftest()` exercises the validate/queue/claim/complete state
 machine and every shape that defeated the old text scanner, and runs as part
@@ -826,8 +852,11 @@ live session (`SET LOCAL ROLE sandbox; SELECT current_user`).
 
 ### Exposure
 
-The dashboard has no user accounts. `ALLGRES_DASHBOARD_TOKEN` is the only
-authentication, and it is empty by default.
+`ALLGRES_DASHBOARD_TOKEN` is the base authentication layer everyone
+sharing this install has in common, and it is empty by default. Real
+per-operator accounts (username/password, Settings → Users) exist and can
+be layered on top, but are optional — see below for exactly what changes
+once the first one is created.
 
 The web worker therefore **refuses to bind a non-loopback address when no token
 is set**, unless `ALLGRES_ALLOW_INSECURE_HTTP=1` says the surrounding network

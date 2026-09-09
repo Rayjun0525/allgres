@@ -70,20 +70,17 @@ set from inside a `SECURITY DEFINER` function and so is still nominal in the
 same nested-statement sense as before; the planner cost ceiling is what
 actually bounds that half.
 
-## 3. Docker image path is unverified in this environment (but now in CI)
+## 3. ~~Docker image path is unverified in this environment~~ — fixed, now green in CI
 
-The build was verified natively against PostgreSQL 18. The `Dockerfile` targets
-`postgres:17-bookworm` and builds `--features pg17`, and `scripts/smoke.sh`
-requires Docker; neither has been run *in this environment* (no Docker daemon
-reachable here). `.github/workflows/ci.yml`'s `docker-smoke` job now runs
-`scripts/smoke.sh` on every push, and `native-matrix` builds and runs
-`fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql` against real PG16/17/18
-native installs the same way this file's other native verification has always
-been done — see item 18. Until that workflow has actually run once on GitHub's
-infrastructure, "added to CI" is not the same claim as "verified there."
-
-`nodeToString` field names and `RawParseMode` are stable across 17 and 18, so
-this is expected to work, but "expected" is not "tested".
+Written when the build had only been verified natively (no Docker daemon
+reachable in that environment) and `docker-smoke`/`native-matrix` had just
+been added to `.github/workflows/ci.yml` but had not yet actually run on
+GitHub's infrastructure — "added to CI" is not the same claim as "verified
+there." It has since run, repeatedly: `docker-smoke` (`docker compose build
++ smoke`, plus the full install flow — first admin, one real agent task to
+completion) and `native-matrix` (`fn_selftest`/`tests/smoke.sql`/
+`tests/e2e_mock.sql` against real PG16/17/18 native installs) are both green
+on every push to `main`, this one included.
 
 ## 4. ~~Extension upgrade has only been installed fresh~~ — fixed
 
