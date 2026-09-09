@@ -2892,3 +2892,26 @@ unchanged -- neither exercises any of the newly gated actions through
 `dashboard_rpc` (the mock providers `e2e_mock.sql` needs are seeded via
 direct `INSERT`, not `provider.create`), confirming this fix didn't need
 to touch either script.
+
+## 38. `sql/control_plane.sql` has grown large enough to trip a real rustc compile-time safety lint
+
+Adding semantic memory recall's schema/functions pushed `sql/
+control_plane.sql` past a genuine limit: `pgrx`'s `extension_sql_file!`
+macro embeds the whole file as a compile-time byte constant, copied one
+byte per const-eval step, and the build started failing outright with
+`error: constant evaluation is taking a long time` /
+`#[deny(long_running_const_eval)]` -- rustc's own safety net against a
+truly infinite const-eval loop, not a sign anything is logically wrong,
+but a real signal the file's size is no longer just a maintainability
+nice-to-have (an earlier outside review already flagged the then-~12,900-
+line file as worth eventually splitting by source unit while keeping
+single-extension deployment, "not urgent"). Worked around for now with
+`#![allow(long_running_const_eval)]` in `src/lib.rs` -- the build succeeds
+and every test still passes, but this is muting a lint, not fixing the
+underlying growth. The next several-hundred-line addition could plausibly
+push the const-eval time past whatever margin remains before the lint's
+own threshold stops being satisfiable by allowing it (or before compile
+times become painful regardless of the lint). Splitting the file by
+source unit (control plane / queues / embeddings / dashboard_rpc, loaded
+via multiple `extension_sql_file!` calls in dependency order) is the real
+fix and should not be deferred indefinitely.
