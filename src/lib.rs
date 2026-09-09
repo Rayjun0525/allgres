@@ -25,16 +25,6 @@
 //! `fn_validate_sql` has confirmed it parses as exactly one non-writing
 //! SELECT, which is what makes that safe.
 
-// sql/control_plane.sql has grown past the point where pgrx's
-// extension_sql_file! macro (which copies the whole file into a const byte
-// buffer at compile time, one byte per const-eval step) trips rustc's
-// long_running_const_eval lint -- a compile-time safety net against a
-// genuinely infinite const-eval loop, not a sign anything here is actually
-// wrong. Splitting the file is future work (KNOWN_ISSUES.md); until then
-// this is the same "the actual computation just takes a while" case the
-// lint's own diagnostic describes.
-#![allow(long_running_const_eval)]
-
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags};
 use pgrx::prelude::*;
 use pgrx::JsonB;
@@ -94,7 +84,23 @@ const SSE_INTERVAL: Duration = Duration::from_secs(1);
 /// a single-use ticket cannot be replayed for that.
 const SSE_TICKET_TTL: Duration = Duration::from_secs(30);
 
-extension_sql_file!("../sql/control_plane.sql", finalize);
+// Three files, loaded in this exact order. pgrx allows only one
+// `finalize`-marked extension_sql_file! in the whole crate (it errors at
+// build time otherwise), so only sql/grants_and_facade.sql -- section 14's
+// final ownership pass, which genuinely needs literally everything else to
+// exist first -- carries it; the other two are "normal" position (same as
+// this module's own #[pg_extern] items below), ordered relative to each
+// other with `requires` since selftest.sql's own REVOKE and grants_and_
+// facade.sql's ownership-fixing catalog scan both need control_plane.sql's
+// (and then selftest.sql's) functions to already exist. Splitting sql/
+// control_plane.sql into these three was what fixed the long_running_
+// const_eval trip in practice, once and for all rather than by muting the
+// lint -- each file is now small enough on its own that the const-eval
+// copy loop pgrx's extension_sql_file! macro runs at compile time finishes
+// comfortably inside rustc's default budget.
+extension_sql_file!("../sql/control_plane.sql", name = "control_plane");
+extension_sql_file!("../sql/selftest.sql", requires = ["control_plane"]);
+extension_sql_file!("../sql/grants_and_facade.sql", requires = ["selftest"], finalize);
 
 #[pg_schema]
 mod allgres {

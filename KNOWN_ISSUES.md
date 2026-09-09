@@ -2893,7 +2893,7 @@ unchanged -- neither exercises any of the newly gated actions through
 direct `INSERT`, not `provider.create`), confirming this fix didn't need
 to touch either script.
 
-## 38. `sql/control_plane.sql` has grown large enough to trip a real rustc compile-time safety lint
+## 38. ~~`sql/control_plane.sql` has grown large enough to trip a real rustc compile-time safety lint~~ -- fixed by actually splitting the file
 
 Adding semantic memory recall's schema/functions pushed `sql/
 control_plane.sql` past a genuine limit: `pgrx`'s `extension_sql_file!`
@@ -2902,16 +2902,63 @@ byte per const-eval step, and the build started failing outright with
 `error: constant evaluation is taking a long time` /
 `#[deny(long_running_const_eval)]` -- rustc's own safety net against a
 truly infinite const-eval loop, not a sign anything is logically wrong,
-but a real signal the file's size is no longer just a maintainability
-nice-to-have (an earlier outside review already flagged the then-~12,900-
-line file as worth eventually splitting by source unit while keeping
-single-extension deployment, "not urgent"). Worked around for now with
-`#![allow(long_running_const_eval)]` in `src/lib.rs` -- the build succeeds
-and every test still passes, but this is muting a lint, not fixing the
-underlying growth. The next several-hundred-line addition could plausibly
-push the const-eval time past whatever margin remains before the lint's
-own threshold stops being satisfiable by allowing it (or before compile
-times become painful regardless of the lint). Splitting the file by
-source unit (control plane / queues / embeddings / dashboard_rpc, loaded
-via multiple `extension_sql_file!` calls in dependency order) is the real
-fix and should not be deferred indefinitely.
+but a real signal the file's size was no longer just a maintainability
+nice-to-have (an earlier outside review had already flagged the then-
+~12,900-line file as worth eventually splitting by source unit while
+keeping single-extension deployment, "not urgent"). First worked around
+with `#![allow(long_running_const_eval)]` -- muting the lint, not fixing
+the growth, and said so explicitly at the time.
+
+Fixed for real the same day: the file's own existing structure already had
+14 clearly numbered sections with a documented dependency order, so no
+redesign was needed, only extraction along seams that already existed.
+Split into three files, always loaded together in this exact order:
+
+- `sql/control_plane.sql` -- sections 1-10 (roles through seed data), ~8.8k
+  lines, down from ~13.7k.
+- `sql/selftest.sql` -- section 11 (`fn_selftest`), ~3.4k lines on its own
+  (it had been about a quarter of the original file).
+- `sql/grants_and_facade.sql` -- sections 12-14 (grants, the allgres facade
+  + `dashboard_rpc`, and the final ownership pass), ~1.6k lines.
+
+The real wrinkle, worth recording for the next split: `pgrx` allows only
+*one* `finalize`-marked `extension_sql_file!` in the whole crate (a second
+one is a hard build error, caught immediately) -- section 14's ownership
+pass is the one genuine "must run after literally everything" piece, so
+only `grants_and_facade.sql` carries `finalize`; the other two are "normal"
+position, ordered relative to each other with `requires = [...]` (pgrx's
+`name = "..."` / `requires = ["that name"]` pair), which pgrx enforces
+regardless of declaration order in `src/lib.rs`. `fn_selftest` itself
+needed no special handling to move: it is `LANGUAGE plpgsql`, so nothing
+inside its body is checked against the catalog until it is actually
+called, long after every file has finished loading -- the same forward-
+reference tolerance this codebase already relied on throughout one file.
+The one real cross-file dependency was `REVOKE ALL ON FUNCTION
+allgres_public.fn_selftest() FROM PUBLIC` living in the old section 12,
+which needs the function to already exist (a `REVOKE` is not deferred the
+way a plpgsql body reference is) -- moved into `selftest.sql` itself,
+right after the function it revokes, so that file is fully self-contained
+and the cross-file ordering concern disappears entirely rather than being
+merely managed.
+
+`scripts/gen-upgrade.sh` (which used to `cat` `control_plane.sql` alone
+into every generated upgrade script) was the one other place the single-
+file assumption was baked in -- fixed to concatenate all three files, in
+the same order, so `ALTER EXTENSION ... UPDATE` keeps installing
+`fn_selftest`, every grant, and the dashboard facade, not just sections
+1-10.
+
+**Verified live**: fresh `CREATE EXTENSION` after the split, with the
+generated combined SQL inspected directly to confirm sections still land
+in the original order (1 → schema creation → 11 → 12 → 14); `fn_selftest`
+confirmed owned by `allgres_owner` (not left at its installing-superuser
+default) and confirmed to still have `PUBLIC`'s `EXECUTE` privilege
+revoked -- the two concrete things that would have silently broken had the
+`requires` chain been wrong, per the "Final ownership pass" comment's own
+account of exactly this failure mode happening once before, pre-split.
+`fn_selftest` run three times consecutively (252/252 each time, matching
+the pre-split count exactly) plus once more with a real admin account
+present, `tests/smoke.sql`, `tests/e2e_mock.sql`, and `cargo test` (30/30)
+all green. The build now succeeds with `#![allow(long_running_const_eval)]`
+removed entirely -- confirming this was the real fix, not a second mute
+alongside a smaller number.

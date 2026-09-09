@@ -1211,11 +1211,15 @@ CREATE EXTENSION allgres;
 
 ### Upgrades
 
-`sql/control_plane.sql` is idempotent — `CREATE OR REPLACE`, `IF NOT EXISTS`,
-`ON CONFLICT DO NOTHING`, create-only seeds (an upgrade never overwrites an
-edited prompt or policy), and explicit `DROP`s for anything whose signature or
-return type changed. `scripts/gen-upgrade.sh <from> <to>` turns it into a
-versioned upgrade script:
+`sql/control_plane.sql`, `sql/selftest.sql`, and `sql/grants_and_facade.sql`
+(three files, always loaded together in that order — split out of what used
+to be one file once it grew large enough to trip a real rustc compile-time
+limit; see KNOWN_ISSUES.md item 38) are idempotent — `CREATE OR REPLACE`,
+`IF NOT EXISTS`, `ON CONFLICT DO NOTHING`, create-only seeds (an upgrade
+never overwrites an edited prompt or policy), and explicit `DROP`s for
+anything whose signature or return type changed. `scripts/gen-upgrade.sh
+<from> <to>` concatenates all three, in that same order, into a versioned
+upgrade script:
 
 ```bash
 ./scripts/gen-upgrade.sh 0.2.0 0.3.0    # writes sql/allgres--0.2.0--0.3.0.sql
@@ -1294,7 +1298,7 @@ psql -c "SELECT allgres_public.fn_selftest()"
 fixture it creates is either uniquely named and hard-deleted before it
 returns, or left behind deactivated and hidden from every operator-facing
 listing by `goal LIKE 'selftest%'` (see `selftest_fixtures_hidden_not_deleted`
-in `sql/control_plane.sql`) — the same convention real accounts, real
+in `sql/selftest.sql`) — the same convention real accounts, real
 agents, real policy history, and real queued work all already rely on not
 being disturbed by. Run it against a database that has been in production
 for months exactly the same way as right after `CREATE EXTENSION allgres`;
@@ -1302,7 +1306,8 @@ nothing in it assumes an empty install, an exact row count anywhere in the
 schema, or that no admin account exists yet (confirmed live: a full
 `fn_selftest()` pass with a real admin account, and real agent/session/task
 history already in the database, both taken before every commit that
-touches `sql/control_plane.sql`).
+touches any of `sql/control_plane.sql`, `sql/selftest.sql`, or
+`sql/grants_and_facade.sql`).
 
 `scripts/fault_injection_drill.sh` is a separate, runnable drill (bare-metal,
 like `scripts/backup_drill.sh`) that sends a real `SIGKILL` to the real
