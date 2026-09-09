@@ -1138,6 +1138,77 @@ CREATE TABLE IF NOT EXISTS allgres_private.audit_log (
 CREATE INDEX IF NOT EXISTS audit_log_created_idx
   ON allgres_private.audit_log (created_at DESC);
 
+-- Every consequential mutation used to be logged only from inside
+-- dashboard_rpc's own dispatch -- an outside review pointed out that this
+-- project's other stated goal, every mutation also being a plain SQL
+-- function an operator can call directly (see "Everything the dashboard
+-- does, psql can do too" in the README), meant a direct SQL call left no
+-- audit trail at all. origin/db_role fix that: origin records whether the
+-- call arrived through dashboard_rpc ('web') or not ('sql', the default --
+-- see allgres_private.audit's own comment for why that has to be the
+-- fail-safe direction); db_role is the actual authenticated Postgres role
+-- for the call, always populated regardless of origin -- unlike
+-- operator_name, which stays exactly what it always was: self-reported,
+-- present only for a 'web' row where the browser sent one.
+ALTER TABLE allgres_private.audit_log
+  ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'sql' CHECK (origin IN ('web', 'sql')),
+  ADD COLUMN IF NOT EXISTS db_role text NOT NULL DEFAULT session_user;
+
+-- dashboard_rpc calls allgres_private.set_audit_context once, before its
+-- CASE dispatch, so every mutating function it goes on to call can write
+-- its own audit_log row (via allgres_private.audit below) already knowing
+-- this transaction arrived through the web/API surface with this self-
+-- reported operator name. A plain `SET LOCAL`-equivalent GUC
+-- (`is_local = true`) carries the actual value for just the current
+-- transaction -- but PostgreSQL has a sharp edge for a *never-before-
+-- referenced* custom GUC specifically: the very first is_local=true SET on
+-- it, in any given session, does not roll back to NULL the way SET LOCAL
+-- normally would -- it silently becomes that session's permanent baseline,
+-- because there was no prior session-level value to revert to. Left alone,
+-- that means the first dashboard_rpc call on a freshly-opened, since-
+-- reused connection (fn_selftest calling itself twice in one psql session
+-- is exactly this) would permanently mislabel every later direct-SQL call
+-- on that same connection as 'web' too, for the rest of the session --
+-- exactly the bug this whole feature exists to avoid. The fix: also issue
+-- a plain (non-local) SET of the sentinel '__sql__' every time, right
+-- before the real is_local value -- this reliably makes '__sql__' the
+-- value this transaction's is_local override reverts to the instant it
+-- commits or rolls back (verified against live PostgreSQL, not just
+-- documented SET LOCAL semantics), regardless of whether this is the
+-- first-ever reference to the GUC in this session. A function called
+-- directly via SQL, in a transaction that never called this, reads back
+-- either that same '__sql__' baseline or a genuine NULL (a connection
+-- that has never touched this GUC at all) -- both mean 'sql' in
+-- allgres_private.audit below.
+CREATE OR REPLACE FUNCTION allgres_private.set_audit_context(p_operator_name text)
+RETURNS void
+LANGUAGE sql
+AS $fn$
+  SELECT set_config('allgres.audit_operator', '__sql__', false);
+  SELECT set_config('allgres.audit_operator', COALESCE(NULLIF(btrim(p_operator_name), ''), ''), true);
+$fn$;
+
+-- The one place every consequential mutating function writes its own
+-- audit_log row from now on, regardless of whether it was reached through
+-- dashboard_rpc or called directly via SQL -- see the table's own comment
+-- for why that parity is the whole point. p_details is whatever fields
+-- that specific function judges safe and useful to record (never a raw
+-- secret -- see each call site), not a generic echo of its arguments.
+CREATE OR REPLACE FUNCTION allgres_private.audit(p_action text, p_details jsonb DEFAULT '{}'::jsonb)
+RETURNS void
+LANGUAGE sql
+AS $fn$
+  INSERT INTO allgres_private.audit_log (operator_name, action, details, origin, db_role)
+  VALUES (
+    NULLIF(NULLIF(current_setting('allgres.audit_operator', true), '__sql__'), ''),
+    p_action,
+    COALESCE(p_details, '{}'::jsonb),
+    CASE WHEN COALESCE(current_setting('allgres.audit_operator', true), '__sql__') = '__sql__'
+         THEN 'sql' ELSE 'web' END,
+    session_user
+  );
+$fn$;
+
 -- Real per-operator accounts (KNOWN_ISSUES.md, item 10 -- what item 28's
 -- lighter audit log kept deferring): a username/password login, distinct
 -- from the dashboard's one shared bearer token, so the conversational
@@ -5049,6 +5120,7 @@ BEGIN
   END IF;
   v_role := allgres_private.fn_provision_agent_role(v_id);
   PERFORM allgres_private.queue_agent_embedding(v_id);
+  PERFORM allgres_private.audit('agents.create', jsonb_build_object('agent_id', v_id, 'name', btrim(p_name)));
   RETURN jsonb_build_object('ok', true, 'agent_id', v_id, 'pg_role', v_role);
 END;
 $fn$;
@@ -5066,6 +5138,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'agent not found' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.audit('agents.update', jsonb_build_object('agent_id', p_agent_id, 'is_active', p_active));
   RETURN jsonb_build_object('ok', true, 'is_active', p_active);
 END;
 $fn$;
@@ -5092,6 +5165,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'agent not found' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.audit('agents.set_autonomy', jsonb_build_object('agent_id', p_agent_id, 'autonomy_level', p_level));
   RETURN jsonb_build_object('ok', true, 'autonomy_level', p_level);
 END;
 $fn$;
@@ -5173,6 +5247,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'agent not found' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.audit('agents.update', jsonb_build_object('agent_id', p_agent_id, 'agent_config', p_config));
   RETURN jsonb_build_object('ok', true, 'agent_config', v_config);
 END;
 $fn$;
@@ -5205,6 +5280,7 @@ BEGIN
     p_agent_id, NULLIF(btrim(COALESCE(p_preset_prompt, '')), '')
   )
   RETURNING project_id INTO v_id;
+  PERFORM allgres_private.audit('projects.create', jsonb_build_object('project_id', v_id, 'name', btrim(p_name)));
   RETURN jsonb_build_object('ok', true, 'project_id', v_id);
 END;
 $fn$;
@@ -5222,6 +5298,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'project not found' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.audit('projects.update', jsonb_build_object('project_id', p_project_id, 'is_active', p_active));
   RETURN jsonb_build_object('ok', true, 'is_active', p_active);
 END;
 $fn$;
@@ -5252,6 +5329,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'project not found' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.audit('projects.update', jsonb_build_object('project_id', p_project_id, 'agent_id', p_agent_id, 'preset_prompt', p_preset_prompt));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -5345,6 +5423,16 @@ BEGIN
       updated_at = now()
   WHERE agent_id = p_agent_id;
 
+  IF v_changed THEN
+    PERFORM allgres_private.audit('agents.update', jsonb_build_object(
+      'agent_id', p_agent_id, 'field', 'policy',
+      'generation', p_row.generation + 1,
+      'llm_config', v_cfg, 'max_steps', v_steps, 'max_retries', v_retries,
+      'max_concurrent_tasks', v_concurrent, 'max_turn_seconds', v_turn_secs,
+      'max_delegation_depth', v_deleg_depth, 'max_session_tasks', v_session_tasks
+    ));
+  END IF;
+
   RETURN jsonb_build_object(
     'ok', true,
     'generation', p_row.generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
@@ -5395,6 +5483,7 @@ BEGIN
     v_count := v_count + 1;
   END LOOP;
 
+  PERFORM allgres_private.audit('agents.bulk_set_model', jsonb_build_object('provider', p_provider, 'model', p_model, 'updated_count', v_count));
   RETURN jsonb_build_object('ok', true, 'updated_count', v_count);
 END;
 $fn$;
@@ -5430,6 +5519,7 @@ BEGIN
     UPDATE allgres_private.change_proposals
     SET status = 'rejected', decided_at = now(), decided_reply = p_reply
     WHERE proposal_id = p_proposal_id;
+    PERFORM allgres_private.audit('proposals.decide', jsonb_build_object('proposal_id', p_proposal_id, 'status', 'rejected'));
     RETURN jsonb_build_object('ok', true, 'status', 'rejected');
   END IF;
 
@@ -5443,6 +5533,7 @@ BEGIN
     UPDATE allgres_private.change_proposals
     SET status = 'approved', decided_at = now(), decided_reply = p_reply
     WHERE proposal_id = p_proposal_id;
+    PERFORM allgres_private.audit('proposals.decide', jsonb_build_object('proposal_id', p_proposal_id, 'status', 'approved', 'kind', 'create_agent'));
     RETURN jsonb_build_object('ok', true, 'status', 'approved', 'created_agent', v_created);
   END IF;
 
@@ -5461,6 +5552,7 @@ BEGIN
     SET status = 'stale', decided_at = now(),
         decided_reply = COALESCE(p_reply, 'base policy changed since this was proposed')
     WHERE proposal_id = p_proposal_id;
+    PERFORM allgres_private.audit('proposals.decide', jsonb_build_object('proposal_id', p_proposal_id, 'status', 'stale'));
     RETURN jsonb_build_object('ok', false, 'status', 'stale');
   END IF;
 
@@ -5476,6 +5568,7 @@ BEGIN
   SET status = 'approved', decided_at = now(), decided_reply = p_reply
   WHERE proposal_id = p_proposal_id;
 
+  PERFORM allgres_private.audit('proposals.decide', jsonb_build_object('proposal_id', p_proposal_id, 'status', 'approved', 'kind', 'policy_change', 'target_agent_id', v_target));
   RETURN jsonb_build_object('ok', true, 'status', 'approved', 'policy', v_policy);
 END;
 $fn$;
@@ -5501,6 +5594,7 @@ BEGIN
       USING ERRCODE = 'P0001';
   END IF;
 
+  PERFORM allgres_private.audit('policy.rollback', jsonb_build_object('agent_id', p_agent_id, 'restored_generation', p_generation));
   RETURN allgres_public.fn_set_policy(
     p_agent_id, h.system_prompt, h.max_steps, h.max_retries, h.llm_config,
     h.max_concurrent_tasks, h.max_turn_seconds, h.max_turn_seconds IS NULL,
@@ -5594,6 +5688,7 @@ BEGIN
   INSERT INTO allgres_private.procedures (name, content)
   VALUES (trim(p_name), p_content)
   RETURNING procedure_id INTO v_id;
+  PERFORM allgres_private.audit('procedures.create', jsonb_build_object('procedure_id', v_id, 'name', trim(p_name)));
   RETURN jsonb_build_object('ok', true, 'procedure_id', v_id);
 END;
 $fn$;
@@ -5632,6 +5727,10 @@ BEGIN
       updated_at = now()
   WHERE procedure_id = p_procedure_id;
 
+  PERFORM allgres_private.audit('procedures.update', jsonb_build_object(
+    'procedure_id', p_procedure_id, 'changed', v_changed, 'enabled', p_enabled,
+    'generation', p_row.generation + (CASE WHEN v_changed THEN 1 ELSE 0 END)
+  ));
   RETURN jsonb_build_object(
     'ok', true,
     'generation', p_row.generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
@@ -5658,6 +5757,7 @@ BEGIN
     RAISE EXCEPTION 'fn_rollback_procedure: no history for that procedure at generation %', p_generation
       USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.audit('procedures.rollback', jsonb_build_object('procedure_id', p_procedure_id, 'restored_generation', p_generation));
   RETURN allgres_public.fn_set_procedure(p_procedure_id, h.content, NULL);
 END;
 $fn$;
@@ -5673,6 +5773,7 @@ BEGIN
   INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
   VALUES (p_agent_id, p_type, p_ref)
   ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
+  PERFORM allgres_private.audit('permissions.grant', jsonb_build_object('agent_id', p_agent_id, 'type', p_type, 'ref', p_ref));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -5687,6 +5788,7 @@ AS $fn$
 BEGIN
   DELETE FROM allgres_private.permissions
   WHERE agent_id = p_agent_id AND resource_type = p_type AND resource_ref = p_ref;
+  PERFORM allgres_private.audit('permissions.revoke', jsonb_build_object('agent_id', p_agent_id, 'type', p_type, 'ref', p_ref));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -5737,6 +5839,7 @@ BEGIN
     UPDATE allgres_private.fix_proposals
     SET status = 'rejected', decided_at = now(), decided_reply = p_reply
     WHERE fix_id = p_fix_id;
+    PERFORM allgres_private.audit('fixes.decide', jsonb_build_object('fix_id', p_fix_id, 'status', 'rejected'));
     RETURN jsonb_build_object('ok', true, 'status', 'rejected');
   END IF;
 
@@ -5746,6 +5849,7 @@ BEGIN
   SET status = 'approved', decided_at = now(), decided_reply = p_reply
   WHERE fix_id = p_fix_id;
 
+  PERFORM allgres_private.audit('fixes.decide', jsonb_build_object('fix_id', p_fix_id, 'status', 'approved'));
   RETURN jsonb_build_object('ok', true, 'status', 'approved', 'result', v_result);
 END;
 $fn$;
@@ -5887,6 +5991,9 @@ BEGIN
   INSERT INTO allgres_private.schedules (name, agent_id, goal, interval_seconds, next_run_at, max_runs, ends_at)
   VALUES (trim(p_name), p_agent_id, trim(p_goal), p_interval_seconds, COALESCE(p_start_at, now()), p_max_runs, p_ends_at)
   RETURNING schedule_id INTO v_id;
+  PERFORM allgres_private.audit('schedules.create', jsonb_build_object(
+    'schedule_id', v_id, 'name', trim(p_name), 'agent_id', p_agent_id, 'interval_seconds', p_interval_seconds
+  ));
   RETURN jsonb_build_object('ok', true, 'schedule_id', v_id);
 END;
 $fn$;
@@ -5924,6 +6031,7 @@ BEGIN
       ends_at = CASE WHEN p_clear_ends_at THEN NULL ELSE COALESCE(p_ends_at, ends_at) END,
       updated_at = now()
   WHERE schedule_id = p_schedule_id;
+  PERFORM allgres_private.audit('schedules.update', jsonb_build_object('schedule_id', p_schedule_id, 'is_active', p_is_active));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -5945,6 +6053,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'schedule not found' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.audit('schedules.delete', jsonb_build_object('schedule_id', p_schedule_id));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -6059,6 +6168,7 @@ BEGIN
       ),
       updated_at = now()
   WHERE schedule_id = p_schedule_id;
+  PERFORM allgres_private.audit('schedules.run_now', jsonb_build_object('schedule_id', p_schedule_id, 'session_id', v_created->>'session_id'));
   RETURN v_created;
 END;
 $fn$;
@@ -6077,6 +6187,8 @@ BEGIN
           allgres_private.encrypt_secret(NULLIF(p_api_key, '')),
           allgres_private.llm_secrets.api_key
         );
+  -- Never log p_api_key itself -- only that a secret was (re)written.
+  PERFORM allgres_private.audit('provider.set_secret', jsonb_build_object('provider_id', p_provider_id, 'api_key_set', true));
   RETURN jsonb_build_object(
     'ok', true,
     'has_secret', true,
@@ -6154,6 +6266,11 @@ BEGIN
     PERFORM allgres_public.fn_set_provider_secret(v_id, p_api_key);
   END IF;
 
+  PERFORM allgres_private.audit('provider.create', jsonb_build_object(
+    'provider_id', v_id, 'name', trim(p_name), 'kind', p_kind, 'base_url', v_url,
+    'purpose', v_purpose, 'allow_private_network', COALESCE(p_allow_private_network, false),
+    'api_key_set', NULLIF(p_api_key, '') IS NOT NULL
+  ));
   RETURN jsonb_build_object('ok', true, 'provider_id', v_id);
 END;
 $fn$;
@@ -6229,6 +6346,10 @@ BEGIN
       SET oauth_client_secret = EXCLUDED.oauth_client_secret;
   END IF;
 
+  PERFORM allgres_private.audit('provider.update', jsonb_build_object(
+    'provider_id', p_provider_id, 'base_url', v_url, 'enabled', p_enabled,
+    'allow_private_network', v_allow, 'oauth_client_secret_set', (p_oauth_client_secret IS NOT NULL AND p_oauth_client_secret <> '')
+  ));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -6287,6 +6408,11 @@ BEGIN
     PERFORM allgres_public.fn_set_connection_secret(v_id, p_api_key);
   END IF;
 
+  PERFORM allgres_private.audit('connections.create', jsonb_build_object(
+    'connection_id', v_id, 'name', trim(p_name), 'base_url', v_url, 'auth_kind', v_auth,
+    'allow_private_network', COALESCE(p_allow_private_network, false),
+    'api_key_set', NULLIF(p_api_key, '') IS NOT NULL
+  ));
   RETURN jsonb_build_object('ok', true, 'connection_id', v_id);
 END;
 $fn$;
@@ -6336,6 +6462,10 @@ BEGIN
       updated_at = now()
   WHERE connection_id = p_connection_id;
 
+  PERFORM allgres_private.audit('connections.update', jsonb_build_object(
+    'connection_id', p_connection_id, 'base_url', v_url, 'auth_kind', v_auth,
+    'enabled', p_enabled, 'allow_private_network', v_allow
+  ));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -6379,6 +6509,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'connection not found' USING ERRCODE = 'P0001';
   END IF;
+  PERFORM allgres_private.audit('connections.delete', jsonb_build_object('connection_id', p_connection_id));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -6479,6 +6610,11 @@ BEGIN
     'queued'
   )
   RETURNING call_id INTO v_call;
+
+  -- Never log p_code/p_redirect: an authorization code is a bearer secret
+  -- until it's redeemed, and the call row above is where it already lives
+  -- (transiently) for the worker to pick up.
+  PERFORM allgres_private.audit('oauth.token_request', jsonb_build_object('provider_id', v_pid, 'call_id', v_call));
 
   RETURN jsonb_build_object('ok', true, 'queued', true, 'call_id', v_call, 'provider_id', v_pid);
 END;
@@ -6829,6 +6965,7 @@ BEGIN
     -- The task moved on without this decision (e.g. fn_watchdog already
     -- expired it).  The approval row itself is still recorded above; there
     -- is nothing left to resume or log against.
+    PERFORM allgres_private.audit('approvals.decide', jsonb_build_object('approval_id', p_approval_id, 'accept', p_accept, 'task_updated', false));
     RETURN jsonb_build_object('ok', true, 'task_updated', false);
   END IF;
 
@@ -6845,6 +6982,7 @@ BEGIN
     WHERE task_id = t.task_id;
     PERFORM allgres_private.maybe_complete_session(t.session_id);
   END IF;
+  PERFORM allgres_private.audit('approvals.decide', jsonb_build_object('approval_id', p_approval_id, 'accept', p_accept, 'task_updated', true));
   RETURN jsonb_build_object('ok', true, 'task_updated', true);
 END;
 $fn$;
@@ -6916,30 +7054,37 @@ BEGIN
   SET status = 'cancelled', completed_at = now()
   WHERE session_id = p_session_id AND status = 'open';
 
+  PERFORM allgres_private.audit('sessions.cancel', jsonb_build_object('session_id', p_session_id, 'reason', v_reason, 'tasks_cancelled', v_n));
   RETURN jsonb_build_object('ok', true, 'tasks_cancelled', v_n);
 END;
 $fn$;
 
 CREATE OR REPLACE FUNCTION allgres_public.fn_allowlist_add(p_ref text)
 RETURNS jsonb
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
+BEGIN
   INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
   VALUES (p_ref)
-  ON CONFLICT DO NOTHING
-  RETURNING jsonb_build_object('ok', true, 'resource_ref', resource_ref);
+  ON CONFLICT DO NOTHING;
+  PERFORM allgres_private.audit('allowlist.add', jsonb_build_object('resource_ref', p_ref));
+  RETURN jsonb_build_object('ok', true, 'resource_ref', p_ref);
+END;
 $fn$;
 
 CREATE OR REPLACE FUNCTION allgres_public.fn_allowlist_del(p_ref text)
 RETURNS jsonb
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
-  DELETE FROM allgres_private.sql_sandbox_allowlist WHERE resource_ref = p_ref
-  RETURNING jsonb_build_object('ok', true);
+BEGIN
+  DELETE FROM allgres_private.sql_sandbox_allowlist WHERE resource_ref = p_ref;
+  PERFORM allgres_private.audit('allowlist.remove', jsonb_build_object('resource_ref', p_ref));
+  RETURN jsonb_build_object('ok', true);
+END;
 $fn$;
 
 -- Operator-authored counterpart to the agent's own `remember` action
@@ -6956,23 +7101,34 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_remember(
   p_subject_id text DEFAULT NULL,
   p_expires_in_days text DEFAULT NULL
 ) RETURNS jsonb
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
-  SELECT allgres_private.write_memory(
+DECLARE
+  v_result jsonb;
+BEGIN
+  v_result := allgres_private.write_memory(
     p_agent_id, p_content, p_memory_type, p_importance, p_subject_id, p_expires_in_days
   );
+  PERFORM allgres_private.audit('memories.create', jsonb_build_object(
+    'agent_id', p_agent_id, 'memory_type', p_memory_type, 'content_preview', left(p_content, 120)
+  ));
+  RETURN v_result;
+END;
 $fn$;
 
 CREATE OR REPLACE FUNCTION allgres_public.fn_forget(p_memory_id uuid)
 RETURNS jsonb
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
-  DELETE FROM allgres_private.agent_memories WHERE memory_id = p_memory_id
-  RETURNING jsonb_build_object('ok', true, 'memory_id', memory_id);
+BEGIN
+  DELETE FROM allgres_private.agent_memories WHERE memory_id = p_memory_id;
+  PERFORM allgres_private.audit('memories.remove', jsonb_build_object('memory_id', p_memory_id));
+  RETURN jsonb_build_object('ok', true, 'memory_id', p_memory_id);
+END;
 $fn$;
 
 CREATE OR REPLACE FUNCTION allgres_private.selftest_cleanup()
@@ -7050,6 +7206,9 @@ BEGIN
   INSERT INTO allgres_private.users (username, password_hash, role)
   VALUES (v_username, v_hash, p_role)
   RETURNING user_id INTO v_id;
+
+  -- Never log p_password/v_hash: audit_log.details is not a secrets store.
+  PERFORM allgres_private.audit('users.create', jsonb_build_object('user_id', v_id, 'username', v_username, 'role', p_role));
 
   RETURN jsonb_build_object('ok', true, 'user_id', v_id, 'username', v_username, 'role', p_role);
 END;
@@ -7140,6 +7299,7 @@ SET search_path = allgres_private, pg_temp
 AS $fn$
 BEGIN
   UPDATE allgres_private.users SET is_active = p_is_active WHERE user_id = p_user_id;
+  PERFORM allgres_private.audit('users.set_active', jsonb_build_object('user_id', p_user_id, 'is_active', p_is_active));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -7155,6 +7315,7 @@ BEGIN
     RAISE EXCEPTION 'invalid role: %', p_role USING ERRCODE = 'P0001';
   END IF;
   UPDATE allgres_private.users SET role = p_role WHERE user_id = p_user_id;
+  PERFORM allgres_private.audit('users.set_role', jsonb_build_object('user_id', p_user_id, 'role', p_role));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -7173,6 +7334,7 @@ BEGIN
   DELETE FROM allgres_private.user_agent_assignments WHERE user_id = p_user_id;
   INSERT INTO allgres_private.user_agent_assignments (user_id, agent_id)
   SELECT p_user_id, a FROM unnest(COALESCE(p_agent_ids, ARRAY[]::uuid[])) a;
+  PERFORM allgres_private.audit('users.set_assignments', jsonb_build_object('user_id', p_user_id, 'agent_ids', to_jsonb(p_agent_ids)));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -7192,6 +7354,7 @@ BEGIN
     DELETE FROM allgres_private.user_agent_assignments
     WHERE user_id = p_user_id AND agent_id = p_agent_id;
   END IF;
+  PERFORM allgres_private.audit('users.set_assignment', jsonb_build_object('user_id', p_user_id, 'agent_id', p_agent_id, 'assigned', p_assigned));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;
@@ -8239,6 +8402,29 @@ BEGIN
   -- creating new ones, so a crash mid-selftest can't leave stale rows
   -- behind indefinitely.
   PERFORM allgres_private.selftest_cleanup();
+
+  -- 0. origin/db_role provenance, sql half (see section 29a below for the
+  -- web half, which uses dashboard_rpc's own calls further down instead):
+  -- allgres.audit_operator is a transaction-local GUC (set_config(...,
+  -- is_local=true)), so this has to run before dashboard_rpc's own
+  -- set_audit_context executes even once anywhere in this function's one
+  -- transaction -- once it has, the GUC stays visibly set (not NULL) for
+  -- the rest of this call, same as it would for any other single
+  -- transaction that mixes a dashboard_rpc call with a later direct one.
+  -- fn_allowlist_add/fn_allowlist_del called here, with no dashboard_rpc
+  -- anywhere above this line, must record origin='sql', db_role = the
+  -- real authenticated role, and no operator_name (nothing here ever
+  -- claimed one) -- the exact direct-SQL audit trail the outside review
+  -- pointed out was missing entirely before allgres_private.audit existed.
+  PERFORM allgres_public.fn_allowlist_add('selftest_audit_origin_marker');
+  SELECT origin = 'sql' AND operator_name IS NULL AND db_role = session_user::text
+  INTO detail_bool
+  FROM allgres_private.audit_log
+  WHERE action = 'allowlist.add' AND details->>'resource_ref' = 'selftest_audit_origin_marker'
+  ORDER BY created_at DESC LIMIT 1;
+  ok := COALESCE(detail_bool, false);
+  PERFORM allgres_public.fn_allowlist_del('selftest_audit_origin_marker');
+  v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_direct_sql_call_records_origin_sql', 'ok', ok));
 
   SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM allgres_private.policies WHERE agent_id = v_agent;
@@ -10056,10 +10242,10 @@ BEGIN
     'session_token', v_audit_tok
   ));
   ok := (sub->>'ok')::boolean IS TRUE;
-  SELECT operator_name = 'selftest_operator' AND details = jsonb_build_object('ref', 'selftest_audit_marker')
+  SELECT operator_name = 'selftest_operator' AND details = jsonb_build_object('resource_ref', 'selftest_audit_marker')
   INTO detail_bool
   FROM allgres_private.audit_log
-  WHERE action = 'allowlist.add' AND details->>'ref' = 'selftest_audit_marker'
+  WHERE action = 'allowlist.add' AND details->>'resource_ref' = 'selftest_audit_marker'
   ORDER BY created_at DESC LIMIT 1;
   ok := ok AND COALESCE(detail_bool, false);
   PERFORM allgres.dashboard_rpc(jsonb_build_object(
@@ -10089,12 +10275,40 @@ BEGIN
     ok := ok AND SQLERRM LIKE '%append-only%';
   END;
 
+  v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
+
+  -- 29a. origin/db_role provenance, web half (the sql half runs at the very
+  -- top of this function, before dashboard_rpc's own set_audit_context has
+  -- ever executed in this transaction -- see that section's comment for
+  -- why it cannot also be checked here): the same allowlist.add action,
+  -- reached through dashboard_rpc with an operator_name, must record
+  -- origin='web' with that operator_name and the real db_role -- proving
+  -- the fail-safe direction in allgres_private.audit's own comment holds.
+  -- A distinct ref from the sql half's, not just a distinct assertion: the
+  -- whole selftest run is one transaction, so now() -- and therefore
+  -- audit_log.created_at -- is identical for every row it inserts; reusing
+  -- the same ref would make "ORDER BY created_at DESC LIMIT 1" pick
+  -- between two same-timestamp rows arbitrarily instead of the one this
+  -- check actually means to look at.
+  sub := allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'allowlist.add', 'ref', 'selftest_audit_origin_marker_web', 'operator_name', 'selftest_operator',
+    'session_token', v_audit_tok
+  ));
+  SELECT origin = 'web' AND operator_name = 'selftest_operator' AND db_role = session_user::text
+  INTO detail_bool
+  FROM allgres_private.audit_log
+  WHERE action = 'allowlist.add' AND details->>'resource_ref' = 'selftest_audit_origin_marker_web'
+  ORDER BY created_at DESC LIMIT 1;
+  ok := COALESCE(detail_bool, false);
+  PERFORM allgres.dashboard_rpc(jsonb_build_object(
+    'action', 'allowlist.remove', 'ref', 'selftest_audit_origin_marker_web', 'session_token', v_audit_tok
+  ));
+  v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_dashboard_rpc_call_records_origin_web', 'ok', ok));
+
   IF v_audit_tok IS NOT NULL THEN
     PERFORM allgres_public.fn_logout(v_audit_tok);
     DELETE FROM allgres_private.users WHERE username = 'selftest_audit_admin';
   END IF;
-
-  v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_consequential_actions_only', 'ok', ok));
 
   -- item 36's own bootstrap guarantee: require_admin_if_accounts_exist must
   -- be a true no-op for a deployment that has never created a user account
@@ -11690,37 +11904,16 @@ DECLARE
   v_user allgres_private.users%ROWTYPE;
   v_scope uuid[];
 BEGIN
-  -- One audit_log row per consequential action, written here rather than
-  -- scattered across each branch below, so no future action can be added
-  -- to the audited set without also being wired in -- and so it lands in
-  -- the same transaction as the mutation itself: if the branch below
-  -- raises, PL/pgSQL's implicit savepoint at this BEGIN block rolls this
-  -- insert back right along with it, so a row only ever exists for
-  -- something that actually committed. operator_name is whatever the
-  -- browser sent (self-reported, see the audit_log table's own comment);
-  -- details is the request minus 'action'/'operator_name' and anything
-  -- that could carry a secret (an API key, an OAuth client secret, an
-  -- authorization code or state) -- generic by design, so a new audited
-  -- action needs no bespoke mapping here, only its name added to the list.
-  IF v_action = ANY (ARRAY[
-    'agents.create', 'agents.update', 'agents.set_autonomy', 'policy.rollback', 'proposals.decide',
-    'permissions.grant', 'permissions.revoke', 'allowlist.add', 'allowlist.remove',
-    'projects.create', 'projects.update', 'sessions.cancel',
-    'memories.create', 'memories.remove', 'provider.update', 'provider.create',
-    'connections.create', 'connections.update', 'connections.delete',
-    'procedures.create', 'procedures.update', 'procedures.rollback',
-    'schedules.create', 'schedules.update', 'schedules.delete', 'schedules.run_now',
-    'providers.oauth_callback', 'approvals.decide', 'fixes.decide',
-    'users.create', 'users.set_active', 'users.set_role', 'assignments.set', 'assignments.toggle'
-  ]) THEN
-    INSERT INTO allgres_private.audit_log (operator_name, action, details)
-    VALUES (
-      NULLIF(btrim(COALESCE(p_request->>'operator_name', '')), ''),
-      v_action,
-      (p_request - 'action' - 'operator_name')
-        - ARRAY['api_key', 'oauth_client_secret', 'code', 'state', 'password', 'session_token']::text[]
-    );
-  END IF;
+  -- Every consequential mutating function below now writes its own
+  -- audit_log row itself (allgres_private.audit) the moment it actually
+  -- runs -- not a centralized list here keyed on action name, which used
+  -- to mean a direct SQL call to the exact same function left no audit
+  -- trail at all (see the table's own comment and "Everything the
+  -- dashboard does, psql can do too" in the README). This one call is all
+  -- dashboard_rpc itself still does: it stamps the current transaction
+  -- with this request's self-reported operator_name so every audit() call
+  -- reached from here on is correctly recorded as 'web', not 'sql'.
+  PERFORM allgres_private.set_audit_context(p_request->>'operator_name');
 
   CASE v_action
     -- Every count/listing here excludes goal LIKE 'selftest%' (see
@@ -12492,12 +12685,21 @@ BEGIN
         ) q
       ), '[]'::jsonb));
 
+    -- origin/db_role now that direct SQL calls also audit themselves
+    -- (a fn_selftest fixture creating its own agents/users/procedures via
+    -- direct SQL calls, exactly like this section does, now leaves an
+    -- audit_log row too) -- filtered out here the same way every other
+    -- operator-facing listing in this file already hides selftest's own
+    -- fixture noise (goal LIKE 'selftest%'), matched here against the
+    -- details this function's own audit() calls always include a name/
+    -- username/ref/goal for.
     WHEN 'audit.list' THEN
       RETURN jsonb_build_object('ok', true, 'entries', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
         FROM (
-          SELECT audit_id, operator_name, action, details, created_at
+          SELECT audit_id, operator_name, action, details, origin, db_role, created_at
           FROM allgres_private.audit_log
+          WHERE details::text NOT ILIKE '%selftest%'
           ORDER BY created_at DESC
           LIMIT LEAST(GREATEST(COALESCE((p_request->>'limit')::int, 200), 1), 1000)
         ) q

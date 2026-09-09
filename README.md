@@ -414,34 +414,59 @@ read surface already in place.
 
 ## Operator audit log
 
-The dashboard has one shared bearer token (see [Exposure](#exposure)), not
-per-operator accounts, so there is no authenticated identity to attach an
-audit trail to. `allgres_private.audit_log` is a lighter answer to the same
-question — "who did this" — built on a self-reported label instead of a
-real login: the browser sends whatever name is set in Settings
-(`sessionStorage`, per browser tab, the same way the dashboard token itself
-is) alongside every request, and `dashboard_rpc` writes one append-only row
-— `operator_name`, `action`, a `details` object (the request minus the
-action itself and anything that could carry a secret: an API key, an OAuth
-client secret, an authorization code or state) — for each consequential
-action: creating or editing an agent, granting or revoking a permission,
+`allgres_private.audit_log` answers "who did this" for every consequential
+mutation: creating or editing an agent, granting or revoking a permission,
 deciding an approval or a proposal, rolling back a policy, cancelling a
 session, editing the SQL sandbox allowlist or a project, updating a
-provider, connecting an OAuth provider, or writing/removing a memory.
+provider, connecting an OAuth provider, creating or editing a user account,
+or writing/removing a memory.
 
-**This is not access control and does not claim to be.** Anyone holding
-the one shared token can type any name in Settings, or leave it blank —
-`audit_log` answers "who claimed responsibility for this," not "who was
-authorized to do it." The row itself is trustworthy (append-only,
-enforced by a trigger that applies even to the table's own owner, not
-just `REVOKE`), but the name inside it is exactly as reliable as the
-person typing it chooses to be. A real answer needs per-operator accounts
-— see [Known limitations](#known-limitations) and KNOWN_ISSUES.md, item
-10 — which this is not, and does not try to shortcut.
+Each of those mutations writes its own row itself, from inside the plain
+SQL function (`allgres_private.audit(...)`, called at the end of e.g.
+`fn_create_agent`, `fn_grant_permission`, `fn_set_policy`) — not from a
+centralized list keyed on `dashboard_rpc` action names the way an earlier
+version of this worked. That distinction is the whole point: this project's
+other stated goal is that "[everything the dashboard does, psql can do
+too](#architecture)," and a mutation audited only from inside `dashboard_rpc`
+left a direct SQL call to that exact same function with no audit trail at
+all — an outside review of an earlier version of this file caught exactly
+that gap. Every row now carries:
 
-Browsable from the new **Audit Log** dashboard page (`audit.list`), newest
-first, with the same self-reported-not-authentication banner repeated
-there.
+- `operator_name` — a self-reported label, present only when the call
+  arrived through the dashboard: the browser sends whatever name is set in
+  Settings (`sessionStorage`, per browser tab, the same way the dashboard
+  token itself is), and `dashboard_rpc` stamps the current transaction with
+  it (`allgres_private.set_audit_context`) before dispatching, so every
+  function it calls already knows to attach it. **This is not access
+  control and does not claim to be** — anyone holding the one shared
+  dashboard token can type any name, or leave it blank — `operator_name`
+  answers "who claimed responsibility for this," not "who was authorized to
+  do it." A real per-operator answer needs the accounts system above
+  (`fn_login`/`users`), which most of these actions already require the
+  caller to hold an admin session for.
+- `origin` — `'web'` when the call arrived through `dashboard_rpc`,
+  `'sql'` otherwise (the fail-safe default): a plain `psql -c "SELECT
+  fn_grant_permission(...)"` shows up as `'sql'` with no `operator_name`,
+  exactly as it should.
+- `db_role` — the actual authenticated PostgreSQL role for the call,
+  always populated regardless of origin, independent of whatever
+  `operator_name` self-reports.
+
+The row itself is trustworthy (append-only, enforced by a trigger that
+applies even to the table's own owner, not just `REVOKE`); `operator_name`
+is exactly as reliable as the person typing it chooses to be, while
+`origin`/`db_role` are not — they come from the actual call path and
+PostgreSQL session identity, not anything the caller can self-report.
+`fn_selftest` proves both directions: a direct SQL call to a mutating
+function records `origin = 'sql'` with no `operator_name`, and the same
+action reached through `dashboard_rpc` with an operator name records
+`origin = 'web'` with that name attached.
+
+Browsable from the **Audit Log** dashboard page (`audit.list`), newest
+first, with the same self-reported-not-authentication banner for
+`operator_name` repeated there; `fn_selftest`'s own fixture noise is
+filtered out of that listing the same way every other operator-facing
+listing in this file already hides it.
 
 ## Model configuration and conversations
 
