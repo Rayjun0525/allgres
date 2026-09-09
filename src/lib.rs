@@ -25,6 +25,16 @@
 //! `fn_validate_sql` has confirmed it parses as exactly one non-writing
 //! SELECT, which is what makes that safe.
 
+// sql/control_plane.sql has grown past the point where pgrx's
+// extension_sql_file! macro (which copies the whole file into a const byte
+// buffer at compile time, one byte per const-eval step) trips rustc's
+// long_running_const_eval lint -- a compile-time safety net against a
+// genuinely infinite const-eval loop, not a sign anything here is actually
+// wrong. Splitting the file is future work (KNOWN_ISSUES.md); until then
+// this is the same "the actual computation just takes a while" case the
+// lint's own diagnostic describes.
+#![allow(long_running_const_eval)]
+
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags};
 use pgrx::prelude::*;
 use pgrx::JsonB;

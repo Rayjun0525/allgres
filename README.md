@@ -90,6 +90,13 @@ limitations](#known-limitations) for what is genuinely still open.
   *session* for every action on the platform-configuration surface, on top
   of the token. See [Exposure](#exposure) for exactly how the two layers
   interact.
+- **Semantic memory recall** — the same embedding infrastructure
+  [semantic delegate search](#semantic-delegate-search) uses, applied to an
+  agent's own `agent_memories` instead of cross-agent discovery: a new
+  `recall` agent action ranks an agent's own memories by relevance to a
+  query, alongside (not instead of) the automatic importance/recency
+  injection every turn already gets. See [Semantic memory
+  recall](#semantic-memory-recall).
 
 Not yet built:
 
@@ -98,8 +105,6 @@ Not yet built:
 - Secret key rotation, and a token *refresh* flow (an expired OAuth access
   token has to be reconnected from Settings; nothing calls `refresh_token`
   automatically yet).
-- Semantic memory search (an embedding column and vector similarity) —
-  recall is importance/recency ranking only in this slice.
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
@@ -794,6 +799,40 @@ actually in use automatically the first time it would help. See
 KNOWN_ISSUES.md item 35 for the full mechanism and two real bugs this
 found (a missing worker grant, and pgvector's own `sum(vector)` overload
 breaking the SQL sandbox's unrelated function allowlist).
+
+## Semantic memory recall
+
+[Memory](#memory)'s automatic every-turn injection stays exactly what it
+was — an agent's own live memories, ranked by importance then recency,
+capped at 15 rows — because that has to run synchronously while a prompt
+is being assembled, and a query embedding is itself an outbound HTTP call
+that cannot complete inline. `recall` is the explicit alternative for
+"find something specific," reusing the identical embedding infrastructure
+[semantic delegate search](#semantic-delegate-search) already built: the
+same shape (`{"action":"recall","query":"..."}`), the same queue-then-
+continue flow (`outbound_calls` kind `'recall'` instead of `'embedding'`),
+the same plain-array-not-pgvector storage, and the same automatic
+opportunistic HNSW indexing once pgvector is installed.
+
+Every `agent_memories` row gets its own embedding (`agent_memories.
+embedding`/`embedding_model`), generated the moment it's written —
+`write_memory`, the one insertion point both the agent's own `remember`
+action and the operator-authored `fn_remember`/`memories.create` share —
+via the same `embedding_calls` queue agent-identity embeddings already
+use, generalized to carry either an agent or a memory as its target.
+`allgres_private.rank_memories_by_embedding` then ranks by cosine
+similarity, scoped strictly to the calling agent's own memories (`WHERE
+agent_id =`, not a cross-agent search — this is semantic search over an
+agent's own private store, never another agent's) and excluding anything
+already expired, with the same dimension/model mismatch guards
+`rank_agents_by_embedding` already enforces so a since-changed embedding
+provider can never silently rank across two incomparable vector spaces.
+
+An optional feature's absence is never fatal: `recall` with no
+`purpose='embedding'` provider configured is a friendly `continue`, the
+same as `search_agents`, and a memory written before one existed simply
+stays ineligible for semantic ranking (still fully recalled by importance/
+recency) until it is re-embedded.
 
 ## Chat: General, Messenger, and Project modes
 

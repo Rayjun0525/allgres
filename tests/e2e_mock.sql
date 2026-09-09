@@ -281,4 +281,99 @@ BEGIN
   END IF;
 END $$;
 
+-- Semantic memory recall, the same embedding infra as agent-identity
+-- embeddings/search_agents above, applied to allgres_private.agent_memories
+-- instead of allgres_private.agents: write_memory -> queue_memory_embedding
+-- -> fn_claim_agent_embedding -> perform_http -> the same mock embeddings
+-- endpoint -> fn_complete_agent_embedding's 'memory' branch (writes
+-- agent_memories.embedding), then a real 'recall' agent action ->
+-- outbound_calls kind='recall' -> fn_claim_outbound -> perform_http ->
+-- fn_complete_outbound's own 'recall' branch -> rank_memories_by_embedding
+-- -> a 'tool_result' landing in execution_logs.
+CREATE TEMP TABLE _allgres_recall_agent(agent_id uuid, task_id uuid);
+INSERT INTO _allgres_recall_agent (agent_id)
+SELECT (allgres_public.fn_create_agent('e2e_recall_agent')->>'agent_id')::uuid;
+
+DO $$
+DECLARE
+  v_agent uuid;
+BEGIN
+  SELECT agent_id INTO v_agent FROM _allgres_recall_agent;
+  PERFORM allgres_public.fn_remember(v_agent, 'The alpha rollout ships next Tuesday.', 'semantic', '0.5', NULL, NULL);
+  PERFORM allgres_public.fn_remember(v_agent, 'The gamma dataset needs re-labeling.', 'semantic', '0.5', NULL, NULL);
+END $$;
+
+DO $$
+DECLARE
+  v_n int;
+  i int;
+BEGIN
+  FOR i IN 1..200 LOOP
+    SELECT count(*) INTO v_n
+    FROM allgres_private.agent_memories am
+    JOIN _allgres_recall_agent r ON r.agent_id = am.agent_id
+    WHERE am.embedding IS NOT NULL;
+    EXIT WHEN v_n = 2;
+    PERFORM pg_sleep(0.1);
+  END LOOP;
+  IF v_n <> 2 THEN
+    RAISE EXCEPTION 'Allgres E2E memory embeddings did not complete (got %)', v_n;
+  END IF;
+END $$;
+
+DO $$
+DECLARE
+  v_agent uuid;
+  v_sid uuid;
+  v_tid uuid;
+BEGIN
+  SELECT agent_id INTO v_agent FROM _allgres_recall_agent;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'recall the alpha memory')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"recall","query":"what is happening with alpha"}',
+    'parsed', jsonb_build_object('action', 'recall', 'query', 'what is happening with alpha')
+  ));
+  UPDATE _allgres_recall_agent SET task_id = v_tid;
+END $$;
+
+DO $$
+DECLARE
+  v_n int;
+  i int;
+BEGIN
+  FOR i IN 1..200 LOOP
+    SELECT count(*) INTO v_n
+    FROM allgres_private.execution_logs e
+    JOIN _allgres_recall_agent r ON r.task_id = e.task_id
+    WHERE e.role = 'tool';
+    EXIT WHEN v_n = 1;
+    PERFORM pg_sleep(0.1);
+  END LOOP;
+  IF v_n <> 1 THEN
+    RAISE EXCEPTION 'Allgres E2E recall did not complete (got % tool results)', v_n;
+  END IF;
+END $$;
+
+DO $$
+DECLARE
+  v_body jsonb;
+  v_top text;
+BEGIN
+  SELECT (e.content->>'body')::jsonb INTO v_body
+  FROM allgres_private.execution_logs e
+  JOIN _allgres_recall_agent r ON r.task_id = e.task_id
+  WHERE e.role = 'tool';
+
+  v_top := v_body->0->>'content';
+  IF v_top NOT LIKE '%alpha%' THEN
+    RAISE EXCEPTION 'Allgres E2E recall ranked % first, expected the alpha memory: %', v_top, v_body;
+  END IF;
+  IF jsonb_array_length(v_body) <> 2 THEN
+    RAISE EXCEPTION 'Allgres E2E recall returned % candidates, expected 2: %', jsonb_array_length(v_body), v_body;
+  END IF;
+END $$;
+
 SELECT 'e2e ok' AS result;

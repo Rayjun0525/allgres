@@ -1139,6 +1139,20 @@ CREATE INDEX IF NOT EXISTS agent_memories_expiry_idx
   ON allgres_private.agent_memories (expires_at)
   WHERE expires_at IS NOT NULL;
 
+-- Slice two, deliberately deferred by slice one's own comment above:
+-- semantic recall, same shape as agents.embedding (see that column's own
+-- comment for why a plain double precision[] rather than pgvector's
+-- `vector` type) -- a vector embedding of this one memory's own content,
+-- so the new 'recall' agent action (fn_next_step) can rank an agent's own
+-- memories by relevance to a query instead of only importance/recency,
+-- which stays exactly as it was for the automatic every-turn injection.
+-- embedding_model records "<provider name>:<model>" the same staleness-
+-- detection reason agents.embedding_model gives.
+ALTER TABLE allgres_private.agent_memories
+  ADD COLUMN IF NOT EXISTS embedding double precision[],
+  ADD COLUMN IF NOT EXISTS embedding_model text,
+  ADD COLUMN IF NOT EXISTS embedding_updated_at timestamptz;
+
 -- A lightweight audit trail (README, "Operator audit log"), deliberately
 -- not a real accounts system: the dashboard has one shared bearer token
 -- (see "Exposure" in the README's Security model), not per-operator
@@ -1542,6 +1556,52 @@ BEGIN
 END;
 $fn$;
 
+-- Same idempotent accelerating-index maintenance as ensure_vector_index
+-- above, for allgres_private.agent_memories.embedding instead of
+-- agents.embedding -- semantic recall's own table, kept as a second
+-- function rather than a parameterized one so a plain `vector(N)`
+-- reference never has to be built generically across two different
+-- target tables inside one EXECUTE string.
+CREATE OR REPLACE FUNCTION allgres_private.ensure_memory_vector_index()
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_dims int;
+  v_idx_oid oid;
+  v_indexed_dims int;
+BEGIN
+  IF NOT allgres_private.vector_available() THEN
+    RETURN;
+  END IF;
+
+  SELECT array_length(embedding, 1) INTO v_dims
+  FROM allgres_private.agent_memories
+  WHERE embedding IS NOT NULL
+  ORDER BY embedding_updated_at DESC NULLS LAST
+  LIMIT 1;
+  IF v_dims IS NULL THEN
+    RETURN;
+  END IF;
+
+  v_idx_oid := to_regclass('allgres_private.agent_memories_embedding_hnsw_idx')::oid;
+  IF v_idx_oid IS NOT NULL THEN
+    SELECT (regexp_match(pg_get_indexdef(v_idx_oid), 'vector\((\d+)\)'))[1]::int INTO v_indexed_dims;
+    IF v_indexed_dims = v_dims THEN
+      RETURN;
+    END IF;
+    EXECUTE 'DROP INDEX allgres_private.agent_memories_embedding_hnsw_idx';
+  END IF;
+
+  EXECUTE format(
+    'CREATE INDEX agent_memories_embedding_hnsw_idx ON allgres_private.agent_memories '
+    || 'USING hnsw ((embedding::%2$I.vector(%1$s)) %2$I.vector_cosine_ops) '
+    || 'WHERE embedding IS NOT NULL AND array_length(embedding, 1) = %1$s',
+    v_dims, allgres_private.vector_schema()
+  );
+END;
+$fn$;
+
 -- Brute-force cosine similarity over two plain float arrays -- 1 = identical
 -- direction, 0 = orthogonal, -1 = opposite; NULL if either side is empty or
 -- their dimensions do not match (an agent embedded under a since-changed
@@ -1643,6 +1703,73 @@ BEGIN
 END;
 $fn$;
 
+-- The 'recall' agent action's own ranking (fn_next_step queues the query
+-- embedding, fn_complete_outbound's 'recall' branch calls this once it
+-- comes back): an agent's own live memories only (WHERE agent_id =, not
+-- <>, unlike rank_agents_by_embedding above -- this is semantic search
+-- over the caller's own store, not a cross-agent discovery), ranked by
+-- cosine similarity to the query, nearest first. No separate permission
+-- check: an agent's own agent_memories rows are already its own private
+-- store with no cross-agent read path at all (see agent_memories' own
+-- comment), the identical trust boundary fn_next_step's automatic
+-- importance/recency recall already uses -- this only changes the
+-- ordering, not who can see what. Same dimension/model guards as
+-- rank_agents_by_embedding, for the same reason (a since-changed
+-- embedding provider must never silently rank across two incomparable
+-- vector spaces).
+CREATE OR REPLACE FUNCTION allgres_private.rank_memories_by_embedding(
+  p_query_embedding double precision[],
+  p_agent_id uuid,
+  p_expected_model text,
+  p_limit int DEFAULT 5
+) RETURNS jsonb
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_out jsonb;
+  v_dims int;
+  v_n int := GREATEST(1, LEAST(COALESCE(p_limit, 5), 20));
+BEGIN
+  v_dims := array_length(p_query_embedding, 1);
+  IF v_dims IS NULL THEN
+    RETURN '[]'::jsonb;
+  END IF;
+
+  IF allgres_private.vector_available() THEN
+    EXECUTE format(
+      'SELECT COALESCE(jsonb_agg(jsonb_build_object('
+      || '''memory_id'', memory_id, ''memory_type'', memory_type, ''content'', content, ''similarity'', similarity'
+      || ') ORDER BY similarity DESC), ''[]''::jsonb) '
+      || 'FROM (SELECT memory_id, memory_type, left(content, 500) AS content, '
+      || '1 - (embedding::%2$I.vector(%1$s) OPERATOR(%2$I.<=>) $1::%2$I.vector(%1$s)) AS similarity '
+      || 'FROM allgres_private.agent_memories '
+      || 'WHERE embedding IS NOT NULL AND agent_id = $2 AND array_length(embedding, 1) = %1$s '
+      || 'AND embedding_model = $4 AND (expires_at IS NULL OR expires_at > now()) '
+      || 'ORDER BY embedding::%2$I.vector(%1$s) OPERATOR(%2$I.<=>) $1::%2$I.vector(%1$s) LIMIT $3) s',
+      v_dims, allgres_private.vector_schema()
+    ) INTO v_out USING p_query_embedding, p_agent_id, v_n, p_expected_model;
+  ELSE
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'memory_id', memory_id, 'memory_type', memory_type, 'content', content, 'similarity', similarity
+    ) ORDER BY similarity DESC), '[]'::jsonb)
+    INTO v_out
+    FROM (
+      SELECT memory_id, memory_type, left(content, 500) AS content,
+             allgres_private.cosine_similarity(embedding, p_query_embedding) AS similarity
+      FROM allgres_private.agent_memories
+      WHERE embedding IS NOT NULL AND agent_id = p_agent_id
+        AND array_length(embedding, 1) = v_dims
+        AND embedding_model = p_expected_model
+        AND (expires_at IS NULL OR expires_at > now())
+      ORDER BY allgres_private.cosine_similarity(embedding, p_query_embedding) DESC NULLS LAST
+      LIMIT v_n
+    ) s;
+  END IF;
+
+  RETURN v_out;
+END;
+$fn$;
+
 -- Never returned by list functions.  Operator writes via fn_set_provider_secret.
 CREATE TABLE IF NOT EXISTS allgres_private.llm_secrets (
   provider_id         uuid PRIMARY KEY REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
@@ -1712,7 +1839,16 @@ CREATE TABLE IF NOT EXISTS allgres_private.outbound_calls (
 -- 'embedding' branch for what happens to the response.
 ALTER TABLE allgres_private.outbound_calls DROP CONSTRAINT IF EXISTS outbound_calls_kind_check;
 ALTER TABLE allgres_private.outbound_calls ADD CONSTRAINT outbound_calls_kind_check
-  CHECK (kind IN ('llm', 'tool', 'embedding'));
+  CHECK (kind IN ('llm', 'tool', 'embedding', 'recall'));
+
+-- 'recall': the new 'recall' agent action's own query text (semantic
+-- memory search, fn_next_step) -- queued and claimed exactly like
+-- 'embedding' above (same provider/auth_kind resolution, same JSON-POST
+-- shape), kept as its own kind rather than reusing 'embedding' only
+-- because fn_complete_outbound needs to know which ranking function to
+-- call once the vector comes back: allgres_private.rank_agents_by_embedding
+-- for 'embedding' (search_agents), allgres_private.rank_memories_by_embedding
+-- for this one.
 
 -- Set (as the 'idempotency-key' request header, mirrored here for
 -- visibility) on every mutating 'http_request' call queued by
@@ -1847,6 +1983,25 @@ CREATE INDEX IF NOT EXISTS embedding_calls_ready_idx
 CREATE INDEX IF NOT EXISTS embedding_calls_inflight_idx
   ON allgres_private.embedding_calls (updated_at)
   WHERE status = 'in_flight';
+
+-- Semantic memory recall (allgres_private.queue_memory_embedding /
+-- fn_complete_agent_embedding's 'memory' branch): the exact same
+-- queued -> in_flight -> harvested/lost pipeline above, generalized to a
+-- second kind of target instead of a second table, since fn_claim_agent_
+-- embedding's own claim query never referenced agent_id at all -- only
+-- fn_complete_agent_embedding's final write needs to know which row this
+-- was for. agent_id is now nullable and memory_id is the alternative
+-- target; the CHECK below is the same "exactly one of two possible
+-- targets" shape outbound_calls' own kind-specific columns already use
+-- informally (a 'tool' row's connection_id, an 'llm' row's provider_id),
+-- just enforced here since there really are only two rows to distinguish.
+ALTER TABLE allgres_private.embedding_calls
+  ALTER COLUMN agent_id DROP NOT NULL,
+  ADD COLUMN IF NOT EXISTS memory_id uuid REFERENCES allgres_private.agent_memories(memory_id) ON DELETE CASCADE;
+
+ALTER TABLE allgres_private.embedding_calls DROP CONSTRAINT IF EXISTS embedding_calls_target_check;
+ALTER TABLE allgres_private.embedding_calls ADD CONSTRAINT embedding_calls_target_check
+  CHECK ((agent_id IS NOT NULL) <> (memory_id IS NOT NULL));
 
 -- Agent SQL is validated here (fn_validate_sql) but executed by the runtime
 -- worker as a top-level statement under the `sandbox` role -- PostgreSQL
@@ -3086,6 +3241,8 @@ BEGIN
     left(v_content, 4000), v_importance, p_source_session_id, p_source_task_id, v_expires
   ) RETURNING memory_id INTO v_memory;
 
+  PERFORM allgres_private.queue_memory_embedding(v_memory);
+
   -- Bounded working set: keeps the 500 most important (then most recent)
   -- rows and evicts the rest, rather than let the table (and every future
   -- prompt's memory block) grow without limit. Ordering DESC and OFFSET-ing
@@ -3511,7 +3668,7 @@ BEGIN
 
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
-    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'search_agents', 'await_human', 'propose_change',
+    'final_answer', 'execute_sql', 'call_tool', 'delegate', 'search_agents', 'recall', 'await_human', 'propose_change',
     'remember', 'create_agent', 'propose_fix', 'await_children'
   ) THEN
     PERFORM allgres_private.append_log(
@@ -3797,6 +3954,73 @@ BEGIN
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'search_agents', 'query', v_parsed->>'query', 'call_id', v_call);
+  END IF;
+
+  -- Semantic memory recall (roadmap backlog item: the same embedding
+  -- infra search_agents already uses, applied to an agent's own
+  -- agent_memories instead of cross-agent discovery). The automatic
+  -- every-turn injection above stays importance/recency ranked -- that
+  -- has to run synchronously while this prompt is being assembled, and a
+  -- query embedding is itself an outbound HTTP call, so it cannot -- this
+  -- is the explicit alternative for "recall something specific," the same
+  -- one-queue-then-continue shape search_agents uses (kind='recall' on
+  -- outbound_calls, since fn_complete_outbound needs to know to rank
+  -- memories, not agents, once the vector comes back). Never a name/id the
+  -- caller could not already see: allgres_private.rank_memories_by_embedding
+  -- only ever reads WHERE agent_id = this task's own agent, the identical
+  -- scope the automatic recall above already uses.
+  IF v_action = 'recall' THEN
+    IF NULLIF(trim(v_parsed->>'query'), '') IS NULL THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'recall_needs_query')
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    SELECT * INTO v_provider FROM allgres_private.llm_providers
+    WHERE purpose = 'embedding' AND is_enabled
+    ORDER BY created_at LIMIT 1;
+    IF NOT FOUND THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'no_embedding_provider_configured')
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    v_url := v_provider.base_url || '/embeddings';
+    v_reason := allgres_private.check_outbound_url(v_url, v_provider.allow_private_network);
+    IF v_reason IS NOT NULL THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', v_reason, 'url', v_url)
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    INSERT INTO allgres_private.outbound_calls (
+      task_id, kind, url, request_headers, request_body, status, allow_private, provider_id, auth_kind
+    ) VALUES (
+      p_task_id, 'recall', v_url,
+      jsonb_build_object('content-type', 'application/json'),
+      jsonb_build_object('model', v_provider.embedding_model, 'input', left(v_parsed->>'query', 8000)),
+      'queued', v_provider.allow_private_network, v_provider.provider_id, 'authorization'
+    ) RETURNING call_id INTO v_call;
+
+    UPDATE allgres_private.tasks
+    SET step_count = step_count + 1, updated_at = now()
+    WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'recall', 'query', v_parsed->>'query', 'call_id', v_call);
   END IF;
 
   IF v_action = 'delegate' THEN
@@ -4736,6 +4960,46 @@ BEGIN
             'status', p_status,
             'body', COALESCE(
               allgres_private.rank_agents_by_embedding(v_query_vec, v_requester, v_expected_model, 5),
+              '[]'::jsonb
+            )::text
+          )
+        );
+      END IF;
+    END IF;
+  -- The 'recall' agent action's own query embedding (semantic memory
+  -- recall). Identical shape to the 'embedding' branch just above --
+  -- same response parsing, same "<provider name>:<model>" staleness
+  -- guard -- ranking an agent's own agent_memories instead of other
+  -- agents' identities is the only difference (rank_memories_by_embedding
+  -- vs rank_agents_by_embedding).
+  ELSIF c.kind = 'recall' THEN
+    IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+      v_payload := jsonb_build_object(
+        'type', 'error',
+        'message', 'embedding http ' || COALESCE(p_status::text, '0') || ': ' || left(COALESCE(p_body, ''), 2000)
+      );
+    ELSE
+      BEGIN
+        v_parsed := p_body::jsonb;
+      EXCEPTION WHEN others THEN
+        v_parsed := NULL;
+      END;
+      SELECT array_agg((x)::double precision) INTO v_query_vec
+      FROM jsonb_array_elements_text(v_parsed->'data'->0->'embedding') AS x;
+      IF v_query_vec IS NULL OR array_length(v_query_vec, 1) IS NULL THEN
+        v_payload := jsonb_build_object(
+          'type', 'error', 'message', 'embedding response had no usable data[0].embedding'
+        );
+      ELSE
+        SELECT agent_id INTO v_requester FROM allgres_private.tasks WHERE task_id = c.task_id;
+        SELECT p.name || ':' || (c.request_body->>'model') INTO v_expected_model
+        FROM allgres_private.llm_providers p WHERE p.provider_id = c.provider_id;
+        v_payload := jsonb_build_object(
+          'type', 'tool_result',
+          'content', jsonb_build_object(
+            'status', p_status,
+            'body', COALESCE(
+              allgres_private.rank_memories_by_embedding(v_query_vec, v_requester, v_expected_model, 5),
               '[]'::jsonb
             )::text
           )
@@ -6935,6 +7199,58 @@ BEGIN
 END;
 $fn$;
 
+-- Same shape as queue_agent_embedding above, for one memory instead of one
+-- agent's identity -- called from write_memory right after every insert
+-- (both the agent's own `remember` action and the operator-authored
+-- fn_remember path share that one insertion point, so this covers both
+-- with no separate wiring). A no-op, exactly like queue_agent_embedding,
+-- when no purpose='embedding' provider is configured -- the memory is
+-- still written and still recalled by importance/recency, it just never
+-- becomes eligible for semantic 'recall' ranking until one exists.
+CREATE OR REPLACE FUNCTION allgres_private.queue_memory_embedding(p_memory_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_provider allgres_private.llm_providers%ROWTYPE;
+  v_type text;
+  v_content text;
+  v_url text;
+  v_reason text;
+BEGIN
+  SELECT * INTO v_provider FROM allgres_private.llm_providers
+  WHERE purpose = 'embedding' AND is_enabled
+  ORDER BY created_at LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  SELECT memory_type, content INTO v_type, v_content
+  FROM allgres_private.agent_memories WHERE memory_id = p_memory_id;
+  IF v_content IS NULL THEN
+    RETURN;
+  END IF;
+
+  v_url := v_provider.base_url || '/embeddings';
+  v_reason := allgres_private.check_outbound_url(v_url, v_provider.allow_private_network);
+  IF v_reason IS NOT NULL THEN
+    RETURN;
+  END IF;
+
+  DELETE FROM allgres_private.embedding_calls WHERE memory_id = p_memory_id AND status = 'queued';
+
+  INSERT INTO allgres_private.embedding_calls
+    (memory_id, provider_id, model, url, request_headers, request_body, allow_private, status)
+  VALUES (
+    p_memory_id, v_provider.provider_id, v_provider.embedding_model, v_url,
+    jsonb_build_object('content-type', 'application/json'),
+    jsonb_build_object('model', v_provider.embedding_model, 'input', left(v_type || ': ' || v_content, 8000)),
+    v_provider.allow_private_network,
+    'queued'
+  );
+END;
+$fn$;
+
 -- Claims queued agent-identity embedding calls for the runtime worker's HTTP
 -- pool -- same claim shape as fn_claim_oauth, credential resolved and
 -- merged into the response right here, never written back to
@@ -7041,20 +7357,37 @@ BEGIN
     RETURN jsonb_build_object('action', 'error', 'reason', 'no_embedding_in_response');
   END IF;
 
-  UPDATE allgres_private.agents
-  SET embedding = v_vec,
-      embedding_model = (SELECT name FROM allgres_private.llm_providers WHERE provider_id = c.provider_id) || ':' || c.model,
-      embedding_updated_at = now(),
-      updated_at = now()
-  WHERE agent_id = c.agent_id;
+  -- Exactly one of agent_id/memory_id is set (embedding_calls_target_check)
+  -- -- an agent's own identity embedding writes to allgres_private.agents,
+  -- a memory's semantic-recall embedding (queue_memory_embedding) writes
+  -- to allgres_private.agent_memories instead. Same "<provider name>:
+  -- <model>" staleness-detection string either way.
+  IF c.agent_id IS NOT NULL THEN
+    UPDATE allgres_private.agents
+    SET embedding = v_vec,
+        embedding_model = (SELECT name FROM allgres_private.llm_providers WHERE provider_id = c.provider_id) || ':' || c.model,
+        embedding_updated_at = now(),
+        updated_at = now()
+    WHERE agent_id = c.agent_id;
+  ELSE
+    UPDATE allgres_private.agent_memories
+    SET embedding = v_vec,
+        embedding_model = (SELECT name FROM allgres_private.llm_providers WHERE provider_id = c.provider_id) || ':' || c.model,
+        embedding_updated_at = now()
+    WHERE memory_id = c.memory_id;
+  END IF;
 
   UPDATE allgres_private.embedding_calls
   SET status = 'harvested', response_status = p_status, updated_at = now()
   WHERE call_id = p_call_id;
 
-  PERFORM allgres_private.ensure_vector_index();
-
-  RETURN jsonb_build_object('action', 'stored', 'agent_id', c.agent_id, 'dims', array_length(v_vec, 1));
+  IF c.agent_id IS NOT NULL THEN
+    PERFORM allgres_private.ensure_vector_index();
+    RETURN jsonb_build_object('action', 'stored', 'agent_id', c.agent_id, 'dims', array_length(v_vec, 1));
+  ELSE
+    PERFORM allgres_private.ensure_memory_vector_index();
+    RETURN jsonb_build_object('action', 'stored', 'memory_id', c.memory_id, 'dims', array_length(v_vec, 1));
+  END IF;
 END;
 $fn$;
 
@@ -11722,6 +12055,85 @@ BEGIN
       WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'no_embedding_provider_configured'
     );
     v := v || jsonb_build_array(jsonb_build_object('name', 'search_agents_no_provider_is_a_friendly_continue', 'ok', ok));
+  END;
+
+  -- Semantic memory recall (roadmap backlog item: the same embedding infra
+  -- as agent-identity embeddings/search_agents just above, applied to
+  -- allgres_private.agent_memories instead). No real HTTP round trip here
+  -- either -- that is tests/e2e_mock.sql's job -- this is allgres_private.
+  -- rank_memories_by_embedding's own ranking/dimension/model/expiry logic
+  -- in isolation, with embeddings set directly rather than generated, plus
+  -- the 'recall' agent action's own no-provider fallback.
+  DECLARE
+    v_rec_agent uuid;
+    v_mem_near uuid;
+    v_mem_far uuid;
+    v_mem_wrongdim uuid;
+    v_mem_wrongmodel uuid;
+    v_mem_expired uuid;
+    v_ranked jsonb;
+  BEGIN
+    SELECT agent_id INTO v_rec_agent FROM allgres_private.agents WHERE name = 'selftest_recall_agent';
+    IF v_rec_agent IS NULL THEN
+      v_rec_agent := (allgres_public.fn_create_agent('selftest_recall_agent')->>'agent_id')::uuid;
+    END IF;
+
+    DELETE FROM allgres_private.agent_memories WHERE agent_id = v_rec_agent;
+
+    v_mem_near := (allgres_public.fn_remember(v_rec_agent, 'selftest memory near', 'semantic', '0.5', NULL, NULL)->>'memory_id')::uuid;
+    v_mem_far := (allgres_public.fn_remember(v_rec_agent, 'selftest memory far', 'semantic', '0.5', NULL, NULL)->>'memory_id')::uuid;
+    v_mem_wrongdim := (allgres_public.fn_remember(v_rec_agent, 'selftest memory wrongdim', 'semantic', '0.5', NULL, NULL)->>'memory_id')::uuid;
+    v_mem_wrongmodel := (allgres_public.fn_remember(v_rec_agent, 'selftest memory wrongmodel', 'semantic', '0.5', NULL, NULL)->>'memory_id')::uuid;
+    -- Same dimension AND direction as v_mem_near -- would rank first on
+    -- similarity alone -- but already expired, so must be excluded exactly
+    -- like fn_next_step's own automatic recall already excludes it.
+    v_mem_expired := (allgres_public.fn_remember(v_rec_agent, 'selftest memory expired', 'semantic', '0.5', NULL, '1')->>'memory_id')::uuid;
+
+    UPDATE allgres_private.agent_memories SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE memory_id = v_mem_near;
+    UPDATE allgres_private.agent_memories SET embedding = ARRAY[0,1,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE memory_id = v_mem_far;
+    UPDATE allgres_private.agent_memories SET embedding = ARRAY[1,0,0]::double precision[], embedding_model = 'selftest_provider:model-a' WHERE memory_id = v_mem_wrongdim;
+    UPDATE allgres_private.agent_memories SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-b' WHERE memory_id = v_mem_wrongmodel;
+    UPDATE allgres_private.agent_memories SET embedding = ARRAY[1,0,0,0]::double precision[], embedding_model = 'selftest_provider:model-a', expires_at = now() - interval '1 hour' WHERE memory_id = v_mem_expired;
+
+    v_ranked := allgres_private.rank_memories_by_embedding(
+      ARRAY[1,0,0,0]::double precision[], v_rec_agent, 'selftest_provider:model-a', 5
+    );
+    ok := jsonb_array_length(v_ranked) = 2
+      AND v_ranked->0->>'memory_id' = v_mem_near::text
+      AND (v_ranked->0->>'similarity')::numeric = 1
+      AND v_ranked->1->>'memory_id' = v_mem_far::text;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'rank_memories_by_embedding_orders_filters_and_excludes_mismatched_dims_models_and_expired', 'ok', ok));
+
+    DELETE FROM allgres_private.agent_memories WHERE agent_id = v_rec_agent;
+
+    -- 'recall' with no purpose='embedding' provider configured (the
+    -- default state here) must be a friendly continue, not an exception --
+    -- an optional feature's absence can never fail a task.
+    v_sid := (allgres_public.fn_create_session(v_rec_agent, 'selftest recall no provider')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response',
+      'content', '{"action":"recall","query":"anything"}',
+      'parsed', jsonb_build_object('action', 'recall', 'query', 'anything')
+    ));
+    ok := sub->>'action' = 'continue' AND EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'no_embedding_provider_configured'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'recall_no_provider_is_a_friendly_continue', 'ok', ok));
+
+    -- Missing query text is rejected the same way search_agents' own
+    -- missing-query case is, before any provider lookup even happens.
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object('action', 'recall')
+    ));
+    ok := sub->>'action' = 'continue' AND EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'recall_needs_query'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'recall_rejects_missing_query', 'ok', ok));
   END;
 
   PERFORM allgres_private.selftest_cleanup();
