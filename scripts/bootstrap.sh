@@ -53,6 +53,12 @@ echo "==> Bringing the stack up on its own named volume"
 docker compose up -d --build
 trap 'docker compose logs --no-color allgres | tail -200' ERR
 
+echo "==> Waiting for the container's own init scripts to settle (see scripts/smoke.sh for why this has to come before pg_isready)"
+for _ in $(seq 1 60); do
+  docker compose logs allgres 2>&1 | grep -qE "PostgreSQL init process complete|Skipping initialization" && break
+  sleep 1
+done
+
 echo "==> Waiting for PostgreSQL"
 for _ in $(seq 1 60); do
   docker compose exec -T allgres pg_isready -U postgres >/dev/null 2>&1 && break
@@ -160,7 +166,9 @@ ok=1
 
 if [[ "$ok" == "1" ]]; then
   echo "PASS: install verified -- the disposable check agent ran a real task to completion, a real config change and model swap over HTTP persisted and a task still completed afterward"
-  [[ "$status3" == "completed" ]] && echo "PASS: AGENT_NAME=$AGENT_NAME's own real provider also completed a task, unmodified"
+  if [[ "$status3" == "completed" ]]; then
+    echo "PASS: AGENT_NAME=$AGENT_NAME's own real provider also completed a task, unmodified"
+  fi
 else
   echo "FAIL: install check ended in '$status1', config-change check ended in '$status2', real-provider check ended in '$status3'"
   exit 1
