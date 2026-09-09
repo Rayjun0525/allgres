@@ -149,20 +149,32 @@ leave them unset and the script proves the same flow with its own
 throwaway admin instead — either way, the same one-liner this project's
 own development has relied on all along (`psql -c "SELECT
 fn_create_user(...)"`) is still exactly what happens under the hood, just
-scripted instead of typed by hand. The final step — logging in, listing agents, running one
-(`AGENT_NAME`, default `analyst`) to a real goal, and polling until it
-reaches `completed` — is also the only real way to verify a *non-mock*
-provider actually works end to end: a task can only reach `completed` if
-the agent's configured provider genuinely answered, so pointing
-`AGENT_NAME` at an agent using a real provider turns this same script into
-that provider's connection check, not a separate one to run by hand.
-The script then goes further than a bare install check: it makes a real
-`agents.update` config change (`max_steps`) and swaps the agent's model,
-confirms both actually persisted, and runs a second real task afterward to
-prove the changed config didn't break execution — roadmap item 9's
-"설정 변경, 모델 교체" (config change, model swap) scenarios, exercised over
-real HTTP with a real session token, not only at the `fn_selftest`/SQL
-level.
+scripted instead of typed by hand.
+
+The script runs two checks, deliberately kept apart:
+
+1. **A mock smoke check, always run.** `analyst` (the seeded default
+   agent) deliberately ships with no provider configured — see
+   [Model configuration](#model-configuration-and-conversations) — so
+   nothing would actually complete out of the box otherwise. The script
+   seeds the built-in `allgres_mock` provider row (idempotent — it only
+   ever touches that one, reserved-name row) and creates its own
+   disposable agent to run against: login, `run`, a real LLM round trip,
+   `completed`; then a real `agents.update` config change (`max_steps`)
+   and model swap, confirmed persisted, and a second task proving the
+   change didn't break execution — roadmap item 9's "설정 변경, 모델 교체"
+   scenarios, exercised over real HTTP with a real session token. The
+   disposable agent is deactivated afterward and no operator-created agent
+   is ever touched by this check.
+2. **An optional real-provider check, only when `AGENT_NAME` is set.**
+   Point it at an agent you've already configured with a working, non-mock
+   provider to prove that provider actually answers — a task can only
+   reach `completed` if it genuinely did. This check only ever reads that
+   agent and runs one task through it; it never modifies its configuration
+   in any way. (An earlier version of this script ran the mock
+   config-change check directly against `AGENT_NAME` and left it
+   permanently repointed at a mock model with no restore — the two checks
+   are separate now specifically so that can't happen again.)
 
 See [Extension installation](#extension-installation) for a bare-metal
 (non-Docker) install and version upgrades, and [Backup and
