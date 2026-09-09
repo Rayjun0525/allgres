@@ -1714,6 +1714,26 @@ ALTER TABLE allgres_private.outbound_calls DROP CONSTRAINT IF EXISTS outbound_ca
 ALTER TABLE allgres_private.outbound_calls ADD CONSTRAINT outbound_calls_kind_check
   CHECK (kind IN ('llm', 'tool', 'embedding'));
 
+-- Set (as the 'idempotency-key' request header, mirrored here for
+-- visibility) on every mutating 'http_request' call queued by
+-- fn_next_step's call_tool handling -- see that INSERT's own comment for
+-- how the value is derived and why. NULL for a GET/http_get call (nothing
+-- to make idempotent) and for anything queued before this column existed.
+-- An outside review pointed out that a crash between an external side
+-- effect actually landing (the worker's HTTP call succeeded) and this
+-- extension recording that it did (fn_complete_outbound never ran, or
+-- fn_watchdog reclaimed a call that was in fact already delivered) could
+-- leave an agent's later retry as a genuine duplicate POST/PATCH/DELETE
+-- against a real external system -- this is the mitigation: a
+-- de-facto-standard header (the same one Stripe/GitHub/PayPal/Square
+-- already accept) that lets an idempotency-aware destination recognize a
+-- retried request and return its original result instead of repeating the
+-- effect. It is a mitigation, not a guarantee -- see this column's own
+-- section in README, "External call idempotency", for exactly which
+-- outcomes it does and does not cover.
+ALTER TABLE allgres_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS idempotency_key text;
+
 -- The URL's host string is checked against allgres_private.is_blocked_host at
 -- queue time (see check_outbound_url), but the worker connects by hostname
 -- later, on its own HTTP thread, with its own DNS resolution -- a hostname
@@ -3652,6 +3672,26 @@ BEGIN
       IF v_method IN ('POST', 'PUT', 'PATCH') THEN
         v_req_body := CASE WHEN jsonb_typeof(v_args->'body') IS NOT NULL THEN v_args->'body' ELSE '{}'::jsonb END;
       END IF;
+
+      -- External call idempotency (see outbound_calls.idempotency_key's own
+      -- comment for the crash scenario this mitigates): every mutating
+      -- method gets a deterministic 'idempotency-key' header, unless the
+      -- agent already set one itself (respected as-is -- an agent that
+      -- knows a destination's own idempotency contract gets to drive it).
+      -- Derived from this task plus the exact method/url/body, not from
+      -- call_id (which is different on every queued row, including a
+      -- genuine retry): an agent retrying the identical request after
+      -- seeing an error or a 'lost' outcome produces the identical key, so
+      -- an idempotency-aware destination can recognize the retry and
+      -- return its original result instead of repeating the effect. A
+      -- deliberately different request (a changed body, a different task)
+      -- produces a different key, same as it should.
+      IF v_method IN ('POST', 'PUT', 'PATCH', 'DELETE') AND NOT (v_req_headers ? 'idempotency-key') THEN
+        v_req_headers := v_req_headers || jsonb_build_object(
+          'idempotency-key',
+          md5(p_task_id::text || '|' || v_method || '|' || v_url || '|' || v_req_body::text)
+        );
+      END IF;
     END IF;
 
     v_reason := allgres_private.check_outbound_url(v_url, COALESCE(v_conn.allow_private_network, false));
@@ -3681,10 +3721,11 @@ BEGIN
 
     INSERT INTO allgres_private.outbound_calls (
       task_id, kind, tool, url, method, request_headers, request_body, status,
-      allow_private, connection_id, auth_kind
+      allow_private, connection_id, auth_kind, idempotency_key
     ) VALUES (
       p_task_id, 'tool', v_tool, v_url, v_method, v_req_headers, v_req_body, 'queued',
-      COALESCE(v_conn.allow_private_network, false), v_conn.connection_id, v_conn_auth
+      COALESCE(v_conn.allow_private_network, false), v_conn.connection_id, v_conn_auth,
+      v_req_headers->>'idempotency-key'
     ) RETURNING call_id INTO v_call;
 
     UPDATE allgres_private.tasks
@@ -9848,6 +9889,73 @@ BEGIN
     AND (r->>'connection_id') = v_conn::text
     AND (r->'request_body') = jsonb_build_object('x', 1);
   v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_via_connection_resolves_relative_path', 'ok', ok));
+
+  -- External call idempotency (an outside review's finding: a crash
+  -- between an external effect landing and this extension recording that
+  -- it did could otherwise leave a later retry as a genuine duplicate
+  -- POST/PATCH/DELETE). A mutating call gets a deterministic
+  -- 'idempotency-key' header, mirrored onto outbound_calls.idempotency_key.
+  ok := (r->>'idempotency_key') IS NOT NULL
+    AND (r->'request_headers'->>'idempotency-key') = (r->>'idempotency_key');
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_mutating_call_gets_idempotency_key', 'ok', ok));
+
+  -- The same task retrying the exact same method/url/body (the ordinary
+  -- shape of an agent retry after an error) reproduces the identical key --
+  -- derived from the request's own content, not from call_id, which is
+  -- different on every queued row including a genuine retry.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'post', 'connection', 'selftest_conn', 'path', 'widgets',
+        'body', jsonb_build_object('x', 1))
+    )
+  ));
+  v_call2 := (comp->>'call_id')::uuid;
+  ok := v_call2 <> v_call
+    AND (SELECT idempotency_key FROM allgres_private.outbound_calls WHERE call_id = v_call2)
+      = (SELECT idempotency_key FROM allgres_private.outbound_calls WHERE call_id = v_call);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_retry_of_same_call_reuses_idempotency_key', 'ok', ok));
+
+  -- A materially different request (a changed body) must not collide with
+  -- it -- this is content-derived isolation, not just a random per-call id.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'post', 'connection', 'selftest_conn', 'path', 'widgets',
+        'body', jsonb_build_object('x', 2))
+    )
+  ));
+  ok := (SELECT idempotency_key FROM allgres_private.outbound_calls WHERE call_id = (comp->>'call_id')::uuid)
+      <> (SELECT idempotency_key FROM allgres_private.outbound_calls WHERE call_id = v_call);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_different_body_gets_different_idempotency_key', 'ok', ok));
+
+  -- An agent that already sets its own idempotency-key header (a
+  -- destination with its own contract for the value's shape) is respected,
+  -- never silently overwritten.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'post', 'connection', 'selftest_conn', 'path', 'widgets',
+        'headers', jsonb_build_object('Idempotency-Key', 'selftest-custom-key'),
+        'body', jsonb_build_object('x', 3))
+    )
+  ));
+  ok := (SELECT idempotency_key FROM allgres_private.outbound_calls WHERE call_id = (comp->>'call_id')::uuid) = 'selftest-custom-key';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_respects_agent_supplied_idempotency_key', 'ok', ok));
+
+  -- A GET has no side effect to protect -- it never gets one at all.
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  comp := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'http_request',
+      'args', jsonb_build_object('method', 'get', 'connection', 'selftest_conn', 'path', 'widgets')
+    )
+  ));
+  ok := (SELECT idempotency_key FROM allgres_private.outbound_calls WHERE call_id = (comp->>'call_id')::uuid) IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'http_request_get_never_gets_an_idempotency_key', 'ok', ok));
 
   -- Never a full URL when a connection is named: the whole point of a
   -- stored credential is that it can only ever reach its own base_url.

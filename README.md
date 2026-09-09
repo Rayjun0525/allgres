@@ -925,6 +925,44 @@ worker — carrying the provider API key — at an arbitrary address.
 Enable a local Ollama or an in-cluster gateway by ticking "Allow loopback /
 private-network endpoint" on that provider in Settings.
 
+### External call idempotency
+
+An outside review raised a real gap: a crash (or a lost worker, or a
+`fn_watchdog` reclaim) between an external side effect actually landing —
+the worker's HTTP call to a third-party API succeeded — and this extension
+recording that it did (`fn_complete_outbound` never runs for that
+`outbound_calls` row) leaves the row `in_flight` until `fn_watchdog` marks
+it `'lost'`. From the agent's point of view that reads as "did not
+complete," and its own retry logic may reasonably queue the identical
+`http_request` call again — at which point a destination with no
+deduplication of its own would perform the effect (create the ticket, charge
+the card, send the message) a second time.
+
+The mitigation: every mutating `http_request` call (`POST`/`PUT`/`PATCH`/
+`DELETE`) is queued with a deterministic `idempotency-key` header —
+`md5(task_id || method || url || body)`, mirrored onto
+`outbound_calls.idempotency_key` for visibility — unless the agent already
+set that header itself, which is honored as-is. The key is derived from
+the request's own content, not from `call_id` (a fresh value on every
+queued row, including a genuine retry), so an agent retrying the *exact
+same* request reproduces the *identical* key; a materially different
+request (a changed body, say) gets a different one. This is the same
+header Stripe, GitHub, PayPal, and Square already accept and deduplicate
+on.
+
+**This is a mitigation, not a guarantee.** It only protects a call against
+a destination that actually implements idempotency-key deduplication —
+plenty of third-party APIs do not, and against one of those, this header
+is inert: sent, ignored, and the underlying at-least-once-delivery risk
+above is unchanged. There is also no cross-check on this extension's own
+side — nothing here calls back to ask "did you already see this key," so
+a `'lost'` call's true outcome (delivered, or never sent at all) stays
+genuinely unknown until an operator checks the destination system
+directly or the agent's own next turn does. Treat a `'lost'` outbound call
+as *ambiguous*, not *failed*, for anything with a real external side
+effect — deciding whether to retry a specific one is a judgment call this
+extension cannot make for you.
+
 ### Secrets at rest
 
 Set `ALLGRES_SECRET_KEY` (Docker) or `allgres.secret_key` in `postgresql.conf`,
