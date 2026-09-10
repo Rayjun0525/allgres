@@ -526,6 +526,28 @@ CREATE TABLE IF NOT EXISTS allgres_private.procedure_history (
 CREATE INDEX IF NOT EXISTS procedure_history_procedure_idx
   ON allgres_private.procedure_history (procedure_id, generation DESC);
 
+-- A Tool Function is a named, reusable execution contract.  Version one is
+-- deliberately narrow: it can only invoke the existing asynchronous
+-- http_get runtime with a fixed operator-reviewed URL.  This makes a
+-- procedure grant meaningful without giving an agent arbitrary SQL/function
+-- execution or an unrestricted network capability.
+CREATE TABLE IF NOT EXISTS allgres_private.procedure_tools (
+  tool_id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL UNIQUE CHECK (name ~ '^[a-z][a-z0-9_]{0,62}$'),
+  description   text NOT NULL,
+  handler       text NOT NULL CHECK (handler IN ('http_get')),
+  args_template jsonb NOT NULL DEFAULT '{}'::jsonb,
+  is_active     boolean NOT NULL DEFAULT true,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS allgres_private.procedure_tool_bindings (
+  procedure_id uuid NOT NULL REFERENCES allgres_private.procedures(procedure_id) ON DELETE CASCADE,
+  tool_id      uuid NOT NULL REFERENCES allgres_private.procedure_tools(tool_id) ON DELETE CASCADE,
+  PRIMARY KEY (procedure_id, tool_id)
+);
+
 -- Every permission check in this file (call_tool's tool/http_host grants,
 -- delegate's target-agent grant, execute_sql's view grant via
 -- agent_may_read/fn_validate_sql below) goes through this one function
@@ -3011,6 +3033,7 @@ DECLARE
   v_memories jsonb;
   v_memory_ids uuid[];
   v_procedures jsonb;
+  v_procedure_tools jsonb;
   v_task_ids uuid[];
   v_compacted_before timestamptz;
   v_summary_text text;
@@ -3127,6 +3150,21 @@ BEGIN
   FROM allgres_private.procedures pr
   WHERE pr.is_active
     AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'));
+
+  -- A procedure grant also exposes its reviewed Tool Functions.  Keep these
+  -- structured rather than merely appending their names: the model receives
+  -- the exact fixed arguments and cannot substitute a host or URL.
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'name', pt.name, 'description', pt.description, 'handler', pt.handler,
+    'args', pt.args_template, 'procedure', pr.name
+  ) ORDER BY pt.name), '[]'::jsonb)
+  INTO v_procedure_tools
+  FROM allgres_private.procedure_tools pt
+  JOIN allgres_private.procedure_tool_bindings pb USING (tool_id)
+  JOIN allgres_private.procedures pr USING (procedure_id)
+  WHERE pt.is_active AND pr.is_active
+    AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'));
+  v_tools := v_tools || v_procedure_tools;
 
   -- Bounds come from the database, not from worker code, so revoking a
   -- Project mode (item 42): this session's project, if any, may narrow the
@@ -3307,6 +3345,8 @@ DECLARE
   v_path text;
   v_req_headers jsonb;
   v_req_body jsonb;
+  v_procedure_tool allgres_private.procedure_tools%ROWTYPE;
+  v_procedure_bound boolean := false;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -3409,7 +3449,26 @@ BEGIN
   END IF;
 
   IF v_action = 'final_answer' THEN
-    v_answer := COALESCE(v_parsed->>'answer', '');
+    -- Some OpenAI-compatible models follow the action correctly but name
+    -- the payload `content` (or repeat the action name as `final_answer`).
+    -- Treat those common shapes as aliases instead of silently completing a
+    -- task with an empty answer.  A genuinely missing/empty payload remains
+    -- invalid and gets another model step.
+    v_answer := COALESCE(
+      NULLIF(v_parsed->>'answer', ''),
+      NULLIF(v_parsed->>'content', ''),
+      NULLIF(v_parsed->>'final_answer', '')
+    );
+    IF v_answer IS NULL THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'final_answer_missing_answer', 'parsed', v_parsed)
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue', 'reason', 'final_answer_missing_answer');
+    END IF;
     UPDATE allgres_private.tasks
     SET status = 'completed',
         output = jsonb_build_object('answer', v_answer),
@@ -3458,14 +3517,29 @@ BEGIN
     v_args := COALESCE(v_parsed->'args', '{}'::jsonb);
     v_allowed := allgres_private.agent_has_permission(t.agent_id, 'tool', v_tool);
     IF NOT v_allowed THEN
-      PERFORM allgres_private.append_log(
-        p_task_id, t.step_count + 1, 'error',
-        jsonb_build_object('reason', 'tool_not_permitted', 'tool', v_tool)
-      );
-      UPDATE allgres_private.tasks
-      SET step_count = step_count + 1, updated_at = now()
-      WHERE task_id = p_task_id;
-      RETURN jsonb_build_object('action', 'continue');
+      SELECT pt.* INTO v_procedure_tool
+      FROM allgres_private.procedure_tools pt
+      JOIN allgres_private.procedure_tool_bindings pb USING (tool_id)
+      JOIN allgres_private.procedures pr USING (procedure_id)
+      WHERE lower(pt.name) = lower(COALESCE(v_tool, ''))
+        AND pt.is_active AND pr.is_active
+        AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'))
+      LIMIT 1;
+      IF FOUND THEN
+        v_procedure_bound := true;
+        v_tool := v_procedure_tool.handler;
+        v_args := v_procedure_tool.args_template;
+        v_allowed := true;
+      ELSE
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'tool_not_permitted', 'tool', v_tool)
+        );
+        UPDATE allgres_private.tasks
+        SET step_count = step_count + 1, updated_at = now()
+        WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
     END IF;
 
     IF v_tool NOT IN ('http_get', 'http_request') THEN
@@ -3571,7 +3645,8 @@ BEGIN
     END IF;
 
     v_host := allgres_private.url_host(v_url);
-    v_allowed := allgres_private.agent_has_permission(t.agent_id, 'http_host', v_host);
+    v_allowed := v_procedure_bound
+      OR allgres_private.agent_has_permission(t.agent_id, 'http_host', v_host);
     IF NOT v_allowed THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
@@ -6429,6 +6504,64 @@ BEGIN
 END;
 $fn$;
 
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_procedure_tool(
+  p_name text, p_description text, p_handler text, p_args_template jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_name text := lower(trim(COALESCE(p_name, '')));
+  v_url text;
+  v_reason text;
+  v_id uuid;
+BEGIN
+  IF v_name !~ '^[a-z][a-z0-9_]{0,62}$' THEN
+    RAISE EXCEPTION 'tool name must use lowercase letters, digits, and underscores' USING ERRCODE = 'P0001';
+  END IF;
+  IF NULLIF(trim(p_description), '') IS NULL THEN
+    RAISE EXCEPTION 'tool description is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_handler <> 'http_get' THEN
+    RAISE EXCEPTION 'only the http_get tool handler is supported' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_args_template IS NULL
+    OR jsonb_typeof(p_args_template) <> 'object'
+    OR p_args_template ?| ARRAY(SELECT key FROM jsonb_object_keys(p_args_template) key WHERE key <> 'url') THEN
+    RAISE EXCEPTION 'http_get tool arguments must contain only url' USING ERRCODE = 'P0001';
+  END IF;
+  v_url := NULLIF(trim(p_args_template->>'url'), '');
+  v_reason := allgres_private.check_outbound_url(v_url, false);
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'invalid tool URL: %', v_reason USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO allgres_private.procedure_tools (name, description, handler, args_template)
+  VALUES (v_name, trim(p_description), p_handler, jsonb_build_object('url', v_url))
+  RETURNING tool_id INTO v_id;
+  RETURN jsonb_build_object('ok', true, 'tool_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_bind_procedure_tool(p_procedure_id uuid, p_tool_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.procedures WHERE procedure_id = p_procedure_id) THEN
+    RAISE EXCEPTION 'procedure not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.procedure_tools WHERE tool_id = p_tool_id) THEN
+    RAISE EXCEPTION 'tool not found' USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO allgres_private.procedure_tool_bindings (procedure_id, tool_id)
+  VALUES (p_procedure_id, p_tool_id) ON CONFLICT DO NOTHING;
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
 -- Starts an RFC 8628 device authorization request.  The worker performs the
 -- HTTP call; this function only creates durable state and queues it.
 CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_device_start(p_provider_id uuid)
@@ -7273,6 +7406,18 @@ BEGIN
   -- terminates anything left non-terminal by an interrupted run, and the
   -- operator-facing views/listings filter out goal LIKE 'selftest%' (see
   -- their own comments) so they never actually show up in the dashboard.
+  -- Some Messenger tests intentionally use a natural-language user message
+  -- as the session goal, so the goal does not begin with `selftest` even
+  -- though the target is one of the disposable selftest agents. Normalize
+  -- those sessions before the status cleanup so failed test deliveries do
+  -- not leak into operator metrics or recent-task lists.
+  UPDATE allgres_private.sessions s
+  SET goal = 'selftest ' || s.goal
+  FROM allgres_private.agents a
+  WHERE a.agent_id = s.agent_id
+    AND a.name LIKE 'selftest%'
+    AND s.goal NOT LIKE 'selftest%';
+
   UPDATE allgres_private.tasks t
   SET status = 'failed', error = 'selftest', updated_at = now()
   FROM allgres_private.sessions s
@@ -8114,6 +8259,29 @@ $prompt$,
 END
 $seed$;
 
+-- A first Procedure / Tool Function pair. The Procedure is reusable prompt
+-- policy; seoul_weather is a fixed, reviewed HTTP capability bound to it.
+-- Granting this one procedure is sufficient for an agent to use the tool.
+INSERT INTO allgres_private.procedures (name, content)
+VALUES ('seoul-weather', $procedure$When asked about Seoul weather, call the `seoul_weather` tool with an empty args object. Read the returned JSON, report the current conditions and temperature in Korean, and say when the source does not contain a requested forecast detail.$procedure$)
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO allgres_private.procedure_tools (name, description, handler, args_template)
+VALUES ('seoul_weather', 'Fetch current weather and forecast data for Seoul.', 'http_get',
+  '{"url":"https://wttr.in/Seoul?format=j1"}'::jsonb)
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO allgres_private.procedure_tool_bindings (procedure_id, tool_id)
+SELECT p.procedure_id, t.tool_id
+FROM allgres_private.procedures p, allgres_private.procedure_tools t
+WHERE p.name = 'seoul-weather' AND t.name = 'seoul_weather'
+ON CONFLICT DO NOTHING;
+
+INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+SELECT agent_id, 'procedure', 'seoul-weather'
+FROM allgres_private.agents WHERE name = 'general'
+ON CONFLICT DO NOTHING;
+
 -- A first, deliberately narrow maintenance/auditor agent (README,
 -- "Maintenance agents"): read-only, no mutation surface at all in this
 -- slice -- not even propose_change is part of its seeded prompt. It reads
@@ -8462,6 +8630,8 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connections', ''
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connection_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedures', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_history', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_tools', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_tool_bindings', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.schedules', '');
 
 -- ---------------------------------------------------------------------------
@@ -8537,11 +8707,13 @@ DECLARE
   v_user_tok text;
   v_audit_tok text;
   v_acct_agent uuid;
+  v_procedure_tool uuid;
 BEGIN
   -- Clear out any leftover fixtures from an interrupted prior run before
   -- creating new ones, so a crash mid-selftest can't leave stale rows
   -- behind indefinitely.
   PERFORM allgres_private.selftest_cleanup();
+  DELETE FROM allgres_private.procedure_tools WHERE name = 'selftest_fixed_get';
 
   SELECT agent_id INTO v_agent FROM allgres_private.agents WHERE name = 'analyst' LIMIT 1;
   SELECT system_prompt INTO v_saved_prompt FROM allgres_private.policies WHERE agent_id = v_agent;
@@ -8703,6 +8875,35 @@ BEGIN
   SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := sub->>'action' = 'done' AND detail = 'completed';
   v := v || jsonb_build_array(jsonb_build_object('name', 'final_answer_completes', 'ok', ok));
+
+  -- OpenAI-compatible providers vary in the name they use for the final
+  -- text even when they follow the action protocol. These aliases must
+  -- preserve the answer, while an empty object must stay running so the
+  -- retry loop can correct it instead of recording a false success.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest final answer aliases')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"final_answer","content":"alias ok"}',
+    'parsed', jsonb_build_object('action', 'final_answer', 'content', 'alias ok')
+  ));
+  SELECT output->>'answer' INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'done' AND detail = 'alias ok';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'final_answer_content_alias_preserved', 'ok', ok));
+
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest empty final answer')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"final_answer"}',
+    'parsed', jsonb_build_object('action', 'final_answer')
+  ));
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'continue' AND detail = 'running'
+    AND sub->>'reason' = 'final_answer_missing_answer';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'empty_final_answer_retries', 'ok', ok));
 
   -- 9. outbound guard blocks the SSRF shapes on every path, not just http_get
   ok := allgres_private.is_blocked_host('169.254.169.254')
@@ -9120,6 +9321,38 @@ BEGIN
   ok := (spec->'messages'->0->>'content') LIKE '%# procedures%'
     AND (spec->'messages'->0->>'content') LIKE '%selftest v1: do the thing carefully%';
   v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_shown_in_prompt_once_granted', 'ok', ok));
+
+  -- A Procedure's Tool Function is visible only with that same procedure
+  -- grant, and its saved arguments replace hostile model-provided ones when
+  -- the call is queued. This is the capability boundary that distinguishes a
+  -- reviewed procedure operation from a broad http_get/http_host grant.
+  sub := allgres_public.fn_create_procedure_tool(
+    'selftest_fixed_get', 'fixed selftest endpoint', 'http_get',
+    jsonb_build_object('url', 'https://example.com/allgres-selftest')
+  );
+  v_procedure_tool := (sub->>'tool_id')::uuid;
+  PERFORM allgres_public.fn_bind_procedure_tool(v_call, v_procedure_tool);
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') LIKE '%selftest_fixed_get%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_tool_shown_with_granted_procedure', 'ok', ok));
+
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"call_tool","tool":"selftest_fixed_get"}',
+    'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'selftest_fixed_get',
+      'args', jsonb_build_object('url', 'https://attacker.invalid/ignored')
+    )
+  ));
+  v_call2 := (sub->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call2;
+  ok := sub->>'action' = 'call_tool'
+    AND r->>'tool' = 'http_get'
+    AND r->>'url' = 'https://example.com/allgres-selftest';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_tool_uses_fixed_saved_url', 'ok', ok));
+  DELETE FROM allgres_private.outbound_calls WHERE call_id = v_call2;
+
   PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
 
   -- Disabled (is_active = false) never shows even with a grant -- the same
@@ -9134,6 +9367,7 @@ BEGIN
   PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
   DELETE FROM allgres_private.procedure_history WHERE procedure_id = v_call;
   DELETE FROM allgres_private.procedures WHERE procedure_id = v_call;
+  DELETE FROM allgres_private.procedure_tools WHERE tool_id = v_procedure_tool;
 
   -- 19. fn_set_policy only versions on a real change.  A no-op call (every
   --     param NULL/false) must not bump generation or write history --
@@ -9751,23 +9985,27 @@ BEGIN
   DELETE FROM allgres_private.llm_providers WHERE name IN
     ('selftest_no_json_mode', 'selftest_autodetect_provider', 'selftest_autodetect_unrelated');
 
-  -- 25g0. The 'general' demo agent (item 39's own follow-up): seeded
-  -- active, no llm_config picked for it yet (same reason as 'analyst'),
-  -- and no view/tool permissions -- a plain conversational partner, unlike
-  -- 'analyst', which is deliberately a data-query one. Checked here, before
-  -- fn_bulk_set_model below runs against every active agent including this
-  -- one -- that would otherwise give this its own llm_config and make the
-  -- "still unconfigured" half of this assertion fail on nothing but test
-  -- ordering.
+  -- 25g0. The 'general' demo agent stays active and has no view/tool
+  -- permissions: a plain conversational partner, unlike 'analyst'. Its
+  -- llm_config is deliberately not asserted here because fn_selftest is a
+  -- live diagnostic and an operator is expected to configure this agent.
+  -- Treating that valid live setting as a failed seed test made selftest
+  -- report a false failure immediately after "Apply to all agents".
   ok := EXISTS (
-    SELECT 1 FROM allgres_private.agents a JOIN allgres_private.policies p USING (agent_id)
-    WHERE a.name = 'general' AND a.is_active AND p.llm_config = '{}'::jsonb
+    SELECT 1 FROM allgres_private.agents a
+    WHERE a.name = 'general' AND a.is_active AND NOT a.is_system
   );
   ok := ok AND NOT EXISTS (
     SELECT 1 FROM allgres_private.permissions
     WHERE agent_id = (SELECT agent_id FROM allgres_private.agents WHERE name = 'general')
+      AND resource_type IN ('view', 'tool', 'http_host')
   );
-  v := v || jsonb_build_array(jsonb_build_object('name', 'general_agent_seeded_plain_and_unconfigured', 'ok', ok));
+  ok := ok AND EXISTS (
+    SELECT 1 FROM allgres_private.permissions
+    WHERE agent_id = (SELECT agent_id FROM allgres_private.agents WHERE name = 'general')
+      AND resource_type = 'procedure' AND resource_ref = 'seoul-weather'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'general_agent_seeded_with_seoul_weather_procedure', 'ok', ok));
 
   -- 25g. fn_bulk_set_model: one call sets llm_config.provider/model on
   -- every active agent, reusing fn_set_policy's own merge (nothing else on
@@ -10118,10 +10356,17 @@ BEGIN
   ok := ok AND comp->>'action'='device_authorization_ready'
     AND (allgres_public.fn_oauth_device_status(v_device_session)->>'status')='awaiting_user'
     AND (allgres_public.fn_oauth_device_status(v_device_session)->>'user_code')='ABCD-EFGH';
-  SELECT ok AND device_code <> 'secret-device-code'
-    AND allgres_private.decrypt_secret(device_code)='secret-device-code' INTO ok
+  -- Encryption is optional until an operator configures a secret key. In
+  -- either supported storage mode the value must round-trip, while an
+  -- encrypted deployment must never leave the raw device code at rest.
+  SELECT ok
+    AND allgres_private.decrypt_secret(device_code)='secret-device-code'
+    AND (
+      (allgres_private.secret_storage_mode()='encrypted' AND device_code <> 'secret-device-code')
+      OR (allgres_private.secret_storage_mode()='plaintext_no_key' AND device_code = 'secret-device-code')
+    ) INTO ok
   FROM allgres_private.oauth_device_sessions WHERE session_id=v_device_session;
-  v := v || jsonb_build_array(jsonb_build_object('name','oauth_device_code_is_queued_and_encrypted','ok',ok));
+  v := v || jsonb_build_array(jsonb_build_object('name','oauth_device_code_matches_configured_storage_mode','ok',ok));
 
   -- 26g. Polling is durable and authorization_pending is progress, not an
   --      error.  The sensitive device code appears only in the worker claim.
@@ -11544,8 +11789,18 @@ BEGIN
     r := allgres.dashboard_rpc(jsonb_build_object('action', 'overview'));
     ok := (r->>'pg_version') IS NOT NULL
       AND (r->'db_sessions'->>'total')::int >= 1
-      AND (r->'host'->'cpu_count') IS NOT NULL;
+      AND (r->'host'->'cpu_count') IS NOT NULL
+      AND (r->>'agents')::int = (SELECT count(*) FROM allgres_private.agents WHERE name NOT LIKE 'selftest%')
+      AND (r->>'active_agents')::int = (SELECT count(*) FROM allgres_private.agents WHERE is_active AND name NOT LIKE 'selftest%');
     v := v || jsonb_build_array(jsonb_build_object('name', 'overview_reports_pg_version_db_sessions_and_host_stats', 'ok', ok));
+
+    r := allgres.dashboard_rpc(jsonb_build_object('action', 'settings.get'));
+    ok := NOT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(COALESCE(r->'providers', '[]'::jsonb)) p
+      WHERE p->>'name' LIKE 'selftest%'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'settings_hides_selftest_providers', 'ok', ok));
 
     -- fn_logout is idempotent, and a logged-out token no longer resolves.
     PERFORM allgres_public.fn_logout(v_user_tok);
@@ -12090,6 +12345,7 @@ BEGIN
     'memories.create', 'memories.remove', 'provider.update', 'provider.create',
     'connections.create', 'connections.update', 'connections.delete',
     'procedures.create', 'procedures.update', 'procedures.rollback',
+    'procedure_tools.create', 'procedure_tools.bind',
     'schedules.create', 'schedules.update', 'schedules.delete', 'schedules.run_now',
     'providers.oauth_callback', 'providers.oauth_device_start', 'approvals.decide', 'fixes.decide',
     'users.create', 'users.set_active', 'users.set_role', 'assignments.set', 'assignments.toggle'
@@ -12113,8 +12369,8 @@ BEGIN
         'ok', true,
         'server_time', now(),
         'version', allgres.native_version(),
-        'agents', (SELECT count(*) FROM allgres_private.agents),
-        'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active),
+        'agents', (SELECT count(*) FROM allgres_private.agents WHERE name NOT LIKE 'selftest%'),
+        'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active AND name NOT LIKE 'selftest%'),
         'running_tasks', (
           SELECT count(*) FROM allgres_private.tasks t JOIN allgres_private.sessions s USING (session_id)
           WHERE t.status IN ('queued','running','waiting_human','waiting_children') AND s.goal NOT LIKE 'selftest%'
@@ -12920,6 +13176,7 @@ BEGIN
             )
           ) ORDER BY p.name)
           FROM allgres_private.llm_providers p
+          WHERE p.name NOT LIKE 'selftest%'
         ), '[]'::jsonb)
       );
 
@@ -13059,6 +13316,35 @@ BEGIN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_rollback_procedure(
         (p_request->>'procedure_id')::uuid, (p_request->>'generation')::int
+      );
+
+    WHEN 'procedure_tools.list' THEN
+      RETURN jsonb_build_object('ok', true, 'tools', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'tool_id', pt.tool_id, 'name', pt.name, 'description', pt.description,
+          'handler', pt.handler, 'args_template', pt.args_template,
+          'is_active', pt.is_active,
+          'procedures', COALESCE((
+            SELECT jsonb_agg(pr.name ORDER BY pr.name)
+            FROM allgres_private.procedure_tool_bindings pb
+            JOIN allgres_private.procedures pr USING (procedure_id)
+            WHERE pb.tool_id = pt.tool_id
+          ), '[]'::jsonb)
+        ) ORDER BY pt.name)
+        FROM allgres_private.procedure_tools pt
+      ), '[]'::jsonb));
+
+    WHEN 'procedure_tools.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_create_procedure_tool(
+        p_request->>'name', p_request->>'description', p_request->>'handler',
+        COALESCE(p_request->'args_template', '{}'::jsonb)
+      );
+
+    WHEN 'procedure_tools.bind' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_bind_procedure_tool(
+        (p_request->>'procedure_id')::uuid, (p_request->>'tool_id')::uuid
       );
 
     -- Roadmap item 6: schedule/event-driven execution (see

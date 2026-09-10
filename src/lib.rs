@@ -1,3 +1,5 @@
+#![allow(long_running_const_eval)]
+
 //! Allgres native runtime.
 //!
 //! Two background workers, neither of which owns any agent state:

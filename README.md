@@ -363,6 +363,31 @@ admin_approval/self_approve/auto autonomy-level flow `propose_change`
 already gives an agent for its own policy) is real future work, not done
 here.
 
+### Procedure tool functions
+
+A procedure may also bind one or more named **tool functions**. A tool
+function is the callable half of a procedure: its name and description are
+shown with the procedure in the agent's `tools` bounds, while its handler and
+arguments stay operator-curated in `allgres_private.procedure_tools`.
+
+The first handler is deliberately narrow: `http_get` with one fixed HTTPS
+URL. An agent calls the function name (for example, `seoul_weather`) with an
+empty argument object. `fn_submit_result` replaces any returned arguments
+with the saved template before queuing the request, then still runs the usual
+outbound URL validation. A procedure grant therefore authorizes precisely
+the reviewed operation without also granting arbitrary `http_get` access or
+an open-ended host permission.
+
+Create and bind functions from **Settings → Procedure tool functions**. The
+seeded `seoul-weather` procedure demonstrates the pattern: it binds
+`seoul_weather` to `https://wttr.in/Seoul?format=j1` and grants the procedure
+to the General agent. To make a new function usable, bind it to a procedure,
+then grant that procedure to the intended agent in the usual permission UI.
+This keeps the naming model clear: **Procedure** is the reusable capability;
+a **tool function** is one fixed operation inside it. More handlers,
+parameter schemas, versioning, and agent-authored proposals remain future
+work.
+
 ## Maintenance agents
 
 An agent can be a system-facing operator instead of a user-facing one: read
