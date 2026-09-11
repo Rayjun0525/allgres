@@ -36,6 +36,23 @@ VALUES
   ('93ad5476-8d3a-4443-8b98-f50b6d1d4fbc', 'openai_compat', 'openai_compat', 'https://api.openai.com/v1',  true,  false)
 ON CONFLICT (name) DO NOTHING;
 
+-- Public-client device OAuth used by xAI's Grok CLI/Hermes-compatible login.
+-- The client id is not a secret; the issued device/access/refresh credentials
+-- are encrypted in llm_secrets/oauth_device_sessions and never listed.
+INSERT INTO allgres_private.llm_providers (
+  provider_id,name,kind,base_url,is_enabled,allow_private_network,
+  oauth_flow,oauth_device_url,oauth_token_url,oauth_client_id,oauth_scope
+) VALUES (
+  '98f88f1a-607d-4b54-b820-66dc40b70449','xai_oauth','oauth','https://api.x.ai/v1',true,false,
+  'device_code','https://auth.x.ai/oauth2/device/code','https://auth.x.ai/oauth2/token',
+  'b1a00492-073a-47ea-816f-4c329264a828',
+  'openid profile email offline_access grok-cli:access api:access'
+)
+ON CONFLICT (name) DO UPDATE SET
+  kind=EXCLUDED.kind, base_url=EXCLUDED.base_url, oauth_flow=EXCLUDED.oauth_flow,
+  oauth_device_url=EXCLUDED.oauth_device_url, oauth_token_url=EXCLUDED.oauth_token_url,
+  oauth_client_id=EXCLUDED.oauth_client_id, oauth_scope=EXCLUDED.oauth_scope;
+
 -- response_format_json_object's own retroactive fix (its column comment
 -- above explains why): must run after the INSERT above, whether that
 -- INSERT just created the row (fresh install) or found it already there
@@ -140,6 +157,29 @@ $prompt$,
   END IF;
 END
 $seed$;
+
+-- A first Procedure / Tool Function pair. The Procedure is reusable prompt
+-- policy; seoul_weather is a fixed, reviewed HTTP capability bound to it.
+-- Granting this one procedure is sufficient for an agent to use the tool.
+INSERT INTO allgres_private.procedures (name, content)
+VALUES ('seoul-weather', $procedure$When asked about Seoul weather, call the `seoul_weather` tool with an empty args object. Read the returned JSON, report the current conditions and temperature in Korean, and say when the source does not contain a requested forecast detail.$procedure$)
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO allgres_private.procedure_tools (name, description, handler, args_template)
+VALUES ('seoul_weather', 'Fetch current weather and forecast data for Seoul.', 'http_get',
+  '{"url":"https://wttr.in/Seoul?format=j1"}'::jsonb)
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO allgres_private.procedure_tool_bindings (procedure_id, tool_id)
+SELECT p.procedure_id, t.tool_id
+FROM allgres_private.procedures p, allgres_private.procedure_tools t
+WHERE p.name = 'seoul-weather' AND t.name = 'seoul_weather'
+ON CONFLICT DO NOTHING;
+
+INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+SELECT agent_id, 'procedure', 'seoul-weather'
+FROM allgres_private.agents WHERE name = 'general'
+ON CONFLICT DO NOTHING;
 
 -- A first, deliberately narrow maintenance/auditor agent (README,
 -- "Maintenance agents"): read-only, no mutation surface at all in this
@@ -482,11 +522,14 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.llm_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.outbound_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.sql_calls', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_calls', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.oauth_device_sessions', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.agent_memories', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.audit_log', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connections', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connection_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedures', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_history', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_tools', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_tool_bindings', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.schedules', '');
 

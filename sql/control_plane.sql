@@ -547,6 +547,28 @@ CREATE TABLE IF NOT EXISTS allgres_private.procedure_history (
 CREATE INDEX IF NOT EXISTS procedure_history_procedure_idx
   ON allgres_private.procedure_history (procedure_id, generation DESC);
 
+-- A Tool Function is a named, reusable execution contract.  Version one is
+-- deliberately narrow: it can only invoke the existing asynchronous
+-- http_get runtime with a fixed operator-reviewed URL.  This makes a
+-- procedure grant meaningful without giving an agent arbitrary SQL/function
+-- execution or an unrestricted network capability.
+CREATE TABLE IF NOT EXISTS allgres_private.procedure_tools (
+  tool_id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL UNIQUE CHECK (name ~ '^[a-z][a-z0-9_]{0,62}$'),
+  description   text NOT NULL,
+  handler       text NOT NULL CHECK (handler IN ('http_get')),
+  args_template jsonb NOT NULL DEFAULT '{}'::jsonb,
+  is_active     boolean NOT NULL DEFAULT true,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS allgres_private.procedure_tool_bindings (
+  procedure_id uuid NOT NULL REFERENCES allgres_private.procedures(procedure_id) ON DELETE CASCADE,
+  tool_id      uuid NOT NULL REFERENCES allgres_private.procedure_tools(tool_id) ON DELETE CASCADE,
+  PRIMARY KEY (procedure_id, tool_id)
+);
+
 -- Every permission check in this file (call_tool's tool/http_host grants,
 -- delegate's target-agent grant, execute_sql's view grant via
 -- agent_may_read/fn_validate_sql below) goes through this one function
@@ -1801,10 +1823,39 @@ CREATE TABLE IF NOT EXISTS allgres_private.llm_secrets (
   expires_at          timestamptz
 );
 
+-- OAuth providers can use the original authorization-code redirect flow or
+-- an RFC 8628 device-code flow.  Device-code is what xAI exposes for a
+-- browser login that works from a headless/containerized Allgres worker.
+ALTER TABLE allgres_private.llm_providers
+  ADD COLUMN IF NOT EXISTS oauth_flow text NOT NULL DEFAULT 'authorization_code'
+    CHECK (oauth_flow IN ('authorization_code', 'device_code')),
+  ADD COLUMN IF NOT EXISTS oauth_device_url text;
+
 CREATE TABLE IF NOT EXISTS allgres_private.oauth_states (
   state        text PRIMARY KEY,
   provider_id  uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
   created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+-- The device_code is a short-lived bearer credential, so it receives the
+-- same encrypted-at-rest treatment as access/refresh tokens.  user_code and
+-- verification URLs are intentionally returned to the dashboard: they are
+-- the public instructions the operator must see to approve the login.
+CREATE TABLE IF NOT EXISTS allgres_private.oauth_device_sessions (
+  session_id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id               uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
+  device_code               text,
+  user_code                 text,
+  verification_uri          text,
+  verification_uri_complete text,
+  status                    text NOT NULL DEFAULT 'starting'
+                              CHECK (status IN ('starting','awaiting_user','connected','denied','expired','error')),
+  interval_seconds          int NOT NULL DEFAULT 5 CHECK (interval_seconds BETWEEN 1 AND 60),
+  expires_at                timestamptz,
+  next_poll_at              timestamptz,
+  error                     text,
+  created_at                timestamptz NOT NULL DEFAULT now(),
+  updated_at                timestamptz NOT NULL DEFAULT now()
 );
 
 -- Roadmap item 2: a named external HTTP endpoint an operator configures once
@@ -1964,6 +2015,12 @@ CREATE TABLE IF NOT EXISTS allgres_private.oauth_calls (
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE allgres_private.oauth_calls
+  ADD COLUMN IF NOT EXISTS operation text NOT NULL DEFAULT 'token_exchange'
+    CHECK (operation IN ('token_exchange','device_authorization','device_poll','refresh')),
+  ADD COLUMN IF NOT EXISTS device_session_id uuid
+    REFERENCES allgres_private.oauth_device_sessions(session_id) ON DELETE CASCADE;
 
 CREATE INDEX IF NOT EXISTS oauth_calls_ready_idx
   ON allgres_private.oauth_calls (created_at)
@@ -2853,7 +2910,10 @@ STABLE
 SECURITY DEFINER
 SET search_path = allgres_private, pg_temp
 AS $fn$
-  SELECT allgres_private.decrypt_secret(api_key)
+  -- OAuth exchanges store an access_token rather than an api_key.  Keeping
+  -- the choice in this private claim-time helper means neither credential is
+  -- ever copied into outbound_calls or returned to the dashboard.
+  SELECT allgres_private.decrypt_secret(COALESCE(api_key, access_token))
   FROM allgres_private.llm_secrets
   WHERE provider_id = p_provider_id
 $fn$;
@@ -3305,6 +3365,7 @@ DECLARE
   v_memories jsonb;
   v_memory_ids uuid[];
   v_procedures jsonb;
+  v_procedure_tools jsonb;
   v_task_ids uuid[];
   v_compacted_before timestamptz;
   v_summary_text text;
@@ -3421,6 +3482,21 @@ BEGIN
   FROM allgres_private.procedures pr
   WHERE pr.is_active
     AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'));
+
+  -- A procedure grant also exposes its reviewed Tool Functions.  Keep these
+  -- structured rather than merely appending their names: the model receives
+  -- the exact fixed arguments and cannot substitute a host or URL.
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'name', pt.name, 'description', pt.description, 'handler', pt.handler,
+    'args', pt.args_template, 'procedure', pr.name
+  ) ORDER BY pt.name), '[]'::jsonb)
+  INTO v_procedure_tools
+  FROM allgres_private.procedure_tools pt
+  JOIN allgres_private.procedure_tool_bindings pb USING (tool_id)
+  JOIN allgres_private.procedures pr USING (procedure_id)
+  WHERE pt.is_active AND pr.is_active
+    AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'));
+  v_tools := v_tools || v_procedure_tools;
 
   -- Bounds come from the database, not from worker code, so revoking a
   -- Project mode (item 42): this session's project, if any, may narrow the
@@ -3601,6 +3677,8 @@ DECLARE
   v_path text;
   v_req_headers jsonb;
   v_req_body jsonb;
+  v_procedure_tool allgres_private.procedure_tools%ROWTYPE;
+  v_procedure_bound boolean := false;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -3703,7 +3781,26 @@ BEGIN
   END IF;
 
   IF v_action = 'final_answer' THEN
-    v_answer := COALESCE(v_parsed->>'answer', '');
+    -- Some OpenAI-compatible models follow the action correctly but name
+    -- the payload `content` (or repeat the action name as `final_answer`).
+    -- Treat those common shapes as aliases instead of silently completing a
+    -- task with an empty answer.  A genuinely missing/empty payload remains
+    -- invalid and gets another model step.
+    v_answer := COALESCE(
+      NULLIF(v_parsed->>'answer', ''),
+      NULLIF(v_parsed->>'content', ''),
+      NULLIF(v_parsed->>'final_answer', '')
+    );
+    IF v_answer IS NULL THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'final_answer_missing_answer', 'parsed', v_parsed)
+      );
+      UPDATE allgres_private.tasks
+      SET step_count = step_count + 1, updated_at = now()
+      WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue', 'reason', 'final_answer_missing_answer');
+    END IF;
     UPDATE allgres_private.tasks
     SET status = 'completed',
         output = jsonb_build_object('answer', v_answer),
@@ -3752,14 +3849,29 @@ BEGIN
     v_args := COALESCE(v_parsed->'args', '{}'::jsonb);
     v_allowed := allgres_private.agent_has_permission(t.agent_id, 'tool', v_tool);
     IF NOT v_allowed THEN
-      PERFORM allgres_private.append_log(
-        p_task_id, t.step_count + 1, 'error',
-        jsonb_build_object('reason', 'tool_not_permitted', 'tool', v_tool)
-      );
-      UPDATE allgres_private.tasks
-      SET step_count = step_count + 1, updated_at = now()
-      WHERE task_id = p_task_id;
-      RETURN jsonb_build_object('action', 'continue');
+      SELECT pt.* INTO v_procedure_tool
+      FROM allgres_private.procedure_tools pt
+      JOIN allgres_private.procedure_tool_bindings pb USING (tool_id)
+      JOIN allgres_private.procedures pr USING (procedure_id)
+      WHERE lower(pt.name) = lower(COALESCE(v_tool, ''))
+        AND pt.is_active AND pr.is_active
+        AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'))
+      LIMIT 1;
+      IF FOUND THEN
+        v_procedure_bound := true;
+        v_tool := v_procedure_tool.handler;
+        v_args := v_procedure_tool.args_template;
+        v_allowed := true;
+      ELSE
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'tool_not_permitted', 'tool', v_tool)
+        );
+        UPDATE allgres_private.tasks
+        SET step_count = step_count + 1, updated_at = now()
+        WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
     END IF;
 
     IF v_tool NOT IN ('http_get', 'http_request') THEN
@@ -3885,7 +3997,8 @@ BEGIN
     END IF;
 
     v_host := allgres_private.url_host(v_url);
-    v_allowed := allgres_private.agent_has_permission(t.agent_id, 'http_host', v_host);
+    v_allowed := v_procedure_bound
+      OR allgres_private.agent_has_permission(t.agent_id, 'http_host', v_host);
     IF NOT v_allowed THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
@@ -4751,6 +4864,14 @@ BEGIN
     JOIN allgres_private.tasks t ON t.task_id = o.task_id
     LEFT JOIN allgres_private.llm_providers p ON p.provider_id = o.provider_id
     WHERE o.status = 'queued' AND t.status = 'running'
+      -- Do not send an expired OAuth token. fn_claim_oauth runs on the same
+      -- worker loop and queues/claims its refresh; this LLM row remains
+      -- durable and becomes claimable as soon as the rotated token lands.
+      AND (p.kind IS DISTINCT FROM 'oauth' OR EXISTS (
+        SELECT 1 FROM allgres_private.llm_secrets s
+        WHERE s.provider_id=o.provider_id AND s.access_token IS NOT NULL
+          AND (s.expires_at IS NULL OR s.expires_at > now()+interval '30 seconds')
+      ))
     ORDER BY o.created_at
     FOR UPDATE OF o SKIP LOCKED
     LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))

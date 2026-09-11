@@ -420,8 +420,8 @@ BEGIN
         'ok', true,
         'server_time', now(),
         'version', allgres.native_version(),
-        'agents', (SELECT count(*) FROM allgres_private.agents),
-        'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active),
+        'agents', (SELECT count(*) FROM allgres_private.agents WHERE name NOT LIKE 'selftest%'),
+        'active_agents', (SELECT count(*) FROM allgres_private.agents WHERE is_active AND name NOT LIKE 'selftest%'),
         'running_tasks', (
           SELECT count(*) FROM allgres_private.tasks t JOIN allgres_private.sessions s USING (session_id)
           WHERE t.status IN ('queued','running','waiting_human','waiting_children') AND s.goal NOT LIKE 'selftest%'
@@ -1216,6 +1216,8 @@ BEGIN
             'allow_private_network', p.allow_private_network,
             'response_format_json_object', p.response_format_json_object,
             'oauth_auth_url', p.oauth_auth_url,
+            'oauth_flow', p.oauth_flow,
+            'oauth_device_url', p.oauth_device_url,
             'oauth_token_url', p.oauth_token_url,
             'oauth_client_id', p.oauth_client_id,
             'oauth_scope', p.oauth_scope,
@@ -1226,9 +1228,15 @@ BEGIN
                 OR NULLIF(s.access_token,'') IS NOT NULL
                 OR NULLIF(s.oauth_client_secret,'') IS NOT NULL
               )
+            ),
+            'oauth_connected', EXISTS (
+              SELECT 1 FROM allgres_private.llm_secrets s
+              WHERE s.provider_id=p.provider_id AND s.access_token IS NOT NULL
+                AND (s.expires_at IS NULL OR s.expires_at>now())
             )
           ) ORDER BY p.name)
           FROM allgres_private.llm_providers p
+          WHERE p.name NOT LIKE 'selftest%'
         ), '[]'::jsonb)
       );
 
@@ -1370,6 +1378,35 @@ BEGIN
         (p_request->>'procedure_id')::uuid, (p_request->>'generation')::int
       );
 
+    WHEN 'procedure_tools.list' THEN
+      RETURN jsonb_build_object('ok', true, 'tools', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'tool_id', pt.tool_id, 'name', pt.name, 'description', pt.description,
+          'handler', pt.handler, 'args_template', pt.args_template,
+          'is_active', pt.is_active,
+          'procedures', COALESCE((
+            SELECT jsonb_agg(pr.name ORDER BY pr.name)
+            FROM allgres_private.procedure_tool_bindings pb
+            JOIN allgres_private.procedures pr USING (procedure_id)
+            WHERE pb.tool_id = pt.tool_id
+          ), '[]'::jsonb)
+        ) ORDER BY pt.name)
+        FROM allgres_private.procedure_tools pt
+      ), '[]'::jsonb));
+
+    WHEN 'procedure_tools.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_create_procedure_tool(
+        p_request->>'name', p_request->>'description', p_request->>'handler',
+        COALESCE(p_request->'args_template', '{}'::jsonb)
+      );
+
+    WHEN 'procedure_tools.bind' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_bind_procedure_tool(
+        (p_request->>'procedure_id')::uuid, (p_request->>'tool_id')::uuid
+      );
+
     -- Roadmap item 6: schedule/event-driven execution (see
     -- allgres_private.schedules' own comment). Listing is open, same as
     -- procedures.list/connections.list -- a shared, operator-curated
@@ -1428,6 +1465,14 @@ BEGIN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'provider_id')::uuid;
       RETURN allgres_public.fn_oauth_start(v_id, p_request->>'redirect');
+
+    WHEN 'providers.oauth_device_start' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_oauth_device_start((p_request->>'provider_id')::uuid);
+
+    WHEN 'providers.oauth_device_status' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_oauth_device_status((p_request->>'session_id')::uuid);
 
     -- Completes the flow: queues the token exchange (fn_oauth_token_request)
     -- rather than performing it inline, so the operator-facing return value

@@ -5,8 +5,8 @@ services:
       # Override in a .env file; the default exists so `docker compose up`
       # works, not because it is a reasonable password.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-allgres}
-      POSTGRES_DB: postgres
-      ALLGRES_DATABASE: postgres
+      POSTGRES_DB: ${ALLGRES_DATABASE:-postgres}
+      ALLGRES_DATABASE: ${ALLGRES_DATABASE:-postgres}
       # 0.0.0.0 inside the container only; the published ports below are bound
       # to the host loopback.
       ALLGRES_HTTP_ADDR: 0.0.0.0:8088

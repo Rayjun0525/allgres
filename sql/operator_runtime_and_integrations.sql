@@ -671,6 +671,215 @@ BEGIN
 END;
 $fn$;
 
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_procedure_tool(
+  p_name text, p_description text, p_handler text, p_args_template jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_name text := lower(trim(COALESCE(p_name, '')));
+  v_url text;
+  v_reason text;
+  v_id uuid;
+BEGIN
+  IF v_name !~ '^[a-z][a-z0-9_]{0,62}$' THEN
+    RAISE EXCEPTION 'tool name must use lowercase letters, digits, and underscores' USING ERRCODE = 'P0001';
+  END IF;
+  IF NULLIF(trim(p_description), '') IS NULL THEN
+    RAISE EXCEPTION 'tool description is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_handler <> 'http_get' THEN
+    RAISE EXCEPTION 'only the http_get tool handler is supported' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_args_template IS NULL
+    OR jsonb_typeof(p_args_template) <> 'object'
+    OR p_args_template ?| ARRAY(SELECT key FROM jsonb_object_keys(p_args_template) key WHERE key <> 'url') THEN
+    RAISE EXCEPTION 'http_get tool arguments must contain only url' USING ERRCODE = 'P0001';
+  END IF;
+  v_url := NULLIF(trim(p_args_template->>'url'), '');
+  v_reason := allgres_private.check_outbound_url(v_url, false);
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'invalid tool URL: %', v_reason USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO allgres_private.procedure_tools (name, description, handler, args_template)
+  VALUES (v_name, trim(p_description), p_handler, jsonb_build_object('url', v_url))
+  RETURNING tool_id INTO v_id;
+  PERFORM allgres_private.audit('procedure_tools.create', jsonb_build_object('tool_id', v_id, 'name', v_name));
+  RETURN jsonb_build_object('ok', true, 'tool_id', v_id);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_bind_procedure_tool(p_procedure_id uuid, p_tool_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.procedures WHERE procedure_id = p_procedure_id) THEN
+    RAISE EXCEPTION 'procedure not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.procedure_tools WHERE tool_id = p_tool_id) THEN
+    RAISE EXCEPTION 'tool not found' USING ERRCODE = 'P0001';
+  END IF;
+  INSERT INTO allgres_private.procedure_tool_bindings (procedure_id, tool_id)
+  VALUES (p_procedure_id, p_tool_id) ON CONFLICT DO NOTHING;
+  PERFORM allgres_private.audit('procedure_tools.bind', jsonb_build_object('procedure_id', p_procedure_id, 'tool_id', p_tool_id));
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- Starts an RFC 8628 device authorization request.  The worker performs the
+-- HTTP call; this function only creates durable state and queues it.
+CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_device_start(p_provider_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v allgres_private.llm_providers%ROWTYPE;
+  v_session uuid;
+  v_call uuid;
+  v_reason text;
+BEGIN
+  SELECT * INTO v FROM allgres_private.llm_providers WHERE provider_id = p_provider_id;
+  IF v.provider_id IS NULL OR v.kind <> 'oauth' OR v.oauth_flow <> 'device_code' THEN
+    RAISE EXCEPTION 'provider is not device-code oauth' USING ERRCODE = 'P0001';
+  END IF;
+  IF v.oauth_device_url IS NULL OR v.oauth_token_url IS NULL OR v.oauth_client_id IS NULL THEN
+    RAISE EXCEPTION 'device url / token url / client id missing' USING ERRCODE = 'P0001';
+  END IF;
+  v_reason := allgres_private.check_outbound_url(v.oauth_device_url, v.allow_private_network);
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'oauth device url rejected: %', v_reason USING ERRCODE = 'P0001';
+  END IF;
+
+  -- Serialize starts per provider so two dashboard clicks cannot leave two
+  -- live device codes racing to replace the same provider token.
+  PERFORM pg_advisory_xact_lock(hashtextextended(p_provider_id::text, 0));
+
+  -- Supersede unfinished attempts for the same provider.  Their device codes
+  -- are single-purpose and expire quickly; keeping them active would create
+  -- ambiguous status in the dashboard.
+  UPDATE allgres_private.oauth_calls
+  SET status='harvested', error='superseded by a newer login', updated_at=now()
+  WHERE device_session_id IN (
+    SELECT session_id FROM allgres_private.oauth_device_sessions
+    WHERE provider_id=p_provider_id AND status IN ('starting','awaiting_user')
+  ) AND status IN ('queued','in_flight');
+
+  UPDATE allgres_private.oauth_device_sessions
+  SET status = 'expired', error = 'superseded by a newer login', updated_at = now()
+  WHERE provider_id = p_provider_id AND status IN ('starting','awaiting_user');
+
+  INSERT INTO allgres_private.oauth_device_sessions(provider_id)
+  VALUES (p_provider_id) RETURNING session_id INTO v_session;
+
+  INSERT INTO allgres_private.oauth_calls
+    (provider_id, state, url, request_headers, request_body, allow_private,
+     status, operation, device_session_id)
+  VALUES (
+    p_provider_id, v_session::text, v.oauth_device_url,
+    jsonb_build_object('accept','application/json'),
+    jsonb_strip_nulls(jsonb_build_object('client_id',v.oauth_client_id,'scope',v.oauth_scope)),
+    v.allow_private_network, 'queued', 'device_authorization', v_session
+  ) RETURNING call_id INTO v_call;
+
+  PERFORM allgres_private.audit('providers.oauth_device_start', jsonb_build_object('provider_id', p_provider_id, 'session_id', v_session));
+  RETURN jsonb_build_object('ok',true,'session_id',v_session,'call_id',v_call,'status','starting');
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_device_status(p_session_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  s allgres_private.oauth_device_sessions%ROWTYPE;
+BEGIN
+  SELECT * INTO s FROM allgres_private.oauth_device_sessions WHERE session_id = p_session_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'oauth device session not found' USING ERRCODE = 'P0001';
+  END IF;
+  RETURN jsonb_strip_nulls(jsonb_build_object(
+    'ok', true, 'session_id', s.session_id, 'provider_id', s.provider_id,
+    'status', s.status, 'user_code', s.user_code,
+    'verification_uri', s.verification_uri,
+    'verification_uri_complete', s.verification_uri_complete,
+    'expires_at', s.expires_at, 'error', s.error
+  ));
+END;
+$fn$;
+
+-- Called from fn_claim_oauth.  It turns due device polls and expiring access
+-- tokens into ordinary durable oauth_calls, with sensitive device/refresh
+-- credentials added only later at claim time.
+CREATE OR REPLACE FUNCTION allgres_private.queue_oauth_maintenance()
+RETURNS int
+LANGUAGE plpgsql
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  n int := 0;
+  m int := 0;
+BEGIN
+  UPDATE allgres_private.oauth_device_sessions
+  SET status='expired', error='device authorization expired', updated_at=now()
+  WHERE status='awaiting_user' AND expires_at <= now();
+
+  INSERT INTO allgres_private.oauth_calls
+    (provider_id,state,url,request_headers,request_body,allow_private,status,operation,device_session_id)
+  SELECT d.provider_id, d.session_id::text, p.oauth_token_url,
+         jsonb_build_object('accept','application/json'),
+         jsonb_build_object(
+           'grant_type','urn:ietf:params:oauth:grant-type:device_code',
+           'client_id',p.oauth_client_id
+         ),
+         p.allow_private_network,'queued','device_poll',d.session_id
+  FROM allgres_private.oauth_device_sessions d
+  JOIN allgres_private.llm_providers p USING(provider_id)
+  WHERE d.status='awaiting_user' AND d.expires_at > now()
+    AND COALESCE(d.next_poll_at,now()) <= now()
+    AND NOT EXISTS (
+      SELECT 1 FROM allgres_private.oauth_calls c
+      WHERE c.device_session_id=d.session_id AND c.operation='device_poll'
+        AND c.status IN ('queued','in_flight')
+    );
+  GET DIAGNOSTICS n = ROW_COUNT;
+
+  UPDATE allgres_private.oauth_device_sessions d
+  SET next_poll_at = now() + make_interval(secs=>d.interval_seconds), updated_at=now()
+  WHERE d.status='awaiting_user' AND d.expires_at > now()
+    AND COALESCE(d.next_poll_at,now()) <= now();
+
+  INSERT INTO allgres_private.oauth_calls
+    (provider_id,state,url,request_headers,request_body,allow_private,status,operation)
+  SELECT p.provider_id, replace(gen_random_uuid()::text,'-',''), p.oauth_token_url,
+         jsonb_build_object('accept','application/json'),
+         jsonb_build_object('grant_type','refresh_token','client_id',p.oauth_client_id),
+         p.allow_private_network,'queued','refresh'
+  FROM allgres_private.llm_providers p
+  JOIN allgres_private.llm_secrets s USING(provider_id)
+  WHERE p.kind='oauth' AND p.is_enabled
+    AND s.refresh_token IS NOT NULL
+    AND s.expires_at IS NOT NULL AND s.expires_at <= now()+interval '2 minutes'
+    AND NOT EXISTS (
+      SELECT 1 FROM allgres_private.oauth_calls c
+      WHERE c.provider_id=p.provider_id AND c.operation='refresh'
+        AND (c.status IN ('queued','in_flight')
+             OR c.created_at > now()-interval '30 seconds')
+    );
+  GET DIAGNOSTICS m = ROW_COUNT;
+  n := n + m;
+  RETURN n;
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_oauth_start(p_provider_id uuid, p_redirect text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -685,6 +894,9 @@ BEGIN
   SELECT * INTO v FROM allgres_private.llm_providers WHERE provider_id = p_provider_id;
   IF v.provider_id IS NULL OR v.kind <> 'oauth' THEN
     RAISE EXCEPTION 'provider is not oauth' USING ERRCODE = 'P0001';
+  END IF;
+  IF v.oauth_flow = 'device_code' THEN
+    RAISE EXCEPTION 'provider uses device-code oauth' USING ERRCODE = 'P0001';
   END IF;
   IF v.oauth_auth_url IS NULL OR v.oauth_client_id IS NULL THEN
     RAISE EXCEPTION 'oauth urls / client id missing' USING ERRCODE = 'P0001';
@@ -793,10 +1005,14 @@ DECLARE
   v_out jsonb := '[]'::jsonb;
   v_n int := 0;
   v_secret text;
+  v_sensitive text;
+  v_body jsonb;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
+  PERFORM allgres_private.queue_oauth_maintenance();
   FOR r IN
-    SELECT call_id, provider_id, url, request_headers, request_body, allow_private
+    SELECT call_id, provider_id, url, request_headers, request_body, allow_private,
+           operation, device_session_id
     FROM allgres_private.oauth_calls
     WHERE status = 'queued'
     ORDER BY created_at
@@ -808,11 +1024,26 @@ BEGIN
     WHERE call_id = r.call_id;
 
     v_secret := allgres_private.oauth_client_secret(r.provider_id);
+    v_body := r.request_body;
+    IF NULLIF(v_secret,'') IS NOT NULL THEN
+      v_body := v_body || jsonb_build_object('client_secret',v_secret);
+    END IF;
+    IF r.operation = 'device_poll' THEN
+      SELECT allgres_private.decrypt_secret(device_code) INTO v_sensitive
+      FROM allgres_private.oauth_device_sessions WHERE session_id=r.device_session_id;
+      v_body := v_body || jsonb_build_object('device_code',COALESCE(v_sensitive,''));
+    ELSIF r.operation = 'refresh' THEN
+      SELECT allgres_private.decrypt_secret(refresh_token) INTO v_sensitive
+      FROM allgres_private.llm_secrets WHERE provider_id=r.provider_id;
+      v_body := v_body || jsonb_build_object('refresh_token',COALESCE(v_sensitive,''));
+    END IF;
     v_out := v_out || jsonb_build_array(jsonb_build_object(
       'call_id', r.call_id,
+      'operation', r.operation,
+      'device_session_id', r.device_session_id,
       'url', r.url,
       'headers', r.request_headers,
-      'body', r.request_body || jsonb_build_object('client_secret', COALESCE(v_secret, '')),
+      'body', v_body,
       'allow_private', r.allow_private
     ));
     v_n := v_n + 1;
@@ -857,7 +1088,73 @@ BEGIN
     RETURN jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status);
   END IF;
 
+  BEGIN
+    v_parsed := p_body::jsonb;
+  EXCEPTION WHEN others THEN
+    v_parsed := NULL;
+  END;
+
+  -- The first device-flow response contains instructions, not tokens.
+  IF c.operation = 'device_authorization' AND p_status BETWEEN 200 AND 299 THEN
+    IF NULLIF(v_parsed->>'device_code','') IS NULL
+       OR NULLIF(v_parsed->>'user_code','') IS NULL
+       OR NULLIF(v_parsed->>'verification_uri','') IS NULL THEN
+      UPDATE allgres_private.oauth_device_sessions
+      SET status='error', error='invalid device authorization response', updated_at=now()
+      WHERE session_id=c.device_session_id;
+    ELSE
+      UPDATE allgres_private.oauth_device_sessions
+      SET device_code=allgres_private.encrypt_secret(v_parsed->>'device_code'),
+          user_code=v_parsed->>'user_code',
+          verification_uri=v_parsed->>'verification_uri',
+          verification_uri_complete=NULLIF(v_parsed->>'verification_uri_complete',''),
+          interval_seconds=LEAST(GREATEST(CASE WHEN v_parsed->>'interval' ~ '^[0-9]{1,9}$'
+                                              THEN (v_parsed->>'interval')::int ELSE 5 END,1),60),
+          expires_at=now()+make_interval(secs=>CASE WHEN v_parsed->>'expires_in' ~ '^[0-9]{1,9}$'
+                                                    THEN (v_parsed->>'expires_in')::int ELSE 900 END),
+          next_poll_at=now()+make_interval(secs=>LEAST(GREATEST(
+            CASE WHEN v_parsed->>'interval' ~ '^[0-9]{1,9}$'
+                 THEN (v_parsed->>'interval')::int ELSE 5 END,1),60)),
+          status='awaiting_user', error=NULL, updated_at=now()
+      WHERE session_id=c.device_session_id;
+    END IF;
+    UPDATE allgres_private.oauth_calls
+    SET status='harvested', response_status=p_status, updated_at=now()
+    WHERE call_id=p_call_id;
+    RETURN jsonb_build_object('action','device_authorization_ready','session_id',c.device_session_id);
+  END IF;
+
+  -- RFC 8628 returns authorization_pending/slow_down as ordinary HTTP 400
+  -- responses.  They are progress states, not failed logins.
+  IF c.operation = 'device_poll' AND p_status >= 400 THEN
+    IF v_parsed->>'error' IN ('authorization_pending','slow_down') THEN
+      UPDATE allgres_private.oauth_device_sessions
+      SET interval_seconds=CASE WHEN v_parsed->>'error'='slow_down'
+                                THEN LEAST(interval_seconds+5,60) ELSE interval_seconds END,
+          next_poll_at=now()+make_interval(secs=>CASE WHEN v_parsed->>'error'='slow_down'
+                                THEN LEAST(interval_seconds+5,60) ELSE interval_seconds END),
+          updated_at=now()
+      WHERE session_id=c.device_session_id AND status='awaiting_user';
+      UPDATE allgres_private.oauth_calls
+      SET status='harvested', response_status=p_status, updated_at=now()
+      WHERE call_id=p_call_id;
+      RETURN jsonb_build_object('action','pending','reason',v_parsed->>'error');
+    END IF;
+    UPDATE allgres_private.oauth_device_sessions
+    SET status=CASE WHEN v_parsed->>'error'='access_denied' THEN 'denied'
+                    WHEN v_parsed->>'error'='expired_token' THEN 'expired' ELSE 'error' END,
+        error=left(COALESCE(v_parsed->>'error_description',v_parsed->>'error',p_body,''),500),
+        updated_at=now()
+    WHERE session_id=c.device_session_id;
+  END IF;
+
   IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+    IF c.operation = 'device_authorization' THEN
+      UPDATE allgres_private.oauth_device_sessions
+      SET status='error', error=left(COALESCE(v_parsed->>'error_description',v_parsed->>'error',p_body,''),500),
+          updated_at=now()
+      WHERE session_id=c.device_session_id;
+    END IF;
     UPDATE allgres_private.oauth_calls
     SET status = 'harvested', response_status = p_status,
         error = left(COALESCE(p_body, ''), 2000), updated_at = now()
@@ -865,15 +1162,10 @@ BEGIN
     RETURN jsonb_build_object('action', 'error', 'status', p_status);
   END IF;
 
-  BEGIN
-    v_parsed := p_body::jsonb;
-  EXCEPTION WHEN others THEN
-    v_parsed := NULL;
-  END;
-
   v_access := NULLIF(v_parsed->>'access_token', '');
   v_refresh := NULLIF(v_parsed->>'refresh_token', '');
-  v_expires_in := NULLIF(v_parsed->>'expires_in', '')::int;
+  v_expires_in := CASE WHEN v_parsed->>'expires_in' ~ '^[0-9]{1,9}$'
+                       THEN (v_parsed->>'expires_in')::int END;
 
   IF v_access IS NULL THEN
     UPDATE allgres_private.oauth_calls
@@ -898,6 +1190,12 @@ BEGIN
   UPDATE allgres_private.oauth_calls
   SET status = 'harvested', response_status = p_status, updated_at = now()
   WHERE call_id = p_call_id;
+
+  IF c.operation = 'device_poll' THEN
+    UPDATE allgres_private.oauth_device_sessions
+    SET status='connected', error=NULL, updated_at=now()
+    WHERE session_id=c.device_session_id;
+  END IF;
 
   RETURN jsonb_build_object('action', 'stored', 'provider_id', c.provider_id);
 END;

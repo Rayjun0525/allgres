@@ -53,6 +53,8 @@ DECLARE
   v_deleg_a uuid;
   v_deleg_b uuid;
   v_provider uuid;
+  v_device_provider uuid;
+  v_device_session uuid;
   v_state text;
   v_call2 uuid;
   detail_bool boolean;
@@ -85,11 +87,13 @@ DECLARE
   v_user_tok text;
   v_audit_tok text;
   v_acct_agent uuid;
+  v_procedure_tool uuid;
 BEGIN
   -- Clear out any leftover fixtures from an interrupted prior run before
   -- creating new ones, so a crash mid-selftest can't leave stale rows
   -- behind indefinitely.
   PERFORM allgres_private.selftest_cleanup();
+  DELETE FROM allgres_private.procedure_tools WHERE name = 'selftest_fixed_get';
 
   -- 0. origin/db_role provenance, sql half (see section 29a below for the
   -- web half, which uses dashboard_rpc's own calls further down instead):
@@ -274,6 +278,35 @@ BEGIN
   SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
   ok := sub->>'action' = 'done' AND detail = 'completed';
   v := v || jsonb_build_array(jsonb_build_object('name', 'final_answer_completes', 'ok', ok));
+
+  -- OpenAI-compatible providers vary in the name they use for the final
+  -- text even when they follow the action protocol. These aliases must
+  -- preserve the answer, while an empty object must stay running so the
+  -- retry loop can correct it instead of recording a false success.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest final answer aliases')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"final_answer","content":"alias ok"}',
+    'parsed', jsonb_build_object('action', 'final_answer', 'content', 'alias ok')
+  ));
+  SELECT output->>'answer' INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'done' AND detail = 'alias ok';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'final_answer_content_alias_preserved', 'ok', ok));
+
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest empty final answer')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  PERFORM allgres_public.fn_next_step(v_tid);
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"final_answer"}',
+    'parsed', jsonb_build_object('action', 'final_answer')
+  ));
+  SELECT status INTO detail FROM allgres_private.tasks WHERE task_id = v_tid;
+  ok := sub->>'action' = 'continue' AND detail = 'running'
+    AND sub->>'reason' = 'final_answer_missing_answer';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'empty_final_answer_retries', 'ok', ok));
 
   -- 9. outbound guard blocks the SSRF shapes on every path, not just http_get
   ok := allgres_private.is_blocked_host('169.254.169.254')
@@ -691,6 +724,38 @@ BEGIN
   ok := (spec->'messages'->0->>'content') LIKE '%# procedures%'
     AND (spec->'messages'->0->>'content') LIKE '%selftest v1: do the thing carefully%';
   v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_shown_in_prompt_once_granted', 'ok', ok));
+
+  -- A Procedure's Tool Function is visible only with that same procedure
+  -- grant, and its saved arguments replace hostile model-provided ones when
+  -- the call is queued. This is the capability boundary that distinguishes a
+  -- reviewed procedure operation from a broad http_get/http_host grant.
+  sub := allgres_public.fn_create_procedure_tool(
+    'selftest_fixed_get', 'fixed selftest endpoint', 'http_get',
+    jsonb_build_object('url', 'https://example.com/allgres-selftest')
+  );
+  v_procedure_tool := (sub->>'tool_id')::uuid;
+  PERFORM allgres_public.fn_bind_procedure_tool(v_call, v_procedure_tool);
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  spec := allgres_public.fn_next_step(v_tid);
+  ok := (spec->'messages'->0->>'content') LIKE '%selftest_fixed_get%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_tool_shown_with_granted_procedure', 'ok', ok));
+
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response',
+    'content', '{"action":"call_tool","tool":"selftest_fixed_get"}',
+    'parsed', jsonb_build_object(
+      'action', 'call_tool', 'tool', 'selftest_fixed_get',
+      'args', jsonb_build_object('url', 'https://attacker.invalid/ignored')
+    )
+  ));
+  v_call2 := (sub->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call2;
+  ok := sub->>'action' = 'call_tool'
+    AND r->>'tool' = 'http_get'
+    AND r->>'url' = 'https://example.com/allgres-selftest';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_tool_uses_fixed_saved_url', 'ok', ok));
+  DELETE FROM allgres_private.outbound_calls WHERE call_id = v_call2;
+
   PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
 
   -- Disabled (is_active = false) never shows even with a grant -- the same
@@ -705,6 +770,7 @@ BEGIN
   PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
   DELETE FROM allgres_private.procedure_history WHERE procedure_id = v_call;
   DELETE FROM allgres_private.procedures WHERE procedure_id = v_call;
+  DELETE FROM allgres_private.procedure_tools WHERE tool_id = v_procedure_tool;
 
   -- 19. fn_set_policy only versions on a real change.  A no-op call (every
   --     param NULL/false) must not bump generation or write history --
@@ -1322,23 +1388,27 @@ BEGIN
   DELETE FROM allgres_private.llm_providers WHERE name IN
     ('selftest_no_json_mode', 'selftest_autodetect_provider', 'selftest_autodetect_unrelated');
 
-  -- 25g0. The 'general' demo agent (item 39's own follow-up): seeded
-  -- active, no llm_config picked for it yet (same reason as 'analyst'),
-  -- and no view/tool permissions -- a plain conversational partner, unlike
-  -- 'analyst', which is deliberately a data-query one. Checked here, before
-  -- fn_bulk_set_model below runs against every active agent including this
-  -- one -- that would otherwise give this its own llm_config and make the
-  -- "still unconfigured" half of this assertion fail on nothing but test
-  -- ordering.
+  -- 25g0. The 'general' demo agent stays active and has no view/tool
+  -- permissions: a plain conversational partner, unlike 'analyst'. Its
+  -- llm_config is deliberately not asserted here because fn_selftest is a
+  -- live diagnostic and an operator is expected to configure this agent.
+  -- Treating that valid live setting as a failed seed test made selftest
+  -- report a false failure immediately after "Apply to all agents".
   ok := EXISTS (
-    SELECT 1 FROM allgres_private.agents a JOIN allgres_private.policies p USING (agent_id)
-    WHERE a.name = 'general' AND a.is_active AND p.llm_config = '{}'::jsonb
+    SELECT 1 FROM allgres_private.agents a
+    WHERE a.name = 'general' AND a.is_active AND NOT a.is_system
   );
   ok := ok AND NOT EXISTS (
     SELECT 1 FROM allgres_private.permissions
     WHERE agent_id = (SELECT agent_id FROM allgres_private.agents WHERE name = 'general')
+      AND resource_type IN ('view', 'tool', 'http_host')
   );
-  v := v || jsonb_build_array(jsonb_build_object('name', 'general_agent_seeded_plain_and_unconfigured', 'ok', ok));
+  ok := ok AND EXISTS (
+    SELECT 1 FROM allgres_private.permissions
+    WHERE agent_id = (SELECT agent_id FROM allgres_private.agents WHERE name = 'general')
+      AND resource_type = 'procedure' AND resource_ref = 'seoul-weather'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'general_agent_seeded_with_seoul_weather_procedure', 'ok', ok));
 
   -- 25g. fn_bulk_set_model: one call sets llm_config.provider/model on
   -- every active agent, reusing fn_set_policy's own merge (nothing else on
@@ -1725,6 +1795,91 @@ BEGIN
 
   DELETE FROM allgres_private.oauth_calls WHERE provider_id = v_provider;
   DELETE FROM allgres_private.oauth_states WHERE provider_id = v_provider;
+
+  -- 26f. RFC 8628 device authorization: requesting a code queues the public
+  --      client request without persisting a device credential; completion
+  --      encrypts that credential and exposes only the operator-facing code.
+  INSERT INTO allgres_private.llm_providers
+    (name,kind,base_url,is_enabled,allow_private_network,oauth_flow,
+     oauth_device_url,oauth_token_url,oauth_client_id,oauth_scope)
+  VALUES ('selftest_device_oauth','oauth','https://selftest.invalid/v1',true,false,'device_code',
+          'https://selftest.invalid/device','https://selftest.invalid/token','public-client','openid offline_access')
+  ON CONFLICT(name) DO UPDATE SET oauth_flow='device_code',oauth_device_url=EXCLUDED.oauth_device_url,
+    oauth_token_url=EXCLUDED.oauth_token_url,oauth_client_id=EXCLUDED.oauth_client_id,
+    oauth_scope=EXCLUDED.oauth_scope
+  RETURNING provider_id INTO v_device_provider;
+  DELETE FROM allgres_private.oauth_calls WHERE provider_id=v_device_provider;
+  DELETE FROM allgres_private.oauth_device_sessions WHERE provider_id=v_device_provider;
+  sub := allgres_public.fn_oauth_device_start(v_device_provider);
+  v_device_session := (sub->>'session_id')::uuid;
+  v_call := (sub->>'call_id')::uuid;
+  SELECT NOT(request_body ? 'device_code') INTO ok
+  FROM allgres_private.oauth_calls WHERE call_id=v_call;
+  claim := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO r FROM jsonb_array_elements(claim->'calls') t(elem)
+  WHERE elem->>'call_id'=v_call::text;
+  ok := ok AND r->>'operation'='device_authorization'
+    AND r->'body'->>'client_id'='public-client'
+    AND NOT(r->'body' ? 'device_code');
+  comp := allgres_public.fn_complete_oauth(v_call,200,
+    '{"device_code":"secret-device-code","user_code":"ABCD-EFGH","verification_uri":"https://login.invalid/device","verification_uri_complete":"https://login.invalid/device?code=ABCD-EFGH","expires_in":900,"interval":5}');
+  ok := ok AND comp->>'action'='device_authorization_ready'
+    AND (allgres_public.fn_oauth_device_status(v_device_session)->>'status')='awaiting_user'
+    AND (allgres_public.fn_oauth_device_status(v_device_session)->>'user_code')='ABCD-EFGH';
+  -- Encryption is optional until an operator configures a secret key. In
+  -- either supported storage mode the value must round-trip, while an
+  -- encrypted deployment must never leave the raw device code at rest.
+  SELECT ok
+    AND allgres_private.decrypt_secret(device_code)='secret-device-code'
+    AND (
+      (allgres_private.secret_storage_mode()='encrypted' AND device_code <> 'secret-device-code')
+      OR (allgres_private.secret_storage_mode()='plaintext_no_key' AND device_code = 'secret-device-code')
+    ) INTO ok
+  FROM allgres_private.oauth_device_sessions WHERE session_id=v_device_session;
+  v := v || jsonb_build_array(jsonb_build_object('name','oauth_device_code_matches_configured_storage_mode','ok',ok));
+
+  -- 26g. Polling is durable and authorization_pending is progress, not an
+  --      error.  The sensitive device code appears only in the worker claim.
+  UPDATE allgres_private.oauth_device_sessions SET next_poll_at=now() WHERE session_id=v_device_session;
+  claim := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO r FROM jsonb_array_elements(claim->'calls') t(elem)
+  WHERE elem->>'operation'='device_poll' AND elem->>'device_session_id'=v_device_session::text;
+  v_call := (r->>'call_id')::uuid;
+  ok := r->'body'->>'device_code'='secret-device-code'
+    AND NOT EXISTS(SELECT 1 FROM allgres_private.oauth_calls WHERE call_id=v_call AND request_body ? 'device_code');
+  comp := allgres_public.fn_complete_oauth(v_call,400,'{"error":"authorization_pending"}');
+  ok := ok AND comp->>'action'='pending'
+    AND (allgres_public.fn_oauth_device_status(v_device_session)->>'status')='awaiting_user';
+  v := v || jsonb_build_array(jsonb_build_object('name','oauth_device_poll_treats_pending_as_progress','ok',ok));
+
+  -- 26h. Approval stores the OAuth bearer, provider_secret selects it for
+  --      inference, and an expiring token queues a refresh with claim-time
+  --      refresh-token injection and rotation.
+  UPDATE allgres_private.oauth_device_sessions SET next_poll_at=now() WHERE session_id=v_device_session;
+  claim := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO r FROM jsonb_array_elements(claim->'calls') t(elem)
+  WHERE elem->>'operation'='device_poll' AND elem->>'device_session_id'=v_device_session::text;
+  v_call := (r->>'call_id')::uuid;
+  PERFORM allgres_public.fn_complete_oauth(v_call,200,
+    '{"access_token":"device-access","refresh_token":"device-refresh","expires_in":3600}');
+  ok := allgres_private.provider_secret(v_device_provider)='device-access'
+    AND (allgres_public.fn_oauth_device_status(v_device_session)->>'status')='connected';
+  UPDATE allgres_private.llm_secrets SET expires_at=now()+interval '10 seconds'
+  WHERE provider_id=v_device_provider;
+  claim := allgres_public.fn_claim_oauth(10);
+  SELECT elem INTO r FROM jsonb_array_elements(claim->'calls') t(elem)
+  WHERE elem->>'operation'='refresh' AND elem->'body'->>'refresh_token'='device-refresh';
+  v_call := (r->>'call_id')::uuid;
+  ok := ok AND v_call IS NOT NULL
+    AND NOT EXISTS(SELECT 1 FROM allgres_private.oauth_calls WHERE call_id=v_call AND request_body ? 'refresh_token');
+  PERFORM allgres_public.fn_complete_oauth(v_call,200,
+    '{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}');
+  ok := ok AND allgres_private.provider_secret(v_device_provider)='rotated-access';
+  v := v || jsonb_build_array(jsonb_build_object('name','oauth_device_tokens_refresh_and_feed_inference','ok',ok));
+
+  DELETE FROM allgres_private.oauth_calls WHERE provider_id=v_device_provider;
+  DELETE FROM allgres_private.oauth_device_sessions WHERE provider_id=v_device_provider;
+  DELETE FROM allgres_private.llm_secrets WHERE provider_id=v_device_provider;
 
   -- 27. Long-term agent memory (item 25). Starts from a clean slate for the
   --     analyst agent so the recall test below can assert on content, not
@@ -3157,8 +3312,18 @@ BEGIN
     r := allgres.dashboard_rpc(jsonb_build_object('action', 'overview'));
     ok := (r->>'pg_version') IS NOT NULL
       AND (r->'db_sessions'->>'total')::int >= 1
-      AND (r->'host'->'cpu_count') IS NOT NULL;
+      AND (r->'host'->'cpu_count') IS NOT NULL
+      AND (r->>'agents')::int = (SELECT count(*) FROM allgres_private.agents WHERE name NOT LIKE 'selftest%')
+      AND (r->>'active_agents')::int = (SELECT count(*) FROM allgres_private.agents WHERE is_active AND name NOT LIKE 'selftest%');
     v := v || jsonb_build_array(jsonb_build_object('name', 'overview_reports_pg_version_db_sessions_and_host_stats', 'ok', ok));
+
+    r := allgres.dashboard_rpc(jsonb_build_object('action', 'settings.get'));
+    ok := NOT EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(COALESCE(r->'providers', '[]'::jsonb)) p
+      WHERE p->>'name' LIKE 'selftest%'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'settings_hides_selftest_providers', 'ok', ok));
 
     -- fn_logout is idempotent, and a logged-out token no longer resolves.
     PERFORM allgres_public.fn_logout(v_user_tok);

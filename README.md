@@ -56,12 +56,12 @@ limitations](#known-limitations) for what is genuinely still open.
   and a logical (`pg_dump`) backup/restore round-trip real data, including
   per-agent role identity. See [Upgrades](#upgrades) and [Backup and
   restore](#backup-and-restore).
-- **OAuth token exchange** — an operator connects a `kind='oauth'` provider
-  from Settings; the authorization-code exchange is queued and performed by
-  the runtime worker itself, the same claim-time-credential-injection shape
-  that already keeps an LLM provider's api_key out of any table (see
-  [Secrets at rest](#secrets-at-rest)) — never returned to the dashboard or
-  written anywhere in plaintext.
+- **OAuth login and token refresh** — an operator can connect a conventional
+  authorization-code provider or use the seeded `xai_oauth` provider's RFC
+  8628 device-code login (the same browser-account flow used by Hermes/Grok
+  CLI). Device approval is polled by the runtime worker, access and rotating
+  refresh tokens are encrypted at rest, credentials are injected only at
+  claim time, and expiring tokens refresh automatically.
 - **Long-term agent memory** — an agent can `remember` something worth
   recalling in a future session (a fact, a preference, an instruction);
   `fn_next_step` reads a bounded set of that agent's own memories, ranked by
@@ -406,6 +406,31 @@ Letting an agent *propose* a new or improved procedure (through the same
 admin_approval/self_approve/auto autonomy-level flow `propose_change`
 already gives an agent for its own policy) is real future work, not done
 here.
+
+### Procedure tool functions
+
+A procedure may also bind one or more named **tool functions**. A tool
+function is the callable half of a procedure: its name and description are
+shown with the procedure in the agent's `tools` bounds, while its handler and
+arguments stay operator-curated in `allgres_private.procedure_tools`.
+
+The first handler is deliberately narrow: `http_get` with one fixed HTTPS
+URL. An agent calls the function name (for example, `seoul_weather`) with an
+empty argument object. `fn_submit_result` replaces any returned arguments
+with the saved template before queuing the request, then still runs the usual
+outbound URL validation. A procedure grant therefore authorizes precisely
+the reviewed operation without also granting arbitrary `http_get` access or
+an open-ended host permission.
+
+Create and bind functions from **Settings → Procedure tool functions**. The
+seeded `seoul-weather` procedure demonstrates the pattern: it binds
+`seoul_weather` to `https://wttr.in/Seoul?format=j1` and grants the procedure
+to the General agent. To make a new function usable, bind it to a procedure,
+then grant that procedure to the intended agent in the usual permission UI.
+This keeps the naming model clear: **Procedure** is the reusable capability;
+a **tool function** is one fixed operation inside it. More handlers,
+parameter schemas, versioning, and agent-authored proposals remain future
+work.
 
 ## Maintenance agents
 
@@ -1051,18 +1076,22 @@ then in the worker's memory for the HTTP request it is used for — never in
 WAL, a physical backup, a PITR archive, a replica, or a plain `SELECT` on
 `outbound_calls`.
 
-OAuth's token exchange follows the identical shape, in its own queue table
-(`allgres_private.oauth_calls`) rather than `outbound_calls`, since it has no
-`task_id` to attach to — connecting a provider is an operator dashboard
-action, not an agent turn. `fn_oauth_token_request` (reachable as
-`providers.oauth_callback`) builds the token request and queues it without
-ever touching the provider's decrypted `oauth_client_secret`; only
-`fn_claim_oauth`, called by the runtime worker, resolves it and merges it
-into the response handed back over the RPC socket. The resulting
-`access_token`/`refresh_token` are encrypted straight into `llm_secrets` by
-`fn_complete_oauth`, which runs entirely inside the worker — the dashboard
-never sees the callback's authorization `code`, the client secret, or the
-issued tokens; it only ever polls `has_secret`.
+OAuth uses the same claim-time injection shape in its own queue table
+(`allgres_private.oauth_calls`). Authorization-code providers queue the code
+exchange through `providers.oauth_callback`. The seeded `xai_oauth` provider
+uses RFC 8628 device authorization: `providers.oauth_device_start` requests a
+user code, the dashboard displays xAI's verification link, and
+`providers.oauth_device_status` reports the worker's approval polling state.
+The worker also queues a refresh grant before an access token expires.
+
+The queue stores neither device codes nor refresh tokens in plaintext.
+`fn_claim_oauth` decrypts the short-lived credential only when the worker
+claims its HTTP request. `fn_complete_oauth` encrypts issued access and refresh
+tokens directly into `llm_secrets`; the dashboard sees only the user code,
+verification URL, and coarse connection state. Once connected, the access
+token is injected into xAI inference requests through the same path as a
+provider API key. An xAI account may still return `403` for inference if its
+subscription does not include API/Grok CLI access.
 
 ### Privileges
 

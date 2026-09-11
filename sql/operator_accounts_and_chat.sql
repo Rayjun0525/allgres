@@ -225,6 +225,18 @@ BEGIN
   -- terminates anything left non-terminal by an interrupted run, and the
   -- operator-facing views/listings filter out goal LIKE 'selftest%' (see
   -- their own comments) so they never actually show up in the dashboard.
+  -- Some Messenger tests intentionally use a natural-language user message
+  -- as the session goal, so the goal does not begin with `selftest` even
+  -- though the target is one of the disposable selftest agents. Normalize
+  -- those sessions before the status cleanup so failed test deliveries do
+  -- not leak into operator metrics or recent-task lists.
+  UPDATE allgres_private.sessions s
+  SET goal = 'selftest ' || s.goal
+  FROM allgres_private.agents a
+  WHERE a.agent_id = s.agent_id
+    AND a.name LIKE 'selftest%'
+    AND s.goal NOT LIKE 'selftest%';
+
   UPDATE allgres_private.tasks t
   SET status = 'failed', error = 'selftest', updated_at = now()
   FROM allgres_private.sessions s
