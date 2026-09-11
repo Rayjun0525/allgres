@@ -7728,14 +7728,30 @@ BEGIN
 END;
 $fn$;
 
--- What approvals.list/proposals.list/fixes.list and their .decide
--- counterparts scope by (item 41, "opening the approval inbox to regular
--- users too"): NULL means unrestricted -- either nobody is logged in (the
--- original shared-bearer-token caller, unaffected by any of this) or the
--- caller is an admin, who could always see everything here before item 28
--- added accounts at all. A non-NULL, possibly empty, array is a regular
--- user's own assigned agents -- exactly user_agent_assignments, the same
--- explicit allow-list require_agent_access already enforces for chat.
+-- What approvals.list/proposals.list/fixes.list/memories.list/
+-- history.search and their .decide counterparts scope by (item 41,
+-- "opening the approval inbox to regular users too"): NULL means
+-- unrestricted -- a real admin, who could always see everything here
+-- before item 28 added accounts at all. A non-NULL, possibly empty, array
+-- is a regular user's own assigned agents -- exactly
+-- user_agent_assignments, the same explicit allow-list require_agent_access
+-- already enforces for chat.
+--
+-- Before this fix, "nobody is logged in" (no session_token, an unknown one,
+-- or an expired one) returned NULL too -- the same value a real admin gets
+-- -- reasoned at the time as "the original shared-bearer-token caller,
+-- unaffected by any of this". That reasoning only ever held before any
+-- account existed; once real accounts exist, the shared HTTP bearer token
+-- every browser tab already carries is not a login, and treating its
+-- absence of a session_token as admin access let any such caller list
+-- every agent's proposals/fixes/approvals/memories and *decide* (approve,
+-- reject -- including applying a policy_change proposal's system_prompt)
+-- any of them, with no login at all -- confirmed live: a bare
+-- proposals.decide with no session_token silently overwrote a real agent's
+-- system_prompt. The same graceful-bootstrap exception
+-- require_admin_if_accounts_exist already makes -- open only while
+-- allgres_private.users is empty -- applies here now instead of
+-- unconditionally.
 CREATE OR REPLACE FUNCTION allgres_private.visible_agent_ids(p_token text)
 RETURNS uuid[]
 LANGUAGE plpgsql
@@ -7745,7 +7761,13 @@ DECLARE
   v_ids uuid[];
 BEGIN
   u := allgres_private.session_user(p_token);
-  IF u.user_id IS NULL OR u.role = 'admin' THEN
+  IF u.user_id IS NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
+      RETURN NULL;
+    END IF;
+    RETURN ARRAY[]::uuid[];
+  END IF;
+  IF u.role = 'admin' THEN
     RETURN NULL;
   END IF;
   SELECT COALESCE(array_agg(agent_id), ARRAY[]::uuid[]) INTO v_ids
@@ -11120,6 +11142,58 @@ BEGIN
     ON CONFLICT DO NOTHING;
     ok := v_sys_target = ANY(allgres_private.visible_agent_ids(v_user_tok));
     v := v || jsonb_build_array(jsonb_build_object('name', 'visible_agent_ids_includes_assigned_target', 'ok', ok));
+
+    -- visible_agent_ids used to return NULL (unrestricted -- the same
+    -- value a real admin gets) for "nobody is logged in" too, unconditional
+    -- on whether any account existed yet. Once real accounts exist (as
+    -- here), an absent/unknown/expired session_token must come back
+    -- maximally restricted (an empty array, not NULL) -- confirmed live
+    -- separately: a bare proposals.decide with no session_token silently
+    -- applied a policy_change proposal's system_prompt before this fix.
+    ok := allgres_private.visible_agent_ids(NULL) = ARRAY[]::uuid[];
+    ok := ok AND allgres_private.visible_agent_ids('') = ARRAY[]::uuid[];
+    ok := ok AND allgres_private.visible_agent_ids('selftest-not-a-real-token') = ARRAY[]::uuid[];
+    v := v || jsonb_build_array(jsonb_build_object('name', 'visible_agent_ids_empty_once_accounts_exist_for_no_session_token', 'ok', ok));
+
+    -- fixes.decide, through the same visible_agent_ids scoping: with no
+    -- session_token at all, must not be able to decide v_fix_id (still
+    -- pending here), even though v_sys_target now has a real assignment.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'fixes.decide', 'fix_id', v_fix_id::text, 'approve', true, 'reply', 'should not apply'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND (SELECT status FROM allgres_private.fix_proposals WHERE fix_id = v_fix_id) = 'pending';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fixes_decide_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+
+    -- proposals.decide, the mutating case that actually changes live
+    -- policy (fn_set_policy) once approved -- reproduces the exact live
+    -- exploit found while fixing visible_agent_ids: a pending policy_change
+    -- proposal must not be approvable with no session_token.
+    INSERT INTO allgres_private.change_proposals (agent_id, kind, target_agent_id, proposed_changes, reason, status, base_generation)
+    VALUES (
+      v_fixer_id, 'policy_change', v_sys_target,
+      jsonb_build_object('system_prompt', 'selftest should not apply this'), 'selftest guard proposal', 'pending',
+      (SELECT generation FROM allgres_private.policies WHERE agent_id = v_sys_target)
+    )
+    RETURNING proposal_id INTO v_proposal;
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'proposals.decide', 'proposal_id', v_proposal::text, 'approve', true, 'reply', 'should not apply'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND (SELECT status FROM allgres_private.change_proposals WHERE proposal_id = v_proposal) = 'pending'
+      AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_sys_target) IS DISTINCT FROM 'selftest should not apply this';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'proposals_decide_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+    DELETE FROM allgres_private.change_proposals WHERE proposal_id = v_proposal;
+
+    -- memories.list, the read-side case: with no session_token, must come
+    -- back scoped to nothing rather than every agent's memories.
+    sub := allgres_public.fn_remember(v_sys_target, 'selftest guard memory for visible_agent_ids', NULL, NULL, NULL, NULL);
+    v_memory_id := (sub->>'memory_id')::uuid;
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'memories.list'));
+    ok := COALESCE((sub->>'ok')::boolean, false)
+      AND NOT (sub->'memories')::text LIKE '%selftest guard memory for visible_agent_ids%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_list_empty_no_session_token_once_accounts_exist', 'ok', ok));
+    DELETE FROM allgres_private.agent_memories WHERE memory_id = v_memory_id;
 
     UPDATE allgres_private.fix_proposals SET status = 'rejected' WHERE fix_id = v_fix_id;
     PERFORM allgres_public.fn_set_agent_active(v_sys_target, true);
