@@ -193,7 +193,7 @@ fn truncation_keeps_utf8_boundaries() {
 
 #[test]
 fn dashboard_html_carries_the_csp_nonce_placeholder() {
-    assert_eq!(DASHBOARD_HTML.matches("__CSP_NONCE__").count(), 2);
+    assert_eq!(DASHBOARD_HTML.matches("__CSP_NONCE__").count(), 3);
 }
 
 // --- node-dump reader -------------------------------------------------
