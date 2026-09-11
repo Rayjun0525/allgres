@@ -70,20 +70,17 @@ set from inside a `SECURITY DEFINER` function and so is still nominal in the
 same nested-statement sense as before; the planner cost ceiling is what
 actually bounds that half.
 
-## 3. Docker image path is unverified in this environment (but now in CI)
+## 3. ~~Docker image path is unverified in this environment~~ — fixed, now green in CI
 
-The build was verified natively against PostgreSQL 18. The `Dockerfile` targets
-`postgres:17-bookworm` and builds `--features pg17`, and `scripts/smoke.sh`
-requires Docker; neither has been run *in this environment* (no Docker daemon
-reachable here). `.github/workflows/ci.yml`'s `docker-smoke` job now runs
-`scripts/smoke.sh` on every push, and `native-matrix` builds and runs
-`fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql` against real PG16/17/18
-native installs the same way this file's other native verification has always
-been done — see item 18. Until that workflow has actually run once on GitHub's
-infrastructure, "added to CI" is not the same claim as "verified there."
-
-`nodeToString` field names and `RawParseMode` are stable across 17 and 18, so
-this is expected to work, but "expected" is not "tested".
+Written when the build had only been verified natively (no Docker daemon
+reachable in that environment) and `docker-smoke`/`native-matrix` had just
+been added to `.github/workflows/ci.yml` but had not yet actually run on
+GitHub's infrastructure — "added to CI" is not the same claim as "verified
+there." It has since run, repeatedly: `docker-smoke` (`docker compose build
++ smoke`, plus the full install flow — first admin, one real agent task to
+completion) and `native-matrix` (`fn_selftest`/`tests/smoke.sql`/
+`tests/e2e_mock.sql` against real PG16/17/18 native installs) are both green
+on every push to `main`, this one included.
 
 ## 4. ~~Extension upgrade has only been installed fresh~~ — fixed
 
@@ -2895,3 +2892,105 @@ unchanged -- neither exercises any of the newly gated actions through
 `dashboard_rpc` (the mock providers `e2e_mock.sql` needs are seeded via
 direct `INSERT`, not `provider.create`), confirming this fix didn't need
 to touch either script.
+
+## 38. ~~`sql/control_plane.sql` has grown large enough to trip a real rustc compile-time safety lint~~ -- fixed by actually splitting the file
+
+Adding semantic memory recall's schema/functions pushed `sql/
+control_plane.sql` past a genuine limit: `pgrx`'s `extension_sql_file!`
+macro embeds the whole file as a compile-time byte constant, copied one
+byte per const-eval step, and the build started failing outright with
+`error: constant evaluation is taking a long time` /
+`#[deny(long_running_const_eval)]` -- rustc's own safety net against a
+truly infinite const-eval loop, not a sign anything is logically wrong,
+but a real signal the file's size was no longer just a maintainability
+nice-to-have (an earlier outside review had already flagged the then-
+~12,900-line file as worth eventually splitting by source unit while
+keeping single-extension deployment, "not urgent"). First worked around
+with `#![allow(long_running_const_eval)]` -- muting the lint, not fixing
+the growth, and said so explicitly at the time.
+
+Fixed for real the same day, in two passes: the file's own existing
+structure already had 14 clearly numbered sections with a documented
+dependency order, so no redesign was needed, only extraction along seams
+that already existed.
+
+**Phase 1** split into three files, always loaded together in this exact
+order:
+
+- `sql/control_plane.sql` -- sections 1-10 (roles through seed data), ~8.8k
+  lines, down from ~13.7k.
+- `sql/selftest.sql` -- section 11 (`fn_selftest`), ~3.4k lines on its own
+  (it had been about a quarter of the original file).
+- `sql/grants_and_facade.sql` -- sections 12-14 (grants, the allgres facade
+  + `dashboard_rpc`, and the final ownership pass), ~1.6k lines.
+
+The real wrinkle, worth recording for the next split: `pgrx` allows only
+*one* `finalize`-marked `extension_sql_file!` in the whole crate (a second
+one is a hard build error, caught immediately) -- section 14's ownership
+pass is the one genuine "must run after literally everything" piece, so
+only `grants_and_facade.sql` carries `finalize`; the other files are
+"normal" position, ordered relative to each other with `requires = [...]`
+(pgrx's `name = "..."` / `requires = ["that name"]` pair), which pgrx
+enforces regardless of declaration order in `src/lib.rs`. `fn_selftest`
+itself needed no special handling to move: it is `LANGUAGE plpgsql`, so
+nothing inside its body is checked against the catalog until it is
+actually called, long after every file has finished loading -- the same
+forward-reference tolerance this codebase already relied on throughout one
+file. The one real cross-file dependency was `REVOKE ALL ON FUNCTION
+allgres_public.fn_selftest() FROM PUBLIC` living in the old section 12,
+which needs the function to already exist (a `REVOKE` is not deferred the
+way a plpgsql body reference is) -- moved into `selftest.sql` itself,
+right after the function it revokes, so that file is fully self-contained
+and the cross-file ordering concern disappears entirely rather than being
+merely managed.
+
+**Phase 2**, the same day: `sql/control_plane.sql` (still ~8.8k lines
+after phase 1) was still large enough to be the file most likely to trip
+the same lint again as it keeps growing, so section 9 (the operator API,
+~2.9k lines -- by far the largest remaining section) and section 10 (seed
+data) were split out too, along the same numbered-section seams:
+
+- `sql/operator_agents_and_policies.sql` -- section 9a: agents, projects,
+  policies, procedures, permissions, fixes.
+- `sql/operator_runtime_and_integrations.sql` -- section 9b: sessions,
+  schedules, providers, connections, OAuth, embeddings.
+- `sql/operator_accounts_and_chat.sql` -- section 9c: approvals, allowlist,
+  memories, accounts/auth, chat/messenger.
+- `sql/seed_data.sql` -- section 10 (seed data) and 10b (extension
+  configuration tables / `pg_extension_config_dump`).
+
+`sql/control_plane.sql` itself is now sections 1-8 only, ~5.4k lines.
+Seven files total now, chained with `requires` in their original numbered
+order (`control_plane` → `operator_agents_and_policies` →
+`operator_runtime_and_integrations` → `operator_accounts_and_chat` →
+`seed_data` → `selftest` → `grants_and_facade`, `finalize` still only on
+the last). All of section 9's split-out functions are `LANGUAGE plpgsql`
+same as `fn_selftest`, so the same forward-reference tolerance applies;
+section 10 turned out to have no real CREATE-time dependency on section 9
+at all (it never calls an operator-API function, only raw `INSERT`/`DO`
+blocks against tables sections 1-8 already created) despite being loaded
+after it to preserve original file position.
+
+`scripts/gen-upgrade.sh` (which used to `cat` `control_plane.sql` alone,
+then all three phase-1 files) was updated again to concatenate all seven
+files, in the same order, so `ALTER EXTENSION ... UPDATE` keeps installing
+every operator-API function, seed data, `fn_selftest`, every grant, and
+the dashboard facade -- not just sections 1-8.
+
+**Verified live**: fresh `CREATE EXTENSION` after each split, with the
+generated combined SQL inspected directly to confirm sections still land
+in the original order (1 → schema creation → 9a → 9b → 9c → 10 → 11 → 12 →
+14); representative functions from every new file (`fn_create_agent` from
+9a, `fn_create_session` from 9b, `fn_create_user` from 9c, `fn_selftest`
+from `selftest.sql`) confirmed owned by `allgres_owner` (not left at their
+installing-superuser default), and `fn_selftest` confirmed to still have
+`PUBLIC`'s `EXECUTE` privilege revoked -- the concrete things that would
+have silently broken had the `requires` chain been wrong anywhere along
+the seven-file chain, per the "Final ownership pass" comment's own account
+of exactly this failure mode happening once before, pre-split. After each
+phase: `fn_selftest` run three times consecutively (252/252 each time,
+matching the pre-split count exactly) plus once more with a real admin
+account present, `tests/smoke.sql`, `tests/e2e_mock.sql`, and `cargo test`
+(30/30) all green. The build now succeeds with
+`#![allow(long_running_const_eval)]` removed entirely -- confirming this
+was the real fix, not a second mute alongside a smaller number.

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Regenerate sql/rpc_catalog.json from allgres.dashboard_rpc's own CASE
-statement in sql/control_plane.sql.
+statement in sql/grants_and_facade.sql (sections 12-14: grants, the
+allgres facade + dashboard RPC, and the final ownership pass -- dashboard_
+rpc itself is section 13, split out of the original single control_plane.sql
+per KNOWN_ISSUES.md item 38).
 
 This is the frozen public contract for the dashboard/API surface: every
 action dashboard_rpc accepts, which guard function (if any) its own branch
@@ -8,7 +11,7 @@ calls directly, and which p_request keys it reads. It is generated, not
 hand-maintained, so it can never silently drift from the real dispatch --
 run this after adding, removing, or renaming an action, then update the
 matching frozen action-name array in fn_selftest's
-'dashboard_rpc_actions_match_frozen_catalog' case (sql/control_plane.sql)
+'dashboard_rpc_actions_match_frozen_catalog' case (sql/selftest.sql)
 to match. That selftest case is what actually enforces the freeze: it
 fails loudly if the two ever disagree.
 
@@ -27,7 +30,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SQL_FILE = ROOT / "sql" / "control_plane.sql"
+SQL_FILE = ROOT / "sql" / "grants_and_facade.sql"
 OUT_FILE = ROOT / "sql" / "rpc_catalog.json"
 
 GUARD_NAMES = [
@@ -54,7 +57,7 @@ def extract_dashboard_rpc_body(lines):
             start = i
             break
     if start is None:
-        sys.exit("could not find allgres.dashboard_rpc in control_plane.sql")
+        sys.exit(f"could not find allgres.dashboard_rpc in {SQL_FILE.name}")
     end = None
     for i in range(start, len(lines)):
         if lines[i].strip() == "$fn$;" and i > start + 10:

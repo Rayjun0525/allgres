@@ -19,7 +19,7 @@ It lists every action with the guard function(s) its own `dashboard_rpc`
 branch calls directly, and the `p_request` keys that branch reads.
 `fn_selftest`'s `dashboard_rpc_actions_match_frozen_catalog` case carries
 its own frozen copy of the action-name list and fails loudly if it and the
-live `CASE` in `sql/control_plane.sql` ever disagree — that selftest case,
+live `CASE` in `sql/grants_and_facade.sql` ever disagree — that selftest case,
 not this file, is what actually enforces the freeze. **Whenever
 `dashboard_rpc`'s `CASE` changes: regenerate the JSON, update that
 selftest case's array to match, and run `fn_selftest()` before
@@ -63,8 +63,8 @@ scope the branch then checks.
   any account exists, an absent/unknown/expired `session_token` returns
   an *empty* array (sees/can decide nothing). Getting this bootstrap
   exception right is the entire point of this function; see its own
-  comment in `sql/control_plane.sql` for the live exploit this was fixed
-  against.
+  comment in `sql/operator_accounts_and_chat.sql` for the live exploit this
+  was fixed against.
 - **`session_user`** (3 actions: `auth.me`, `agents.mine`,
   `messenger.list`) — resolves the token directly rather than through one
   of the helpers above; each of these three checks `user_id IS NULL`

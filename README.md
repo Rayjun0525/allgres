@@ -49,8 +49,11 @@ backups -- not required to get a working instance running.
 
 ## Status
 
-Implemented and verified (natively on PostgreSQL 16.15; see [Known
-limitations](#known-limitations) for what the PG17/Docker path still needs):
+Implemented and verified: natively against PostgreSQL 16, 17, and 18
+(`native-matrix` in CI, every push), and via the shipped Docker image
+(`docker-smoke` in CI: a real `docker compose build`, the full install flow
+end to end, and `scripts/smoke.sh`). See [Known
+limitations](#known-limitations) for what is genuinely still open.
 
 - **Agent control plane** — policy, permissions, delegation (bounded by a
   per-agent depth cap, an ancestor-cycle check, and a per-session total-task
@@ -107,32 +110,44 @@ limitations](#known-limitations) for what the PG17/Docker path still needs):
   every agent's permission grants) and asked to report what it finds; a
   seeded example, `health_monitor`, ships read-only with both. See
   [Maintenance agents](#maintenance-agents).
-- **Operator audit log** — a self-reported operator name, sent with every
-  dashboard request, recorded append-only against every consequential
-  action (a permission grant, a decided approval or proposal, a policy
-  rollback, a cancelled session, and more). Answers "who claimed
-  responsibility for this," not "who was authorized" — see [Operator audit
-  log](#operator-audit-log) for exactly what that distinction means and
-  doesn't.
+- **Operator audit log** — every consequential mutating SQL function writes
+  its own append-only row (`agents.create`, a permission grant, a decided
+  approval or proposal, a policy rollback, a cancelled session, and more),
+  whether it was reached through the dashboard or called directly via SQL,
+  recording `origin` (`web`/`sql`), the real authenticated `db_role`, and —
+  only for a dashboard call — a self-reported `operator_name`. Answers "who
+  claimed responsibility for this," not "who was authorized" — see
+  [Operator audit log](#operator-audit-log) for exactly what that
+  distinction means and doesn't.
+- **Real accounts** — username/password login (`fn_login`/`fn_create_user`,
+  bcrypt via `pgcrypto`), `admin`/`user` roles, and per-user agent
+  assignment, layered on top of (not instead of) the dashboard's own shared
+  bearer token: creating even one account starts requiring a real admin
+  *session* for every action on the platform-configuration surface, on top
+  of the token. See [Exposure](#exposure) for exactly how the two layers
+  interact.
+- **Semantic memory recall** — the same embedding infrastructure
+  [semantic delegate search](#semantic-delegate-search) uses, applied to an
+  agent's own `agent_memories` instead of cross-agent discovery: a new
+  `recall` agent action ranks an agent's own memories by relevance to a
+  query, alongside (not instead of) the automatic importance/recency
+  injection every turn already gets. See [Semantic memory
+  recall](#semantic-memory-recall).
 
 Not yet built:
 
 - Helm charts, Kubernetes manifests, and CNPG dynamic loading — only a
   native install and `docker-compose` exist today.
-- Real per-operator identity/accounts — the dashboard still has one shared
-  token, not user accounts; the audit log records a self-reported name
-  alongside consequential actions, but that name is not authenticated, so
-  "who was actually authorized to do this" stays unanswerable by design,
-  only "who claimed it" is now on record.
-- Secret key rotation.
-- Semantic memory search (an embedding column and vector similarity) —
-  recall is importance/recency ranking only in this slice.
+- Secret key rotation, and a token *refresh* flow (an expired OAuth access
+  token has to be reconnected from Settings; nothing calls `refresh_token`
+  automatically yet).
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
 ## Runtime requirements
 
-- PostgreSQL 17+
+- PostgreSQL 16, 17, or 18 — all three are natively CI-verified on every
+  push (`native-matrix`); the Docker image ships PostgreSQL 17
 - `allgres` extension
 - `shared_preload_libraries = 'allgres'`
 - `pgcrypto` (optional, for encrypted provider secrets)
@@ -147,7 +162,15 @@ required at runtime.
 
 This is what [Quick start](#quick-start)'s `./scripts/bootstrap.sh` actually
 does, for anyone who wants to run the steps by hand or understand what just
-happened:
+happened. It builds the image locally from this repo's own `Dockerfile`
+(there is no published image to pull — `docker-compose.yml`'s `build: .`
+is the whole story), starts it on its own named data volume, and the
+defaults below (`docker-compose.yml`) are chosen so this works with zero
+configuration for a first run and local evaluation — `ALLGRES_ENABLE_MOCK`
+on, `ALLGRES_ALLOW_INSECURE_HTTP` set, no `ALLGRES_SECRET_KEY` — **none of
+that is a production posture**; see [Exposure](#exposure) and [Secrets at
+rest](#secrets-at-rest) for what to change before this ever serves real
+traffic or real provider keys.
 
 ```bash
 docker compose up -d --build       # allgres_pgdata is a named volume (docker-compose.yml),
@@ -170,20 +193,32 @@ leave them unset and the script proves the same flow with its own
 throwaway admin instead — either way, the same one-liner this project's
 own development has relied on all along (`psql -c "SELECT
 fn_create_user(...)"`) is still exactly what happens under the hood, just
-scripted instead of typed by hand. The final step — logging in, listing agents, running one
-(`AGENT_NAME`, default `analyst`) to a real goal, and polling until it
-reaches `completed` — is also the only real way to verify a *non-mock*
-provider actually works end to end: a task can only reach `completed` if
-the agent's configured provider genuinely answered, so pointing
-`AGENT_NAME` at an agent using a real provider turns this same script into
-that provider's connection check, not a separate one to run by hand.
-The script then goes further than a bare install check: it makes a real
-`agents.update` config change (`max_steps`) and swaps the agent's model,
-confirms both actually persisted, and runs a second real task afterward to
-prove the changed config didn't break execution — roadmap item 9's
-"설정 변경, 모델 교체" (config change, model swap) scenarios, exercised over
-real HTTP with a real session token, not only at the `fn_selftest`/SQL
-level.
+scripted instead of typed by hand.
+
+The script runs two checks, deliberately kept apart:
+
+1. **A mock smoke check, always run.** `analyst` (the seeded default
+   agent) deliberately ships with no provider configured — see
+   [Model configuration](#model-configuration-and-conversations) — so
+   nothing would actually complete out of the box otherwise. The script
+   seeds the built-in `allgres_mock` provider row (idempotent — it only
+   ever touches that one, reserved-name row) and creates its own
+   disposable agent to run against: login, `run`, a real LLM round trip,
+   `completed`; then a real `agents.update` config change (`max_steps`)
+   and model swap, confirmed persisted, and a second task proving the
+   change didn't break execution — roadmap item 9's "설정 변경, 모델 교체"
+   scenarios, exercised over real HTTP with a real session token. The
+   disposable agent is deactivated afterward and no operator-created agent
+   is ever touched by this check.
+2. **An optional real-provider check, only when `AGENT_NAME` is set.**
+   Point it at an agent you've already configured with a working, non-mock
+   provider to prove that provider actually answers — a task can only
+   reach `completed` if it genuinely did. This check only ever reads that
+   agent and runs one task through it; it never modifies its configuration
+   in any way. (An earlier version of this script ran the mock
+   config-change check directly against `AGENT_NAME` and left it
+   permanently repointed at a mock model with no restore — the two checks
+   are separate now specifically so that can't happen again.)
 
 Want to check the container without the full bootstrap flow, or run the
 broader test suite against it?
@@ -191,6 +226,16 @@ broader test suite against it?
 ```bash
 curl http://127.0.0.1:8088/healthz
 ./scripts/smoke.sh      # full smoke + end-to-end + security checks
+```
+
+Forcing a clean rebuild (after changing the `Dockerfile` or `Cargo.toml`,
+or to rule out a stale layer) drops the data volume — only run this when
+you mean to discard whatever is in it:
+
+```bash
+docker compose down -v             # drops allgres_pgdata -- confirm you mean this
+docker compose build --no-cache
+docker compose up -d
 ```
 
 See [Extension installation](#extension-installation) for a bare-metal
@@ -456,34 +501,59 @@ read surface already in place.
 
 ## Operator audit log
 
-The dashboard has one shared bearer token (see [Exposure](#exposure)), not
-per-operator accounts, so there is no authenticated identity to attach an
-audit trail to. `allgres_private.audit_log` is a lighter answer to the same
-question — "who did this" — built on a self-reported label instead of a
-real login: the browser sends whatever name is set in Settings
-(`sessionStorage`, per browser tab, the same way the dashboard token itself
-is) alongside every request, and `dashboard_rpc` writes one append-only row
-— `operator_name`, `action`, a `details` object (the request minus the
-action itself and anything that could carry a secret: an API key, an OAuth
-client secret, an authorization code or state) — for each consequential
-action: creating or editing an agent, granting or revoking a permission,
+`allgres_private.audit_log` answers "who did this" for every consequential
+mutation: creating or editing an agent, granting or revoking a permission,
 deciding an approval or a proposal, rolling back a policy, cancelling a
 session, editing the SQL sandbox allowlist or a project, updating a
-provider, connecting an OAuth provider, or writing/removing a memory.
+provider, connecting an OAuth provider, creating or editing a user account,
+or writing/removing a memory.
 
-**This is not access control and does not claim to be.** Anyone holding
-the one shared token can type any name in Settings, or leave it blank —
-`audit_log` answers "who claimed responsibility for this," not "who was
-authorized to do it." The row itself is trustworthy (append-only,
-enforced by a trigger that applies even to the table's own owner, not
-just `REVOKE`), but the name inside it is exactly as reliable as the
-person typing it chooses to be. A real answer needs per-operator accounts
-— see [Known limitations](#known-limitations) and KNOWN_ISSUES.md, item
-10 — which this is not, and does not try to shortcut.
+Each of those mutations writes its own row itself, from inside the plain
+SQL function (`allgres_private.audit(...)`, called at the end of e.g.
+`fn_create_agent`, `fn_grant_permission`, `fn_set_policy`) — not from a
+centralized list keyed on `dashboard_rpc` action names the way an earlier
+version of this worked. That distinction is the whole point: this project's
+other stated goal is that "[everything the dashboard does, psql can do
+too](#architecture)," and a mutation audited only from inside `dashboard_rpc`
+left a direct SQL call to that exact same function with no audit trail at
+all — an outside review of an earlier version of this file caught exactly
+that gap. Every row now carries:
 
-Browsable from the new **Audit Log** dashboard page (`audit.list`), newest
-first, with the same self-reported-not-authentication banner repeated
-there.
+- `operator_name` — a self-reported label, present only when the call
+  arrived through the dashboard: the browser sends whatever name is set in
+  Settings (`sessionStorage`, per browser tab, the same way the dashboard
+  token itself is), and `dashboard_rpc` stamps the current transaction with
+  it (`allgres_private.set_audit_context`) before dispatching, so every
+  function it calls already knows to attach it. **This is not access
+  control and does not claim to be** — anyone holding the one shared
+  dashboard token can type any name, or leave it blank — `operator_name`
+  answers "who claimed responsibility for this," not "who was authorized to
+  do it." A real per-operator answer needs the accounts system above
+  (`fn_login`/`users`), which most of these actions already require the
+  caller to hold an admin session for.
+- `origin` — `'web'` when the call arrived through `dashboard_rpc`,
+  `'sql'` otherwise (the fail-safe default): a plain `psql -c "SELECT
+  fn_grant_permission(...)"` shows up as `'sql'` with no `operator_name`,
+  exactly as it should.
+- `db_role` — the actual authenticated PostgreSQL role for the call,
+  always populated regardless of origin, independent of whatever
+  `operator_name` self-reports.
+
+The row itself is trustworthy (append-only, enforced by a trigger that
+applies even to the table's own owner, not just `REVOKE`); `operator_name`
+is exactly as reliable as the person typing it chooses to be, while
+`origin`/`db_role` are not — they come from the actual call path and
+PostgreSQL session identity, not anything the caller can self-report.
+`fn_selftest` proves both directions: a direct SQL call to a mutating
+function records `origin = 'sql'` with no `operator_name`, and the same
+action reached through `dashboard_rpc` with an operator name records
+`origin = 'web'` with that name attached.
+
+Browsable from the **Audit Log** dashboard page (`audit.list`), newest
+first, with the same self-reported-not-authentication banner for
+`operator_name` repeated there; `fn_selftest`'s own fixture noise is
+filtered out of that listing the same way every other operator-facing
+listing in this file already hides it.
 
 ## Model configuration and conversations
 
@@ -683,31 +753,59 @@ a real inbound trigger is future work.
 
 Roadmap item 7: every prior slice let `self_improve` (or an operator)
 change an agent's policy, but nothing ever recorded whether that change
-actually helped. `agent_recent_success_rate(agent_id, limit=20)` is the
-underlying signal — the completed/failed ratio over an agent's most recent
-root-level tasks only (`parent_task_id IS NULL`), so a delegated child's own
-outcome never blurs the delegating agent's own score, and it deliberately
-returns `NULL` (not `0`) when there is no evaluable data yet, so a brand
-new agent is never read as "0% success." It also excludes any session whose
-`goal LIKE 'selftest%'`, the same convention every other operator-facing
-count in this file already applies to `fn_selftest`'s own fixtures.
+actually helped. **What this measures is task throughput (the
+completed/failed ratio of an agent's own root-level tasks), not semantic
+correctness** — a task can finish `completed` having produced a wrong or
+useless answer, and nothing here can tell the difference. Read `improved`/
+`regressed` as "this policy finishes more (or fewer) of its own tasks than
+the one before it," not "this policy is smarter." A real correctness judge
+would need task-specific success criteria (something to grade the actual
+output against) and is out of scope here — see "Deliberately out of
+scope" below.
 
-`fn_set_policy` now stamps every archived version with this rate, in
-`policy_history.success_rate_at_change`, at the exact moment it is
-overwritten — so "how was this agent actually doing right before this
-change was made" is a real historical fact attached to that row, not
-something recomputed later from a moving window. `fn_evaluate_last_change
-(agent_id)` compares that snapshot against the agent's *current* rate and
-returns one of five verdicts: `improved`, `regressed`, `unchanged`,
-`insufficient_data` (either side is `NULL`), or `no_change_recorded_yet`
-(the agent has never had a policy change at all). `v_agent_health` is the
-same permission-gated shape as `v_system_health`, one row per agent
-instead of a single aggregate, and `self_improve` is granted read access
-to it by default (both at seed time and, for an existing install, via an
-unconditional grant so upgrading picks it up too). `self_improve`'s system
-prompt now points it at both `v_agent_health` and `fn_evaluate_last_change`
-so it can check the outcome of its own prior proposals before making a new
-one.
+`agent_recent_success_rate(agent_id, limit=20)` is the coarse version of
+that signal: the completed/failed ratio over an agent's most recent
+root-level tasks (`parent_task_id IS NULL`), regardless of which policy
+version they ran under. It excludes delegated children (a child's own
+outcome never blurs the delegating agent's own score) and any session
+whose `goal LIKE 'selftest%'`, and returns `NULL` (not `0`) when there is
+no evaluable data yet, so a brand new agent is never read as "0% success."
+It still backs `v_agent_health`'s "how is this agent doing lately,
+overall" column, but an outside review pointed out it is the wrong tool
+for judging one specific change: "most recent 20 tasks" can span several
+policy versions, so a handful of tasks from just before a change and a
+handful from just after can land in the same window and get averaged
+together — enough to call a real regression "unchanged," or the reverse.
+
+`allgres_private.agent_success_rate_for_generation(agent_id, generation,
+limit=20)` is the fix: every root task is stamped at creation time
+(`tasks.policy_generation`) with whichever `policies.generation` was live
+when it was queued, and this computes the same completed/failed ratio
+scoped to exactly one generation's own tasks. `fn_set_policy` now snapshots
+`policy_history.success_rate_at_change` from this (the outgoing
+generation's own rate, not a mixed recent window) at the exact moment a
+version is replaced. `fn_evaluate_last_change(agent_id, min_samples=5)`
+compares the agent's current-generation rate against its immediately
+prior generation's rate — both computed fresh from their own isolated
+task sets, live, every time this is called, not a frozen snapshot on one
+side — and returns one of five verdicts: `improved`, `regressed`,
+`unchanged`, `insufficient_data`, or `no_change_recorded_yet` (the agent
+has never had a policy change at all). `insufficient_data` fires whenever
+either side has fewer than `min_samples` evaluable tasks (default 5, not
+just "any data at all") — a single task on either side is not enough to
+call a trend, and the response reports `current_sample_size`/
+`before_sample_size` alongside the verdict so a caller can see exactly why
+judgment was withheld. Right after a change, before the new generation has
+run a single task yet, this correctly reports `insufficient_data` — never
+a false `unchanged` implying "checked, no difference."
+
+`v_agent_health` is the same permission-gated shape as `v_system_health`,
+one row per agent instead of a single aggregate, and `self_improve` is
+granted read access to it by default (both at seed time and, for an
+existing install, via an unconditional grant so upgrading picks it up
+too). `self_improve`'s system prompt now points it at both
+`v_agent_health` and `fn_evaluate_last_change` so it can check the outcome
+of its own prior proposals before making a new one.
 
 Both are exposed read-only, the same way `policy.history` already is:
 `dashboard_rpc` action `agents.evaluate` (wraps `fn_evaluate_last_change`
@@ -717,18 +815,20 @@ change" button next to History that shows the verdict and both rates, and
 the History modal itself now shows each version's `success_rate_at_change`
 inline.
 
-Deliberately not in this slice: a mechanical block on `self_improve`
-proposing a change (e.g. refusing a new proposal until the last one shows
+Deliberately out of scope: a mechanical block on `self_improve` proposing
+a change (e.g. refusing a new proposal until the last one shows
 `improved`) — `self_improve`'s stated purpose is token/time cost, not
 correctness, and a hard gate on that basis would be enforcing something
 this feature was never meant to guarantee. This makes a change's outcome
 *evaluable*, not automatically enforced: no automatic rollback on
 `regressed` either, only a computed verdict for a human, or a future
-`self_improve` turn reading its own history, to act on. A real cost-based
-signal (tokens or dollars per change) is the same deferred item Schedules
-above already named — nothing in this codebase prices a provider or parses
-token usage out of a response yet, so a cost dimension here would only
-ever compare against a number nothing populates.
+`self_improve` turn reading its own history, to act on. Also deferred: a
+per-task correctness judge (grading actual output against a task-specific
+success criterion, rather than just "did the task finish"), and a real
+cost-based signal (tokens or dollars per change, the same deferred item
+Schedules above already named) — nothing in this codebase prices a
+provider or parses token usage out of a response yet, so a cost dimension
+here would only ever compare against a number nothing populates.
 
 ## Semantic delegate search
 
@@ -756,6 +856,40 @@ actually in use automatically the first time it would help. See
 KNOWN_ISSUES.md item 35 for the full mechanism and two real bugs this
 found (a missing worker grant, and pgvector's own `sum(vector)` overload
 breaking the SQL sandbox's unrelated function allowlist).
+
+## Semantic memory recall
+
+[Memory](#memory)'s automatic every-turn injection stays exactly what it
+was — an agent's own live memories, ranked by importance then recency,
+capped at 15 rows — because that has to run synchronously while a prompt
+is being assembled, and a query embedding is itself an outbound HTTP call
+that cannot complete inline. `recall` is the explicit alternative for
+"find something specific," reusing the identical embedding infrastructure
+[semantic delegate search](#semantic-delegate-search) already built: the
+same shape (`{"action":"recall","query":"..."}`), the same queue-then-
+continue flow (`outbound_calls` kind `'recall'` instead of `'embedding'`),
+the same plain-array-not-pgvector storage, and the same automatic
+opportunistic HNSW indexing once pgvector is installed.
+
+Every `agent_memories` row gets its own embedding (`agent_memories.
+embedding`/`embedding_model`), generated the moment it's written —
+`write_memory`, the one insertion point both the agent's own `remember`
+action and the operator-authored `fn_remember`/`memories.create` share —
+via the same `embedding_calls` queue agent-identity embeddings already
+use, generalized to carry either an agent or a memory as its target.
+`allgres_private.rank_memories_by_embedding` then ranks by cosine
+similarity, scoped strictly to the calling agent's own memories (`WHERE
+agent_id =`, not a cross-agent search — this is semantic search over an
+agent's own private store, never another agent's) and excluding anything
+already expired, with the same dimension/model mismatch guards
+`rank_agents_by_embedding` already enforces so a since-changed embedding
+provider can never silently rank across two incomparable vector spaces.
+
+An optional feature's absence is never fatal: `recall` with no
+`purpose='embedding'` provider configured is a friendly `continue`, the
+same as `search_agents`, and a memory written before one existed simply
+stays ineligible for semantic ranking (still fully recalled by importance/
+recency) until it is re-embedded.
 
 ## Chat: General, Messenger, and Project modes
 
@@ -799,9 +933,10 @@ name, a log's own content) — see KNOWN_ISSUES item 31 for the exact scope.
 
 ## Known limitations
 
-Outstanding gaps — the unverified Docker/PG17 build, secret key rotation, no
-automatic OAuth token refresh, and more — are tracked in
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
+Outstanding gaps — secret key rotation, no automatic OAuth token refresh,
+no per-task correctness judge behind [evaluation-gated
+self-improvement](#evaluation-gated-self-improvement), and more — are
+tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
 
 `allgres_public.fn_selftest()` exercises the validate/queue/claim/complete state
 machine and every shape that defeated the old text scanner, and runs as part
@@ -813,8 +948,11 @@ live session (`SET LOCAL ROLE sandbox; SELECT current_user`).
 
 ### Exposure
 
-The dashboard has no user accounts. `ALLGRES_DASHBOARD_TOKEN` is the only
-authentication, and it is empty by default.
+`ALLGRES_DASHBOARD_TOKEN` is the base authentication layer everyone
+sharing this install has in common, and it is empty by default. Real
+per-operator accounts (username/password, Settings → Users) exist and can
+be layered on top, but are optional — see below for exactly what changes
+once the first one is created.
 
 The web worker therefore **refuses to bind a non-loopback address when no token
 is set**, unless `ALLGRES_ALLOW_INSECURE_HTTP=1` says the surrounding network
@@ -911,6 +1049,44 @@ worker — carrying the provider API key — at an arbitrary address.
 
 Enable a local Ollama or an in-cluster gateway by ticking "Allow loopback /
 private-network endpoint" on that provider in Settings.
+
+### External call idempotency
+
+An outside review raised a real gap: a crash (or a lost worker, or a
+`fn_watchdog` reclaim) between an external side effect actually landing —
+the worker's HTTP call to a third-party API succeeded — and this extension
+recording that it did (`fn_complete_outbound` never runs for that
+`outbound_calls` row) leaves the row `in_flight` until `fn_watchdog` marks
+it `'lost'`. From the agent's point of view that reads as "did not
+complete," and its own retry logic may reasonably queue the identical
+`http_request` call again — at which point a destination with no
+deduplication of its own would perform the effect (create the ticket, charge
+the card, send the message) a second time.
+
+The mitigation: every mutating `http_request` call (`POST`/`PUT`/`PATCH`/
+`DELETE`) is queued with a deterministic `idempotency-key` header —
+`md5(task_id || method || url || body)`, mirrored onto
+`outbound_calls.idempotency_key` for visibility — unless the agent already
+set that header itself, which is honored as-is. The key is derived from
+the request's own content, not from `call_id` (a fresh value on every
+queued row, including a genuine retry), so an agent retrying the *exact
+same* request reproduces the *identical* key; a materially different
+request (a changed body, say) gets a different one. This is the same
+header Stripe, GitHub, PayPal, and Square already accept and deduplicate
+on.
+
+**This is a mitigation, not a guarantee.** It only protects a call against
+a destination that actually implements idempotency-key deduplication —
+plenty of third-party APIs do not, and against one of those, this header
+is inert: sent, ignored, and the underlying at-least-once-delivery risk
+above is unchanged. There is also no cross-check on this extension's own
+side — nothing here calls back to ask "did you already see this key," so
+a `'lost'` call's true outcome (delivered, or never sent at all) stays
+genuinely unknown until an operator checks the destination system
+directly or the agent's own next turn does. Treat a `'lost'` outbound call
+as *ambiguous*, not *failed*, for anything with a real external side
+effect — deciding whether to retry a specific one is a judgment call this
+extension cannot make for you.
 
 ### Secrets at rest
 
@@ -1081,13 +1257,13 @@ bypass of the dashboard token.
 
 ## Extension installation
 
-No Docker: install straight onto an existing PostgreSQL 16 or 17 server.
-You need `cargo-pgrx` (`cargo install --locked cargo-pgrx --version 0.19.2`)
-and that PostgreSQL version's own `-dev`/`-server-dev` package installed
-first (`pg_config` must be on `PATH`), then:
+No Docker: install straight onto an existing PostgreSQL 16, 17, or 18
+server. You need `cargo-pgrx` (`cargo install --locked cargo-pgrx --version
+0.19.2`) and that PostgreSQL version's own `-dev`/`-server-dev` package
+installed first (`pg_config` must be on `PATH`), then:
 
 ```bash
-cargo pgrx install --release --features pg17   # or --features pg16
+cargo pgrx install --release --features pg17   # or --features pg16 / pg18
 ```
 
 This compiles the extension and copies the `.so`/`.control`/`.sql` files
@@ -1114,11 +1290,18 @@ runtime worker reads.
 
 ### Upgrades
 
-`sql/control_plane.sql` is idempotent — `CREATE OR REPLACE`, `IF NOT EXISTS`,
-`ON CONFLICT DO NOTHING`, create-only seeds (an upgrade never overwrites an
-edited prompt or policy), and explicit `DROP`s for anything whose signature or
-return type changed. `scripts/gen-upgrade.sh <from> <to>` turns it into a
-versioned upgrade script:
+`sql/control_plane.sql`, `sql/operator_agents_and_policies.sql`,
+`sql/operator_runtime_and_integrations.sql`,
+`sql/operator_accounts_and_chat.sql`, `sql/seed_data.sql`,
+`sql/selftest.sql`, and `sql/grants_and_facade.sql`
+(seven files, always loaded together in that order — split out of what used
+to be one file once it grew large enough to trip a real rustc compile-time
+limit; see KNOWN_ISSUES.md item 38) are idempotent — `CREATE OR REPLACE`,
+`IF NOT EXISTS`, `ON CONFLICT DO NOTHING`, create-only seeds (an upgrade
+never overwrites an edited prompt or policy), and explicit `DROP`s for
+anything whose signature or return type changed. `scripts/gen-upgrade.sh
+<from> <to>` concatenates all seven, in that same order, into a versioned
+upgrade script:
 
 ```bash
 ./scripts/gen-upgrade.sh 0.2.0 0.3.0    # writes sql/allgres--0.2.0--0.3.0.sql
@@ -1161,7 +1344,8 @@ extension does that a generic `pg_dump` would otherwise miss silently:
   any database dump — restoring onto a fresh cluster needs
   `pg_dumpall --globals-only` applied first, or every agent's row-level
   isolation is gone even though the row data itself restored fine.
-- **Restore in two passes, not one.** `sql/control_plane.sql` registers
+- **Restore in two passes, not one.** `sql/control_plane.sql` and
+  `sql/seed_data.sql` register
   every table holding real operator/agent state via
   `pg_extension_config_dump()` (agents, sessions, tasks, policies and their
   history, permissions, projects, execution logs, human approvals, change
@@ -1197,7 +1381,7 @@ psql -c "SELECT allgres_public.fn_selftest()"
 fixture it creates is either uniquely named and hard-deleted before it
 returns, or left behind deactivated and hidden from every operator-facing
 listing by `goal LIKE 'selftest%'` (see `selftest_fixtures_hidden_not_deleted`
-in `sql/control_plane.sql`) — the same convention real accounts, real
+in `sql/selftest.sql`) — the same convention real accounts, real
 agents, real policy history, and real queued work all already rely on not
 being disturbed by. Run it against a database that has been in production
 for months exactly the same way as right after `CREATE EXTENSION allgres`;
@@ -1205,7 +1389,10 @@ nothing in it assumes an empty install, an exact row count anywhere in the
 schema, or that no admin account exists yet (confirmed live: a full
 `fn_selftest()` pass with a real admin account, and real agent/session/task
 history already in the database, both taken before every commit that
-touches `sql/control_plane.sql`).
+touches any of `sql/control_plane.sql`, `sql/operator_agents_and_policies.sql`,
+`sql/operator_runtime_and_integrations.sql`,
+`sql/operator_accounts_and_chat.sql`, `sql/seed_data.sql`,
+`sql/selftest.sql`, or `sql/grants_and_facade.sql`).
 
 `scripts/fault_injection_drill.sh` is a separate, runnable drill (bare-metal,
 like `scripts/backup_drill.sh`) that sends a real `SIGKILL` to the real

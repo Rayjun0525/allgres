@@ -1,5 +1,3 @@
-#![allow(long_running_const_eval)]
-
 //! Allgres native runtime.
 //!
 //! Two background workers, neither of which owns any agent state:
@@ -81,7 +79,45 @@ pub(crate) const SSE_INTERVAL: Duration = Duration::from_secs(1);
 /// a single-use ticket cannot be replayed for that.
 pub(crate) const SSE_TICKET_TTL: Duration = Duration::from_secs(30);
 
-extension_sql_file!("../sql/control_plane.sql", finalize);
+// Seven files, loaded in this exact order -- mirroring sql/control_plane.
+// sql's own original section order (1-8, 9a, 9b, 9c, 10, 11, 12-14)
+// exactly, just as separate compilation units now instead of one file.
+// pgrx allows only one `finalize`-marked extension_sql_file! in the whole
+// crate (it errors at build time otherwise), so only sql/grants_and_
+// facade.sql -- section 14's final ownership pass, which genuinely needs
+// literally everything else to exist first -- carries it; every other
+// file is "normal" position (same as this module's own #[pg_extern] items
+// below), chained to each other with `requires` purely to preserve this
+// original order (most of them have no real cross-file dependency at
+// CREATE time -- see each file's own header for exactly which ones do).
+// Splitting sql/control_plane.sql this way is what fixed the long_
+// running_const_eval trip in practice, once and for all rather than by
+// muting the lint -- each file is now small enough on its own that the
+// const-eval copy loop pgrx's extension_sql_file! macro runs at compile
+// time finishes comfortably inside rustc's default budget.
+extension_sql_file!("../sql/control_plane.sql", name = "control_plane");
+extension_sql_file!(
+    "../sql/operator_agents_and_policies.sql",
+    name = "operator_agents_and_policies",
+    requires = ["control_plane"]
+);
+extension_sql_file!(
+    "../sql/operator_runtime_and_integrations.sql",
+    name = "operator_runtime_and_integrations",
+    requires = ["operator_agents_and_policies"]
+);
+extension_sql_file!(
+    "../sql/operator_accounts_and_chat.sql",
+    name = "operator_accounts_and_chat",
+    requires = ["operator_runtime_and_integrations"]
+);
+extension_sql_file!(
+    "../sql/seed_data.sql",
+    name = "seed_data",
+    requires = ["operator_accounts_and_chat"]
+);
+extension_sql_file!("../sql/selftest.sql", requires = ["seed_data"]);
+extension_sql_file!("../sql/grants_and_facade.sql", requires = ["selftest"], finalize);
 
 #[pg_schema]
 mod allgres {
