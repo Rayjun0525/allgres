@@ -88,6 +88,12 @@ DECLARE
   v_audit_tok text;
   v_acct_agent uuid;
   v_procedure_tool uuid;
+  v_memory_id uuid;
+  v_other_memory_id uuid;
+  v_guard_project uuid;
+  v_live_rpc_actions text[];
+  v_missing_rpc_actions text[];
+  v_extra_rpc_actions text[];
 BEGIN
   -- Clear out any leftover fixtures from an interrupted prior run before
   -- creating new ones, so a crash mid-selftest can't leave stale rows
@@ -481,6 +487,25 @@ BEGIN
   SELECT count(*) INTO v_gen FROM allgres_private.execution_logs WHERE task_id = v_tid;
   ok := ok AND v_gen = n_logs;
   v := v || jsonb_build_array(jsonb_build_object('name', 'complete_outbound_fences_stale_result', 'ok', ok));
+
+  -- fn_check_lost_outbound: the one thing the worker's real-time-cancel
+  -- registry (OUTBOUND_CANCEL_FLAGS in src/lib.rs) is allowed to ask about
+  -- outbound_calls without direct table access (see that function's own
+  -- comment). Must return exactly the 'lost' ids among the ones it was
+  -- asked about, and nothing else -- an 'in_flight' row passed in the same
+  -- array must not come back, or a call still genuinely running would be
+  -- flagged cancelled by mistake.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest check_lost_outbound')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status)
+  VALUES (v_tid, 'llm', 'https://api.x.ai/v1/chat/completions', 'lost')
+  RETURNING call_id INTO v_call;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status)
+  VALUES (v_tid, 'llm', 'https://api.x.ai/v1/chat/completions', 'in_flight')
+  RETURNING call_id INTO v_call2;
+  sub := to_jsonb(allgres_public.fn_check_lost_outbound(ARRAY[v_call, v_call2]));
+  ok := sub @> to_jsonb(ARRAY[v_call]) AND NOT (sub @> to_jsonb(ARRAY[v_call2])) AND jsonb_array_length(sub) = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'check_lost_outbound_returns_only_lost_ids', 'ok', ok));
 
   -- 14. sessions can be scoped to a project; fn_create_session rejects an
   --     inactive or missing project the same way it already rejects an
@@ -2641,6 +2666,58 @@ BEGIN
     ok := v_sys_target = ANY(allgres_private.visible_agent_ids(v_user_tok));
     v := v || jsonb_build_array(jsonb_build_object('name', 'visible_agent_ids_includes_assigned_target', 'ok', ok));
 
+    -- visible_agent_ids used to return NULL (unrestricted -- the same
+    -- value a real admin gets) for "nobody is logged in" too, unconditional
+    -- on whether any account existed yet. Once real accounts exist (as
+    -- here), an absent/unknown/expired session_token must come back
+    -- maximally restricted (an empty array, not NULL) -- confirmed live
+    -- separately: a bare proposals.decide with no session_token silently
+    -- applied a policy_change proposal's system_prompt before this fix.
+    ok := allgres_private.visible_agent_ids(NULL) = ARRAY[]::uuid[];
+    ok := ok AND allgres_private.visible_agent_ids('') = ARRAY[]::uuid[];
+    ok := ok AND allgres_private.visible_agent_ids('selftest-not-a-real-token') = ARRAY[]::uuid[];
+    v := v || jsonb_build_array(jsonb_build_object('name', 'visible_agent_ids_empty_once_accounts_exist_for_no_session_token', 'ok', ok));
+
+    -- fixes.decide, through the same visible_agent_ids scoping: with no
+    -- session_token at all, must not be able to decide v_fix_id (still
+    -- pending here), even though v_sys_target now has a real assignment.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'fixes.decide', 'fix_id', v_fix_id::text, 'approve', true, 'reply', 'should not apply'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND (SELECT status FROM allgres_private.fix_proposals WHERE fix_id = v_fix_id) = 'pending';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fixes_decide_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+
+    -- proposals.decide, the mutating case that actually changes live
+    -- policy (fn_set_policy) once approved -- reproduces the exact live
+    -- exploit found while fixing visible_agent_ids: a pending policy_change
+    -- proposal must not be approvable with no session_token.
+    INSERT INTO allgres_private.change_proposals (agent_id, kind, target_agent_id, proposed_changes, reason, status, base_generation)
+    VALUES (
+      v_fixer_id, 'policy_change', v_sys_target,
+      jsonb_build_object('system_prompt', 'selftest should not apply this'), 'selftest guard proposal', 'pending',
+      (SELECT generation FROM allgres_private.policies WHERE agent_id = v_sys_target)
+    )
+    RETURNING proposal_id INTO v_proposal;
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'proposals.decide', 'proposal_id', v_proposal::text, 'approve', true, 'reply', 'should not apply'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND (SELECT status FROM allgres_private.change_proposals WHERE proposal_id = v_proposal) = 'pending'
+      AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_sys_target) IS DISTINCT FROM 'selftest should not apply this';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'proposals_decide_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+    DELETE FROM allgres_private.change_proposals WHERE proposal_id = v_proposal;
+
+    -- memories.list, the read-side case: with no session_token, must come
+    -- back scoped to nothing rather than every agent's memories.
+    sub := allgres_public.fn_remember(v_sys_target, 'selftest guard memory for visible_agent_ids', NULL, NULL, NULL, NULL);
+    v_memory_id := (sub->>'memory_id')::uuid;
+    sub := allgres.dashboard_rpc(jsonb_build_object('action', 'memories.list'));
+    ok := COALESCE((sub->>'ok')::boolean, false)
+      AND NOT (sub->'memories')::text LIKE '%selftest guard memory for visible_agent_ids%';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_list_empty_no_session_token_once_accounts_exist', 'ok', ok));
+    DELETE FROM allgres_private.agent_memories WHERE memory_id = v_memory_id;
+
     UPDATE allgres_private.fix_proposals SET status = 'rejected' WHERE fix_id = v_fix_id;
     PERFORM allgres_public.fn_set_agent_active(v_sys_target, true);
 
@@ -2904,6 +2981,106 @@ BEGIN
     sub := allgres.dashboard_rpc(jsonb_build_object('action', 'logs.list'));
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
     v := v || jsonb_build_array(jsonb_build_object('name', 'logs_list_needs_admin_once_accounts_exist', 'ok', ok));
+
+    -- projects.create/projects.update (same class of gap as run/sessions.*
+    -- above, closed the same way schedules/procedures/connections already
+    -- are: admin-only, no per-user ownership). Before this fix, any caller
+    -- holding the shared dashboard token could create or reconfigure a
+    -- project regardless of account state.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.create', 'name', 'selftest_projects_rpc_guard'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_create_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.create', 'name', 'selftest_projects_rpc_guard', 'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_create_rejects_non_admin_user', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.create', 'name', 'selftest_projects_rpc_guard', 'session_token', v_admin_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v_guard_project := (sub->>'project_id')::uuid;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_create_allows_admin', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.update', 'project_id', v_guard_project::text, 'is_active', false,
+      'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND (SELECT is_active FROM allgres_private.projects WHERE project_id = v_guard_project) = true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_update_rejects_non_admin_user', 'ok', ok));
+
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.update', 'project_id', v_guard_project::text, 'is_active', false,
+      'session_token', v_admin_tok
+    ));
+    ok := (SELECT is_active FROM allgres_private.projects WHERE project_id = v_guard_project) = false;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_update_allows_admin', 'ok', ok));
+    DELETE FROM allgres_private.projects WHERE project_id = v_guard_project;
+
+    -- memories.create/memories.remove (same class of gap
+    -- memories.list's own v_scope fix already closed for listing): before
+    -- this fix, any caller holding the shared dashboard token could plant
+    -- or delete any agent's memory regardless of account state or
+    -- assignment. A fresh, genuinely-unassigned agent for the "not
+    -- assigned" cases -- not v_sys_target, which the run/sessions.* block
+    -- above deliberately assigns to selftest_user already.
+    DELETE FROM allgres_private.agents WHERE name = 'selftest_unassigned_target';
+    v_new_agent := (allgres_public.fn_create_agent('selftest_unassigned_target')->>'agent_id')::uuid;
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.create', 'agent_id', v_acct_agent::text, 'content', 'selftest guard memory'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_create_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.create', 'agent_id', v_new_agent::text, 'content', 'selftest guard memory',
+      'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_create_rejects_user_not_assigned_to_this_agent', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.create', 'agent_id', v_acct_agent::text, 'content', 'selftest guard memory',
+      'session_token', v_user_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v_memory_id := (sub->>'memory_id')::uuid;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_create_allows_assigned_user', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.create', 'agent_id', v_new_agent::text, 'content', 'selftest guard memory',
+      'session_token', v_admin_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v_other_memory_id := (sub->>'memory_id')::uuid;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_create_allows_admin_on_any_agent', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.remove', 'memory_id', v_other_memory_id::text, 'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_other_memory_id);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_remove_rejects_user_not_assigned_to_this_agent', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.remove', 'memory_id', v_memory_id::text, 'session_token', v_user_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false)
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_memory_id);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_remove_allows_assigned_user', 'ok', ok));
+
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.remove', 'memory_id', v_other_memory_id::text, 'session_token', v_admin_tok
+    ));
+    ok := NOT EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_other_memory_id);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_remove_allows_admin_on_any_agent', 'ok', ok));
+    DELETE FROM allgres_private.agents WHERE agent_id = v_new_agent;
 
     -- Setting a key to JSON null clears it back to the reader's own coded
     -- default rather than leaving a stray {"probe":2} on a real seeded
@@ -3524,6 +3701,68 @@ BEGIN
     );
     v := v || jsonb_build_array(jsonb_build_object('name', 'recall_rejects_missing_query', 'ok', ok));
   END;
+
+  -- The RPC contract freeze (P0): dashboard_rpc's own action set, pinned
+  -- here so adding, removing, or renaming an action is a visible,
+  -- deliberate act instead of silent drift an operator only discovers
+  -- from a 404 in production. This is what "freeze the contract" means in
+  -- practice for a jsonb-dispatched action set that CASE alone cannot
+  -- check at parse time. Regenerate sql/rpc_catalog.json
+  -- (scripts/gen_rpc_catalog.py) and update this array together whenever
+  -- dashboard_rpc's CASE changes -- the two are meant to be edited in the
+  -- same commit, never one without the other.
+  SELECT array_agg(DISTINCT m[1]) INTO v_live_rpc_actions
+  FROM regexp_matches(
+    pg_get_functiondef('allgres.dashboard_rpc(jsonb)'::regprocedure),
+    'WHEN ''([a-zA-Z_.]+)'' THEN', 'g'
+  ) AS m;
+  SELECT array_agg(a ORDER BY a) INTO v_missing_rpc_actions
+  FROM unnest(ARRAY[
+    'overview', 'agents.list', 'agents.set_autonomy', 'agents.bulk_set_model', 'agents.create',
+    'agents.update', 'policy.history', 'policy.rollback', 'agents.evaluate', 'proposals.list',
+    'proposals.decide', 'fixes.list', 'fixes.decide', 'permissions.list', 'permissions.grant',
+    'permissions.revoke', 'permissions.options', 'allowlist.list', 'allowlist.add', 'allowlist.remove',
+    'projects.list', 'projects.create', 'projects.update', 'project_chat.send', 'project_chat.history',
+    'run', 'sessions.cancel', 'sessions.continue', 'auth.login', 'auth.logout', 'auth.me',
+    'users.create', 'users.list', 'users.set_active', 'users.set_role', 'assignments.set',
+    'assignments.list', 'assignments.for_agent', 'assignments.toggle', 'agents.mine', 'agents.set_my_model',
+    'chat.send', 'chat.history', 'messenger.post', 'messenger.list', 'sessions.list', 'sessions.get',
+    'tasks.list', 'logs.list', 'memories.list', 'memories.create', 'memories.remove', 'history.search',
+    'audit.list', 'settings.get', 'provider.update', 'provider.create', 'connections.list',
+    'connections.create', 'connections.update', 'connections.delete', 'procedures.list', 'procedures.get',
+    'procedures.create', 'procedures.update', 'procedures.rollback', 'procedure_tools.list',
+    'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
+    'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
+    'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
+    'approvals.decide', 'selftest'
+  ]::text[]) a
+  WHERE a <> ALL(COALESCE(v_live_rpc_actions, ARRAY[]::text[]));
+  SELECT array_agg(a ORDER BY a) INTO v_extra_rpc_actions
+  FROM unnest(v_live_rpc_actions) a
+  WHERE a <> ALL(ARRAY[
+    'overview', 'agents.list', 'agents.set_autonomy', 'agents.bulk_set_model', 'agents.create',
+    'agents.update', 'policy.history', 'policy.rollback', 'agents.evaluate', 'proposals.list',
+    'proposals.decide', 'fixes.list', 'fixes.decide', 'permissions.list', 'permissions.grant',
+    'permissions.revoke', 'permissions.options', 'allowlist.list', 'allowlist.add', 'allowlist.remove',
+    'projects.list', 'projects.create', 'projects.update', 'project_chat.send', 'project_chat.history',
+    'run', 'sessions.cancel', 'sessions.continue', 'auth.login', 'auth.logout', 'auth.me',
+    'users.create', 'users.list', 'users.set_active', 'users.set_role', 'assignments.set',
+    'assignments.list', 'assignments.for_agent', 'assignments.toggle', 'agents.mine', 'agents.set_my_model',
+    'chat.send', 'chat.history', 'messenger.post', 'messenger.list', 'sessions.list', 'sessions.get',
+    'tasks.list', 'logs.list', 'memories.list', 'memories.create', 'memories.remove', 'history.search',
+    'audit.list', 'settings.get', 'provider.update', 'provider.create', 'connections.list',
+    'connections.create', 'connections.update', 'connections.delete', 'procedures.list', 'procedures.get',
+    'procedures.create', 'procedures.update', 'procedures.rollback', 'procedure_tools.list',
+    'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
+    'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
+    'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
+    'approvals.decide', 'selftest'
+  ]::text[]);
+  ok := v_missing_rpc_actions IS NULL AND v_extra_rpc_actions IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object(
+    'name', 'dashboard_rpc_actions_match_frozen_catalog', 'ok', ok,
+    'missing_from_dispatch', to_jsonb(v_missing_rpc_actions), 'not_yet_cataloged', to_jsonb(v_extra_rpc_actions)
+  ));
 
   PERFORM allgres_private.selftest_cleanup();
 

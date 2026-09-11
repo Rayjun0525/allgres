@@ -69,7 +69,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname <> 'fn_provision_agent_role'
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;
@@ -80,6 +80,14 @@ BEGIN
       AND p.proowner <> 'allgres_role_admin'::regrole
   ) THEN
     ALTER FUNCTION allgres_private.fn_provision_agent_role(uuid) OWNER TO allgres_role_admin;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'allgres_private' AND p.proname = 'fn_signal_cancel_worker'
+      AND p.proowner <> 'allgres_signal_admin'::regrole
+  ) THEN
+    ALTER FUNCTION allgres_private.fn_signal_cancel_worker() OWNER TO allgres_signal_admin;
   END IF;
 
   IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres_private') <> 'allgres_owner'::regrole THEN
@@ -125,6 +133,21 @@ $$;
 -- short of it.
 GRANT sandbox TO allgres_role_admin WITH ADMIN OPTION;
 GRANT worker TO allgres_role_admin WITH ADMIN OPTION;
+
+-- fn_signal_cancel_worker's owner (allgres_signal_admin) needs
+-- pg_signal_backend membership to make pg_cancel_backend do anything --
+-- and, because allgres_signal_admin is itself NOLOGIN NOINHERIT (see "1.
+-- Roles"), plain membership alone grants nothing to a SECURITY DEFINER
+-- call running as it: PG16+'s WITH INHERIT TRUE is what actually makes the
+-- privilege apply, confirmed live (pg_auth_members.inherit_option flipped
+-- f -> t, and cancellation only started working after).
+GRANT pg_signal_backend TO allgres_signal_admin WITH INHERIT TRUE;
+
+-- fn_cancel_session (owned by allgres_owner) calls fn_signal_cancel_worker
+-- directly -- the same cross-owner EXECUTE grant fn_provision_agent_role
+-- needed above, for the same reason (two objects owned by the same role
+-- never needed one, which is why this class of gap keeps recurring).
+GRANT EXECUTE ON FUNCTION allgres_private.fn_signal_cancel_worker() TO allgres_owner;
 
 -- fn_create_agent (owned by allgres_owner) calls fn_provision_agent_role
 -- directly -- across the ownership split above, that is now a call to a
@@ -749,13 +772,22 @@ BEGIN
         ) pr
       ), '[]'::jsonb));
 
+    -- Same operator-config class as schedules/procedures/connections (no
+    -- per-user ownership, admin-curated) -- guarded the same way those are,
+    -- not the agent-scoped require_agent_access_if_accounts_exist used for
+    -- run/sessions.*. Before this fix, any caller holding the shared
+    -- dashboard token could create or reconfigure a project regardless of
+    -- account state, the same class of hole already closed elsewhere in
+    -- this function.
     WHEN 'projects.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_create_project(
         p_request->>'name', p_request->>'description',
         NULLIF(p_request->>'agent_id', '')::uuid, p_request->>'preset_prompt'
       );
 
     WHEN 'projects.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'project_id')::uuid;
       IF p_request ? 'is_active' THEN
         PERFORM allgres_public.fn_set_project_active(v_id, (p_request->>'is_active')::boolean);
@@ -1093,7 +1125,17 @@ BEGIN
         ) q
       ), '[]'::jsonb));
 
+    -- Agent-scoped the same way run/sessions.cancel are, not the v_scope
+    -- listing pattern memories.list uses -- a single target agent_id is
+    -- already in the request (create) or resolvable from the memory row
+    -- (remove). Before this fix, any caller holding the shared dashboard
+    -- token could plant or delete any agent's memory regardless of account
+    -- state or assignment, the same class of hole memories.list's own
+    -- v_scope fix already closed for listing.
     WHEN 'memories.create' THEN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid
+      );
       RETURN allgres_public.fn_remember(
         (p_request->>'agent_id')::uuid,
         p_request->>'content',
@@ -1104,6 +1146,10 @@ BEGIN
       );
 
     WHEN 'memories.remove' THEN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(
+        p_request->>'session_token',
+        (SELECT agent_id FROM allgres_private.agent_memories WHERE memory_id = (p_request->>'memory_id')::uuid)
+      );
       RETURN allgres_public.fn_forget((p_request->>'memory_id')::uuid);
 
     -- Roadmap item 3: search past work/decisions/failures, instead of only
@@ -1616,7 +1662,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname <> 'fn_provision_agent_role'
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;

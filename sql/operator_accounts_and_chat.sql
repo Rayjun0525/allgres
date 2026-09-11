@@ -66,6 +66,70 @@ BEGIN
 END;
 $fn$;
 
+-- An attempt at the real-time cancel button's one privileged action,
+-- isolated into its own single-statement function (owned by
+-- allgres_signal_admin, see "1. Roles") specifically so the
+-- pg_signal_backend grant that makes pg_cancel_backend do anything at all
+-- never has to be handed to fn_cancel_session itself -- that would mean
+-- replicating every table grant allgres_owner already has on
+-- allgres_private.sessions/tasks/outbound_calls/sql_calls/human_approvals
+-- onto a second role just to keep fn_cancel_session working, confirmed
+-- live to actually be necessary the moment that was tried instead
+-- ("permission denied for schema allgres_private"). There is exactly one
+-- backend that ever executes sandboxed SQL (run_sandboxed_sql's own
+-- header comment) -- found by its bgworker name, not a stored pid, since
+-- the worker restarts under the same name after a crash.
+--
+-- CONFIRMED live, after two further fixes beyond the crash-safety one
+-- below: (1) allgres_signal_admin (this function's owner) is itself
+-- NOLOGIN NOINHERIT, so `GRANT pg_signal_backend TO allgres_signal_admin`
+-- alone grants membership without inheriting the privilege -- needed
+-- `WITH INHERIT TRUE` (PG16+) before a SECURITY DEFINER call here could
+-- actually signal anything; and (2) BackgroundWorker::transaction()'s raw
+-- StartTransactionCommand()/CommitTransactionCommand() bypasses
+-- tcop/postgres.c's per-query dispatch, which is what normally arms the
+-- statement_timeout timer -- so `SET LOCAL statement_timeout` alone set
+-- the GUC value but never actually started a timer in this worker. Fixed
+-- by hand-calling enable_timeout_after/disable_timeout (utils/timeout.h)
+-- around the sandboxed call in run_sandboxed_sql (src/lib.rs). With both
+-- fixed and the extension's .so actually reloaded via a full
+-- `service postgresql restart` (DROP/CREATE EXTENSION does not reload an
+-- already-running worker's shared library), live testing measured ~60-75ms
+-- from this function's call to the sandboxed statement erroring out with
+-- query_canceled, the worker surviving via run_in_subtransaction below,
+-- and statement_timeout itself independently firing at its configured 5s.
+CREATE OR REPLACE FUNCTION allgres_private.fn_signal_cancel_worker()
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+  SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE backend_type = 'allgres runtime';
+$fn$;
+
+-- Lets the worker's own outbound-cancellation registry (OUTBOUND_CANCEL_FLAGS
+-- in src/lib.rs) discover which of its currently-registered in-flight HTTP/LLM
+-- calls fn_cancel_session has since marked 'lost', without granting the
+-- dropped-privilege worker role direct SELECT on allgres_private.outbound_calls
+-- -- the same reasoning as fn_signal_cancel_worker just above: raw table access
+-- would mean replicating allgres_owner's grants onto a role that otherwise
+-- only ever calls through fn_claim_outbound/fn_complete_outbound. Called once
+-- per main-loop iteration from propagate_outbound_cancellations(), with only
+-- the call_ids the registry currently holds a flag for -- never a full table
+-- scan.
+CREATE OR REPLACE FUNCTION allgres_public.fn_check_lost_outbound(p_call_ids uuid[])
+RETURNS uuid[]
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  SELECT COALESCE(array_agg(call_id), ARRAY[]::uuid[])
+  FROM allgres_private.outbound_calls
+  WHERE call_id = ANY(p_call_ids) AND status = 'lost';
+$fn$;
+
+GRANT EXECUTE ON FUNCTION allgres_public.fn_check_lost_outbound(uuid[]) TO worker;
+
 -- The one control that was missing entirely: nothing could stop a runaway
 -- agent.  Cancels every open task in the session (queued/running/
 -- waiting_human/waiting_children), rejects any pending approval so it
@@ -84,6 +148,7 @@ DECLARE
   r record;
   v_reason text := COALESCE(NULLIF(btrim(p_reason), ''), 'Cancelled by operator.');
   v_n int := 0;
+  v_sql_in_flight boolean;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM allgres_private.sessions WHERE session_id = p_session_id) THEN
     RAISE EXCEPTION 'session not found' USING ERRCODE = 'P0001';
@@ -118,11 +183,25 @@ BEGIN
   WHERE o.task_id = t.task_id AND t.session_id = p_session_id
     AND o.status IN ('queued', 'in_flight');
 
+  SELECT bool_or(sc.status = 'in_flight') INTO v_sql_in_flight
+  FROM allgres_private.sql_calls sc
+  JOIN allgres_private.tasks t USING (task_id)
+  WHERE t.session_id = p_session_id AND sc.status IN ('queued', 'in_flight');
+
   UPDATE allgres_private.sql_calls sc
   SET status = 'lost', updated_at = now()
   FROM allgres_private.tasks t
   WHERE sc.task_id = t.task_id AND t.session_id = p_session_id
     AND sc.status IN ('queued', 'in_flight');
+
+  -- Unlike an outbound HTTP call (a real 'in_flight' row above is already
+  -- claimed and cannot be un-sent -- see that UPDATE's own comment), a
+  -- sandboxed SQL statement is *meant* to be interruptible mid-flight --
+  -- see fn_signal_cancel_worker's own comment for why that privileged step
+  -- is a separate function instead of living here directly.
+  IF v_sql_in_flight THEN
+    PERFORM allgres_private.fn_signal_cancel_worker();
+  END IF;
 
   UPDATE allgres_private.human_approvals h
   SET status = 'rejected', reply_text = 'session_cancelled', decided_at = now()
@@ -554,14 +633,30 @@ BEGIN
 END;
 $fn$;
 
--- What approvals.list/proposals.list/fixes.list and their .decide
--- counterparts scope by (item 41, "opening the approval inbox to regular
--- users too"): NULL means unrestricted -- either nobody is logged in (the
--- original shared-bearer-token caller, unaffected by any of this) or the
--- caller is an admin, who could always see everything here before item 28
--- added accounts at all. A non-NULL, possibly empty, array is a regular
--- user's own assigned agents -- exactly user_agent_assignments, the same
--- explicit allow-list require_agent_access already enforces for chat.
+-- What approvals.list/proposals.list/fixes.list/memories.list/
+-- history.search and their .decide counterparts scope by (item 41,
+-- "opening the approval inbox to regular users too"): NULL means
+-- unrestricted -- a real admin, who could always see everything here
+-- before item 28 added accounts at all. A non-NULL, possibly empty, array
+-- is a regular user's own assigned agents -- exactly
+-- user_agent_assignments, the same explicit allow-list require_agent_access
+-- already enforces for chat.
+--
+-- Before this fix, "nobody is logged in" (no session_token, an unknown one,
+-- or an expired one) returned NULL too -- the same value a real admin gets
+-- -- reasoned at the time as "the original shared-bearer-token caller,
+-- unaffected by any of this". That reasoning only ever held before any
+-- account existed; once real accounts exist, the shared HTTP bearer token
+-- every browser tab already carries is not a login, and treating its
+-- absence of a session_token as admin access let any such caller list
+-- every agent's proposals/fixes/approvals/memories and *decide* (approve,
+-- reject -- including applying a policy_change proposal's system_prompt)
+-- any of them, with no login at all -- confirmed live: a bare
+-- proposals.decide with no session_token silently overwrote a real agent's
+-- system_prompt. The same graceful-bootstrap exception
+-- require_admin_if_accounts_exist already makes -- open only while
+-- allgres_private.users is empty -- applies here now instead of
+-- unconditionally.
 CREATE OR REPLACE FUNCTION allgres_private.visible_agent_ids(p_token text)
 RETURNS uuid[]
 LANGUAGE plpgsql
@@ -571,7 +666,13 @@ DECLARE
   v_ids uuid[];
 BEGIN
   u := allgres_private.session_user(p_token);
-  IF u.user_id IS NULL OR u.role = 'admin' THEN
+  IF u.user_id IS NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM allgres_private.users) THEN
+      RETURN NULL;
+    END IF;
+    RETURN ARRAY[]::uuid[];
+  END IF;
+  IF u.role = 'admin' THEN
     RETURN NULL;
   END IF;
   SELECT COALESCE(array_agg(agent_id), ARRAY[]::uuid[]) INTO v_ids

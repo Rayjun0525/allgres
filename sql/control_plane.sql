@@ -189,6 +189,18 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_role_admin') THEN
     CREATE ROLE allgres_role_admin NOLOGIN NOINHERIT CREATEROLE;
   END IF;
+  -- Same reasoning as allgres_role_admin (see its own comment above): the
+  -- real-time cancel button's fn_signal_cancel_worker is the only thing in
+  -- this file that ever calls pg_cancel_backend, and pg_signal_backend
+  -- membership lets its owner signal *any* backend in the cluster, not
+  -- just the "allgres runtime" worker it actually targets -- scoping that
+  -- to a role owning nothing but that one, single-statement function
+  -- keeps the blast radius of a bug (or an unreviewed future change) in
+  -- it to that one function, instead of handing every other SECURITY
+  -- DEFINER function allgres_owner also owns that same signaling power.
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_signal_admin') THEN
+    CREATE ROLE allgres_signal_admin NOLOGIN NOINHERIT;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator') THEN
     CREATE ROLE operator LOGIN;
   END IF;
@@ -212,6 +224,7 @@ $$;
 -- live that a real 0.2.0-upgraded allgres_owner stayed LOGIN without this.
 ALTER ROLE allgres_owner NOLOGIN NOINHERIT;
 ALTER ROLE allgres_role_admin NOLOGIN NOINHERIT CREATEROLE;
+ALTER ROLE allgres_signal_admin NOLOGIN NOINHERIT;
 
 -- The sandbox never resolves an unqualified relation name: the runtime worker
 -- narrows search_path to pg_temp before running model-generated SQL, and this
