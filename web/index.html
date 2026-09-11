@@ -287,10 +287,12 @@ function evaluateModal(r){
   $('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>Evaluate last change</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div>
 <div class="field"><span style="font-size:14px;font-weight:600;color:${color}">${esc(r.verdict)}</span></div>
 <div class="muted" style="font-size:12px;line-height:1.6">
-current success rate: ${r.current_success_rate??'no evaluable data yet'}<br>
-success rate before that change: ${r.success_rate_before_last_change??'no evaluable data yet'}<br>
+current success rate: ${r.current_success_rate??'no evaluable data yet'} (${r.current_sample_size??0} sample${r.current_sample_size===1?'':'s'})<br>
+success rate before that change: ${r.success_rate_before_last_change??'no evaluable data yet'} (${r.before_sample_size??0} sample${r.before_sample_size===1?'':'s'})<br>
 compared to generation: ${r.compared_to_generation??'—'}<br>
-last changed at: ${r.last_changed_at?esc(r.last_changed_at):'—'}
+last changed at: ${r.last_changed_at?esc(r.last_changed_at):'—'}<br>
+${r.verdict==='insufficient_data'?`<span style="color:var(--muted)">needs at least ${r.min_samples_required??5} evaluable tasks on each side to judge a trend</span><br>`:''}
+completion rate only -- not a judge of whether the agent's actual output was correct
 </div></div>`;
   $('#closeM').onclick=closeModal;
 }

@@ -13,6 +13,26 @@ HDR=(-H 'X-Allgres-Client: smoke')
 docker compose up -d --build
 trap 'docker compose logs --no-color allgres | tail -200' ERR
 
+# The official postgres image runs docker-entrypoint-initdb.d/*
+# (001-create-extension.sql's own `CREATE EXTENSION IF NOT EXISTS allgres`)
+# against a transient, Unix-socket-only instance before starting the real
+# one -- and that transient instance already accepts `pg_isready`/our own
+# healthz bgworker, since shared_preload_libraries loads for it too. Waiting
+# on those alone is a real race: this script's own smoke.sql runs the exact
+# same `CREATE EXTENSION IF NOT EXISTS allgres` statement, and two
+# concurrent IF-NOT-EXISTS checks against the same not-yet-committed row can
+# both decide to insert, one losing to
+# "duplicate key value violates unique constraint pg_extension_name_index"
+# (confirmed live in CI). Wait for the entrypoint's own unambiguous
+# end-of-init marker first -- "PostgreSQL init process complete" on a fresh
+# volume, "Skipping initialization" when reusing an existing one -- so the
+# init scripts (and their CREATE EXTENSION) have already committed before
+# anything here can possibly race them.
+for _ in $(seq 1 60); do
+  docker compose logs allgres 2>&1 | grep -qE "PostgreSQL init process complete|Skipping initialization" && break
+  sleep 1
+done
+
 for _ in $(seq 1 60); do
   docker compose exec -T allgres pg_isready -U postgres >/dev/null 2>&1 && break
   sleep 1
