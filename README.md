@@ -11,6 +11,42 @@ not every development milestone (see KNOWN_ISSUES.md's versioning note).
 This is an MVP: read [Security model](#security-model) before
 putting it anywhere that matters.
 
+## Quick start
+
+You need [Docker](https://docs.docker.com/get-docker/) with Compose v2
+(the `docker compose` command, not the older standalone `docker-compose`).
+Nothing else -- no PostgreSQL, no Rust, no Node.
+
+```bash
+git clone https://github.com/Rayjun0525/allgres.git
+cd allgres
+./scripts/bootstrap.sh
+```
+
+That one script builds the image, starts the container on its own data
+volume, waits for PostgreSQL to actually accept connections, creates a
+throwaway admin account, and runs one real agent task end to end to prove
+the whole thing works -- not just that the container started. The first
+run builds the extension from source, so it takes a few minutes; every
+run after that is fast, since Docker caches the build.
+
+When it finishes, open **<http://127.0.0.1:8088>** in a browser. There is
+no login token by default (see [Exposure](#exposure)) and no dashboard
+password unless you create one, so you land straight on the dashboard.
+
+Want a real admin account waiting for you instead of the script's
+throwaway one? Set these two variables *before* the first run (they only
+take effect the very first time the database is created):
+
+```bash
+ALLGRES_BOOTSTRAP_ADMIN_USER=you ALLGRES_BOOTSTRAP_ADMIN_PASSWORD=change-me ./scripts/bootstrap.sh
+```
+
+To stop it: `docker compose stop`. To stop and delete all data:
+`docker compose down -v`. Everything below this section is detail for
+when you need it -- production hardening, a non-Docker install, upgrades,
+backups -- not required to get a working instance running.
+
 ## Status
 
 Implemented and verified (natively on PostgreSQL 16.15; see [Known
@@ -107,27 +143,11 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 No Node, Python, Redis, RabbitMQ, pg_net, pg_cron, or external web server is
 required at runtime.
 
-## Docker
+## Docker install, in detail
 
-```bash
-docker compose down -v
-docker compose build --no-cache
-docker compose up
-```
-
-Then open <http://127.0.0.1:8088/>. Both published ports are bound to host
-loopback; see [Exposure](#exposure) before changing that.
-
-```bash
-curl http://127.0.0.1:8088/healthz
-./scripts/smoke.sh      # full smoke + end-to-end + security checks
-```
-
-## Install flow
-
-The pre-built image, an explicit named data volume, production-leaning
-defaults, first-admin creation, and a real provider round trip are one
-flow, not five separate steps an operator has to assemble by hand:
+This is what [Quick start](#quick-start)'s `./scripts/bootstrap.sh` actually
+does, for anyone who wants to run the steps by hand or understand what just
+happened:
 
 ```bash
 docker compose up -d --build       # allgres_pgdata is a named volume (docker-compose.yml),
@@ -136,6 +156,9 @@ docker compose up -d --build       # allgres_pgdata is a named volume (docker-co
 ./scripts/bootstrap.sh             # waits for healthy, makes sure a first admin exists,
                                     # then runs one real agent task through to completion
 ```
+
+Both published ports (`5432`, `8088`) are bound to host loopback only; see
+[Exposure](#exposure) before changing that.
 
 `scripts/bootstrap.sh` is the install's actual completion criterion: a
 container reporting healthy only means PostgreSQL accepted a connection,
@@ -161,6 +184,14 @@ prove the changed config didn't break execution — roadmap item 9's
 "설정 변경, 모델 교체" (config change, model swap) scenarios, exercised over
 real HTTP with a real session token, not only at the `fn_selftest`/SQL
 level.
+
+Want to check the container without the full bootstrap flow, or run the
+broader test suite against it?
+
+```bash
+curl http://127.0.0.1:8088/healthz
+./scripts/smoke.sh      # full smoke + end-to-end + security checks
+```
 
 See [Extension installation](#extension-installation) for a bare-metal
 (non-Docker) install and version upgrades, and [Backup and
@@ -203,8 +234,8 @@ wrapper around a plain PL/pgSQL function (`fn_create_agent`,
 body — the same function an operator can call directly from `psql` with no
 HTTP, no dashboard, and no JSON in sight, exactly the way this project's
 own development creates its very first admin account
-(`psql -c "SELECT fn_create_user(...)"`, see [Install
-flow](#install-flow)). `dashboard_rpc`'s own job is strictly session
+(`psql -c "SELECT fn_create_user(...)"`, see [Docker install, in
+detail](#docker-install-in-detail)). `dashboard_rpc`'s own job is strictly session
 resolution, admin gating, and the operator audit log entry — never logic a
 direct SQL caller would be missing out on. A handful of mutations
 (`users.set_active`/`set_role`, a user's agent assignments) used to be the
@@ -1050,18 +1081,36 @@ bypass of the dashboard token.
 
 ## Extension installation
 
-Install the extension files, set:
+No Docker: install straight onto an existing PostgreSQL 16 or 17 server.
+You need `cargo-pgrx` (`cargo install --locked cargo-pgrx --version 0.19.2`)
+and that PostgreSQL version's own `-dev`/`-server-dev` package installed
+first (`pg_config` must be on `PATH`), then:
+
+```bash
+cargo pgrx install --release --features pg17   # or --features pg16
+```
+
+This compiles the extension and copies the `.so`/`.control`/`.sql` files
+into that PostgreSQL installation's own extension directory — no manual
+file copying. Then set:
 
 ```conf
 shared_preload_libraries = 'allgres'
 ```
 
-restart PostgreSQL, then:
+restart PostgreSQL (a plain reload is not enough — this registers a
+background worker, which only happens at postmaster start), and create
+the extension:
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- optional
+CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- optional, encrypts secrets at rest
 CREATE EXTENSION allgres;
 ```
+
+Open the address `ALLGRES_HTTP_ADDR` defaults to
+(`http://127.0.0.1:8088`) the same as the Docker path above. See
+[Configuration](#configuration) for every environment variable the
+runtime worker reads.
 
 ### Upgrades
 
