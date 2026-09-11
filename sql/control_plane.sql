@@ -8708,6 +8708,9 @@ DECLARE
   v_audit_tok text;
   v_acct_agent uuid;
   v_procedure_tool uuid;
+  v_memory_id uuid;
+  v_other_memory_id uuid;
+  v_guard_project uuid;
 BEGIN
   -- Clear out any leftover fixtures from an interrupted prior run before
   -- creating new ones, so a crash mid-selftest can't leave stale rows
@@ -11382,6 +11385,106 @@ BEGIN
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
     v := v || jsonb_build_array(jsonb_build_object('name', 'logs_list_needs_admin_once_accounts_exist', 'ok', ok));
 
+    -- projects.create/projects.update (same class of gap as run/sessions.*
+    -- above, closed the same way schedules/procedures/connections already
+    -- are: admin-only, no per-user ownership). Before this fix, any caller
+    -- holding the shared dashboard token could create or reconfigure a
+    -- project regardless of account state.
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.create', 'name', 'selftest_projects_rpc_guard'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_create_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.create', 'name', 'selftest_projects_rpc_guard', 'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_create_rejects_non_admin_user', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.create', 'name', 'selftest_projects_rpc_guard', 'session_token', v_admin_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v_guard_project := (sub->>'project_id')::uuid;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_create_allows_admin', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.update', 'project_id', v_guard_project::text, 'is_active', false,
+      'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND (SELECT is_active FROM allgres_private.projects WHERE project_id = v_guard_project) = true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_update_rejects_non_admin_user', 'ok', ok));
+
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'projects.update', 'project_id', v_guard_project::text, 'is_active', false,
+      'session_token', v_admin_tok
+    ));
+    ok := (SELECT is_active FROM allgres_private.projects WHERE project_id = v_guard_project) = false;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'projects_update_allows_admin', 'ok', ok));
+    DELETE FROM allgres_private.projects WHERE project_id = v_guard_project;
+
+    -- memories.create/memories.remove (same class of gap
+    -- memories.list's own v_scope fix already closed for listing): before
+    -- this fix, any caller holding the shared dashboard token could plant
+    -- or delete any agent's memory regardless of account state or
+    -- assignment. A fresh, genuinely-unassigned agent for the "not
+    -- assigned" cases -- not v_sys_target, which the run/sessions.* block
+    -- above deliberately assigns to selftest_user already.
+    DELETE FROM allgres_private.agents WHERE name = 'selftest_unassigned_target';
+    v_new_agent := (allgres_public.fn_create_agent('selftest_unassigned_target')->>'agent_id')::uuid;
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.create', 'agent_id', v_acct_agent::text, 'content', 'selftest guard memory'
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_create_rejects_no_session_token_once_accounts_exist', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.create', 'agent_id', v_new_agent::text, 'content', 'selftest guard memory',
+      'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_create_rejects_user_not_assigned_to_this_agent', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.create', 'agent_id', v_acct_agent::text, 'content', 'selftest guard memory',
+      'session_token', v_user_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v_memory_id := (sub->>'memory_id')::uuid;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_create_allows_assigned_user', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.create', 'agent_id', v_new_agent::text, 'content', 'selftest guard memory',
+      'session_token', v_admin_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false);
+    v_other_memory_id := (sub->>'memory_id')::uuid;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_create_allows_admin_on_any_agent', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.remove', 'memory_id', v_other_memory_id::text, 'session_token', v_user_tok
+    ));
+    ok := (sub->>'ok')::boolean IS DISTINCT FROM true
+      AND EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_other_memory_id);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_remove_rejects_user_not_assigned_to_this_agent', 'ok', ok));
+
+    sub := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.remove', 'memory_id', v_memory_id::text, 'session_token', v_user_tok
+    ));
+    ok := COALESCE((sub->>'ok')::boolean, false)
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_memory_id);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_remove_allows_assigned_user', 'ok', ok));
+
+    PERFORM allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'memories.remove', 'memory_id', v_other_memory_id::text, 'session_token', v_admin_tok
+    ));
+    ok := NOT EXISTS (SELECT 1 FROM allgres_private.agent_memories WHERE memory_id = v_other_memory_id);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'memories_remove_allows_admin_on_any_agent', 'ok', ok));
+    DELETE FROM allgres_private.agents WHERE agent_id = v_new_agent;
+
     -- Setting a key to JSON null clears it back to the reader's own coded
     -- default rather than leaving a stray {"probe":2} on a real seeded
     -- agent.
@@ -12698,13 +12801,22 @@ BEGIN
         ) pr
       ), '[]'::jsonb));
 
+    -- Same operator-config class as schedules/procedures/connections (no
+    -- per-user ownership, admin-curated) -- guarded the same way those are,
+    -- not the agent-scoped require_agent_access_if_accounts_exist used for
+    -- run/sessions.*. Before this fix, any caller holding the shared
+    -- dashboard token could create or reconfigure a project regardless of
+    -- account state, the same class of hole already closed elsewhere in
+    -- this function.
     WHEN 'projects.create' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_create_project(
         p_request->>'name', p_request->>'description',
         NULLIF(p_request->>'agent_id', '')::uuid, p_request->>'preset_prompt'
       );
 
     WHEN 'projects.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'project_id')::uuid;
       IF p_request ? 'is_active' THEN
         PERFORM allgres_public.fn_set_project_active(v_id, (p_request->>'is_active')::boolean);
@@ -13042,7 +13154,17 @@ BEGIN
         ) q
       ), '[]'::jsonb));
 
+    -- Agent-scoped the same way run/sessions.cancel are, not the v_scope
+    -- listing pattern memories.list uses -- a single target agent_id is
+    -- already in the request (create) or resolvable from the memory row
+    -- (remove). Before this fix, any caller holding the shared dashboard
+    -- token could plant or delete any agent's memory regardless of account
+    -- state or assignment, the same class of hole memories.list's own
+    -- v_scope fix already closed for listing.
     WHEN 'memories.create' THEN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(
+        p_request->>'session_token', (p_request->>'agent_id')::uuid
+      );
       RETURN allgres_public.fn_remember(
         (p_request->>'agent_id')::uuid,
         p_request->>'content',
@@ -13053,6 +13175,10 @@ BEGIN
       );
 
     WHEN 'memories.remove' THEN
+      PERFORM allgres_private.require_agent_access_if_accounts_exist(
+        p_request->>'session_token',
+        (SELECT agent_id FROM allgres_private.agent_memories WHERE memory_id = (p_request->>'memory_id')::uuid)
+      );
       RETURN allgres_public.fn_forget((p_request->>'memory_id')::uuid);
 
     -- Roadmap item 3: search past work/decisions/failures, instead of only
