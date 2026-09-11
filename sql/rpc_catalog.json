@@ -1,0 +1,837 @@
+[
+  {
+    "action": "overview",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "agents.list",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "agents.set_autonomy",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "autonomy_level",
+      "session_token"
+    ]
+  },
+  {
+    "action": "agents.bulk_set_model",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "model",
+      "provider",
+      "session_token"
+    ]
+  },
+  {
+    "action": "agents.create",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "name",
+      "session_token",
+      "system_prompt"
+    ]
+  },
+  {
+    "action": "agents.update",
+    "guards": [
+      "require_admin_for_system_agent",
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_config",
+      "agent_id",
+      "is_active",
+      "llm_config",
+      "max_concurrent_tasks",
+      "max_delegation_depth",
+      "max_retries",
+      "max_session_tasks",
+      "max_steps",
+      "max_turn_seconds",
+      "session_token",
+      "system_prompt"
+    ]
+  },
+  {
+    "action": "policy.history",
+    "guards": [],
+    "params": [
+      "agent_id"
+    ]
+  },
+  {
+    "action": "policy.rollback",
+    "guards": [
+      "require_admin_for_system_agent",
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "generation",
+      "session_token"
+    ]
+  },
+  {
+    "action": "agents.evaluate",
+    "guards": [],
+    "params": [
+      "agent_id"
+    ]
+  },
+  {
+    "action": "proposals.list",
+    "guards": [
+      "visible_agent_ids"
+    ],
+    "params": [
+      "agent_id",
+      "session_token",
+      "status"
+    ]
+  },
+  {
+    "action": "proposals.decide",
+    "guards": [
+      "visible_agent_ids"
+    ],
+    "params": [
+      "approve",
+      "proposal_id",
+      "reply",
+      "session_token"
+    ]
+  },
+  {
+    "action": "fixes.list",
+    "guards": [
+      "visible_agent_ids"
+    ],
+    "params": [
+      "session_token",
+      "status"
+    ]
+  },
+  {
+    "action": "fixes.decide",
+    "guards": [
+      "visible_agent_ids"
+    ],
+    "params": [
+      "approve",
+      "fix_id",
+      "reply",
+      "session_token"
+    ]
+  },
+  {
+    "action": "permissions.list",
+    "guards": [],
+    "params": [
+      "agent_id"
+    ]
+  },
+  {
+    "action": "permissions.grant",
+    "guards": [
+      "require_admin_for_system_agent",
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "ref",
+      "session_token",
+      "type"
+    ]
+  },
+  {
+    "action": "permissions.revoke",
+    "guards": [
+      "require_admin_for_system_agent",
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "ref",
+      "session_token",
+      "type"
+    ]
+  },
+  {
+    "action": "permissions.options",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "allowlist.list",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "allowlist.add",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "ref",
+      "session_token"
+    ]
+  },
+  {
+    "action": "allowlist.remove",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "ref",
+      "session_token"
+    ]
+  },
+  {
+    "action": "projects.list",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "projects.create",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "description",
+      "name",
+      "preset_prompt",
+      "session_token"
+    ]
+  },
+  {
+    "action": "projects.update",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "is_active",
+      "preset_prompt",
+      "project_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "project_chat.send",
+    "guards": [],
+    "params": [
+      "message",
+      "project_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "project_chat.history",
+    "guards": [],
+    "params": [
+      "project_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "run",
+    "guards": [
+      "require_agent_access_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "goal",
+      "project_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "sessions.cancel",
+    "guards": [
+      "require_agent_access_if_accounts_exist"
+    ],
+    "params": [
+      "reason",
+      "session_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "sessions.continue",
+    "guards": [
+      "require_agent_access_if_accounts_exist"
+    ],
+    "params": [
+      "message",
+      "session_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "auth.login",
+    "guards": [],
+    "params": [
+      "password",
+      "username"
+    ]
+  },
+  {
+    "action": "auth.logout",
+    "guards": [],
+    "params": [
+      "session_token"
+    ]
+  },
+  {
+    "action": "auth.me",
+    "guards": [
+      "session_user"
+    ],
+    "params": [
+      "session_token"
+    ]
+  },
+  {
+    "action": "users.create",
+    "guards": [
+      "require_admin"
+    ],
+    "params": [
+      "password",
+      "role",
+      "session_token",
+      "username"
+    ]
+  },
+  {
+    "action": "users.list",
+    "guards": [
+      "require_admin"
+    ],
+    "params": [
+      "session_token"
+    ]
+  },
+  {
+    "action": "users.set_active",
+    "guards": [
+      "require_admin"
+    ],
+    "params": [
+      "is_active",
+      "session_token",
+      "user_id"
+    ]
+  },
+  {
+    "action": "users.set_role",
+    "guards": [
+      "require_admin"
+    ],
+    "params": [
+      "role",
+      "session_token",
+      "user_id"
+    ]
+  },
+  {
+    "action": "assignments.set",
+    "guards": [
+      "require_admin"
+    ],
+    "params": [
+      "agent_ids",
+      "session_token",
+      "user_id"
+    ]
+  },
+  {
+    "action": "assignments.list",
+    "guards": [
+      "require_admin"
+    ],
+    "params": [
+      "session_token",
+      "user_id"
+    ]
+  },
+  {
+    "action": "assignments.for_agent",
+    "guards": [
+      "require_admin"
+    ],
+    "params": [
+      "agent_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "assignments.toggle",
+    "guards": [
+      "require_admin"
+    ],
+    "params": [
+      "agent_id",
+      "assigned",
+      "session_token",
+      "user_id"
+    ]
+  },
+  {
+    "action": "agents.mine",
+    "guards": [
+      "session_user"
+    ],
+    "params": [
+      "session_token"
+    ]
+  },
+  {
+    "action": "agents.set_my_model",
+    "guards": [],
+    "params": [
+      "agent_id",
+      "model",
+      "provider",
+      "session_token"
+    ]
+  },
+  {
+    "action": "chat.send",
+    "guards": [],
+    "params": [
+      "agent_id",
+      "message",
+      "session_token"
+    ]
+  },
+  {
+    "action": "chat.history",
+    "guards": [],
+    "params": [
+      "agent_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "messenger.post",
+    "guards": [],
+    "params": [
+      "session_token",
+      "text"
+    ]
+  },
+  {
+    "action": "messenger.list",
+    "guards": [
+      "session_user"
+    ],
+    "params": [
+      "limit",
+      "session_token"
+    ]
+  },
+  {
+    "action": "sessions.list",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "limit",
+      "project_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "sessions.get",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "session_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "tasks.list",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "limit",
+      "session_token"
+    ]
+  },
+  {
+    "action": "logs.list",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "limit",
+      "session_token"
+    ]
+  },
+  {
+    "action": "memories.list",
+    "guards": [
+      "visible_agent_ids"
+    ],
+    "params": [
+      "agent_id",
+      "limit",
+      "session_token"
+    ]
+  },
+  {
+    "action": "memories.create",
+    "guards": [
+      "require_agent_access_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "content",
+      "expires_in_days",
+      "importance",
+      "memory_type",
+      "session_token",
+      "subject_id"
+    ]
+  },
+  {
+    "action": "memories.remove",
+    "guards": [
+      "require_agent_access_if_accounts_exist"
+    ],
+    "params": [
+      "memory_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "history.search",
+    "guards": [
+      "visible_agent_ids"
+    ],
+    "params": [
+      "agent_id",
+      "limit",
+      "project_id",
+      "query",
+      "session_token"
+    ]
+  },
+  {
+    "action": "audit.list",
+    "guards": [],
+    "params": [
+      "limit"
+    ]
+  },
+  {
+    "action": "settings.get",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "provider.update",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "allow_private_network",
+      "api_key",
+      "base_url",
+      "embedding_model",
+      "is_enabled",
+      "oauth_auth_url",
+      "oauth_client_id",
+      "oauth_client_secret",
+      "oauth_token_url",
+      "provider_id",
+      "response_format_json_object",
+      "session_token"
+    ]
+  },
+  {
+    "action": "provider.create",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "allow_private_network",
+      "api_key",
+      "base_url",
+      "embedding_model",
+      "kind",
+      "name",
+      "purpose",
+      "response_format_json_object",
+      "session_token"
+    ]
+  },
+  {
+    "action": "connections.list",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "connections.create",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "allow_private_network",
+      "api_key",
+      "auth_kind",
+      "base_url",
+      "name",
+      "session_token"
+    ]
+  },
+  {
+    "action": "connections.update",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "allow_private_network",
+      "api_key",
+      "auth_kind",
+      "base_url",
+      "connection_id",
+      "is_enabled",
+      "session_token"
+    ]
+  },
+  {
+    "action": "connections.delete",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "connection_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "procedures.list",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "procedures.get",
+    "guards": [],
+    "params": [
+      "procedure_id"
+    ]
+  },
+  {
+    "action": "procedures.create",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "content",
+      "name",
+      "session_token"
+    ]
+  },
+  {
+    "action": "procedures.update",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "content",
+      "is_active",
+      "procedure_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "procedures.rollback",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "generation",
+      "procedure_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "procedure_tools.list",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "procedure_tools.create",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "args_template",
+      "description",
+      "handler",
+      "name",
+      "session_token"
+    ]
+  },
+  {
+    "action": "procedure_tools.bind",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "procedure_id",
+      "session_token",
+      "tool_id"
+    ]
+  },
+  {
+    "action": "schedules.list",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "schedules.create",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "ends_at",
+      "goal",
+      "interval_seconds",
+      "max_runs",
+      "name",
+      "session_token",
+      "start_at"
+    ]
+  },
+  {
+    "action": "schedules.update",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "clear_ends_at",
+      "clear_max_runs",
+      "ends_at",
+      "goal",
+      "interval_seconds",
+      "is_active",
+      "max_runs",
+      "schedule_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "schedules.delete",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "schedule_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "schedules.run_now",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "schedule_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "providers.oauth_start",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "provider_id",
+      "redirect",
+      "session_token"
+    ]
+  },
+  {
+    "action": "providers.oauth_device_start",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "provider_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "providers.oauth_device_status",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "session_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "providers.oauth_callback",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "code",
+      "redirect",
+      "session_token",
+      "state"
+    ]
+  },
+  {
+    "action": "events",
+    "guards": [],
+    "params": []
+  },
+  {
+    "action": "approvals.list",
+    "guards": [
+      "visible_agent_ids"
+    ],
+    "params": [
+      "limit",
+      "session_token"
+    ]
+  },
+  {
+    "action": "approvals.decide",
+    "guards": [
+      "visible_agent_ids"
+    ],
+    "params": [
+      "accept",
+      "approval_id",
+      "reply",
+      "session_token"
+    ]
+  },
+  {
+    "action": "selftest",
+    "guards": [],
+    "params": []
+  }
+]

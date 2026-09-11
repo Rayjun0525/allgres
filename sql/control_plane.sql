@@ -8733,6 +8733,9 @@ DECLARE
   v_memory_id uuid;
   v_other_memory_id uuid;
   v_guard_project uuid;
+  v_live_rpc_actions text[];
+  v_missing_rpc_actions text[];
+  v_extra_rpc_actions text[];
 BEGIN
   -- Clear out any leftover fixtures from an interrupted prior run before
   -- creating new ones, so a crash mid-selftest can't leave stale rows
@@ -12099,6 +12102,68 @@ BEGIN
     );
     v := v || jsonb_build_array(jsonb_build_object('name', 'search_agents_no_provider_is_a_friendly_continue', 'ok', ok));
   END;
+
+  -- The RPC contract freeze (P0): dashboard_rpc's own action set, pinned
+  -- here so adding, removing, or renaming an action is a visible,
+  -- deliberate act instead of silent drift an operator only discovers
+  -- from a 404 in production. This is what "freeze the contract" means in
+  -- practice for a jsonb-dispatched action set that CASE alone cannot
+  -- check at parse time. Regenerate sql/rpc_catalog.json
+  -- (scripts/gen_rpc_catalog.py) and update this array together whenever
+  -- dashboard_rpc's CASE changes -- the two are meant to be edited in the
+  -- same commit, never one without the other.
+  SELECT array_agg(DISTINCT m[1]) INTO v_live_rpc_actions
+  FROM regexp_matches(
+    pg_get_functiondef('allgres.dashboard_rpc(jsonb)'::regprocedure),
+    'WHEN ''([a-zA-Z_.]+)'' THEN', 'g'
+  ) AS m;
+  SELECT array_agg(a ORDER BY a) INTO v_missing_rpc_actions
+  FROM unnest(ARRAY[
+    'overview', 'agents.list', 'agents.set_autonomy', 'agents.bulk_set_model', 'agents.create',
+    'agents.update', 'policy.history', 'policy.rollback', 'agents.evaluate', 'proposals.list',
+    'proposals.decide', 'fixes.list', 'fixes.decide', 'permissions.list', 'permissions.grant',
+    'permissions.revoke', 'permissions.options', 'allowlist.list', 'allowlist.add', 'allowlist.remove',
+    'projects.list', 'projects.create', 'projects.update', 'project_chat.send', 'project_chat.history',
+    'run', 'sessions.cancel', 'sessions.continue', 'auth.login', 'auth.logout', 'auth.me',
+    'users.create', 'users.list', 'users.set_active', 'users.set_role', 'assignments.set',
+    'assignments.list', 'assignments.for_agent', 'assignments.toggle', 'agents.mine', 'agents.set_my_model',
+    'chat.send', 'chat.history', 'messenger.post', 'messenger.list', 'sessions.list', 'sessions.get',
+    'tasks.list', 'logs.list', 'memories.list', 'memories.create', 'memories.remove', 'history.search',
+    'audit.list', 'settings.get', 'provider.update', 'provider.create', 'connections.list',
+    'connections.create', 'connections.update', 'connections.delete', 'procedures.list', 'procedures.get',
+    'procedures.create', 'procedures.update', 'procedures.rollback', 'procedure_tools.list',
+    'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
+    'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
+    'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
+    'approvals.decide', 'selftest'
+  ]::text[]) a
+  WHERE a <> ALL(COALESCE(v_live_rpc_actions, ARRAY[]::text[]));
+  SELECT array_agg(a ORDER BY a) INTO v_extra_rpc_actions
+  FROM unnest(v_live_rpc_actions) a
+  WHERE a <> ALL(ARRAY[
+    'overview', 'agents.list', 'agents.set_autonomy', 'agents.bulk_set_model', 'agents.create',
+    'agents.update', 'policy.history', 'policy.rollback', 'agents.evaluate', 'proposals.list',
+    'proposals.decide', 'fixes.list', 'fixes.decide', 'permissions.list', 'permissions.grant',
+    'permissions.revoke', 'permissions.options', 'allowlist.list', 'allowlist.add', 'allowlist.remove',
+    'projects.list', 'projects.create', 'projects.update', 'project_chat.send', 'project_chat.history',
+    'run', 'sessions.cancel', 'sessions.continue', 'auth.login', 'auth.logout', 'auth.me',
+    'users.create', 'users.list', 'users.set_active', 'users.set_role', 'assignments.set',
+    'assignments.list', 'assignments.for_agent', 'assignments.toggle', 'agents.mine', 'agents.set_my_model',
+    'chat.send', 'chat.history', 'messenger.post', 'messenger.list', 'sessions.list', 'sessions.get',
+    'tasks.list', 'logs.list', 'memories.list', 'memories.create', 'memories.remove', 'history.search',
+    'audit.list', 'settings.get', 'provider.update', 'provider.create', 'connections.list',
+    'connections.create', 'connections.update', 'connections.delete', 'procedures.list', 'procedures.get',
+    'procedures.create', 'procedures.update', 'procedures.rollback', 'procedure_tools.list',
+    'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
+    'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
+    'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
+    'approvals.decide', 'selftest'
+  ]::text[]);
+  ok := v_missing_rpc_actions IS NULL AND v_extra_rpc_actions IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object(
+    'name', 'dashboard_rpc_actions_match_frozen_catalog', 'ok', ok,
+    'missing_from_dispatch', to_jsonb(v_missing_rpc_actions), 'not_yet_cataloged', to_jsonb(v_extra_rpc_actions)
+  ));
 
   PERFORM allgres_private.selftest_cleanup();
 
