@@ -7292,31 +7292,24 @@ $fn$;
 -- header comment) -- found by its bgworker name, not a stored pid, since
 -- the worker restarts under the same name after a crash.
 --
--- NOT YET RELIABLE, unlike the rest of this comment's claims: calling
--- this against a real in-flight sandboxed statement (including a plain
--- SET LOCAL statement_timeout expiry, tested independently of this
--- function entirely) did not reliably interrupt it live -- observed a
--- CPU-bound sandboxed query keep running past 60s despite
--- statement_timeout='5s' and repeated pg_cancel_backend/
--- pg_terminate_backend calls against this exact worker pid, with no
--- corresponding cancellation error ever logged. The "allgres runtime"
--- worker requests SIGHUP/SIGTERM wake flags only (see
--- allgres_runtime_main), and pgrx's own default handler for those (and,
--- if installed at all, SIGINT) only sets a flag and wakes its own latch
--- -- checked at the top of the worker's own while loop, never while
--- blocked inside one long-running SPI call -- which may mean neither an
--- external cancel nor even statement_timeout's own interrupt-checking
--- reaches a sandboxed statement already executing here, independent of
--- permissions. Root cause not yet confirmed; do not rely on this to
--- bound a stuck sandboxed statement's runtime until it is. What is
--- confirmed live: when a cancellation error *is* delivered and caught,
--- run_in_subtransaction in src/lib.rs correctly stops it from crashing
--- the whole worker (plain PL/pgSQL EXCEPTION WHEN OTHERS cannot trap a
--- query cancellation at all, confirmed live separately) -- that part of
--- the fix is real regardless of whether this function reliably triggers
--- one. A rare race where the worker has already moved on to unrelated
--- pump work by the time this runs would cancel that instead -- moot
--- until delivery itself is confirmed working at all.
+-- CONFIRMED live, after two further fixes beyond the crash-safety one
+-- below: (1) allgres_signal_admin (this function's owner) is itself
+-- NOLOGIN NOINHERIT, so `GRANT pg_signal_backend TO allgres_signal_admin`
+-- alone grants membership without inheriting the privilege -- needed
+-- `WITH INHERIT TRUE` (PG16+) before a SECURITY DEFINER call here could
+-- actually signal anything; and (2) BackgroundWorker::transaction()'s raw
+-- StartTransactionCommand()/CommitTransactionCommand() bypasses
+-- tcop/postgres.c's per-query dispatch, which is what normally arms the
+-- statement_timeout timer -- so `SET LOCAL statement_timeout` alone set
+-- the GUC value but never actually started a timer in this worker. Fixed
+-- by hand-calling enable_timeout_after/disable_timeout (utils/timeout.h)
+-- around the sandboxed call in run_sandboxed_sql (src/lib.rs). With both
+-- fixed and the extension's .so actually reloaded via a full
+-- `service postgresql restart` (DROP/CREATE EXTENSION does not reload an
+-- already-running worker's shared library), live testing measured ~60-75ms
+-- from this function's call to the sandboxed statement erroring out with
+-- query_canceled, the worker surviving via run_in_subtransaction below,
+-- and statement_timeout itself independently firing at its configured 5s.
 CREATE OR REPLACE FUNCTION allgres_private.fn_signal_cancel_worker()
 RETURNS void
 LANGUAGE sql
@@ -7325,6 +7318,29 @@ SET search_path = pg_catalog, pg_temp
 AS $fn$
   SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE backend_type = 'allgres runtime';
 $fn$;
+
+-- Lets the worker's own outbound-cancellation registry (OUTBOUND_CANCEL_FLAGS
+-- in src/lib.rs) discover which of its currently-registered in-flight HTTP/LLM
+-- calls fn_cancel_session has since marked 'lost', without granting the
+-- dropped-privilege worker role direct SELECT on allgres_private.outbound_calls
+-- -- the same reasoning as fn_signal_cancel_worker just above: raw table access
+-- would mean replicating allgres_owner's grants onto a role that otherwise
+-- only ever calls through fn_claim_outbound/fn_complete_outbound. Called once
+-- per main-loop iteration from propagate_outbound_cancellations(), with only
+-- the call_ids the registry currently holds a flag for -- never a full table
+-- scan.
+CREATE OR REPLACE FUNCTION allgres_public.fn_check_lost_outbound(p_call_ids uuid[])
+RETURNS uuid[]
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  SELECT COALESCE(array_agg(call_id), ARRAY[]::uuid[])
+  FROM allgres_private.outbound_calls
+  WHERE call_id = ANY(p_call_ids) AND status = 'lost';
+$fn$;
+
+GRANT EXECUTE ON FUNCTION allgres_public.fn_check_lost_outbound(uuid[]) TO worker;
 
 -- The one control that was missing entirely: nothing could stop a runaway
 -- agent.  Cancels every open task in the session (queued/running/
@@ -9183,6 +9199,25 @@ BEGIN
   SELECT count(*) INTO v_gen FROM allgres_private.execution_logs WHERE task_id = v_tid;
   ok := ok AND v_gen = n_logs;
   v := v || jsonb_build_array(jsonb_build_object('name', 'complete_outbound_fences_stale_result', 'ok', ok));
+
+  -- fn_check_lost_outbound: the one thing the worker's real-time-cancel
+  -- registry (OUTBOUND_CANCEL_FLAGS in src/lib.rs) is allowed to ask about
+  -- outbound_calls without direct table access (see that function's own
+  -- comment). Must return exactly the 'lost' ids among the ones it was
+  -- asked about, and nothing else -- an 'in_flight' row passed in the same
+  -- array must not come back, or a call still genuinely running would be
+  -- flagged cancelled by mistake.
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest check_lost_outbound')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status)
+  VALUES (v_tid, 'llm', 'https://api.x.ai/v1/chat/completions', 'lost')
+  RETURNING call_id INTO v_call;
+  INSERT INTO allgres_private.outbound_calls (task_id, kind, url, status)
+  VALUES (v_tid, 'llm', 'https://api.x.ai/v1/chat/completions', 'in_flight')
+  RETURNING call_id INTO v_call2;
+  sub := to_jsonb(allgres_public.fn_check_lost_outbound(ARRAY[v_call, v_call2]));
+  ok := sub @> to_jsonb(ARRAY[v_call]) AND NOT (sub @> to_jsonb(ARRAY[v_call2])) AND jsonb_array_length(sub) = 1;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'check_lost_outbound_returns_only_lost_ids', 'ok', ok));
 
   -- 14. sessions can be scoped to a project; fn_create_session rejects an
   --     inactive or missing project the same way it already rejects an

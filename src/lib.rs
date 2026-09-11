@@ -39,7 +39,7 @@ use std::net::{IpAddr, Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -571,6 +571,51 @@ fn drop_privileges() -> bool {
     }
 }
 
+/// The SPI-thread half of real-time HTTP/LLM cancellation: for every
+/// outbound call an HTTP thread is *currently* running (present in
+/// `OUTBOUND_CANCEL_FLAGS`), check whether fn_cancel_session has since
+/// marked its `outbound_calls` row 'lost' -- and if so, flip that call's
+/// flag so `CancellableTransport` notices within one `CANCEL_POLL_INTERVAL`
+/// instead of only when the request would otherwise time out on its own.
+/// An HTTP thread must never touch Postgres itself (this module's own
+/// header comment), which is exactly why this lives here instead of in
+/// `perform_http`. A no-op query (empty id list) when nothing is in
+/// flight, so this costs nothing on an idle worker.
+fn propagate_outbound_cancellations() {
+    let ids: Vec<String> = match OUTBOUND_CANCEL_FLAGS.lock() {
+        Ok(map) => map.keys().cloned().collect(),
+        Err(_) => return,
+    };
+    if ids.is_empty() {
+        return;
+    }
+    let lost: Vec<String> = BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            return Vec::new();
+        }
+        match Spi::get_one_with_args::<JsonB>(
+            "SELECT to_jsonb(allgres_public.fn_check_lost_outbound($1::text[]::uuid[]))",
+            &[ids.into()],
+        ) {
+            Ok(Some(JsonB(v))) => v
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    });
+    if lost.is_empty() {
+        return;
+    }
+    if let Ok(map) = OUTBOUND_CANCEL_FLAGS.lock() {
+        for call_id in &lost {
+            if let Some(flag) = map.get(call_id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 fn dispatch_and_claim(limit: usize) -> Value {
     BackgroundWorker::transaction(|| {
         if !drop_privileges() {
@@ -1090,7 +1135,180 @@ impl ureq::unversioned::resolver::Resolver for GuardedResolver {
     }
 }
 
-fn perform_http(call: &Value) -> (i32, String) {
+/// Every in-flight outbound HTTP call's cooperative cancellation flag, keyed
+/// by call_id -- the real-time "stop" button's mechanism for a session that
+/// is currently blocked inside `perform_http` on an HTTP thread, not the
+/// SPI thread (see `run_in_subtransaction`'s own comment for the sandboxed
+/// SQL half of the same feature). Entries live only as long as
+/// `perform_http` is actually running that call: inserted at the top,
+/// removed via `CancelGuard`'s `Drop` on every return path. The main loop
+/// (not this thread -- an HTTP thread must never touch Postgres, see this
+/// module's own header comment) is the one place that ever sets a flag to
+/// true, on noticing `outbound_calls.status` for that call_id flip to
+/// 'lost' (fn_cancel_session's own doing) while it is still in this map.
+static OUTBOUND_CANCEL_FLAGS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct CancelGuard {
+    call_id: String,
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelGuard {
+    fn register(call_id: &str) -> Self {
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Ok(mut map) = OUTBOUND_CANCEL_FLAGS.lock() {
+            map.insert(call_id.to_string(), flag.clone());
+        }
+        CancelGuard { call_id: call_id.to_string(), flag }
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = OUTBOUND_CANCEL_FLAGS.lock() {
+            map.remove(&self.call_id);
+        }
+    }
+}
+
+/// Wraps ureq's real connector so every `Transport` it produces carries this
+/// call's own cancellation flag -- see `CancellableTransport`.
+#[derive(Debug)]
+struct CancellableConnector {
+    inner: ureq::unversioned::transport::DefaultConnector,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ureq::unversioned::transport::Connector for CancellableConnector {
+    type Out = CancellableTransport;
+
+    fn connect(
+        &self,
+        details: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<()>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        match self.inner.connect(details, chained)? {
+            Some(inner) => Ok(Some(CancellableTransport { inner, cancel: self.cancel.clone() })),
+            None => Ok(None),
+        }
+    }
+}
+
+/// How often a wait against the real transport is interrupted to re-check
+/// the cancellation flag. Small enough that a "stop" click lands well
+/// under a second, large enough not to busy-loop.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Delegates every real read/write to ureq's own transport, but slices
+/// `await_input`/`transmit_output`'s own timeout into `CANCEL_POLL_INTERVAL`
+/// steps so a cancellation flagged mid-wait is noticed promptly instead of
+/// only at the next natural timeout (which, for an LLM response, can be the
+/// entire per-call HTTP_TIMEOUT away).
+#[derive(Debug)]
+struct CancellableTransport {
+    inner: Box<dyn ureq::unversioned::transport::Transport>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl CancellableTransport {
+    fn check_cancelled(&self) -> Result<(), ureq::Error> {
+        if self.cancel.load(Ordering::Relaxed) {
+            Err(ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "cancelled by operator",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// ureq's own `Duration`/`Instant` (`ureq::unversioned::transport::time`)
+    /// are distinct types from `std::time`'s, needed only at the boundary
+    /// of a call into `self.inner` -- everywhere else here just tracks a
+    /// plain `std::time::Duration` deadline. `Duration` derefs to
+    /// `std::time::Duration` (`NotHappening` as `u64::MAX` seconds), which
+    /// is what makes a "no timeout configured" `NextTimeout` safe to treat
+    /// the same as any other.
+    fn sliced(
+        after: std::time::Duration,
+        reason: ureq::Timeout,
+    ) -> ureq::unversioned::transport::NextTimeout {
+        ureq::unversioned::transport::NextTimeout {
+            after: ureq::unversioned::transport::time::Duration::Exact(after.min(CANCEL_POLL_INTERVAL)),
+            reason,
+        }
+    }
+}
+
+impl ureq::unversioned::transport::Transport for CancellableTransport {
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<(), ureq::Error> {
+        let deadline = Instant::now() + *timeout.after;
+        loop {
+            self.check_cancelled()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.inner.transmit_output(amount, timeout);
+            }
+            match self.inner.transmit_output(amount, Self::sliced(remaining, timeout.reason)) {
+                Ok(()) => return Ok(()),
+                Err(ureq::Error::Timeout(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn maybe_await_input(&mut self, timeout: ureq::unversioned::transport::NextTimeout) -> Result<bool, ureq::Error> {
+        if self.buffers().can_use_input() {
+            return Ok(true);
+        }
+        self.await_input(timeout)
+    }
+
+    fn await_input(&mut self, timeout: ureq::unversioned::transport::NextTimeout) -> Result<bool, ureq::Error> {
+        let deadline = Instant::now() + *timeout.after;
+        loop {
+            self.check_cancelled()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.inner.await_input(timeout);
+            }
+            match self.inner.await_input(Self::sliced(remaining, timeout.reason)) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                // A sliced sub-timeout expiring is not the real deadline -- only
+                // the outer `deadline` (derived from the caller's own original
+                // `timeout.after`) means the actual wait ran out. Without this,
+                // the very first 150ms slice with no data yet available would
+                // surface as a genuine timeout error to the caller instead of
+                // looping, which is exactly what made a real 15s-slow response
+                // fail in ~50ms during live testing.
+                Err(ureq::Error::Timeout(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
+fn perform_http(call_id: &str, call: &Value) -> (i32, String) {
+    let cancel_guard = CancelGuard::register(call_id);
+    let cancel_flag = cancel_guard.flag.clone();
     let Some(url) = call.get("url").and_then(Value::as_str) else {
         return (0, "missing outbound URL".into());
     };
@@ -1118,7 +1336,10 @@ fn perform_http(call: &Value) -> (i32, String) {
         .build();
     let agent = ureq::Agent::with_parts(
         config,
-        ureq::unversioned::transport::DefaultConnector::default(),
+        CancellableConnector {
+            inner: ureq::unversioned::transport::DefaultConnector::default(),
+            cancel: cancel_flag,
+        },
         GuardedResolver { allow_private },
     );
 
@@ -1225,7 +1446,7 @@ fn spawn_http_pool(threads: usize) -> (Sender<OutboundJob>, Receiver<OutboundRes
                     guard.recv()
                 };
                 let Ok(job) = job else { return };
-                let (status, body) = perform_http(&job.call);
+                let (status, body) = perform_http(&job.call_id, &job.call);
                 if out
                     .send(OutboundResult { call_id: job.call_id, queue: job.queue, status, body })
                     .is_err()
@@ -1333,6 +1554,11 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
+
+        // 2b. Real-time cancel: notice any in-flight outbound call an
+        // operator just cancelled, every tick (not gated by next_pump's
+        // slower idle backoff below) so "stop" stays fast.
+        propagate_outbound_cancellations();
 
         // 3. Pump, on its own schedule and only with spare HTTP capacity.
         if Instant::now() < next_pump {
