@@ -168,6 +168,18 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_role_admin') THEN
     CREATE ROLE allgres_role_admin NOLOGIN NOINHERIT CREATEROLE;
   END IF;
+  -- Same reasoning as allgres_role_admin (see its own comment above): the
+  -- real-time cancel button's fn_signal_cancel_worker is the only thing in
+  -- this file that ever calls pg_cancel_backend, and pg_signal_backend
+  -- membership lets its owner signal *any* backend in the cluster, not
+  -- just the "allgres runtime" worker it actually targets -- scoping that
+  -- to a role owning nothing but that one, single-statement function
+  -- keeps the blast radius of a bug (or an unreviewed future change) in
+  -- it to that one function, instead of handing every other SECURITY
+  -- DEFINER function allgres_owner also owns that same signaling power.
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_signal_admin') THEN
+    CREATE ROLE allgres_signal_admin NOLOGIN NOINHERIT;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator') THEN
     CREATE ROLE operator LOGIN;
   END IF;
@@ -191,6 +203,7 @@ $$;
 -- live that a real 0.2.0-upgraded allgres_owner stayed LOGIN without this.
 ALTER ROLE allgres_owner NOLOGIN NOINHERIT;
 ALTER ROLE allgres_role_admin NOLOGIN NOINHERIT CREATEROLE;
+ALTER ROLE allgres_signal_admin NOLOGIN NOINHERIT;
 
 -- The sandbox never resolves an unqualified relation name: the runtime worker
 -- narrows search_path to pg_temp before running model-generated SQL, and this
@@ -7265,6 +7278,54 @@ BEGIN
 END;
 $fn$;
 
+-- An attempt at the real-time cancel button's one privileged action,
+-- isolated into its own single-statement function (owned by
+-- allgres_signal_admin, see "1. Roles") specifically so the
+-- pg_signal_backend grant that makes pg_cancel_backend do anything at all
+-- never has to be handed to fn_cancel_session itself -- that would mean
+-- replicating every table grant allgres_owner already has on
+-- allgres_private.sessions/tasks/outbound_calls/sql_calls/human_approvals
+-- onto a second role just to keep fn_cancel_session working, confirmed
+-- live to actually be necessary the moment that was tried instead
+-- ("permission denied for schema allgres_private"). There is exactly one
+-- backend that ever executes sandboxed SQL (run_sandboxed_sql's own
+-- header comment) -- found by its bgworker name, not a stored pid, since
+-- the worker restarts under the same name after a crash.
+--
+-- NOT YET RELIABLE, unlike the rest of this comment's claims: calling
+-- this against a real in-flight sandboxed statement (including a plain
+-- SET LOCAL statement_timeout expiry, tested independently of this
+-- function entirely) did not reliably interrupt it live -- observed a
+-- CPU-bound sandboxed query keep running past 60s despite
+-- statement_timeout='5s' and repeated pg_cancel_backend/
+-- pg_terminate_backend calls against this exact worker pid, with no
+-- corresponding cancellation error ever logged. The "allgres runtime"
+-- worker requests SIGHUP/SIGTERM wake flags only (see
+-- allgres_runtime_main), and pgrx's own default handler for those (and,
+-- if installed at all, SIGINT) only sets a flag and wakes its own latch
+-- -- checked at the top of the worker's own while loop, never while
+-- blocked inside one long-running SPI call -- which may mean neither an
+-- external cancel nor even statement_timeout's own interrupt-checking
+-- reaches a sandboxed statement already executing here, independent of
+-- permissions. Root cause not yet confirmed; do not rely on this to
+-- bound a stuck sandboxed statement's runtime until it is. What is
+-- confirmed live: when a cancellation error *is* delivered and caught,
+-- run_in_subtransaction in src/lib.rs correctly stops it from crashing
+-- the whole worker (plain PL/pgSQL EXCEPTION WHEN OTHERS cannot trap a
+-- query cancellation at all, confirmed live separately) -- that part of
+-- the fix is real regardless of whether this function reliably triggers
+-- one. A rare race where the worker has already moved on to unrelated
+-- pump work by the time this runs would cancel that instead -- moot
+-- until delivery itself is confirmed working at all.
+CREATE OR REPLACE FUNCTION allgres_private.fn_signal_cancel_worker()
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+  SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE backend_type = 'allgres runtime';
+$fn$;
+
 -- The one control that was missing entirely: nothing could stop a runaway
 -- agent.  Cancels every open task in the session (queued/running/
 -- waiting_human/waiting_children), rejects any pending approval so it
@@ -7283,6 +7344,7 @@ DECLARE
   r record;
   v_reason text := COALESCE(NULLIF(btrim(p_reason), ''), 'Cancelled by operator.');
   v_n int := 0;
+  v_sql_in_flight boolean;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM allgres_private.sessions WHERE session_id = p_session_id) THEN
     RAISE EXCEPTION 'session not found' USING ERRCODE = 'P0001';
@@ -7317,11 +7379,26 @@ BEGIN
   WHERE o.task_id = t.task_id AND t.session_id = p_session_id
     AND o.status IN ('queued', 'in_flight');
 
+  SELECT bool_or(sc.status = 'in_flight') INTO v_sql_in_flight
+  FROM allgres_private.sql_calls sc
+  JOIN allgres_private.tasks t USING (task_id)
+  WHERE t.session_id = p_session_id AND sc.status IN ('queued', 'in_flight');
+
   UPDATE allgres_private.sql_calls sc
   SET status = 'lost', updated_at = now()
   FROM allgres_private.tasks t
   WHERE sc.task_id = t.task_id AND t.session_id = p_session_id
     AND sc.status IN ('queued', 'in_flight');
+
+  -- Unlike an outbound HTTP call (a real 'in_flight' row above is already
+  -- claimed and cannot be un-sent -- see that UPDATE's own comment), a
+  -- sandboxed SQL statement is *meant* to be interruptible mid-flight --
+  -- see fn_signal_cancel_worker's own comment for why that privileged step
+  -- is a separate function instead of living here directly, and for why
+  -- that is not yet confirmed to actually happen live.
+  IF v_sql_in_flight THEN
+    PERFORM allgres_private.fn_signal_cancel_worker();
+  END IF;
 
   UPDATE allgres_private.human_approvals h
   SET status = 'rejected', reply_text = 'session_cancelled', decided_at = now()
@@ -12237,7 +12314,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname <> 'fn_provision_agent_role'
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;
@@ -12248,6 +12325,14 @@ BEGIN
       AND p.proowner <> 'allgres_role_admin'::regrole
   ) THEN
     ALTER FUNCTION allgres_private.fn_provision_agent_role(uuid) OWNER TO allgres_role_admin;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'allgres_private' AND p.proname = 'fn_signal_cancel_worker'
+      AND p.proowner <> 'allgres_signal_admin'::regrole
+  ) THEN
+    ALTER FUNCTION allgres_private.fn_signal_cancel_worker() OWNER TO allgres_signal_admin;
   END IF;
 
   IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres_private') <> 'allgres_owner'::regrole THEN
@@ -12302,6 +12387,43 @@ GRANT worker TO allgres_role_admin WITH ADMIN OPTION;
 -- pass (confirmed live: fn_create_agent failed with "permission denied for
 -- function fn_provision_agent_role" the moment the two owners diverged).
 GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_agent_role(uuid) TO allgres_owner;
+
+-- fn_signal_cancel_worker's owner (allgres_signal_admin) needs
+-- pg_signal_backend membership to make pg_cancel_backend do anything at
+-- all -- confirmed live: without it, PERFORM pg_cancel_backend(...)
+-- against the "allgres runtime" worker's own pid (which connects as a
+-- different role than this function's owner) just silently returns
+-- false, and a stuck sandboxed statement keeps running for its full
+-- SQL_STATEMENT_TIMEOUT regardless of how many times an operator clicks
+-- cancel. This predefined role, not superuser, is the standard, minimal
+-- grant PostgreSQL provides for exactly this (cancel/terminate any
+-- backend, nothing else) -- deliberately isolated to this one
+-- single-statement function (see its own comment) rather than granted to
+-- fn_cancel_session itself, which would otherwise need this same
+-- ownership split to also replicate every table grant allgres_owner
+-- already has on allgres_private.sessions/tasks/outbound_calls/
+-- sql_calls/human_approvals just to keep working -- confirmed live, tried
+-- first: fn_cancel_session immediately failed with "permission denied for
+-- schema allgres_private" the moment its owner changed away from
+-- allgres_owner.
+--
+-- WITH INHERIT TRUE (PG16+) is not optional: allgres_signal_admin is
+-- NOLOGIN NOINHERIT like every other role in this file (see "1. Roles"),
+-- so plain membership in pg_signal_backend grants nothing by itself --
+-- SECURITY DEFINER sets current_user to allgres_signal_admin, but a
+-- NOINHERIT role does not automatically use privileges of a role it
+-- merely belongs to. Confirmed live: pg_cancel_backend returned
+-- successfully and the target statement kept running regardless, every
+-- time, until this specific membership was marked to inherit -- the one
+-- exception this role needs, without turning its own NOINHERIT default
+-- back on for anything else it might ever be granted.
+GRANT pg_signal_backend TO allgres_signal_admin WITH INHERIT TRUE;
+
+-- fn_cancel_session (owned by allgres_owner) calls fn_signal_cancel_worker
+-- directly -- across the ownership split above, that is now a call to a
+-- function owned by a *different* role, which needs its own EXECUTE grant
+-- the same as fn_provision_agent_role's own did just above.
+GRANT EXECUTE ON FUNCTION allgres_private.fn_signal_cancel_worker() TO allgres_owner;
 
 -- fn_provision_agent_role's own body reads and updates allgres_private.agents
 -- directly -- also implicit before the ownership split (same reasoning as
@@ -13821,7 +13943,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname <> 'fn_provision_agent_role'
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;

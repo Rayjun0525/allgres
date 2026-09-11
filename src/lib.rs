@@ -752,6 +752,87 @@ fn valid_pg_role(s: &str) -> bool {
         .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// Runs `f` inside its own subtransaction so a Postgres ERROR raised while
+/// it runs is caught and the enclosing transaction kept alive afterward,
+/// instead of the error propagating out of the pump loop and terminating
+/// the whole worker process. Needed specifically for query cancellation
+/// (`pg_cancel_backend`, the real-time "stop" button's own mechanism for a
+/// stuck sandboxed statement): confirmed live that a plain PL/pgSQL
+/// `BEGIN ... EXCEPTION WHEN OTHERS ... END` around a cancelled `pg_sleep`
+/// never reaches its handler at all -- plpgsql's own exception handling
+/// does not trap a query cancellation, full stop, no matter how it is
+/// nested -- so `fn_run_sandboxed_sql`'s own exception block (needed for
+/// every *other* kind of SQL error an agent's own query can raise) cannot
+/// cover this one case. Before this existed, cancelling an in-flight
+/// sandboxed statement crashed the "allgres runtime" worker outright
+/// (`SIGINT` from `pg_cancel_backend` reached this backend, became a real
+/// `ERROR`, and nothing between here and `allgres_runtime_main`'s own
+/// top-level pg_guard caught it) -- restarted automatically
+/// (`set_restart_time`), but every agent's task processing paused for the
+/// few seconds that took, on every single cancel, not just this one.
+///
+/// Mirrors the same `BeginInternalSubTransaction` /
+/// `RollbackAndReleaseCurrentSubTransaction` pattern PL/pgSQL's own
+/// exception handling uses internally in C -- one level below plpgsql's
+/// own exception semantics, where a cancellation is just as catchable as
+/// any other error. Per `BeginInternalSubTransaction`'s own doc comment,
+/// the caller is responsible for restoring `CurrentMemoryContext` and
+/// `CurrentResourceOwner` itself after a rollback, which is what the
+/// explicit switches/restores below are for.
+///
+/// This only protects against a cancellation once one is actually
+/// delivered to and processed by this worker's current statement -- see
+/// `fn_signal_cancel_worker`'s own comment in `sql/control_plane.sql` for
+/// why that delivery itself is not yet confirmed reliable: this worker
+/// requests only `SIGHUP`/`SIGTERM` wake flags, and a stuck sandboxed
+/// query was observed live to keep running well past both a
+/// `pg_cancel_backend` call against this exact pid and its own
+/// `statement_timeout`, with no cancellation error ever logged.
+fn run_in_subtransaction<F>(f: F) -> Result<Value, String>
+where
+    F: FnOnce() -> Result<Value, String> + std::panic::UnwindSafe,
+{
+    let old_context = unsafe { pg_sys::CurrentMemoryContext };
+    let old_owner = unsafe { pg_sys::CurrentResourceOwner };
+
+    unsafe {
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        // BeginInternalSubTransaction switches to the subtransaction's own
+        // memory context; run the closure in the caller's own context
+        // instead so nothing it builds is freed out from under it when the
+        // subtransaction ends.
+        pg_sys::MemoryContextSwitchTo(old_context);
+    }
+
+    let result = PgTryBuilder::new(f)
+        .catch_others(|caught| {
+            let message = match &caught {
+                pg_sys::panic::CaughtError::PostgresError(e)
+                | pg_sys::panic::CaughtError::ErrorReport(e) => e.message().to_string(),
+                pg_sys::panic::CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+            };
+            unsafe {
+                pg_sys::MemoryContextSwitchTo(old_context);
+                pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                pg_sys::MemoryContextSwitchTo(old_context);
+                pg_sys::CurrentResourceOwner = old_owner;
+            }
+            Err(message)
+        })
+        .execute();
+
+    if result.is_ok() {
+        unsafe {
+            pg_sys::MemoryContextSwitchTo(old_context);
+            pg_sys::ReleaseCurrentSubTransaction();
+            pg_sys::MemoryContextSwitchTo(old_context);
+            pg_sys::CurrentResourceOwner = old_owner;
+        }
+    }
+
+    result
+}
+
 /// Runs one already-validated agent statement as the agent's own sandboxed
 /// role if it has one (see fn_provision_agent_role), or the shared
 /// `sandbox` role for an agent that predates per-agent roles. `sql` must be
@@ -760,27 +841,29 @@ fn valid_pg_role(s: &str) -> bool {
 fn run_sandboxed_sql(agent_id: &str, sql: &str, pg_role: Option<&str>) -> Result<Value, String> {
     let role = pg_role.filter(|r| valid_pg_role(r)).unwrap_or("sandbox");
     BackgroundWorker::transaction(|| {
-        let dropped = drop_privileges()
-            && Spi::run(&format!("SET LOCAL ROLE {role}")).is_ok()
-            && Spi::run("SET LOCAL search_path = pg_temp").is_ok()
-            && Spi::run("SET LOCAL transaction_read_only = on").is_ok()
-            && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT}'")).is_ok()
-            && Spi::run_with_args(
-                "SELECT set_config('allgres.agent_id', $1, true)",
-                &[agent_id.into()],
-            )
-            .is_ok();
-        if !dropped {
-            return Err("sandbox role unavailable".to_string());
-        }
-        match Spi::get_one_with_args::<JsonB>(
-            "SELECT allgres_public.fn_run_sandboxed_sql($1)",
-            &[sql.into()],
-        ) {
-            Ok(Some(JsonB(v))) => Ok(v),
-            Ok(None) => Err("sandboxed execution returned nothing".to_string()),
-            Err(e) => Err(e.to_string()),
-        }
+        run_in_subtransaction(|| {
+            let dropped = drop_privileges()
+                && Spi::run(&format!("SET LOCAL ROLE {role}")).is_ok()
+                && Spi::run("SET LOCAL search_path = pg_temp").is_ok()
+                && Spi::run("SET LOCAL transaction_read_only = on").is_ok()
+                && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT}'")).is_ok()
+                && Spi::run_with_args(
+                    "SELECT set_config('allgres.agent_id', $1, true)",
+                    &[agent_id.into()],
+                )
+                .is_ok();
+            if !dropped {
+                return Err("sandbox role unavailable".to_string());
+            }
+            match Spi::get_one_with_args::<JsonB>(
+                "SELECT allgres_public.fn_run_sandboxed_sql($1)",
+                &[sql.into()],
+            ) {
+                Ok(Some(JsonB(v))) => Ok(v),
+                Ok(None) => Err("sandboxed execution returned nothing".to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        })
     })
 }
 
