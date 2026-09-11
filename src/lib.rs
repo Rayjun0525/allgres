@@ -65,11 +65,15 @@ const PUMP_IDLE_MAX: Duration = Duration::from_secs(4);
 
 /// Sandboxed SQL executes on the SPI thread itself (it needs SPI, so it can't
 /// go on an HTTP pool thread the way outbound calls do), one call at a time,
-/// bounded by `SQL_STATEMENT_TIMEOUT` each.  Claiming only one per tick, not a
+/// bounded by `SQL_STATEMENT_TIMEOUT_MS` each.  Claiming only one per tick, not a
 /// batch, keeps a burst of agent queries from shutting the RPC/dashboard path
 /// out for several statement-timeouts in a row.
 const SQL_CLAIM_LIMIT: i32 = 1;
-const SQL_STATEMENT_TIMEOUT: &str = "5s";
+/// Milliseconds, the unit both `SET LOCAL statement_timeout` (as a string)
+/// and `enable_timeout_after` (as an integer -- see run_sandboxed_sql's own
+/// comment on why that call exists at all) need; kept as one constant so
+/// the two can never drift apart.
+const SQL_STATEMENT_TIMEOUT_MS: i32 = 5000;
 
 const MAX_WEB_THREADS: usize = 64;
 const MAX_REQUEST_BYTES: usize = 1 << 20;
@@ -838,6 +842,21 @@ where
 /// `sandbox` role for an agent that predates per-agent roles. `sql` must be
 /// `fn_validate_sql`'s return value, never raw agent input: this function
 /// trusts it completely and so does the database function it calls.
+/// Not in pgrx's generated bindings (utils/timeout.h is outside its
+/// bindgen allowlist), declared by hand instead. TimeoutId's first four
+/// entries -- STARTUP_PACKET_TIMEOUT=0, DEADLOCK_TIMEOUT=1, LOCK_TIMEOUT=2,
+/// STATEMENT_TIMEOUT=3 -- have held this order across every Postgres major
+/// version that has ever shipped `utils/timeout.h`'s `TimeoutId` enum;
+/// every timeout reason added since has been appended after them, never
+/// inserted before, which is what makes hardcoding 3 here safe across
+/// pg16/17/18 rather than something that needs a per-version binding.
+const PG_STATEMENT_TIMEOUT_ID: std::ffi::c_int = 3;
+
+unsafe extern "C" {
+    fn enable_timeout_after(id: std::ffi::c_int, delay_ms: std::ffi::c_int);
+    fn disable_timeout(id: std::ffi::c_int, keep_indicator: bool);
+}
+
 fn run_sandboxed_sql(agent_id: &str, sql: &str, pg_role: Option<&str>) -> Result<Value, String> {
     let role = pg_role.filter(|r| valid_pg_role(r)).unwrap_or("sandbox");
     BackgroundWorker::transaction(|| {
@@ -846,7 +865,7 @@ fn run_sandboxed_sql(agent_id: &str, sql: &str, pg_role: Option<&str>) -> Result
                 && Spi::run(&format!("SET LOCAL ROLE {role}")).is_ok()
                 && Spi::run("SET LOCAL search_path = pg_temp").is_ok()
                 && Spi::run("SET LOCAL transaction_read_only = on").is_ok()
-                && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT}'")).is_ok()
+                && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT_MS}ms'")).is_ok()
                 && Spi::run_with_args(
                     "SELECT set_config('allgres.agent_id', $1, true)",
                     &[agent_id.into()],
@@ -855,14 +874,36 @@ fn run_sandboxed_sql(agent_id: &str, sql: &str, pg_role: Option<&str>) -> Result
             if !dropped {
                 return Err("sandbox role unavailable".to_string());
             }
-            match Spi::get_one_with_args::<JsonB>(
+            // SET LOCAL statement_timeout (above) only sets the GUC value --
+            // it does not by itself arm the actual timer. In a normal
+            // client backend that happens once per query in
+            // tcop/postgres.c's own dispatch (exec_simple_query), which
+            // this background worker's BackgroundWorker::transaction (a
+            // bare StartTransactionCommand/CommitTransactionCommand pair,
+            // nothing that goes through postgres.c at all) never runs.
+            // Confirmed live: without this call, a 30-second pg_sleep ran
+            // to completion untouched with statement_timeout showing '5s'
+            // the whole time -- the GUC was set, nothing was ever
+            // listening for it. This is what actually bounds a stuck
+            // sandboxed statement (and, combined with
+            // fn_signal_cancel_worker's pg_cancel_backend, is also what
+            // makes the operator "stop" button interrupt one in real
+            // time: same run_in_subtransaction recovery either way).
+            unsafe {
+                enable_timeout_after(PG_STATEMENT_TIMEOUT_ID, SQL_STATEMENT_TIMEOUT_MS);
+            }
+            let r = match Spi::get_one_with_args::<JsonB>(
                 "SELECT allgres_public.fn_run_sandboxed_sql($1)",
                 &[sql.into()],
             ) {
                 Ok(Some(JsonB(v))) => Ok(v),
                 Ok(None) => Err("sandboxed execution returned nothing".to_string()),
                 Err(e) => Err(e.to_string()),
+            };
+            unsafe {
+                disable_timeout(PG_STATEMENT_TIMEOUT_ID, false);
             }
+            r
         })
     })
 }
