@@ -8,7 +8,7 @@ embedded browser control panel into one PostgreSQL extension.
 
 Version 0.1.0 -- pre-release; the version number tracks an actual release,
 not every development milestone (see KNOWN_ISSUES.md's versioning note).
-This is an MVP: read [Security model](#security-model) before
+This is an early alpha: read [Security model](#security-model) before
 putting it anywhere that matters.
 
 ## Quick start
