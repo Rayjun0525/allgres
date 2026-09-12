@@ -602,14 +602,11 @@ built, once checked against the actual code rather than assumed missing:
   `execute_sql`/`call_llm` attempt is a fresh row, not a retried one.
 - **Cancellation semantics** — item 12 already closed the main gap
   (queued/in-flight calls voided on cancel, claim functions joined to task
-  status). What's still true and not fixed here: an *already in-flight*
+  status). ~~What's still true and not fixed here: an *already in-flight*
   HTTP request or an *already executing* sandboxed query cannot be
-  interrupted mid-flight — there is no separate backend to send
-  `pg_cancel_backend()` at (sandboxed SQL runs on the runtime worker's own
-  SPI thread, the same one running everything else), and no HTTP
-  cancellation token wired into the pool threads. Cancel stops new work
-  from starting and stops a stale result from being recorded (see below);
-  it does not abort work already underway.
+  interrupted mid-flight~~ — fixed, see item 39: both now abort within
+  roughly 50-80ms of `fn_cancel_session`, live-verified, worker survival
+  included.
 
 What genuinely was missing, found by reading the actual claim/complete
 code rather than assuming the durable-queue shape was enough on its own:
@@ -2994,3 +2991,106 @@ account present, `tests/smoke.sql`, `tests/e2e_mock.sql`, and `cargo test`
 (30/30) all green. The build now succeeds with
 `#![allow(long_running_const_eval)]` removed entirely -- confirming this
 was the real fix, not a second mute alongside a smaller number.
+
+## 39. A real-time "stop" button -- item 16's cancellation gap actually closed, plus the RPC contract frozen
+
+Item 16 left one honest gap: `fn_cancel_session` stopped new work from
+starting and fenced a stale result from being recorded, but could not
+touch a call already executing -- an in-flight sandboxed SQL statement or
+outbound HTTP/LLM request ran to completion (or its own timeout)
+regardless of an operator hitting cancel. Closed for both halves,
+separately, because they run on different threads with different
+interrupt mechanisms.
+
+**SQL sandbox half.** The obvious approach -- `fn_signal_cancel_worker()`
+(new, owned by a new `allgres_signal_admin` role so the `pg_signal_backend`
+grant it needs stays scoped to this one function instead of handed to
+`allgres_owner` wholesale) calling `pg_cancel_backend()` against the
+`allgres runtime` worker's own pid -- crashed the worker outright the first
+time it was tried live. Root cause, found by direct minimal reproduction in
+psql: plain PL/pgSQL `EXCEPTION WHEN OTHERS` does not trap a query
+cancellation (`query_canceled`, SQLSTATE 57014) at all, no matter how it is
+nested, so `fn_run_sandboxed_sql`'s own exception block never got a chance
+to run. Fixed one level below plpgsql's own exception semantics: `src/lib.rs`'s
+`run_in_subtransaction` mirrors what `BeginInternalSubTransaction`/
+`RollbackAndReleaseCurrentSubTransaction` do internally in C, using pgrx's
+`PgTryBuilder` (its own `PG_TRY`/`PG_CATCH` equivalent) to catch the
+cancellation as a Rust-level error instead of letting it unwind into the
+worker's top-level `pg_guard` and take the whole process down.
+
+Two further layered bugs surfaced only once the crash was fixed and the
+signal was actually being delivered:
+
+- `allgres_signal_admin` is itself `NOLOGIN NOINHERIT` (same reasoning as
+  `allgres_owner`/`allgres_role_admin` -- nobody connects as it directly), so
+  a plain `GRANT pg_signal_backend TO allgres_signal_admin` granted
+  membership without inheriting the privilege; a `SECURITY DEFINER` call
+  running as that role could not actually signal anything until the grant
+  was reissued `WITH INHERIT TRUE` (PG16+). Confirmed live via
+  `pg_auth_members.inherit_option` flipping `f` → `t`.
+- `statement_timeout` was not firing at all, independent of cancellation:
+  `BackgroundWorker::transaction()`'s raw `StartTransactionCommand()`/
+  `CommitTransactionCommand()` bypasses `tcop/postgres.c`'s per-query
+  dispatch, which is what normally arms the timer in an ordinary client
+  backend. `SET LOCAL statement_timeout` set the GUC value and nothing else
+  -- confirmed live with a 30-second `pg_sleep` cross join that ran
+  untouched past its configured 5s limit. Fixed by hand-declaring
+  `enable_timeout_after`/`disable_timeout` (`utils/timeout.h`, not in
+  pgrx's generated bindings -- outside its bindgen allowlist) and calling
+  them directly around the sandboxed statement in `run_sandboxed_sql`.
+
+**HTTP/LLM half.** A separate mechanism, because outbound calls run on the
+runtime worker's HTTP thread pool, not its SPI thread, and "an HTTP thread
+must never touch Postgres" (this module's own long-standing rule).
+`OUTBOUND_CANCEL_FLAGS` (`src/outbound.rs`) is a `call_id -> Arc<AtomicBool>`
+registry; `perform_http` registers one (RAII `CancelGuard`, removed on every
+return path) and runs the request through `CancellableConnector`/
+`CancellableTransport`, which wrap `ureq`'s own connector/transport and
+slice every blocking read/write wait into 150ms steps, checking the flag
+between slices. The main SPI-thread loop -- never the HTTP thread itself --
+flips a flag to `true` once per tick, via `propagate_outbound_cancellations()`
+calling `fn_check_lost_outbound` (new, `SECURITY DEFINER`, granted to
+`worker`) to ask which of the registry's current call_ids `fn_cancel_session`
+has since marked `'lost'` in `outbound_calls`, without needing to grant the
+dropped-privilege worker role raw `SELECT` on that table.
+
+**Verified live**, both halves, after learning the hard way that
+`DROP EXTENSION`/`CREATE EXTENSION` does **not** reload an already-running
+background worker's loaded `.so` -- only a full `service postgresql restart`
+does, which is why several earlier test runs in this same effort produced
+confusing (stale-binary) results before that was caught: a queued
+sandboxed statement and a queued outbound call against a deliberately slow
+mock endpoint, each cancelled mid-flight via `fn_cancel_session`, aborted in
+roughly 60-75ms and 50-80ms respectively; the worker's own pid and
+`backend_start` were unchanged afterward (no crash, no restart) in every
+run; and `statement_timeout` was separately confirmed to fire on its own at
+its configured 5s. `fn_selftest` covers the parts that do not need a live
+process (`check_lost_outbound_returns_only_lost_ids`); the crash-safety and
+signal-delivery claims above are the parts it structurally cannot, being
+`SECURITY DEFINER` itself, which is why they are recorded here as live
+verification rather than a selftest case.
+
+**The RPC contract frozen, alongside this.** `dashboard_rpc`'s action set
+had no enforcement against silent drift -- adding, removing, or renaming an
+action was not a visible, deliberate act. `CONTRACT.md` now documents every
+action's guard class; `scripts/gen_rpc_catalog.py` regenerates
+`sql/rpc_catalog.json` from the live `CASE` statement; and `fn_selftest`'s
+`dashboard_rpc_actions_match_frozen_catalog` case fails loudly if the live
+dispatch and a hardcoded frozen array of all 82 action names ever disagree.
+Two real, pre-existing bugs were caught while building this frozen
+baseline, not introduced by it: `visible_agent_ids` returned `NULL`
+(unrestricted, the same value a real admin gets) for "nobody is logged in"
+unconditionally, rather than only before any account existed -- confirmed
+live by reproducing the exploit (an unauthenticated `proposals.decide` call
+silently overwriting an agent's `system_prompt`) and then confirming the
+fix blocks it; and four `dashboard_rpc` actions
+(`projects.create`/`.update`, `memories.create`/`.remove`) had no admin or
+agent-access guard at all.
+
+Also landed in the same effort, unrelated to any of the above:
+`src/lib.rs` (2782 lines) split into nine focused modules (`sql_parser`,
+`config`, `sandbox`, `outbound`, `rpc`, `runtime_worker`, `http_protocol`,
+`web`, `tests`) by concern -- pure reorganization, verified equivalent by
+identical `cargo test --lib` (30/30), identical `fn_selftest` count, and
+identical `cargo clippy` lint count before and after (diffed directly via
+`git stash`, confirming the split introduced no lints of its own).

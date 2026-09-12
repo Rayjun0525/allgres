@@ -138,9 +138,7 @@ Not yet built:
 
 - Helm charts, Kubernetes manifests, and CNPG dynamic loading — only a
   native install and `docker-compose` exist today.
-- Secret key rotation, and a token *refresh* flow (an expired OAuth access
-  token has to be reconnected from Settings; nothing calls `refresh_token`
-  automatically yet).
+- Secret key rotation.
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
