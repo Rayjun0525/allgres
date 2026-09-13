@@ -3311,3 +3311,22 @@ override-less live config instead of inheriting the stale cached
 decision). Verified on both a fresh `CREATE EXTENSION` and a rerun in the
 same database; `cargo test --lib`'s 30 cases are unaffected (SQL-only
 change).
+
+**Follow-up (same effort): a dashboard panel for both `tool_experiments.list`
+and `agents.set_tool_override_autonomy_preset`.** Both existed only as
+`dashboard_rpc` actions -- an operator could see canary experiments or
+retune self_improve's autonomy dials only via raw RPC calls or `psql`, the
+one genuine gap in an otherwise-UI-reachable feature. Settings gained a
+"Tool model experiments" panel: a read-only table of every
+`model_experiments` row (tool, candidate provider/model, canary percent,
+status, sample size and success rate, baseline), self_improve's current
+`tool_override_self_approve_canary_cap`/`tool_override_auto_promote_slack_pct`
+values read straight from its own `agent_config`, and a preset selector
+(`conservative`/`balanced`/`aggressive`) wired to
+`fn_set_tool_override_autonomy_preset`. Verified live rather than only by
+selftest: rebuilt, restarted postgres to load the new binary, confirmed
+the panel's markup is actually served, and exercised both RPC actions over
+HTTP the same way the dashboard's own JS calls them --
+`tool_experiments.list` returns the expected shape and
+`agents.set_tool_override_autonomy_preset` actually updates self_improve's
+`agent_config`, visible again through `agents.list`.
