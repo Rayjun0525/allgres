@@ -2957,6 +2957,53 @@ BEGIN
     );
     v := v || jsonb_build_array(jsonb_build_object('name', 'tool_experiments_list_shows_decided_experiments', 'ok', ok));
 
+    -- model_experiments must actually be registered for pg_dump (the exact
+    -- class of bug the backup/PITR drill, KNOWN_ISSUES item 18, already
+    -- found once for a different table) -- checked directly against
+    -- pg_extension's own extconfig, not just trusted from the seed file.
+    SELECT 'allgres_private.model_experiments'::regclass::oid = ANY(extconfig) INTO ok
+    FROM pg_extension WHERE extname = 'allgres';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'model_experiments_registered_for_pg_dump', 'ok', ok));
+
+    -- start_experiment must fail closed on a candidate provider that does
+    -- not exist or is disabled, the same as fn_bulk_set_model already does
+    -- for its own provider argument -- otherwise a typo'd/disabled
+    -- candidate sits "running" until the canary first fires, deep inside a
+    -- real task's own turn.
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override bad provider')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    PERFORM allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_nonexistent_provider_xyz',
+        'candidate_model', 'x', 'canary_percent', 10
+      )
+    ));
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_ovr_tid AND role = 'error' AND content->>'reason' = 'tool_override_candidate_provider_not_enabled'
+    ) AND NOT EXISTS (
+      SELECT 1 FROM allgres_private.model_experiments WHERE tool_id = v_ovr_tool AND status = 'running'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'start_experiment_rejects_unenabled_candidate_provider', 'ok', ok));
+
+    -- A canary-tagged call that fn_watchdog reclaims as 'lost' (the worker
+    -- never came back) must count as a 'failure', not silently drop out of
+    -- the experiment's sample -- otherwise a candidate that simply times
+    -- out more than the baseline would look artificially good.
+    INSERT INTO allgres_private.outbound_calls
+      (task_id, kind, url, request_headers, request_body, status, procedure_tool_id, experiment_id, updated_at)
+    VALUES (
+      v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb,
+      'in_flight', v_ovr_tool, v_exp_id, now() - interval '1 hour'
+    ) RETURNING call_id INTO v_ovr_call;
+    PERFORM allgres_public.fn_watchdog(1);
+    ok := (SELECT status FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'lost'
+      AND (SELECT outcome FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'failure';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_reclaimed_canary_call_records_failure_outcome', 'ok', ok));
+
     -- Leave everything this block touched as it found it.
     DELETE FROM allgres_private.outbound_calls
     WHERE procedure_tool_id = v_ovr_tool

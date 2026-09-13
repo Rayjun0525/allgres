@@ -4591,6 +4591,23 @@ BEGIN
           UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
           RETURN jsonb_build_object('action', 'continue');
         END IF;
+        -- Same fail-closed check fn_bulk_set_model already makes for its own
+        -- provider argument: a candidate must be a real, enabled provider at
+        -- propose time, not discovered missing/disabled only when the
+        -- canary first fires (build_llm_http would raise mid-turn, deep
+        -- inside a real task, instead of here at propose time where the
+        -- caller can see it and correct it immediately).
+        IF NOT EXISTS (
+          SELECT 1 FROM allgres_private.llm_providers
+          WHERE name = v_parsed->>'candidate_provider' AND is_enabled
+        ) THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'tool_override_candidate_provider_not_enabled', 'candidate_provider', v_parsed->>'candidate_provider')
+          );
+          UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
         IF EXISTS (
           SELECT 1 FROM allgres_private.model_experiments WHERE tool_id = v_tool_target AND status = 'running'
         ) THEN
@@ -5701,8 +5718,18 @@ BEGIN
       AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
     FOR UPDATE SKIP LOCKED
   LOOP
+    -- outcome = 'failure' whenever this call was tagged with a canary
+    -- experiment_id (fn_next_step's dice roll): a call that never comes
+    -- back is exactly as unusable to the task as one that comes back
+    -- malformed, and outbound_calls.outcome's own comment already covers
+    -- both under "the model's own output was unusable." Without this a
+    -- candidate that simply times out more often than the baseline would
+    -- have its failures silently excluded from candidate_success_rate
+    -- instead of counting against it -- fn_complete_outbound (the only
+    -- other place outcome is ever set) never runs for a 'lost' call.
     UPDATE allgres_private.outbound_calls
-    SET status = 'lost', error = 'timeout', updated_at = now()
+    SET status = 'lost', error = 'timeout', updated_at = now(),
+        outcome = CASE WHEN experiment_id IS NOT NULL THEN 'failure' ELSE outcome END
     WHERE call_id = r.call_id;
     IF EXISTS (SELECT 1 FROM allgres_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
       BEGIN
