@@ -3176,3 +3176,37 @@ aggregate query is always consistent and never races a counter update.
   the model needed to interpret a result correctly -- a different axis,
   and one `execute_sql`'s own real, measured latency could be added
   against later if it turns out to matter.
+
+**Follow-up (same effort): three real gaps an outside review found, all fixed.**
+`model_experiments` was never registered with `pg_extension_config_dump` --
+the exact class of bug the backup/PITR drill above already found once for
+a different table; a `pg_dump`/restore would have silently lost every
+experiment's history. `start_experiment` accepted any `candidate_provider`
+text with no check that it names a real, enabled `llm_providers` row --
+`fn_bulk_set_model` already makes this exact check for its own provider
+argument, this path just missed it; now checked at `start_experiment` and,
+since an operator can disable a provider at any point while an experiment
+is still running, re-checked at `promote` too (rejected outright rather
+than silently promoting a dead provider into the tool's live
+`llm_override`). And a canary-tagged `outbound_calls` row `fn_watchdog`
+reclaims as `'lost'` (the worker never came back) never got an `outcome`
+recorded at all -- the first fix for this only covered `experiment_id IS
+NOT NULL` (the candidate side), which left `baseline_success_rate`
+computed from the exact same column exposed to the identical hole from
+the *other* direction; corrected to score every `procedure_tool_id`-tagged
+row the same way, whichever side of the comparison it is on. Six new
+selftest cases (302, up from 296); verified on both a fresh
+`CREATE EXTENSION` and a rerun in the same database.
+
+**Still open, on purpose, while every one of these actions stays gated
+behind `self_improve`'s own `admin_approval`:** no sticky model choice
+across a retry (a `build_llm_http` failure or a `fn_watchdog`-reclaimed
+timeout drops the override/canary context entirely -- the retry silently
+falls back to the agent's own default model rather than re-rolling the
+canary, which is a safe direction to fail in but not a designed
+guarantee); no minimum sample size or elapsed time enforced before
+`promote` is allowed to fire; no UI copy on `tool_experiments.list`
+stating that `candidate_success_rate` is a format-validity signal, not a
+quality judgment. Raising `self_improve`'s autonomy past
+`admin_approval` for this capability should not happen before these are
+closed.

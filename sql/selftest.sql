@@ -2989,6 +2989,31 @@ BEGIN
     );
     v := v || jsonb_build_array(jsonb_build_object('name', 'start_experiment_rejects_unenabled_candidate_provider', 'ok', ok));
 
+    -- Same check, but against a provider that genuinely exists and is just
+    -- disabled -- the "not enabled" reason has to actually cover both
+    -- halves of its own name, not only a name that resolves to nothing.
+    PERFORM allgres_public.fn_create_provider('selftest_override_disabled_provider', 'openai_compat', 'https://selftest.invalid/v1', NULL, false);
+    UPDATE allgres_private.llm_providers SET is_enabled = false WHERE name = 'selftest_override_disabled_provider';
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override disabled provider')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    PERFORM allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_disabled_provider',
+        'candidate_model', 'x', 'canary_percent', 10
+      )
+    ));
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_ovr_tid AND role = 'error' AND content->>'reason' = 'tool_override_candidate_provider_not_enabled'
+    ) AND NOT EXISTS (
+      SELECT 1 FROM allgres_private.model_experiments WHERE tool_id = v_ovr_tool AND status = 'running'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'start_experiment_rejects_disabled_candidate_provider', 'ok', ok));
+    DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_override_disabled_provider';
+
     -- A canary-tagged call that fn_watchdog reclaims as 'lost' (the worker
     -- never came back) must count as a 'failure', not silently drop out of
     -- the experiment's sample -- otherwise a candidate that simply times
@@ -3003,6 +3028,73 @@ BEGIN
     ok := (SELECT status FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'lost'
       AND (SELECT outcome FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'failure';
     v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_reclaimed_canary_call_records_failure_outcome', 'ok', ok));
+
+    -- The same reclaim must count against a *baseline* (non-canary) call
+    -- too, not just a canary-tagged one -- the first version of this fix
+    -- only gated on experiment_id IS NOT NULL, which fixed the candidate's
+    -- side of the bias but left baseline_success_rate exposed to the exact
+    -- same hole from the other direction.
+    INSERT INTO allgres_private.outbound_calls
+      (task_id, kind, url, request_headers, request_body, status, procedure_tool_id, updated_at)
+    VALUES (
+      v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb,
+      'in_flight', v_ovr_tool, now() - interval '1 hour'
+    ) RETURNING call_id INTO v_ovr_call;
+    PERFORM allgres_public.fn_watchdog(1);
+    ok := (SELECT status FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'lost'
+      AND (SELECT outcome FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'failure';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_reclaimed_baseline_call_records_failure_outcome', 'ok', ok));
+
+    -- promote must re-check the candidate provider is still enabled at
+    -- decision time, not only at propose time -- an operator can disable a
+    -- provider at any point while the experiment is running.
+    PERFORM allgres_public.fn_create_provider('selftest_override_provider_2', 'openai_compat', 'https://selftest.invalid/v1', NULL, false);
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override promote after disable')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_provider_2',
+        'candidate_model', 'x', 'canary_percent', 10
+      )
+    ));
+    v_proposal := (sub->>'proposal_id')::uuid;
+    comp := allgres_public.fn_decide_proposal(v_proposal, true);
+    v_exp_id := (comp->>'experiment_id')::uuid;
+
+    UPDATE allgres_private.llm_providers SET is_enabled = false WHERE name = 'selftest_override_provider_2';
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override promote rejected after disable')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'promote', 'experiment_id', v_exp_id::text
+      )
+    ));
+    v_proposal := (sub->>'proposal_id')::uuid;
+    BEGIN
+      PERFORM allgres_public.fn_decide_proposal(v_proposal, true);
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%candidate provider is no longer enabled%';
+    END;
+    ok := ok AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'running';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'promote_rechecks_candidate_provider_still_enabled', 'ok', ok));
+
+    -- Clean up: reject the still-running experiment so it does not linger,
+    -- and drop the throwaway provider.
+    PERFORM allgres_public.fn_decide_proposal(
+      (allgres_public.fn_submit_result(
+        v_ovr_tid, jsonb_build_object('type', 'llm_response', 'content', '{}', 'parsed', jsonb_build_object(
+          'action', 'propose_change', 'target_tool_id', v_ovr_tool::text, 'op', 'reject', 'experiment_id', v_exp_id::text
+        ))
+      )->>'proposal_id')::uuid, true
+    );
+    DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_override_provider_2';
 
     -- Leave everything this block touched as it found it.
     DELETE FROM allgres_private.outbound_calls

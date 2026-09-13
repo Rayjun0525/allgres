@@ -5718,18 +5718,23 @@ BEGIN
       AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
     FOR UPDATE SKIP LOCKED
   LOOP
-    -- outcome = 'failure' whenever this call was tagged with a canary
-    -- experiment_id (fn_next_step's dice roll): a call that never comes
-    -- back is exactly as unusable to the task as one that comes back
-    -- malformed, and outbound_calls.outcome's own comment already covers
-    -- both under "the model's own output was unusable." Without this a
-    -- candidate that simply times out more often than the baseline would
-    -- have its failures silently excluded from candidate_success_rate
-    -- instead of counting against it -- fn_complete_outbound (the only
-    -- other place outcome is ever set) never runs for a 'lost' call.
+    -- outcome = 'failure' for any 'llm' call this feature scores at all --
+    -- procedure_tool_id IS NOT NULL, not just experiment_id IS NOT NULL. A
+    -- call that never comes back is exactly as unusable to the task as one
+    -- that comes back malformed, and outbound_calls.outcome's own comment
+    -- already covers both under "the model's own output was unusable."
+    -- Gating this on experiment_id alone was an earlier, incomplete version
+    -- of this same fix: it stopped a candidate's timeouts from being
+    -- silently excluded from candidate_success_rate, but left baseline_
+    -- success_rate (computed from the exact same column, just filtered to
+    -- experiment_id IS NULL) with the identical hole -- a *baseline* that
+    -- times out a lot would still look artificially good, just shifting
+    -- which side of the comparison the bias landed on instead of removing
+    -- it. Scoring the whole procedure_tool_id-tagged population the same
+    -- way closes both directions at once.
     UPDATE allgres_private.outbound_calls
     SET status = 'lost', error = 'timeout', updated_at = now(),
-        outcome = CASE WHEN experiment_id IS NOT NULL THEN 'failure' ELSE outcome END
+        outcome = CASE WHEN procedure_tool_id IS NOT NULL THEN 'failure' ELSE outcome END
     WHERE call_id = r.call_id;
     IF EXISTS (SELECT 1 FROM allgres_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
       BEGIN

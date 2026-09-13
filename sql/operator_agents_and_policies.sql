@@ -564,6 +564,25 @@ BEGIN
       END IF;
 
       IF v_op = 'promote' THEN
+        -- Re-check the candidate is still an enabled provider: fn_submit_
+        -- result already required this at start_experiment time, but an
+        -- operator can disable a provider at any point while the
+        -- experiment is running -- promoting it anyway would write a
+        -- dead provider straight into this tool's live llm_override,
+        -- exactly the failure fn_bulk_set_model's own fail-closed check
+        -- (and start_experiment's, above) exists to avoid. Reject
+        -- outright rather than approve-with-a-broken-result; the
+        -- operator can fix the provider and promote again, or reject the
+        -- experiment instead.
+        IF NOT EXISTS (
+          SELECT 1 FROM allgres_private.model_experiments me
+          JOIN allgres_private.llm_providers p ON p.name = me.candidate_provider AND p.is_enabled
+          WHERE me.experiment_id = v_experiment_id
+        ) THEN
+          RAISE EXCEPTION 'fn_decide_proposal: candidate provider is no longer enabled -- fix it or reject this experiment instead'
+            USING ERRCODE = 'P0001';
+        END IF;
+
         UPDATE allgres_private.procedure_tools pt
         SET llm_override = jsonb_build_object(
               'provider', me.candidate_provider, 'model', me.candidate_model
