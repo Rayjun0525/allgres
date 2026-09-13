@@ -3231,10 +3231,10 @@ Eight new selftest cases (310, up from 302) exercise every tier;
 verified on both a fresh `CREATE EXTENSION` and a rerun in the same
 database.
 
-**Still open, on purpose:** no UI copy on `tool_experiments.list` stating
+~~**Still open, on purpose:** no UI copy on `tool_experiments.list` stating
 that `candidate_success_rate` is a format-validity signal, not a quality
-judgment. Not gated behind autonomy the way the rest of this item was --
-just not fixed yet.
+judgment.~~ -- closed by the dashboard-panel follow-up further below, which
+carries that exact caveat as the panel's own copy.
 
 **Follow-up (same effort): the two tier thresholds are tunable, not
 hardcoded, plus three named presets.** `self_approve`'s canary_percent
