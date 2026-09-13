@@ -94,6 +94,9 @@ DECLARE
   v_ovr_proc uuid;
   v_ovr_tool uuid;
   v_ovr_sid uuid;
+  v_auto_tool uuid;
+  v_auto_tool2 uuid;
+  v_auto_proc uuid;
   v_ovr_tid uuid;
   v_ovr_call uuid;
   v_exp_id uuid;
@@ -3095,6 +3098,184 @@ BEGIN
       )->>'proposal_id')::uuid, true
     );
     DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_override_provider_2';
+
+    -- Autonomy-tiered automation: self_improve's own autonomy_level decides
+    -- how much of tool_override applies immediately vs. still queues for an
+    -- admin (see fn_submit_result's own comment on the tiers). A dedicated
+    -- tool/procedure here, not v_auto_tool, so its own call history stays
+    -- deterministic -- baseline_success_rate below has to be an exact,
+    -- known number for the min_sample_size/rate-floor checks to mean
+    -- anything.
+    v_auto_proc := (allgres_public.fn_create_procedure('selftest_autonomy_procedure', 'selftest autonomy procedure')->>'procedure_id')::uuid;
+    v_auto_tool := (allgres_public.fn_create_procedure_tool(
+      'selftest_autonomy_tool', 'selftest autonomy tool', 'http_get',
+      jsonb_build_object('url', 'https://example.com/allgres-selftest-autonomy')
+    )->>'tool_id')::uuid;
+    PERFORM allgres_public.fn_bind_procedure_tool(v_auto_proc, v_auto_tool);
+    PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', 'selftest_autonomy_procedure');
+
+    v_ovr_sid := (allgres_public.fn_create_session(v_agent, 'selftest autonomy fixture task')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+
+    -- baseline: 1 success, 1 failure -> baseline_success_rate = 0.5 exactly.
+    INSERT INTO allgres_private.outbound_calls (task_id, kind, url, request_headers, request_body, status, procedure_tool_id, outcome)
+    SELECT v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_auto_tool, o
+    FROM unnest(ARRAY['success', 'failure']) AS o;
+
+    PERFORM allgres_public.fn_set_agent_autonomy(v_self_id, 'self_approve');
+
+    -- self_approve + canary_percent <= 20: start_experiment auto-applies,
+    -- no change_proposals row at all.
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest autonomy self_approve small canary')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_provider',
+        'candidate_model', 'self-approve-model', 'canary_percent', 20, 'min_sample_size', 2
+      )
+    ));
+    v_exp_id := (sub->>'experiment_id')::uuid;
+    ok := (sub->>'applied')::boolean IS TRUE AND v_exp_id IS NOT NULL
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'running'
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.change_proposals WHERE target_tool_id = v_auto_tool AND status = 'pending');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'self_approve_auto_starts_experiment_at_or_below_cap', 'ok', ok));
+
+    -- self_approve + canary_percent > 20: still queues for an admin.
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest autonomy self_approve over cap')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    -- the tool already has a 'running' experiment from just above, so this
+    -- has to target a second, throwaway tool to isolate the canary_percent
+    -- cap check from the "one running experiment per tool" check.
+    v_auto_tool2 := (allgres_public.fn_create_procedure_tool(
+      'selftest_autonomy_tool_2', 'selftest autonomy tool 2', 'http_get', jsonb_build_object('url', 'https://example.com/x')
+    )->>'tool_id')::uuid;
+    PERFORM allgres_public.fn_bind_procedure_tool(v_auto_proc, v_auto_tool2);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool2::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_provider',
+        'candidate_model', 'should-queue-model', 'canary_percent', 21
+      )
+    ));
+    ok := sub ? 'proposal_id' AND NOT (sub ? 'applied')
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.model_experiments WHERE tool_id = v_auto_tool2 AND status = 'running');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'self_approve_queues_experiment_above_cap', 'ok', ok));
+    PERFORM allgres_public.fn_decide_proposal((sub->>'proposal_id')::uuid, false);
+    DELETE FROM allgres_private.procedure_tool_bindings WHERE tool_id = v_auto_tool2;
+    DELETE FROM allgres_private.procedure_tools WHERE tool_id = v_auto_tool2;
+
+    -- self_approve + promote: never auto-applies, regardless of how the
+    -- experiment is doing -- only start_experiment and reject are cheap
+    -- enough to trust at this level.
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'promote', 'experiment_id', v_exp_id::text
+      )
+    ));
+    ok := sub ? 'proposal_id' AND NOT (sub ? 'applied')
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'running';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'self_approve_never_auto_promotes', 'ok', ok));
+    PERFORM allgres_public.fn_decide_proposal((sub->>'proposal_id')::uuid, false);
+
+    -- self_approve + reject: always auto-applies -- reverting to the
+    -- already-safe status quo carries no risk to gate.
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'reject', 'experiment_id', v_exp_id::text
+      )
+    ));
+    ok := (sub->>'applied')::boolean IS TRUE
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'rejected';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'self_approve_auto_rejects', 'ok', ok));
+
+    PERFORM allgres_public.fn_set_agent_autonomy(v_self_id, 'auto');
+
+    -- auto: start_experiment auto-applies with no canary_percent cap at all.
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_provider',
+        'candidate_model', 'auto-model', 'canary_percent', 90, 'min_sample_size', 2
+      )
+    ));
+    v_exp_id := (sub->>'experiment_id')::uuid;
+    ok := (sub->>'applied')::boolean IS TRUE AND v_exp_id IS NOT NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'auto_starts_experiment_above_self_approve_cap', 'ok', ok));
+
+    -- auto + promote: falls back to queueing (not a turn error) when the
+    -- experiment has not yet reached its own min_sample_size, even though
+    -- the one sample so far looks perfect.
+    INSERT INTO allgres_private.outbound_calls (task_id, kind, url, request_headers, request_body, status, experiment_id, outcome)
+    VALUES (v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_exp_id, 'success');
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'promote', 'experiment_id', v_exp_id::text
+      )
+    ));
+    ok := sub ? 'proposal_id' AND NOT (sub ? 'applied')
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'running';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'auto_promote_falls_back_below_min_sample_size', 'ok', ok));
+    PERFORM allgres_public.fn_decide_proposal((sub->>'proposal_id')::uuid, false);
+
+    -- auto + promote: falls back to queueing when the sample is large
+    -- enough but the candidate's own rate is below baseline (0.5) --
+    -- one more failure brings candidate_success_rate to 1/2 = 0.5... so add
+    -- two failures instead, landing it at 1/3, below the 0.5 baseline.
+    INSERT INTO allgres_private.outbound_calls (task_id, kind, url, request_headers, request_body, status, experiment_id, outcome)
+    SELECT v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_exp_id, 'failure'
+    FROM generate_series(1, 2);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'promote', 'experiment_id', v_exp_id::text
+      )
+    ));
+    ok := sub ? 'proposal_id' AND NOT (sub ? 'applied')
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'running';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'auto_promote_falls_back_below_baseline_rate', 'ok', ok));
+    PERFORM allgres_public.fn_decide_proposal((sub->>'proposal_id')::uuid, false);
+
+    -- auto + promote: applies automatically once sample_size >=
+    -- min_sample_size and candidate_success_rate >= baseline_success_rate --
+    -- two more successes bring it to 3 successes / 6 = 0.5, tying baseline.
+    INSERT INTO allgres_private.outbound_calls (task_id, kind, url, request_headers, request_body, status, experiment_id, outcome)
+    SELECT v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_exp_id, 'success'
+    FROM generate_series(1, 2);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'promote', 'experiment_id', v_exp_id::text
+      )
+    ));
+    ok := (sub->>'applied')::boolean IS TRUE
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'promoted'
+      AND (SELECT llm_override FROM allgres_private.procedure_tools WHERE tool_id = v_auto_tool)
+          = jsonb_build_object('provider', 'selftest_override_provider', 'model', 'auto-model');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'auto_promote_applies_at_or_above_baseline_rate', 'ok', ok));
+
+    PERFORM allgres_public.fn_set_agent_autonomy(v_self_id, 'admin_approval');
+    DELETE FROM allgres_private.outbound_calls WHERE procedure_tool_id = v_auto_tool OR experiment_id IN (
+      SELECT experiment_id FROM allgres_private.model_experiments WHERE tool_id = v_auto_tool
+    );
+    DELETE FROM allgres_private.model_experiments WHERE tool_id = v_auto_tool;
+    PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_autonomy_procedure');
+    DELETE FROM allgres_private.procedure_tool_bindings WHERE tool_id = v_auto_tool;
+    DELETE FROM allgres_private.procedure_tools WHERE tool_id = v_auto_tool;
+    DELETE FROM allgres_private.procedures WHERE procedure_id = v_auto_proc;
 
     -- Leave everything this block touched as it found it.
     DELETE FROM allgres_private.outbound_calls

@@ -454,6 +454,95 @@ BEGIN
 END;
 $fn$;
 
+-- The three tool_override mutations, factored out of fn_decide_proposal so
+-- self_improve's own autonomy_level (fn_submit_result, same shape the
+-- ordinary policy_change path already uses) can apply them directly without
+-- going through change_proposals at all, while an admin-approval decision
+-- still goes through the identical code -- one mutation path, two ways to
+-- reach it, never two implementations that could drift apart.
+CREATE OR REPLACE FUNCTION allgres_private.apply_tool_experiment_start(
+  p_tool_id uuid, p_candidate_provider text, p_candidate_model text,
+  p_canary_percent int, p_min_sample_size int, p_proposed_by_agent_id uuid, p_reason text
+) RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_baseline numeric;
+  v_experiment_id uuid;
+BEGIN
+  -- baseline_success_rate is captured now, from this tool's history
+  -- *before* the experiment, so a later promote/reject decision (whether an
+  -- operator's or a later autonomy-driven one) compares against a frozen
+  -- number rather than one that keeps moving while the experiment runs.
+  SELECT round(
+    count(*) FILTER (WHERE outcome = 'success')::numeric
+      / NULLIF(count(*) FILTER (WHERE outcome IS NOT NULL), 0),
+    3
+  ) INTO v_baseline
+  FROM allgres_private.outbound_calls
+  WHERE kind = 'llm' AND procedure_tool_id = p_tool_id AND experiment_id IS NULL;
+
+  INSERT INTO allgres_private.model_experiments (
+    tool_id, candidate_provider, candidate_model, canary_percent,
+    min_sample_size, baseline_success_rate, proposed_by_agent_id, reason
+  ) VALUES (
+    p_tool_id, p_candidate_provider, p_candidate_model, p_canary_percent,
+    COALESCE(p_min_sample_size, 20), v_baseline, p_proposed_by_agent_id, p_reason
+  ) RETURNING experiment_id INTO v_experiment_id;
+
+  RETURN v_experiment_id;
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_private.apply_tool_experiment_promote(p_experiment_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  -- Re-check the candidate is still an enabled provider: start_experiment
+  -- already required this when the experiment was proposed, but an operator
+  -- (or, now, an autonomous decision) can disable a provider at any point
+  -- while the experiment is running -- promoting it anyway would write a
+  -- dead provider straight into this tool's live llm_override, exactly the
+  -- failure fn_bulk_set_model's own fail-closed check exists to avoid.
+  IF NOT EXISTS (
+    SELECT 1 FROM allgres_private.model_experiments me
+    JOIN allgres_private.llm_providers p ON p.name = me.candidate_provider AND p.is_enabled
+    WHERE me.experiment_id = p_experiment_id
+  ) THEN
+    RAISE EXCEPTION 'candidate provider is no longer enabled -- fix it or reject this experiment instead'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  UPDATE allgres_private.procedure_tools pt
+  SET llm_override = jsonb_build_object(
+        'provider', me.candidate_provider, 'model', me.candidate_model
+      ),
+      updated_at = now()
+  FROM allgres_private.model_experiments me
+  WHERE me.experiment_id = p_experiment_id AND pt.tool_id = me.tool_id;
+
+  UPDATE allgres_private.model_experiments
+  SET status = 'promoted', decided_at = now()
+  WHERE experiment_id = p_experiment_id;
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_private.apply_tool_experiment_reject(p_experiment_id uuid)
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+  UPDATE allgres_private.model_experiments
+  SET status = 'rejected', decided_at = now()
+  WHERE experiment_id = p_experiment_id;
+$fn$;
+
 -- Operator-only: an agent's own propose_change action (fn_submit_result)
 -- only ever reaches this table, never the live policy directly. Approving
 -- applies the change through fn_set_policy -- the same versioning path any
@@ -523,23 +612,11 @@ BEGIN
   IF r.kind = 'tool_override' THEN
     v_op := r.proposed_changes->>'op';
     IF v_op = 'start_experiment' THEN
-      SELECT round(
-        count(*) FILTER (WHERE outcome = 'success')::numeric
-          / NULLIF(count(*) FILTER (WHERE outcome IS NOT NULL), 0),
-        3
-      ) INTO v_baseline
-      FROM allgres_private.outbound_calls
-      WHERE kind = 'llm' AND procedure_tool_id = r.target_tool_id AND experiment_id IS NULL;
-
-      INSERT INTO allgres_private.model_experiments (
-        tool_id, candidate_provider, candidate_model, canary_percent,
-        min_sample_size, baseline_success_rate, proposed_by_agent_id, reason
-      ) VALUES (
+      v_experiment_id := allgres_private.apply_tool_experiment_start(
         r.target_tool_id, r.proposed_changes->>'candidate_provider', r.proposed_changes->>'candidate_model',
-        (r.proposed_changes->>'canary_percent')::int,
-        COALESCE((r.proposed_changes->>'min_sample_size')::int, 20),
-        v_baseline, r.agent_id, r.reason
-      ) RETURNING experiment_id INTO v_experiment_id;
+        (r.proposed_changes->>'canary_percent')::int, (r.proposed_changes->>'min_sample_size')::int,
+        r.agent_id, r.reason
+      );
 
       UPDATE allgres_private.change_proposals
       SET status = 'approved', decided_at = now(), decided_reply = p_reply
@@ -564,39 +641,9 @@ BEGIN
       END IF;
 
       IF v_op = 'promote' THEN
-        -- Re-check the candidate is still an enabled provider: fn_submit_
-        -- result already required this at start_experiment time, but an
-        -- operator can disable a provider at any point while the
-        -- experiment is running -- promoting it anyway would write a
-        -- dead provider straight into this tool's live llm_override,
-        -- exactly the failure fn_bulk_set_model's own fail-closed check
-        -- (and start_experiment's, above) exists to avoid. Reject
-        -- outright rather than approve-with-a-broken-result; the
-        -- operator can fix the provider and promote again, or reject the
-        -- experiment instead.
-        IF NOT EXISTS (
-          SELECT 1 FROM allgres_private.model_experiments me
-          JOIN allgres_private.llm_providers p ON p.name = me.candidate_provider AND p.is_enabled
-          WHERE me.experiment_id = v_experiment_id
-        ) THEN
-          RAISE EXCEPTION 'fn_decide_proposal: candidate provider is no longer enabled -- fix it or reject this experiment instead'
-            USING ERRCODE = 'P0001';
-        END IF;
-
-        UPDATE allgres_private.procedure_tools pt
-        SET llm_override = jsonb_build_object(
-              'provider', me.candidate_provider, 'model', me.candidate_model
-            ),
-            updated_at = now()
-        FROM allgres_private.model_experiments me
-        WHERE me.experiment_id = v_experiment_id AND pt.tool_id = r.target_tool_id;
-        UPDATE allgres_private.model_experiments
-        SET status = 'promoted', decided_at = now()
-        WHERE experiment_id = v_experiment_id;
+        PERFORM allgres_private.apply_tool_experiment_promote(v_experiment_id);
       ELSE -- 'reject'
-        UPDATE allgres_private.model_experiments
-        SET status = 'rejected', decided_at = now()
-        WHERE experiment_id = v_experiment_id;
+        PERFORM allgres_private.apply_tool_experiment_reject(v_experiment_id);
       END IF;
 
       UPDATE allgres_private.change_proposals

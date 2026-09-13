@@ -3901,6 +3901,10 @@ DECLARE
   v_op text;
   v_canary_percent int;
   v_experiment_ref allgres_private.model_experiments%ROWTYPE;
+  v_tool_auto_applied boolean;
+  v_tool_candidate_rate numeric;
+  v_tool_sample_size int;
+  v_tool_experiment_id uuid;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -4635,6 +4639,81 @@ BEGIN
           UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
           RETURN jsonb_build_object('action', 'continue');
         END IF;
+      END IF;
+
+      -- self_improve's autonomy_level governs how much of this stays gated
+      -- behind an admin, the same "opt out of admin_approval" shape the
+      -- ordinary policy_change path already applies immediately for below --
+      -- but tiered per op rather than uniform, since the three ops are not
+      -- equally risky: starting a small canary barely touches production
+      -- traffic, rejecting one only ever reverts to the already-safe status
+      -- quo, but promoting rewrites the tool's *live* default for everyone.
+      --   admin_approval (default): nothing here auto-applies -- unchanged.
+      --   self_approve: start_experiment auto-applies only at
+      --     canary_percent <= 20 (a larger ask still queues); reject always
+      --     auto-applies (never makes anything worse); promote still queues.
+      --   auto: start_experiment auto-applies at any canary_percent;
+      --     promote auto-applies only when the experiment has reached its
+      --     own min_sample_size AND has a real (non-NULL) baseline AND the
+      --     candidate's live success rate is at or above it -- otherwise
+      --     it falls through to the same admin queue an admin_approval
+      --     agent would use, rather than promoting on thin or bad evidence;
+      --     reject always auto-applies.
+      -- A promote auto-apply can still fail closed (apply_tool_experiment_
+      -- promote's own provider-enabled re-check) -- caught here and treated
+      -- as "did not qualify," not as a turn error, so it queues for an
+      -- admin to see instead of erroring the whole turn out.
+      v_tool_auto_applied := false;
+      IF v_op = 'start_experiment' THEN
+        IF a.autonomy_level = 'auto'
+           OR (a.autonomy_level = 'self_approve' AND v_canary_percent <= 20) THEN
+          v_tool_experiment_id := allgres_private.apply_tool_experiment_start(
+            v_tool_target, v_parsed->>'candidate_provider', v_parsed->>'candidate_model',
+            v_canary_percent, (v_parsed->>'min_sample_size')::int,
+            t.agent_id, NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), '')
+          );
+          v_tool_auto_applied := true;
+        END IF;
+      ELSIF v_op = 'promote' THEN
+        IF a.autonomy_level = 'auto' THEN
+          SELECT count(*) FILTER (WHERE outcome IS NOT NULL),
+                 round(count(*) FILTER (WHERE outcome = 'success')::numeric / NULLIF(count(*) FILTER (WHERE outcome IS NOT NULL), 0), 3)
+          INTO v_tool_sample_size, v_tool_candidate_rate
+          FROM allgres_private.outbound_calls WHERE experiment_id = v_experiment_ref.experiment_id;
+
+          IF v_experiment_ref.baseline_success_rate IS NOT NULL
+             AND v_tool_candidate_rate IS NOT NULL
+             AND v_tool_sample_size >= v_experiment_ref.min_sample_size
+             AND v_tool_candidate_rate >= v_experiment_ref.baseline_success_rate THEN
+            BEGIN
+              PERFORM allgres_private.apply_tool_experiment_promote(v_experiment_ref.experiment_id);
+              v_tool_auto_applied := true;
+            EXCEPTION WHEN others THEN
+              v_tool_auto_applied := false;
+            END;
+          END IF;
+        END IF;
+      ELSE -- 'reject'
+        IF a.autonomy_level IN ('self_approve', 'auto') THEN
+          PERFORM allgres_private.apply_tool_experiment_reject(v_experiment_ref.experiment_id);
+          v_tool_auto_applied := true;
+        END IF;
+      END IF;
+
+      IF v_tool_auto_applied THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'assistant',
+          jsonb_build_object(
+            'applied_tool_override', v_parsed, 'target_tool_id', v_tool_target,
+            'op', v_op, 'autonomy_level', a.autonomy_level, 'experiment_id',
+            COALESCE(v_tool_experiment_id, v_experiment_ref.experiment_id)
+          )
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object(
+          'action', 'continue', 'applied', true, 'target_tool_id', v_tool_target, 'op', v_op,
+          'experiment_id', COALESCE(v_tool_experiment_id, v_experiment_ref.experiment_id)
+        );
       END IF;
 
       INSERT INTO allgres_private.change_proposals

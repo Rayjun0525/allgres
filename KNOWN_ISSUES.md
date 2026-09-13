@@ -3198,15 +3198,45 @@ row the same way, whichever side of the comparison it is on. Six new
 selftest cases (302, up from 296); verified on both a fresh
 `CREATE EXTENSION` and a rerun in the same database.
 
-**Still open, on purpose, while every one of these actions stays gated
-behind `self_improve`'s own `admin_approval`:** no sticky model choice
-across a retry (a `build_llm_http` failure or a `fn_watchdog`-reclaimed
-timeout drops the override/canary context entirely -- the retry silently
-falls back to the agent's own default model rather than re-rolling the
-canary, which is a safe direction to fail in but not a designed
-guarantee); no minimum sample size or elapsed time enforced before
-`promote` is allowed to fire; no UI copy on `tool_experiments.list`
-stating that `candidate_success_rate` is a format-validity signal, not a
-quality judgment. Raising `self_improve`'s autonomy past
-`admin_approval` for this capability should not happen before these are
-closed.
+**Follow-up (same effort): `autonomy_level` now actually governs how much
+of this is automated, tiered per op rather than uniform -- the three ops
+are not equally risky (starting a small canary barely touches production
+traffic, rejecting only ever reverts to the already-safe status quo,
+promoting rewrites the tool's live default for everyone). The three
+mutations (`start_experiment`/`promote`/`reject`) were factored out of
+`fn_decide_proposal` into `allgres_private.apply_tool_experiment_*`
+helpers so an autonomy-driven auto-apply (`fn_submit_result`) and an
+admin's manual approval (`fn_decide_proposal`) run the identical code,
+never two implementations that could drift apart.
+- `admin_approval` (default): nothing auto-applies, unchanged.
+- `self_approve`: `start_experiment` auto-applies only at
+  `canary_percent <= 20` (a larger ask still queues); `reject` always
+  auto-applies; `promote` always still queues -- self_approve is trusted
+  to try small, cheap experiments and to back out of them, not to make
+  the actual go-live call.
+- `auto`: `start_experiment` auto-applies at any `canary_percent`;
+  `reject` always auto-applies; `promote` auto-applies only when the
+  experiment has reached its own `min_sample_size`, has a real (non-NULL)
+  `baseline_success_rate`, and the candidate's live success rate is at or
+  above it -- otherwise it falls through to the same admin queue an
+  `admin_approval` agent would use (a disabled-provider failure inside
+  the auto-promote attempt is caught the same way, falling through to
+  the queue rather than erroring the whole turn out). This closes the
+  "no minimum sample size enforced before promote" gap listed below as
+  still open in the very same commit that introduced it -- auto-promote
+  was the first caller that actually needed the floor enforced in code,
+  not just documented as a risk.
+
+Eight new selftest cases (310, up from 302) exercise every tier;
+verified on both a fresh `CREATE EXTENSION` and a rerun in the same
+database.
+
+**Still open, on purpose:** no sticky model choice across a retry (a
+`build_llm_http` failure or a `fn_watchdog`-reclaimed timeout drops the
+override/canary context entirely -- the retry silently falls back to the
+agent's own default model rather than re-rolling the canary, which is a
+safe direction to fail in but not a designed guarantee); no UI copy on
+`tool_experiments.list` stating that `candidate_success_rate` is a
+format-validity signal, not a quality judgment. Neither is gated behind
+autonomy the way the rest of this item was -- they are just not fixed
+yet.
