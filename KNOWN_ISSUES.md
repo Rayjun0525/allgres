@@ -3240,3 +3240,38 @@ safe direction to fail in but not a designed guarantee); no UI copy on
 format-validity signal, not a quality judgment. Neither is gated behind
 autonomy the way the rest of this item was -- they are just not fixed
 yet.
+
+**Follow-up (same effort): the two tier thresholds are tunable, not
+hardcoded, plus three named presets.** `self_approve`'s canary_percent
+ceiling and `auto`'s promote rate floor were fixed at 20 and "candidate
+>= baseline exactly" in the commit that introduced them -- reasonable
+defaults, but a real operator's risk tolerance is a dial, not a fixed
+point, and Claude Code's own multi-level permission model was the
+concrete comparison raised for why this shouldn't be just three hardcoded
+stops. Both are now `self_improve`'s own `agent_config` (the same jsonb
+bag `compaction_threshold`/`min_mentions_to_route` already use, validated
+in `validate_agent_config`):
+- `tool_override_self_approve_canary_cap` (1-100, default 20): the
+  `canary_percent` ceiling `self_approve` auto-starts under.
+- `tool_override_auto_promote_slack_pct` (0-100, default 0): how many
+  percentage points below `baseline_success_rate` `auto`'s own promote
+  will still accept (0 = candidate must be at or above baseline exactly,
+  the original behavior).
+
+Continuous tuning is `fn_set_agent_config` directly (any value, not just
+a preset). `fn_set_tool_override_autonomy_preset` adds three named
+starting points on the same scale for an operator who does not already
+have a number in mind: `conservative` (10, 0), `balanced` (20, 0, the
+original defaults), `aggressive` (50, 5). New `dashboard_rpc` action
+`agents.set_tool_override_autonomy_preset` (84th frozen action,
+`require_admin_if_accounts_exist`) exposes the preset only -- an operator
+who wants a value between or outside the three presets still calls
+`fn_set_agent_config` with the exact numbers, same as any other
+`agent_config` tunable.
+
+Four new selftest cases (314, up from 310): an unknown preset name is
+rejected, the `aggressive` preset writes both keys, a widened canary cap
+changes `self_approve`'s own auto-start behavior, and a generous
+`slack_pct` set directly (not through a preset) auto-promotes a candidate
+that the default floor would have queued instead. Verified on both a
+fresh `CREATE EXTENSION` and a rerun in the same database.

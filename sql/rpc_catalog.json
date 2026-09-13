@@ -21,6 +21,17 @@
     ]
   },
   {
+    "action": "agents.set_tool_override_autonomy_preset",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "agent_id",
+      "preset",
+      "session_token"
+    ]
+  },
+  {
     "action": "agents.bulk_set_model",
     "guards": [
       "require_admin_if_accounts_exist"

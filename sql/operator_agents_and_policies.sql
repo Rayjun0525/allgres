@@ -160,7 +160,19 @@ BEGIN
     SELECT * FROM (VALUES
       ('compaction_threshold', 1, 1000000),
       ('compaction_keep_recent', 0, 1000000),
-      ('min_mentions_to_route', 1, 1000)
+      ('min_mentions_to_route', 1, 1000),
+      -- self_improve's own tool_override autonomy dials (fn_submit_result's
+      -- own comment on the tiers): tool_override_self_approve_canary_cap is
+      -- the canary_percent ceiling self_approve auto-starts under (higher =
+      -- more of self_approve's own traffic gets auto-started); tool_
+      -- override_auto_promote_slack_pct is how many percentage points below
+      -- baseline_success_rate auto's own promote will still accept (0 =
+      -- candidate must be at or above baseline exactly, the original
+      -- behavior; higher = more permissive). Meaningless for any agent but
+      -- self_improve, same "a plain column with a safe default" reasoning
+      -- as the three above.
+      ('tool_override_self_approve_canary_cap', 1, 100),
+      ('tool_override_auto_promote_slack_pct', 0, 100)
     ) AS t(key, min_val, max_val)
   LOOP
     IF NOT (p_config ? r.key) THEN
@@ -215,6 +227,41 @@ BEGIN
   END IF;
   PERFORM allgres_private.audit('agents.update', jsonb_build_object('agent_id', p_agent_id, 'agent_config', p_config));
   RETURN jsonb_build_object('ok', true, 'agent_config', v_config);
+END;
+$fn$;
+
+-- A named convenience over fn_set_agent_config's own two tool_override
+-- dials (see validate_agent_config's own comment on both): three fixed
+-- points on the same continuous scale, for an operator who wants a
+-- reasonable starting position without having to already know what
+-- canary_percent ceiling or promote slack "conservative" or "aggressive"
+-- should mean in numbers. Never the only way to set these -- an operator
+-- who wants a value between two presets, or outside all three, still
+-- calls fn_set_agent_config directly with the exact numbers; this only
+-- ever writes the same two keys that function already validates.
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_tool_override_autonomy_preset(
+  p_agent_id uuid, p_preset text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  v_canary_cap int;
+  v_promote_slack int;
+BEGIN
+  CASE p_preset
+    WHEN 'conservative' THEN v_canary_cap := 10; v_promote_slack := 0;
+    WHEN 'balanced'     THEN v_canary_cap := 20; v_promote_slack := 0;
+    WHEN 'aggressive'   THEN v_canary_cap := 50; v_promote_slack := 5;
+    ELSE
+      RAISE EXCEPTION 'unknown tool_override autonomy preset: % (use conservative, balanced, or aggressive)', p_preset
+        USING ERRCODE = 'P0001';
+  END CASE;
+  RETURN allgres_public.fn_set_agent_config(p_agent_id, jsonb_build_object(
+    'tool_override_self_approve_canary_cap', v_canary_cap,
+    'tool_override_auto_promote_slack_pct', v_promote_slack
+  ));
 END;
 $fn$;
 

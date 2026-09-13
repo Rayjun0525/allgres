@@ -3905,6 +3905,8 @@ DECLARE
   v_tool_candidate_rate numeric;
   v_tool_sample_size int;
   v_tool_experiment_id uuid;
+  v_tool_canary_cap int;
+  v_tool_promote_slack int;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -4650,23 +4652,36 @@ BEGIN
       -- quo, but promoting rewrites the tool's *live* default for everyone.
       --   admin_approval (default): nothing here auto-applies -- unchanged.
       --   self_approve: start_experiment auto-applies only at
-      --     canary_percent <= 20 (a larger ask still queues); reject always
-      --     auto-applies (never makes anything worse); promote still queues.
+      --     canary_percent <= tool_override_self_approve_canary_cap (an
+      --     agent_config dial, default 20 -- a larger ask still queues);
+      --     reject always auto-applies (never makes anything worse);
+      --     promote still queues.
       --   auto: start_experiment auto-applies at any canary_percent;
       --     promote auto-applies only when the experiment has reached its
       --     own min_sample_size AND has a real (non-NULL) baseline AND the
-      --     candidate's live success rate is at or above it -- otherwise
-      --     it falls through to the same admin queue an admin_approval
-      --     agent would use, rather than promoting on thin or bad evidence;
-      --     reject always auto-applies.
+      --     candidate's live success rate is at or above baseline minus
+      --     tool_override_auto_promote_slack_pct (another agent_config
+      --     dial, default 0 -- candidate must be at or above baseline
+      --     exactly) -- otherwise it falls through to the same admin queue
+      --     an admin_approval agent would use, rather than promoting on
+      --     thin or bad evidence; reject always auto-applies.
+      -- Both dials are self_improve's own agent_config (validate_agent_
+      -- config's own comment), not a new column: an operator tunes them
+      -- with fn_set_agent_config directly, or fn_set_tool_override_
+      -- autonomy_preset for one of three named starting points
+      -- (conservative/balanced/aggressive) -- unset reads back as the same
+      -- defaults this feature originally shipped with, so an install that
+      -- never touches either dial behaves exactly as before.
       -- A promote auto-apply can still fail closed (apply_tool_experiment_
       -- promote's own provider-enabled re-check) -- caught here and treated
       -- as "did not qualify," not as a turn error, so it queues for an
       -- admin to see instead of erroring the whole turn out.
       v_tool_auto_applied := false;
+      v_tool_canary_cap := COALESCE((a.agent_config->>'tool_override_self_approve_canary_cap')::int, 20);
+      v_tool_promote_slack := COALESCE((a.agent_config->>'tool_override_auto_promote_slack_pct')::int, 0);
       IF v_op = 'start_experiment' THEN
         IF a.autonomy_level = 'auto'
-           OR (a.autonomy_level = 'self_approve' AND v_canary_percent <= 20) THEN
+           OR (a.autonomy_level = 'self_approve' AND v_canary_percent <= v_tool_canary_cap) THEN
           v_tool_experiment_id := allgres_private.apply_tool_experiment_start(
             v_tool_target, v_parsed->>'candidate_provider', v_parsed->>'candidate_model',
             v_canary_percent, (v_parsed->>'min_sample_size')::int,
@@ -4684,7 +4699,7 @@ BEGIN
           IF v_experiment_ref.baseline_success_rate IS NOT NULL
              AND v_tool_candidate_rate IS NOT NULL
              AND v_tool_sample_size >= v_experiment_ref.min_sample_size
-             AND v_tool_candidate_rate >= v_experiment_ref.baseline_success_rate THEN
+             AND v_tool_candidate_rate >= (v_experiment_ref.baseline_success_rate - v_tool_promote_slack::numeric / 100) THEN
             BEGIN
               PERFORM allgres_private.apply_tool_experiment_promote(v_experiment_ref.experiment_id);
               v_tool_auto_applied := true;

@@ -550,6 +550,17 @@ BEGIN
         (p_request->>'agent_id')::uuid, p_request->>'autonomy_level'
       );
 
+    -- Named starting points for self_improve's own two tool_override
+    -- autonomy dials (allgres_private.validate_agent_config's own
+    -- comment) -- a value between or outside the three presets is still
+    -- reachable directly with fn_set_agent_config, same as any other
+    -- agent_config tunable; this is only the convenience wrapper.
+    WHEN 'agents.set_tool_override_autonomy_preset' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_set_tool_override_autonomy_preset(
+        (p_request->>'agent_id')::uuid, p_request->>'preset'
+      );
+
     WHEN 'agents.bulk_set_model' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_bulk_set_model(p_request->>'provider', p_request->>'model');

@@ -3267,6 +3267,76 @@ BEGIN
           = jsonb_build_object('provider', 'selftest_override_provider', 'model', 'auto-model');
     v := v || jsonb_build_array(jsonb_build_object('name', 'auto_promote_applies_at_or_above_baseline_rate', 'ok', ok));
 
+    -- Both autonomy dials are agent_config, not hardcoded: an unknown
+    -- preset name is rejected, applying a real one actually writes both
+    -- keys, and a value set directly with fn_set_agent_config (not just a
+    -- preset) changes fn_submit_result's own decision -- exercised here by
+    -- making auto_promote_slack_pct generous enough to accept a candidate
+    -- that would have failed the tiers tested above.
+    BEGIN
+      PERFORM allgres_public.fn_set_tool_override_autonomy_preset(v_self_id, 'not_a_real_preset');
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%unknown tool_override autonomy preset%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'set_tool_override_autonomy_preset_rejects_unknown_name', 'ok', ok));
+
+    comp := allgres_public.fn_set_tool_override_autonomy_preset(v_self_id, 'aggressive');
+    ok := (comp->>'ok')::boolean
+      AND (SELECT (agent_config->>'tool_override_self_approve_canary_cap')::int FROM allgres_private.agents WHERE agent_id = v_self_id) = 50
+      AND (SELECT (agent_config->>'tool_override_auto_promote_slack_pct')::int FROM allgres_private.agents WHERE agent_id = v_self_id) = 5;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'aggressive_preset_widens_both_dials', 'ok', ok));
+
+    -- self_approve now auto-starts a 30% canary -- above the feature's
+    -- original hardcoded 20% default, but within the aggressive preset's
+    -- own 50% cap.
+    PERFORM allgres_public.fn_set_agent_autonomy(v_self_id, 'self_approve');
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest autonomy preset widened cap')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_provider',
+        'candidate_model', 'preset-cap-model', 'canary_percent', 30, 'min_sample_size', 3
+      )
+    ));
+    v_exp_id := (sub->>'experiment_id')::uuid;
+    ok := (sub->>'applied')::boolean IS TRUE AND v_exp_id IS NOT NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'preset_widened_canary_cap_changes_self_approve_behavior', 'ok', ok));
+
+    -- A directly-set slack_pct (not just a preset) changes auto's own
+    -- promote floor: 1 success out of 3 (~0.33) is well below this tool's
+    -- 0.5 baseline and would fail the default slack=0 floor tested above,
+    -- but passes once slack_pct is generous enough that baseline - slack
+    -- goes negative.
+    PERFORM allgres_public.fn_set_agent_config(v_self_id, jsonb_build_object('tool_override_auto_promote_slack_pct', 100));
+    PERFORM allgres_public.fn_set_agent_autonomy(v_self_id, 'auto');
+    INSERT INTO allgres_private.outbound_calls (task_id, kind, url, request_headers, request_body, status, experiment_id, outcome)
+    VALUES
+      (v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_exp_id, 'success'),
+      (v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_exp_id, 'failure'),
+      (v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_exp_id, 'failure');
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_auto_tool::text,
+        'op', 'promote', 'experiment_id', v_exp_id::text
+      )
+    ));
+    ok := (sub->>'applied')::boolean IS TRUE
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'promoted';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'generous_slack_pct_auto_promotes_a_below_baseline_candidate', 'ok', ok));
+
+    -- Clear both dials back to their coded defaults (jsonb null, per
+    -- validate_agent_config's own documented "clear it back to default"
+    -- convention), leaving self_improve's agent_config as this block
+    -- found it.
+    PERFORM allgres_public.fn_set_agent_config(v_self_id, jsonb_build_object(
+      'tool_override_self_approve_canary_cap', NULL, 'tool_override_auto_promote_slack_pct', NULL
+    ));
+
     PERFORM allgres_public.fn_set_agent_autonomy(v_self_id, 'admin_approval');
     DELETE FROM allgres_private.outbound_calls WHERE procedure_tool_id = v_auto_tool OR experiment_id IN (
       SELECT experiment_id FROM allgres_private.model_experiments WHERE tool_id = v_auto_tool
@@ -4364,7 +4434,7 @@ BEGIN
   ) AS m;
   SELECT array_agg(a ORDER BY a) INTO v_missing_rpc_actions
   FROM unnest(ARRAY[
-    'overview', 'agents.list', 'agents.set_autonomy', 'agents.bulk_set_model', 'agents.create',
+    'overview', 'agents.list', 'agents.set_autonomy', 'agents.set_tool_override_autonomy_preset', 'agents.bulk_set_model', 'agents.create',
     'agents.update', 'policy.history', 'policy.rollback', 'agents.evaluate', 'proposals.list',
     'proposals.decide', 'fixes.list', 'fixes.decide', 'permissions.list', 'permissions.grant',
     'permissions.revoke', 'permissions.options', 'allowlist.list', 'allowlist.add', 'allowlist.remove',
@@ -4386,7 +4456,7 @@ BEGIN
   SELECT array_agg(a ORDER BY a) INTO v_extra_rpc_actions
   FROM unnest(v_live_rpc_actions) a
   WHERE a <> ALL(ARRAY[
-    'overview', 'agents.list', 'agents.set_autonomy', 'agents.bulk_set_model', 'agents.create',
+    'overview', 'agents.list', 'agents.set_autonomy', 'agents.set_tool_override_autonomy_preset', 'agents.bulk_set_model', 'agents.create',
     'agents.update', 'policy.history', 'policy.rollback', 'agents.evaluate', 'proposals.list',
     'proposals.decide', 'fixes.list', 'fixes.decide', 'permissions.list', 'permissions.grant',
     'permissions.revoke', 'permissions.options', 'allowlist.list', 'allowlist.add', 'allowlist.remove',
