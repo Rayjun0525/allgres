@@ -3231,15 +3231,10 @@ Eight new selftest cases (310, up from 302) exercise every tier;
 verified on both a fresh `CREATE EXTENSION` and a rerun in the same
 database.
 
-**Still open, on purpose:** no sticky model choice across a retry (a
-`build_llm_http` failure or a `fn_watchdog`-reclaimed timeout drops the
-override/canary context entirely -- the retry silently falls back to the
-agent's own default model rather than re-rolling the canary, which is a
-safe direction to fail in but not a designed guarantee); no UI copy on
-`tool_experiments.list` stating that `candidate_success_rate` is a
-format-validity signal, not a quality judgment. Neither is gated behind
-autonomy the way the rest of this item was -- they are just not fixed
-yet.
+**Still open, on purpose:** no UI copy on `tool_experiments.list` stating
+that `candidate_success_rate` is a format-validity signal, not a quality
+judgment. Not gated behind autonomy the way the rest of this item was --
+just not fixed yet.
 
 **Follow-up (same effort): the two tier thresholds are tunable, not
 hardcoded, plus three named presets.** `self_approve`'s canary_percent
@@ -3275,3 +3270,44 @@ changes `self_approve`'s own auto-start behavior, and a generous
 `slack_pct` set directly (not through a preset) auto-promotes a candidate
 that the default floor would have queued instead. Verified on both a
 fresh `CREATE EXTENSION` and a rerun in the same database.
+
+**Follow-up (same effort): the sticky-retry gap above is closed.** A
+`build_llm_http` failure, a `fn_watchdog`-reclaimed timeout, or an
+unparseable/invalid model response used to drop the override/canary
+context entirely -- `fn_next_step` located the turn's context by looking
+at the single most recent `execution_logs` row, and any of those failure
+paths appends a `role='error'` row that then *became* "the most recent
+row", silently falling back to the agent's own default model on retry
+(a safe direction to fail in, but not a designed guarantee, and the
+retried turn's outcome was never attributed to the running experiment
+either way -- it just vanished from the sample in both directions).
+
+`tasks` gained a nullable `tool_override_state jsonb` column: the frozen
+`{procedure_tool_id, experiment_id, provider, model}` decision for the
+turn currently in flight. `fn_next_step` now distinguishes a genuine retry
+from a fresh turn by whether an `'error'` row exists *after* the last
+`'tool'` result -- not by simply excluding `'error'` rows from the lookup,
+which turned out not to be enough on its own: `fn_submit_result`'s
+`llm_response` handling always logs the raw `'assistant'` content **and**,
+if it doesn't parse, an `'error'` row at the *same* `step_number`, so a
+naive `role <> 'error'` filter still landed on that raw assistant row
+instead of the `'tool'` row underneath it. The fix excludes any
+`step_number` that has an `'error'` row at all, not just `'error'` rows
+themselves. Only when that check finds a genuine retry does `fn_next_step`
+reuse the frozen decision (never re-rolling the canary die, never
+re-reading since-changed `llm_override`/experiment config); a fresh
+`call_tool` (no error after its own `'tool'` result) always re-resolves
+from live config, exactly as before this fix.
+
+Two new selftest cases (316, up from 314), on a fully isolated
+tool/procedure/session so mutating the experiment's status couldn't
+disturb the shared fixtures other cases in this item still depend on:
+`retry_after_error_reuses_frozen_override_decision` (an unparseable
+response is retried, the running experiment is rejected out from under
+it, and the retry still returns the pre-rejection candidate model) and
+`fresh_call_tool_breaks_stickiness_and_reresolves` (a genuinely new
+`call_tool` on the same task afterward re-resolves from the now-rejected,
+override-less live config instead of inheriting the stale cached
+decision). Verified on both a fresh `CREATE EXTENSION` and a rerun in the
+same database; `cargo test --lib`'s 30 cases are unaffected (SQL-only
+change).

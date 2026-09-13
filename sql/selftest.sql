@@ -100,6 +100,11 @@ DECLARE
   v_ovr_tid uuid;
   v_ovr_call uuid;
   v_exp_id uuid;
+  v_retry_tool uuid;
+  v_retry_exp uuid;
+  v_retry_sid uuid;
+  v_retry_tid uuid;
+  v_retry_call uuid;
   v_saved_llm_config jsonb;
   v_live_rpc_actions text[];
   v_missing_rpc_actions text[];
@@ -2806,6 +2811,90 @@ BEGIN
     PERFORM allgres_public.fn_complete_outbound(v_ovr_call, 200, 'not json at all');
     ok := (SELECT outcome FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'failure';
     v := v || jsonb_build_array(jsonb_build_object('name', 'unparseable_llm_response_records_failure_outcome', 'ok', ok));
+
+    -- Sticky retry, on a fully isolated tool/experiment/session/task (own
+    -- v_retry_* variables throughout) so nothing here disturbs the shared
+    -- v_ovr_sid/v_ovr_tid/v_ovr_call/v_exp_id fixture the very next test
+    -- (and the promote/reject tests further below) still depend on.
+    -- selftest_retry_tool is bound to the same v_ovr_proc but carries no
+    -- override of its own, so a fresh resolution falls back to v_ovr_proc's
+    -- own override ('proc-model', set above).
+    DELETE FROM allgres_private.model_experiments WHERE tool_id IN (
+      SELECT tool_id FROM allgres_private.procedure_tools WHERE name = 'selftest_retry_tool'
+    );
+    DELETE FROM allgres_private.procedure_tools WHERE name = 'selftest_retry_tool';
+    v_retry_tool := (allgres_public.fn_create_procedure_tool(
+      'selftest_retry_tool', 'selftest retry tool', 'http_get',
+      jsonb_build_object('url', 'https://example.com/allgres-selftest-retry')
+    )->>'tool_id')::uuid;
+    PERFORM allgres_public.fn_bind_procedure_tool(v_ovr_proc, v_retry_tool);
+
+    v_retry_sid := (allgres_public.fn_create_session(v_agent, 'selftest sticky retry')->>'session_id')::uuid;
+    SELECT task_id INTO v_retry_tid FROM allgres_private.tasks WHERE session_id = v_retry_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_retry_tid);
+    sub := allgres_public.fn_submit_result(v_retry_tid, jsonb_build_object(
+      'type', 'llm_response',
+      'content', '{"action":"call_tool","tool":"selftest_retry_tool"}',
+      'parsed', jsonb_build_object('action', 'call_tool', 'tool', 'selftest_retry_tool')
+    ));
+    v_retry_call := (sub->>'call_id')::uuid;
+    UPDATE allgres_private.outbound_calls SET status = 'in_flight' WHERE call_id = v_retry_call;
+    PERFORM allgres_public.fn_complete_outbound(v_retry_call, 200, 'ok');
+
+    -- A 100%-canary experiment on this tool freezes the first resolution
+    -- onto the candidate model.
+    INSERT INTO allgres_private.model_experiments
+      (tool_id, candidate_provider, candidate_model, canary_percent, min_sample_size)
+    VALUES (v_retry_tool, 'selftest_override_provider', 'retry-canary-model', 100, 1)
+    RETURNING experiment_id INTO v_retry_exp;
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_retry_tid;
+    spec := allgres_public.fn_next_step(v_retry_tid);
+
+    -- Simulate that resolved turn's own LLM call coming back unparseable --
+    -- this logs a role='error' row after the 'tool' result, the only proof
+    -- (tasks.tool_override_state's own comment) that the next fn_next_step
+    -- call is a retry of the SAME turn, not a fresh one.
+    INSERT INTO allgres_private.outbound_calls (
+      task_id, kind, url, request_headers, request_body, status, procedure_tool_id, experiment_id
+    ) VALUES (
+      v_retry_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'in_flight',
+      v_retry_tool, v_retry_exp
+    ) RETURNING call_id INTO v_retry_call;
+    PERFORM allgres_public.fn_complete_outbound(v_retry_call, 200, 'not json at all');
+
+    -- The retry must reuse the exact decision frozen above (still
+    -- 'retry-canary-model'/v_retry_exp) even though the experiment itself is
+    -- now rejected underneath it -- a fresh resolution would find no
+    -- running experiment at all and never produce this result.
+    UPDATE allgres_private.model_experiments SET status = 'rejected' WHERE experiment_id = v_retry_exp;
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_retry_tid;
+    spec := allgres_public.fn_next_step(v_retry_tid);
+    ok := spec->'llm_config'->>'model' = 'retry-canary-model'
+      AND (spec->>'experiment_id')::uuid = v_retry_exp;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'retry_after_error_reuses_frozen_override_decision', 'ok', ok));
+
+    -- A genuinely NEW call_tool on the same task (not a retry of the old
+    -- one) must break the stickiness and re-resolve from live config -- the
+    -- experiment is now rejected and this tool has no override of its own,
+    -- so this should fall back to the procedure's own override
+    -- ('proc-model'), not the stale cached canary pick.
+    sub := allgres_public.fn_submit_result(v_retry_tid, jsonb_build_object(
+      'type', 'llm_response',
+      'content', '{"action":"call_tool","tool":"selftest_retry_tool"}',
+      'parsed', jsonb_build_object('action', 'call_tool', 'tool', 'selftest_retry_tool')
+    ));
+    UPDATE allgres_private.outbound_calls SET status = 'in_flight' WHERE call_id = (sub->>'call_id')::uuid;
+    PERFORM allgres_public.fn_complete_outbound((sub->>'call_id')::uuid, 200, 'ok');
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_retry_tid;
+    spec := allgres_public.fn_next_step(v_retry_tid);
+    ok := spec->'llm_config'->>'model' = 'proc-model'
+      AND spec->>'experiment_id' IS NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fresh_call_tool_breaks_stickiness_and_reresolves', 'ok', ok));
+
+    DELETE FROM allgres_private.outbound_calls
+      WHERE procedure_tool_id = v_retry_tool OR experiment_id = v_retry_exp;
+    DELETE FROM allgres_private.model_experiments WHERE tool_id = v_retry_tool;
+    DELETE FROM allgres_private.procedure_tools WHERE tool_id = v_retry_tool;
 
     INSERT INTO allgres_private.outbound_calls (
       task_id, kind, url, request_headers, request_body, status, procedure_tool_id, experiment_id

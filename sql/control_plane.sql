@@ -1098,6 +1098,36 @@ CREATE INDEX IF NOT EXISTS tasks_agent_policy_generation_idx
   ON allgres_private.tasks (agent_id, policy_generation, created_at DESC)
   WHERE parent_task_id IS NULL;
 
+-- Makes the per-tool model override/canary resolution (fn_next_step's own
+-- comment on procedure_tools.llm_override) survive a retry instead of
+-- silently vanishing after the first error. Before this, fn_next_step only
+-- ever looked at the single most recent execution_logs row to decide "is
+-- this turn processing a procedure-bound tool's result" -- the instant any
+-- retry (an infra failure in build_llm_http, a fn_watchdog timeout, or the
+-- model's own output being unparseable) appended an 'error' row, that row
+-- became the most recent one and the override context was gone: the retry
+-- silently fell back to the agent's own default model with no override,
+-- no experiment_id, and no outcome recorded against the experiment at all
+-- -- a turn that just vanishes from the sample rather than counting either
+-- way. Fixed in two parts: fn_next_step's own log lookup now skips 'error'
+-- rows entirely (they are retries of the *same* turn, not a new one), so
+-- the underlying 'tool' row stays visible across any number of retries;
+-- and this column freezes the *canary dice roll* specifically the first
+-- time it is made for a given tool-result context, since that part is
+-- genuinely random (random() re-evaluated on a later fn_next_step call
+-- could pick differently) and nothing about a retry should be able to
+-- change which model this turn was already committed to. Holds
+-- {"procedure_tool_id","procedure_id","experiment_id","provider","model"}
+-- (the last two present only when an override/candidate actually applies)
+-- once resolved; overwritten the moment a *different* tool's result
+-- becomes current (a fresh call_tool, not a retry of this one), and left
+-- stale but unread once the turn moves past needing it at all (there is no
+-- separate "this task has no pending tool context" list to keep in sync --
+-- fn_next_step simply never looks at this column except when the log
+-- lookup itself finds a procedure-bound tool result to resolve).
+ALTER TABLE allgres_private.tasks
+  ADD COLUMN IF NOT EXISTS tool_override_state jsonb;
+
 -- 'cancelled' is distinct from 'failed': an operator stopping a task is a
 -- different signal than the agent's own logic giving up.  Unnamed CHECK
 -- constraints get Postgres's default <table>_<column>_check name, so this is
@@ -3529,6 +3559,7 @@ DECLARE
   v_effective_override jsonb;
   v_experiment allgres_private.model_experiments%ROWTYPE;
   v_experiment_id uuid;
+  v_is_retry boolean;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -3779,50 +3810,94 @@ BEGIN
 
   -- Per-tool/per-procedure model override (see procedure_tools.llm_override's
   -- own comment). Only applies to the turn that immediately follows a
-  -- procedure-bound tool call: the most recent log row for *this* task, if
-  -- it is a 'tool' result carrying procedure_tool_id (fn_submit_result's
-  -- call_tool branch stamps this into the row fn_complete_outbound builds,
-  -- which append_log then persists verbatim). Any other last-row shape
-  -- (assistant, user, error, or a tool result with no procedure_tool_id --
-  -- a directly-permitted tool call, not one resolved through a procedure)
+  -- procedure-bound tool call: the most recent log row for *this* task that
+  -- isn't part of a failed attempt to advance past it, if it is a 'tool'
+  -- result carrying procedure_tool_id (fn_submit_result's call_tool branch
+  -- stamps this into the row fn_complete_outbound builds, which append_log
+  -- then persists verbatim).
+  -- Both an 'error' row AND the raw 'assistant' row fn_submit_result logs
+  -- right before it (same step_number -- see its own llm_response handling)
+  -- are excluded here (tasks.tool_override_state's own comment): together
+  -- they mark a retry of the same turn, not a new one, so an infra failure
+  -- or an unparseable response must not make this context disappear the way
+  -- it used to. Any other last-row shape (a genuinely advancing assistant
+  -- turn, a plain user row, or a tool result with no procedure_tool_id -- a
+  -- directly-permitted tool call, not one resolved through a procedure)
   -- leaves v_last_procedure_tool_id NULL and this whole block a no-op, so
-  -- every turn keeps using the agent's own llm_config exactly as before.
-  SELECT el.role, el.content INTO v_last_log
+  -- every turn with no procedure-bound tool in play keeps using the agent's
+  -- own llm_config exactly as before.
+  SELECT el.role, el.content, el.step_number INTO v_last_log
   FROM allgres_private.execution_logs el
   WHERE el.task_id = p_task_id
+    AND el.step_number NOT IN (
+      SELECT step_number FROM allgres_private.execution_logs
+      WHERE task_id = p_task_id AND role = 'error'
+    )
   ORDER BY el.step_number DESC, el.created_at DESC
   LIMIT 1;
 
+  v_is_retry := false;
   IF v_last_log.role = 'tool' THEN
     v_last_procedure_tool_id := NULLIF(v_last_log.content->>'procedure_tool_id', '')::uuid;
     v_last_procedure_id := NULLIF(v_last_log.content->>'procedure_id', '')::uuid;
+    -- Only a genuine retry of THIS turn -- proven by an 'error' row logged
+    -- after this tool result -- may reuse a previously frozen decision.
+    -- Without that proof, a repeated fn_next_step on the same tool result
+    -- (e.g. an operator editing procedure_tools.llm_override between calls)
+    -- must keep re-resolving from the live config, not from stale cache.
+    SELECT EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = p_task_id AND role = 'error' AND step_number > v_last_log.step_number
+    ) INTO v_is_retry;
   END IF;
 
   IF v_last_procedure_tool_id IS NOT NULL THEN
-    SELECT llm_override INTO v_tool_override
-    FROM allgres_private.procedure_tools WHERE tool_id = v_last_procedure_tool_id;
-    SELECT llm_override INTO v_proc_override
-    FROM allgres_private.procedures WHERE procedure_id = v_last_procedure_id;
-    -- tool override wins over its procedure's own override, which wins over
-    -- nothing at all (agent default) -- see the column's own comment.
-    v_effective_override := COALESCE(v_tool_override, v_proc_override);
+    -- Sticky across a retry: if this is still the same tool-result context
+    -- this task already resolved a decision for (not a fresh call_tool),
+    -- reuse exactly what was decided the first time -- in particular, never
+    -- re-roll the canary die, which random() would otherwise happily do
+    -- differently on every retry.
+    IF v_is_retry AND t.tool_override_state IS NOT NULL
+       AND (t.tool_override_state->>'procedure_tool_id')::uuid = v_last_procedure_tool_id THEN
+      IF t.tool_override_state ? 'provider' THEN
+        v_effective_override := jsonb_build_object(
+          'provider', t.tool_override_state->>'provider', 'model', t.tool_override_state->>'model'
+        );
+      END IF;
+      v_experiment_id := NULLIF(t.tool_override_state->>'experiment_id', '')::uuid;
+    ELSE
+      SELECT llm_override INTO v_tool_override
+      FROM allgres_private.procedure_tools WHERE tool_id = v_last_procedure_tool_id;
+      SELECT llm_override INTO v_proc_override
+      FROM allgres_private.procedures WHERE procedure_id = v_last_procedure_id;
+      -- tool override wins over its procedure's own override, which wins
+      -- over nothing at all (agent default) -- see the column's own comment.
+      v_effective_override := COALESCE(v_tool_override, v_proc_override);
 
-    -- Canary dice roll: a 'running' experiment on this tool redirects
-    -- canary_percent% of these specific turns to the candidate model
-    -- instead of whatever v_effective_override (or the agent default)
-    -- would otherwise apply -- the live override is untouched either way
-    -- until an operator promotes or rejects the experiment
-    -- (fn_decide_proposal). experiment_id is stamped on this turn's own
-    -- outbound_calls row below so fn_complete_outbound can record this
-    -- specific call's outcome against it.
-    SELECT * INTO v_experiment
-    FROM allgres_private.model_experiments
-    WHERE tool_id = v_last_procedure_tool_id AND status = 'running';
-    IF FOUND AND random() * 100 < v_experiment.canary_percent THEN
-      v_effective_override := jsonb_build_object(
-        'provider', v_experiment.candidate_provider, 'model', v_experiment.candidate_model
-      );
-      v_experiment_id := v_experiment.experiment_id;
+      -- Canary dice roll: a 'running' experiment on this tool redirects
+      -- canary_percent% of these specific turns to the candidate model
+      -- instead of whatever v_effective_override (or the agent default)
+      -- would otherwise apply -- the live override is untouched either way
+      -- until an operator promotes or rejects the experiment
+      -- (fn_decide_proposal). experiment_id is stamped on this turn's own
+      -- outbound_calls row below so fn_complete_outbound can record this
+      -- specific call's outcome against it.
+      SELECT * INTO v_experiment
+      FROM allgres_private.model_experiments
+      WHERE tool_id = v_last_procedure_tool_id AND status = 'running';
+      IF FOUND AND random() * 100 < v_experiment.canary_percent THEN
+        v_effective_override := jsonb_build_object(
+          'provider', v_experiment.candidate_provider, 'model', v_experiment.candidate_model
+        );
+        v_experiment_id := v_experiment.experiment_id;
+      END IF;
+
+      -- Freeze this decision for any retry of this exact turn.
+      UPDATE allgres_private.tasks
+      SET tool_override_state = jsonb_build_object('procedure_tool_id', v_last_procedure_tool_id)
+        || jsonb_build_object('experiment_id', v_experiment_id)
+        || COALESCE(v_effective_override, '{}'::jsonb)
+      WHERE task_id = p_task_id;
     END IF;
   END IF;
 
