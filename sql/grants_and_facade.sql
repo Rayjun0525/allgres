@@ -666,6 +666,50 @@ BEGIN
         NULLIF(p_request->>'reply', '')
       );
 
+    -- Read-only visibility into self_improve's model-optimizer canary
+    -- experiments. Admin-only, the same as a 'create_agent' proposal in the
+    -- inbox above (proposals.list's own comment) -- a tool's model choice
+    -- is an infra-wide decision, not scoped to any one non-admin user's
+    -- agents. Queries the private tables directly rather than going through
+    -- allgres_public.v_tool_model_experiments: that view's own
+    -- agent_may_read gate is for an *agent's* execute_sql (current_agent_id()
+    -- is NULL here, dashboard_rpc has no agent context of its own), and
+    -- dashboard_rpc's admin check just above already is this surface's
+    -- access control -- the same reasoning proposals.list/fixes.list below
+    -- query allgres_private.change_proposals/fix_proposals directly instead
+    -- of through a view.
+    WHEN 'tool_experiments.list' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'experiments', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'experiment_id', x.experiment_id, 'tool_id', x.tool_id, 'tool_name', x.tool_name,
+          'candidate_provider', x.candidate_provider, 'candidate_model', x.candidate_model,
+          'canary_percent', x.canary_percent, 'status', x.status,
+          'min_sample_size', x.min_sample_size, 'baseline_success_rate', x.baseline_success_rate,
+          'sample_size', x.sample_size, 'success_count', x.success_count,
+          'candidate_success_rate', x.candidate_success_rate,
+          'reason', x.reason, 'created_at', x.created_at, 'decided_at', x.decided_at
+        ) ORDER BY x.created_at DESC)
+        FROM (
+          SELECT
+            e.experiment_id, e.tool_id, pt.name AS tool_name,
+            e.candidate_provider, e.candidate_model, e.canary_percent, e.status,
+            e.min_sample_size, e.baseline_success_rate,
+            count(oc.call_id) AS sample_size,
+            count(oc.call_id) FILTER (WHERE oc.outcome = 'success') AS success_count,
+            round(
+              count(oc.call_id) FILTER (WHERE oc.outcome = 'success')::numeric / NULLIF(count(oc.call_id), 0), 3
+            ) AS candidate_success_rate,
+            e.reason, e.created_at, e.decided_at
+          FROM allgres_private.model_experiments e
+          JOIN allgres_private.procedure_tools pt USING (tool_id)
+          LEFT JOIN allgres_private.outbound_calls oc
+            ON oc.experiment_id = e.experiment_id AND oc.outcome IS NOT NULL
+          WHERE NOT (p_request ? 'status') OR e.status = p_request->>'status'
+          GROUP BY e.experiment_id, pt.name
+        ) x
+      ), '[]'::jsonb));
+
     WHEN 'fixes.list' THEN
       v_scope := allgres_private.visible_agent_ids(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'fixes', COALESCE((

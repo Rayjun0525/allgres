@@ -91,6 +91,13 @@ DECLARE
   v_memory_id uuid;
   v_other_memory_id uuid;
   v_guard_project uuid;
+  v_ovr_proc uuid;
+  v_ovr_tool uuid;
+  v_ovr_sid uuid;
+  v_ovr_tid uuid;
+  v_ovr_call uuid;
+  v_exp_id uuid;
+  v_saved_llm_config jsonb;
   v_live_rpc_actions text[];
   v_missing_rpc_actions text[];
   v_extra_rpc_actions text[];
@@ -2647,6 +2654,325 @@ BEGIN
     ) AND (SELECT system_prompt FROM allgres_private.policies WHERE agent_id = v_sys_target) <> 'should not apply';
     v := v || jsonb_build_array(jsonb_build_object('name', 'propose_change_cross_agent_rejected_from_others', 'ok', ok));
 
+    -- Per-tool/per-procedure model override + self_improve's canary
+    -- experiments (procedure_tools.llm_override's own comment). Exercises
+    -- the whole chain: override resolution priority (tool > procedure >
+    -- agent default), the canary dice roll, outcome recording on
+    -- outbound_calls, and the tool_override propose/decide flow.
+    SELECT llm_config INTO v_saved_llm_config FROM allgres_private.policies WHERE agent_id = v_agent;
+    UPDATE allgres_private.policies
+    SET llm_config = jsonb_build_object('provider', 'selftest_override_provider', 'model', 'agent-default-model')
+    WHERE agent_id = v_agent;
+
+    -- A dedicated provider, not a reused earlier fixture: selftest_new_
+    -- provider (25d above) is deliberately deleted by its own section long
+    -- before this one runs.
+    DELETE FROM allgres_private.llm_secrets WHERE provider_id IN (
+      SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_override_provider'
+    );
+    DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_override_provider';
+    PERFORM allgres_public.fn_create_provider(
+      'selftest_override_provider', 'openai_compat', 'https://selftest.invalid/v1', NULL, false
+    );
+
+    DELETE FROM allgres_private.model_experiments WHERE tool_id IN (
+      SELECT tool_id FROM allgres_private.procedure_tools WHERE name = 'selftest_override_tool'
+    );
+    DELETE FROM allgres_private.procedure_tools WHERE name = 'selftest_override_tool';
+    DELETE FROM allgres_private.procedures WHERE name = 'selftest_override_procedure';
+
+    v_ovr_proc := (allgres_public.fn_create_procedure('selftest_override_procedure', 'selftest override procedure')->>'procedure_id')::uuid;
+    v_ovr_tool := (allgres_public.fn_create_procedure_tool(
+      'selftest_override_tool', 'selftest override tool', 'http_get',
+      jsonb_build_object('url', 'https://example.com/allgres-selftest-override')
+    )->>'tool_id')::uuid;
+    PERFORM allgres_public.fn_bind_procedure_tool(v_ovr_proc, v_ovr_tool);
+    PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', 'selftest_override_procedure');
+
+    v_ovr_sid := (allgres_public.fn_create_session(v_agent, 'selftest model override')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response',
+      'content', '{"action":"call_tool","tool":"selftest_override_tool"}',
+      'parsed', jsonb_build_object('action', 'call_tool', 'tool', 'selftest_override_tool')
+    ));
+    v_ovr_call := (sub->>'call_id')::uuid;
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.outbound_calls
+      WHERE call_id = v_ovr_call AND procedure_tool_id = v_ovr_tool AND procedure_id = v_ovr_proc
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'call_tool_stamps_procedure_tool_id_on_outbound_call', 'ok', ok));
+
+    -- Simulate the tool's HTTP result coming back -- fn_complete_outbound's
+    -- 'tool' branch must carry procedure_tool_id/procedure_id into the
+    -- execution_logs entry itself, not just the outbound_calls row.
+    -- fn_complete_outbound only ever acts on an 'in_flight' row (its own
+    -- fencing against a stale/already-reclaimed call) -- the worker's own
+    -- fn_claim_outbound is what normally flips 'queued' to that, skipped
+    -- here since nothing simulates a real worker in this test.
+    UPDATE allgres_private.outbound_calls SET status = 'in_flight' WHERE call_id = v_ovr_call;
+    PERFORM allgres_public.fn_complete_outbound(v_ovr_call, 200, 'ok');
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_ovr_tid AND role = 'tool'
+        AND content->>'procedure_tool_id' = v_ovr_tool::text
+        AND content->>'procedure_id' = v_ovr_proc::text
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'tool_result_log_carries_procedure_tool_id', 'ok', ok));
+
+    -- No override configured yet -- the next turn must still use the
+    -- agent's own default llm_config, unchanged, and carry no experiment_id.
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_ovr_tid;
+    spec := allgres_public.fn_next_step(v_ovr_tid);
+    ok := spec->'llm_config'->>'provider' = 'selftest_override_provider'
+      AND spec->'llm_config'->>'model' = 'agent-default-model'
+      AND (spec->>'procedure_tool_id')::uuid = v_ovr_tool
+      AND (spec->>'procedure_id')::uuid = v_ovr_proc
+      AND spec->>'experiment_id' IS NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'no_override_uses_agent_default_model', 'ok', ok));
+
+    -- A tool-level override replaces the agent's own model for this turn.
+    UPDATE allgres_private.procedure_tools
+    SET llm_override = jsonb_build_object('provider', 'selftest_override_provider', 'model', 'tool-model')
+    WHERE tool_id = v_ovr_tool;
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_ovr_tid;
+    spec := allgres_public.fn_next_step(v_ovr_tid);
+    ok := spec->'llm_config'->>'model' = 'tool-model';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'tool_override_replaces_agent_default_model', 'ok', ok));
+
+    -- With the tool's own override cleared, its procedure's override is the
+    -- fallback.
+    UPDATE allgres_private.procedure_tools SET llm_override = NULL WHERE tool_id = v_ovr_tool;
+    UPDATE allgres_private.procedures
+    SET llm_override = jsonb_build_object('provider', 'selftest_override_provider', 'model', 'proc-model')
+    WHERE procedure_id = v_ovr_proc;
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_ovr_tid;
+    spec := allgres_public.fn_next_step(v_ovr_tid);
+    ok := spec->'llm_config'->>'model' = 'proc-model';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_override_used_when_tool_has_none', 'ok', ok));
+
+    -- With both set, the tool's own override wins.
+    UPDATE allgres_private.procedure_tools
+    SET llm_override = jsonb_build_object('provider', 'selftest_override_provider', 'model', 'tool-wins-model')
+    WHERE tool_id = v_ovr_tool;
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_ovr_tid;
+    spec := allgres_public.fn_next_step(v_ovr_tid);
+    ok := spec->'llm_config'->>'model' = 'tool-wins-model';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'tool_override_takes_precedence_over_procedure', 'ok', ok));
+
+    -- A running canary experiment at 100% must always redirect this turn to
+    -- the candidate model, and stamp this turn's spec with the experiment_id
+    -- (so the outbound_calls row it produces can be attributed to it).
+    INSERT INTO allgres_private.model_experiments
+      (tool_id, candidate_provider, candidate_model, canary_percent, min_sample_size)
+    VALUES (v_ovr_tool, 'selftest_override_provider', 'canary-model', 100, 1)
+    RETURNING experiment_id INTO v_exp_id;
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_ovr_tid;
+    spec := allgres_public.fn_next_step(v_ovr_tid);
+    ok := spec->'llm_config'->>'model' = 'canary-model'
+      AND (spec->>'experiment_id')::uuid = v_exp_id;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'running_canary_experiment_redirects_the_turn', 'ok', ok));
+
+    -- build_llm_http only resolves the provider/model into a real request --
+    -- fn_dispatch_tasks is what has to carry procedure_tool_id/procedure_id/
+    -- experiment_id from fn_next_step's spec onto the outbound_calls row it
+    -- inserts. Mirrored here by hand (not a real fn_dispatch_tasks() call,
+    -- which would also sweep every other pending task in the install) the
+    -- same way this file's own build_llm_http tests already call it
+    -- directly.
+    r := allgres_private.build_llm_http(spec);
+    INSERT INTO allgres_private.outbound_calls (
+      task_id, kind, url, request_headers, request_body, status, allow_private,
+      provider_id, auth_kind, procedure_tool_id, procedure_id, experiment_id
+    ) VALUES (
+      v_ovr_tid, 'llm', r->>'url', r->'headers', r->'body', 'in_flight',
+      COALESCE((r->>'allow_private')::boolean, false),
+      (r->>'provider_id')::uuid, r->>'auth_kind',
+      NULLIF(r->>'procedure_tool_id', '')::uuid, NULLIF(r->>'procedure_id', '')::uuid, NULLIF(r->>'experiment_id', '')::uuid
+    ) RETURNING call_id INTO v_ovr_call;
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.outbound_calls
+      WHERE call_id = v_ovr_call AND procedure_tool_id = v_ovr_tool AND experiment_id = v_exp_id
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'llm_call_row_carries_experiment_id', 'ok', ok));
+
+    -- An unparseable/unrecognized response is a 'failure' outcome -- a
+    -- format-validity signal, not a quality judgment (outbound_calls.
+    -- outcome's own comment).
+    PERFORM allgres_public.fn_complete_outbound(v_ovr_call, 200, 'not json at all');
+    ok := (SELECT outcome FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'failure';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'unparseable_llm_response_records_failure_outcome', 'ok', ok));
+
+    INSERT INTO allgres_private.outbound_calls (
+      task_id, kind, url, request_headers, request_body, status, procedure_tool_id, experiment_id
+    ) VALUES (
+      v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'in_flight',
+      v_ovr_tool, v_exp_id
+    ) RETURNING call_id INTO v_ovr_call;
+    PERFORM allgres_public.fn_complete_outbound(
+      v_ovr_call, 200,
+      '{"choices":[{"message":{"content":"{\"action\":\"final_answer\",\"answer\":\"ok\"}"}}]}'
+    );
+    ok := (SELECT outcome FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'success';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'well_formed_llm_response_records_success_outcome', 'ok', ok));
+
+    -- Only self_improve may propose a tool_override at all.
+    v_ovr_sid := (allgres_public.fn_create_session(v_agent, 'selftest tool_override not self_improve')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    PERFORM allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_provider',
+        'candidate_model', 'should-not-apply', 'canary_percent', 50
+      )
+    ));
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_ovr_tid AND role = 'error' AND content->>'reason' = 'propose_change_cross_agent_not_permitted'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'tool_override_proposal_rejected_from_non_self_improve', 'ok', ok));
+
+    -- A second start_experiment on a tool that already has one running is
+    -- rejected outright, before it ever reaches an operator.
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override duplicate')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    PERFORM allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_provider',
+        'candidate_model', 'another-candidate', 'canary_percent', 10
+      )
+    ));
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_ovr_tid AND role = 'error' AND content->>'reason' = 'tool_override_experiment_already_running'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'duplicate_running_experiment_rejected', 'ok', ok));
+
+    -- Promoting the running experiment copies its candidate onto the tool's
+    -- live llm_override and closes it.
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override promote')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'promote', 'experiment_id', v_exp_id::text, 'reason', 'selftest promote'
+      )
+    ));
+    v_proposal := (sub->>'proposal_id')::uuid;
+    ok := v_proposal IS NOT NULL AND EXISTS (
+      SELECT 1 FROM allgres_private.change_proposals
+      WHERE proposal_id = v_proposal AND kind = 'tool_override' AND target_tool_id = v_ovr_tool
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'tool_override_promote_proposal_queued', 'ok', ok));
+
+    comp := allgres_public.fn_decide_proposal(v_proposal, true);
+    ok := comp->>'status' = 'approved'
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'promoted'
+      AND (SELECT llm_override FROM allgres_private.procedure_tools WHERE tool_id = v_ovr_tool)
+          = jsonb_build_object('provider', 'selftest_override_provider', 'model', 'canary-model');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_promotes_experiment_to_live_override', 'ok', ok));
+
+    -- Once decided, referencing the same experiment_id again (even a
+    -- different op) must be rejected at propose time, not silently reapplied.
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override stale reference')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    PERFORM allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'reject', 'experiment_id', v_exp_id::text
+      )
+    ));
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_ovr_tid AND role = 'error' AND content->>'reason' = 'tool_override_experiment_not_running'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'already_decided_experiment_rejected_at_propose', 'ok', ok));
+
+    -- start_experiment freezes baseline_success_rate from this tool's own
+    -- prior (non-experiment) call history; two synthetic rows, one success
+    -- one failure, must average to exactly 0.5.
+    INSERT INTO allgres_private.outbound_calls
+      (task_id, kind, url, request_headers, request_body, status, procedure_tool_id, outcome)
+    VALUES
+      (v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_ovr_tool, 'success'),
+      (v_ovr_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb, '{}'::jsonb, 'harvested', v_ovr_tool, 'failure');
+
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override baseline and reject')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'start_experiment', 'candidate_provider', 'selftest_override_provider',
+        'candidate_model', 'baseline-check-candidate', 'canary_percent', 15, 'reason', 'selftest baseline'
+      )
+    ));
+    v_proposal := (sub->>'proposal_id')::uuid;
+    comp := allgres_public.fn_decide_proposal(v_proposal, true);
+    v_exp_id := (comp->>'experiment_id')::uuid;
+    ok := comp->>'status' = 'approved'
+      AND (SELECT baseline_success_rate FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 0.5;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'start_experiment_captures_baseline_success_rate', 'ok', ok));
+
+    -- Rejecting an experiment closes it without touching the live override,
+    -- which must still be exactly what the earlier promote left it as.
+    v_ovr_sid := (allgres_public.fn_create_session(v_self_id, 'selftest tool_override reject path')->>'session_id')::uuid;
+    SELECT task_id INTO v_ovr_tid FROM allgres_private.tasks WHERE session_id = v_ovr_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_ovr_tid);
+    sub := allgres_public.fn_submit_result(v_ovr_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"propose_change"}',
+      'parsed', jsonb_build_object(
+        'action', 'propose_change', 'target_tool_id', v_ovr_tool::text,
+        'op', 'reject', 'experiment_id', v_exp_id::text, 'reason', 'selftest reject'
+      )
+    ));
+    v_proposal := (sub->>'proposal_id')::uuid;
+    comp := allgres_public.fn_decide_proposal(v_proposal, true);
+    ok := comp->>'status' = 'approved'
+      AND (SELECT status FROM allgres_private.model_experiments WHERE experiment_id = v_exp_id) = 'rejected'
+      AND (SELECT llm_override FROM allgres_private.procedure_tools WHERE tool_id = v_ovr_tool)
+          = jsonb_build_object('provider', 'selftest_override_provider', 'model', 'canary-model');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_reject_leaves_live_override_untouched', 'ok', ok));
+
+    -- Frozen dashboard_rpc surface: an operator can list these experiments
+    -- read-only. v_admin_tok is already a valid admin session token from
+    -- the accounts/auth section earlier in this same run.
+    comp := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'tool_experiments.list', 'session_token', v_admin_tok
+    ));
+    ok := (comp->>'ok')::boolean AND EXISTS (
+      SELECT 1 FROM jsonb_array_elements(comp->'experiments') e
+      WHERE (e->>'experiment_id')::uuid = v_exp_id
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'tool_experiments_list_shows_decided_experiments', 'ok', ok));
+
+    -- Leave everything this block touched as it found it.
+    DELETE FROM allgres_private.outbound_calls
+    WHERE procedure_tool_id = v_ovr_tool
+       OR provider_id IN (SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_override_provider');
+    DELETE FROM allgres_private.model_experiments WHERE tool_id = v_ovr_tool;
+    PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_override_procedure');
+    DELETE FROM allgres_private.procedure_tool_bindings WHERE tool_id = v_ovr_tool;
+    DELETE FROM allgres_private.procedure_tools WHERE tool_id = v_ovr_tool;
+    DELETE FROM allgres_private.procedure_history WHERE procedure_id = v_ovr_proc;
+    DELETE FROM allgres_private.procedures WHERE procedure_id = v_ovr_proc;
+    UPDATE allgres_private.policies SET llm_config = v_saved_llm_config WHERE agent_id = v_agent;
+    DELETE FROM allgres_private.llm_secrets WHERE provider_id IN (
+      SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_override_provider'
+    );
+    DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_override_provider';
+
     -- Regular-user approval scoping (item 41): an admin sees/decides
     -- everything; a regular user only proposals/fixes whose target is one
     -- of their own assigned agents.
@@ -3734,7 +4060,7 @@ BEGIN
     'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
     'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
-    'approvals.decide', 'selftest'
+    'approvals.decide', 'tool_experiments.list', 'selftest'
   ]::text[]) a
   WHERE a <> ALL(COALESCE(v_live_rpc_actions, ARRAY[]::text[]));
   SELECT array_agg(a ORDER BY a) INTO v_extra_rpc_actions
@@ -3756,7 +4082,7 @@ BEGIN
     'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
     'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
-    'approvals.decide', 'selftest'
+    'approvals.decide', 'tool_experiments.list', 'selftest'
   ]::text[]);
   ok := v_missing_rpc_actions IS NULL AND v_extra_rpc_actions IS NULL;
   v := v || jsonb_build_array(jsonb_build_object(

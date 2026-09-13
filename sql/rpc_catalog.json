@@ -113,6 +113,16 @@
     ]
   },
   {
+    "action": "tool_experiments.list",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "session_token",
+      "status"
+    ]
+  },
+  {
     "action": "fixes.list",
     "guards": [
       "visible_agent_ids"

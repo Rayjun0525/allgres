@@ -472,6 +472,9 @@ DECLARE
   v_policy jsonb;
   v_target uuid;
   v_created jsonb;
+  v_op text;
+  v_experiment_id uuid;
+  v_baseline numeric;
 BEGIN
   SELECT * INTO r FROM allgres_private.change_proposals WHERE proposal_id = p_proposal_id FOR UPDATE;
   IF NOT FOUND THEN
@@ -501,6 +504,91 @@ BEGIN
     WHERE proposal_id = p_proposal_id;
     PERFORM allgres_private.audit('proposals.decide', jsonb_build_object('proposal_id', p_proposal_id, 'status', 'approved', 'kind', 'create_agent'));
     RETURN jsonb_build_object('ok', true, 'status', 'approved', 'created_agent', v_created);
+  END IF;
+
+  -- 'tool_override' (self_improve's model-optimizer role, see
+  -- procedure_tools.llm_override's own comment): also no generation to go
+  -- stale against, same reasoning as 'create_agent' -- a procedure_tool has
+  -- no version counter of its own. 'start_experiment' opens the canary
+  -- (baseline_success_rate is captured now, from this tool's history
+  -- *before* the experiment, so a later promote/reject decision compares
+  -- against a frozen number rather than one that keeps moving while the
+  -- experiment runs); 'promote' copies the already-running experiment's
+  -- candidate onto the tool's live llm_override and closes it; 'reject'
+  -- just closes it, leaving llm_override exactly as it was. fn_submit_result
+  -- already re-validated the referenced experiment is still 'running' for
+  -- this exact tool at propose time, but re-checks status here too, since
+  -- an operator could have decided a duplicate proposal for the same
+  -- experiment in between.
+  IF r.kind = 'tool_override' THEN
+    v_op := r.proposed_changes->>'op';
+    IF v_op = 'start_experiment' THEN
+      SELECT round(
+        count(*) FILTER (WHERE outcome = 'success')::numeric
+          / NULLIF(count(*) FILTER (WHERE outcome IS NOT NULL), 0),
+        3
+      ) INTO v_baseline
+      FROM allgres_private.outbound_calls
+      WHERE kind = 'llm' AND procedure_tool_id = r.target_tool_id AND experiment_id IS NULL;
+
+      INSERT INTO allgres_private.model_experiments (
+        tool_id, candidate_provider, candidate_model, canary_percent,
+        min_sample_size, baseline_success_rate, proposed_by_agent_id, reason
+      ) VALUES (
+        r.target_tool_id, r.proposed_changes->>'candidate_provider', r.proposed_changes->>'candidate_model',
+        (r.proposed_changes->>'canary_percent')::int,
+        COALESCE((r.proposed_changes->>'min_sample_size')::int, 20),
+        v_baseline, r.agent_id, r.reason
+      ) RETURNING experiment_id INTO v_experiment_id;
+
+      UPDATE allgres_private.change_proposals
+      SET status = 'approved', decided_at = now(), decided_reply = p_reply
+      WHERE proposal_id = p_proposal_id;
+      PERFORM allgres_private.audit('proposals.decide', jsonb_build_object(
+        'proposal_id', p_proposal_id, 'status', 'approved', 'kind', 'tool_override',
+        'op', 'start_experiment', 'experiment_id', v_experiment_id, 'target_tool_id', r.target_tool_id
+      ));
+      RETURN jsonb_build_object('ok', true, 'status', 'approved', 'experiment_id', v_experiment_id);
+    ELSE
+      v_experiment_id := NULLIF(r.proposed_changes->>'experiment_id', '')::uuid;
+      IF NOT EXISTS (
+        SELECT 1 FROM allgres_private.model_experiments
+        WHERE experiment_id = v_experiment_id AND tool_id = r.target_tool_id AND status = 'running'
+      ) THEN
+        UPDATE allgres_private.change_proposals
+        SET status = 'stale', decided_at = now(),
+            decided_reply = COALESCE(p_reply, 'experiment already decided or no longer running')
+        WHERE proposal_id = p_proposal_id;
+        PERFORM allgres_private.audit('proposals.decide', jsonb_build_object('proposal_id', p_proposal_id, 'status', 'stale'));
+        RETURN jsonb_build_object('ok', false, 'status', 'stale');
+      END IF;
+
+      IF v_op = 'promote' THEN
+        UPDATE allgres_private.procedure_tools pt
+        SET llm_override = jsonb_build_object(
+              'provider', me.candidate_provider, 'model', me.candidate_model
+            ),
+            updated_at = now()
+        FROM allgres_private.model_experiments me
+        WHERE me.experiment_id = v_experiment_id AND pt.tool_id = r.target_tool_id;
+        UPDATE allgres_private.model_experiments
+        SET status = 'promoted', decided_at = now()
+        WHERE experiment_id = v_experiment_id;
+      ELSE -- 'reject'
+        UPDATE allgres_private.model_experiments
+        SET status = 'rejected', decided_at = now()
+        WHERE experiment_id = v_experiment_id;
+      END IF;
+
+      UPDATE allgres_private.change_proposals
+      SET status = 'approved', decided_at = now(), decided_reply = p_reply
+      WHERE proposal_id = p_proposal_id;
+      PERFORM allgres_private.audit('proposals.decide', jsonb_build_object(
+        'proposal_id', p_proposal_id, 'status', 'approved', 'kind', 'tool_override',
+        'op', v_op, 'experiment_id', v_experiment_id, 'target_tool_id', r.target_tool_id
+      ));
+      RETURN jsonb_build_object('ok', true, 'status', 'approved', 'experiment_id', v_experiment_id, 'op', v_op);
+    END IF;
   END IF;
 
   -- 'policy_change': target_agent_id is who this actually changes -- the

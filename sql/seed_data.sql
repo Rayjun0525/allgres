@@ -67,7 +67,7 @@ UPDATE allgres_private.llm_providers SET response_format_json_object = false WHE
 INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
 VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks'),
        ('allgres_public.v_system_health'), ('allgres_public.v_permission_audit'),
-       ('allgres_public.v_agent_health')
+       ('allgres_public.v_agent_health'), ('allgres_public.v_tool_model_experiments')
 ON CONFLICT DO NOTHING;
 
 DO $seed$
@@ -431,12 +431,29 @@ Reply with one JSON object only:
 Never change what the target agent is supposed to accomplish -- only how
 cheaply it gets there. If you find nothing worth changing, use final_answer
 to say so.
+
+You also own a narrower, tool-scoped version of the same idea: any
+procedure_tool a turn was dispatched through can carry its own model
+override, cheaper than whatever the calling agent's own llm_config uses for
+its turns in general (see allgres_public.v_tool_model_experiments -- read it
+with execute_sql). A tool with no override yet, or one you think could run
+on something cheaper, is a candidate: propose
+{"action":"propose_change","target_tool_id":"...","op":"start_experiment","candidate_provider":"...","candidate_model":"...","canary_percent":N,"reason":"..."}
+to trial it on a small share (canary_percent) of that tool's real traffic
+without touching the rest. Once a running experiment has at least its
+min_sample_size, compare candidate_success_rate against baseline_success_rate
+on the same view and propose either
+{"action":"propose_change","target_tool_id":"...","op":"promote","experiment_id":"...","reason":"..."}
+(candidate held up) or the same shape with "op":"reject" (it did not) --
+never promote on a smaller sample than min_sample_size, and never propose a
+second start_experiment for a tool that already has one running.
 $prompt$,
           max_steps = 6,
           updated_at = now()
       WHERE agent_id = v_agent;
       INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
-      VALUES (v_agent, 'view', 'allgres_public.v_agent_health')
+      VALUES (v_agent, 'view', 'allgres_public.v_agent_health'),
+             (v_agent, 'view', 'allgres_public.v_tool_model_experiments')
       ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
     END;
   END IF;
@@ -448,6 +465,15 @@ $prompt$,
   INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
   SELECT agent_id, 'view', 'allgres_public.v_agent_health'
   FROM allgres_private.agents WHERE name = 'health_monitor'
+  ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
+
+  -- Same "an existing install picks this up too, not just a fresh one"
+  -- reasoning as health_monitor's grant just above, for self_improve's own
+  -- new tool-model-experiment view: the IF NOT EXISTS block only runs the
+  -- very first time this agent is created.
+  INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
+  SELECT agent_id, 'view', 'allgres_public.v_tool_model_experiments'
+  FROM allgres_private.agents WHERE name = 'self_improve'
   ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
 END
 $seed$;

@@ -3094,3 +3094,85 @@ Also landed in the same effort, unrelated to any of the above:
 identical `cargo test --lib` (30/30), identical `fn_selftest` count, and
 identical `cargo clippy` lint count before and after (diffed directly via
 `git stash`, confirming the split introduced no lints of its own).
+
+## 40. Per-tool/per-procedure model override, and a self_improve-run canary experiment to find one
+
+Before this, one agent's `policies.llm_config` was a single provider/model
+for its *every* turn -- including a turn that exists only to process the
+result of a fixed, narrow `procedure_tool` (a status ping, a canned lookup)
+and hand it back as a sentence. There was no way to route that specific
+turn to a cheaper model while the agent's own open-ended reasoning kept
+using whatever it was actually configured for.
+
+**The override itself.** `procedures` and `procedure_tools` each gained a
+nullable `llm_override jsonb` column (`{"provider":"...","model":"..."}`,
+the same two keys `sanitize_llm_config` already accepts). `fn_next_step`
+resolves it only for the turn that immediately follows a procedure-bound
+`call_tool`: if the most recent `execution_logs` row for the task is a
+`'tool'` result carrying `procedure_tool_id` (stamped by `fn_submit_result`'s
+`call_tool` branch when the call resolved through a procedure grant, and
+carried into the log entry itself by `fn_complete_outbound` so no later
+join is needed), that tool's own override wins, then its procedure's, then
+the agent's own `llm_config` -- unchanged when none is set. Every existing
+task with no such log entry behaves exactly as before.
+
+**The canary.** A `model_experiments` row (`tool_id`, `candidate_provider`/
+`candidate_model`, `canary_percent`, `status`) lets `fn_next_step` roll a
+die for that specific turn only: `canary_percent`% of the time it uses the
+candidate instead of the tool's current override/the agent default, and
+stamps this turn's `outbound_calls` row with the `experiment_id` so its
+outcome can be attributed. Only one `'running'` experiment per tool at a
+time (a partial unique index). `outbound_calls` also gained `outcome`
+(`'success'`/`'failure'`), filled in by `fn_complete_outbound` for any
+`'llm'`-kind call tied to a `procedure_tool_id`: **a purely operational
+signal, deliberately not a quality judgment** -- failure means the model's
+own output was unusable (`unknown_action`, `payload_rejected`,
+`final_answer_missing_answer`, or an exception in `fn_submit_result`
+itself), success means anything else, including a `final_answer` nobody
+would call especially good. No LLM grades another LLM's answer here; that
+was a deliberate scope cut (see below), not an oversight.
+
+**Who runs it.** Reuses the existing `self_improve` system agent (cost/
+efficiency is already its whole job) rather than adding a new system agent
+kind. `change_proposals` gained a `'tool_override'` kind and a
+`target_tool_id` column, alongside the existing `'policy_change'`/
+`'create_agent'`; `propose_change` with a `target_tool_id` present is
+routed to an entirely separate validation path in `fn_submit_result`
+(self_improve-only, same as cross-agent `target_agent_id` already was),
+with three ops: `start_experiment` (rejected outright if one is already
+`'running'` for that tool), `promote` (copies the still-running
+experiment's candidate onto the tool's live `llm_override`, closes it),
+`reject` (closes it, leaves the live override untouched) -- both `promote`/
+`reject` require naming a `'running'` experiment on that exact tool, so a
+stale or already-decided reference is rejected at propose time, not
+silently reapplied. `fn_decide_proposal` gained the matching approval
+branch; `start_experiment`'s approval is also where `baseline_success_rate`
+is frozen -- computed once, from that tool's own prior (non-experiment)
+call history, specifically so a later promote/reject decision compares
+against a fixed number instead of one that keeps moving while the
+experiment runs. Every step (start, promote, reject) is gated by
+self_improve's own `autonomy_level` exactly like its existing agent-policy
+proposals -- `admin_approval` by default, same as everything else in this
+platform. `allgres.dashboard_rpc`'s new `tool_experiments.list` action (83rd
+frozen action, `require_admin_if_accounts_exist`) gives an operator
+read-only visibility into `sample_size`/`success_count`/
+`candidate_success_rate` alongside `baseline_success_rate`, computed live
+from `outbound_calls.outcome` rather than a maintained counter -- a plain
+aggregate query is always consistent and never races a counter update.
+
+**Deliberately cut from this pass, not forgotten:**
+- **No LLM-judged quality score.** Considered and rejected: it would cost
+  real tokens to run, and introduces "who judges the judge" -- the
+  operational signal above is free and matches this platform's existing
+  evaluation philosophy (`agent_success_rate_for_generation` also only
+  ever asks "did the task complete", never "was the answer good").
+- **No procedure-level experiment**, only a procedure-level *default*
+  (the fallback an unset tool override falls through to). A procedure has
+  no discrete "this turn was for procedure X" trigger the way a specific
+  `call_tool` does, so there is nothing clean to attribute a canary
+  outcome to at that granularity yet.
+- **No SQL-execution cost signal** (`EXPLAIN`/`pg_stat_statements`) feeds
+  into any of this. That measures database work, not how much reasoning
+  the model needed to interpret a result correctly -- a different axis,
+  and one `execute_sql`'s own real, measured latency could be added
+  against later if it turns out to matter.

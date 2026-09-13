@@ -582,6 +582,60 @@ CREATE TABLE IF NOT EXISTS allgres_private.procedure_tool_bindings (
   PRIMARY KEY (procedure_id, tool_id)
 );
 
+-- Per-tool/per-procedure model override: NULL (the default for every
+-- existing row) means "no override, use the calling agent's own
+-- policies.llm_config" -- exactly today's behavior, unchanged. When set,
+-- shape is {"provider":"...","model":"..."} -- the same two keys
+-- sanitize_llm_config already accepts, deliberately never a full llm_config
+-- (temperature/max_tokens still come from the agent's own policy either
+-- way). fn_next_step resolves these with tool taking precedence over the
+-- procedure it was bound through, which in turn takes precedence over the
+-- agent's own default -- see its own comment. Why this exists at all: one
+-- agent's own llm_config is a single provider/model for its *entire* turn,
+-- but a turn that only exists to process a fixed, narrow tool's result (a
+-- weather lookup, a status ping) or follow a narrow curated procedure does
+-- not need the same model the agent uses for open-ended reasoning. This is
+-- the lever self_improve's tool_override proposals (below) actually turn --
+-- not a one-time setting, but the thing a canary experiment gradually
+-- ratchets down as cheaper models prove themselves for one specific tool.
+ALTER TABLE allgres_private.procedures
+  ADD COLUMN IF NOT EXISTS llm_override jsonb;
+ALTER TABLE allgres_private.procedure_tools
+  ADD COLUMN IF NOT EXISTS llm_override jsonb;
+
+-- A canary experiment against one procedure_tool's model choice: self_improve
+-- proposes candidate_provider/candidate_model at a given canary_percent (what
+-- share of the turns that would otherwise use this tool's current override/
+-- the agent default get redirected to the candidate instead -- see
+-- fn_next_step's dice roll), an operator approves starting it (fn_decide_
+-- proposal, kind='tool_override', op='start_experiment'), and outbound_calls
+-- rows tagged with this experiment_id (below) accumulate real outcomes.
+-- Deliberately no running success_count/sample_size columns here: those are
+-- computed live, from outbound_calls.outcome, by allgres_public.
+-- v_tool_model_experiments -- a query is always consistent and never races a
+-- counter update, and this table only needs to remember the experiment's own
+-- configuration and final disposition. Only one 'running' experiment per
+-- tool_id at a time (the partial unique index below) -- a second proposal
+-- for the same tool must wait for the first to be promoted or rejected,
+-- the same "one thing at a time" shape policy_history's own generation
+-- versioning already uses.
+CREATE TABLE IF NOT EXISTS allgres_private.model_experiments (
+  experiment_id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tool_id             uuid NOT NULL REFERENCES allgres_private.procedure_tools(tool_id) ON DELETE CASCADE,
+  candidate_provider  text NOT NULL,
+  candidate_model     text NOT NULL,
+  canary_percent      int NOT NULL CHECK (canary_percent > 0 AND canary_percent <= 100),
+  status              text NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'promoted', 'rejected')),
+  min_sample_size     int NOT NULL DEFAULT 20 CHECK (min_sample_size > 0),
+  baseline_success_rate numeric,
+  proposed_by_agent_id uuid REFERENCES allgres_private.agents(agent_id),
+  reason              text,
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  decided_at          timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS model_experiments_one_running_per_tool
+  ON allgres_private.model_experiments (tool_id) WHERE status = 'running';
+
 -- Every permission check in this file (call_tool's tool/http_host grants,
 -- delegate's target-agent grant, execute_sql's view grant via
 -- agent_may_read/fn_validate_sql below) goes through this one function
@@ -1117,6 +1171,23 @@ ALTER TABLE allgres_private.change_proposals
   ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'policy_change'
     CHECK (kind IN ('policy_change', 'create_agent')),
   ADD COLUMN IF NOT EXISTS target_agent_id uuid REFERENCES allgres_private.agents(agent_id);
+
+-- 'tool_override' (self_improve's model-optimizer role): proposed_changes
+-- holds {"op":"start_experiment","candidate_provider":...,"candidate_model":
+-- ...,"canary_percent":N,"min_sample_size":N?} or {"op":"promote"|"reject",
+-- "experiment_id":...} -- never {system_prompt,llm_config}, so this kind is
+-- exempt from the field-shape check policy_change enforces (see
+-- fn_submit_result's propose_change branch). target_tool_id names which
+-- procedure_tool this is about; target_agent_id/base_generation stay
+-- meaningless for it, the same way both are for 'create_agent'. Only
+-- self_improve may ever create one (enforced in fn_submit_result, not
+-- here, the same as target_agent_id above) -- widening the CHECK, not
+-- re-adding the column, since an existing install already has it.
+ALTER TABLE allgres_private.change_proposals DROP CONSTRAINT IF EXISTS change_proposals_kind_check;
+ALTER TABLE allgres_private.change_proposals ADD CONSTRAINT change_proposals_kind_check
+  CHECK (kind IN ('policy_change', 'create_agent', 'tool_override'));
+ALTER TABLE allgres_private.change_proposals
+  ADD COLUMN IF NOT EXISTS target_tool_id uuid REFERENCES allgres_private.procedure_tools(tool_id) ON DELETE CASCADE;
 
 -- fixer's remediation queue (item 37): shaped like change_proposals but for
 -- an action on permissions/agents.is_active rather than on policy fields --
@@ -1926,6 +1997,34 @@ ALTER TABLE allgres_private.outbound_calls DROP CONSTRAINT IF EXISTS outbound_ca
 ALTER TABLE allgres_private.outbound_calls ADD CONSTRAINT outbound_calls_kind_check
   CHECK (kind IN ('llm', 'tool', 'embedding', 'recall'));
 
+-- Per-tool model override/canary tracking. procedure_tool_id is stamped on
+-- BOTH sides of the "tool call, then the turn that processes its result"
+-- pair: on the 'tool' row itself (fn_submit_result's call_tool branch, when
+-- the call resolved through a procedure grant) so fn_next_step's next call
+-- can find it via the execution_logs entry that row's result became, and
+-- again on the *following* 'llm' row once fn_next_step resolves that turn's
+-- override from it -- the second stamping is what lets
+-- v_tool_model_experiments and the baseline-rate query below select "every
+-- llm call this tool's result ever triggered" with one flat WHERE, without
+-- re-deriving it from execution_logs each time. experiment_id is set only
+-- when the canary dice roll (fn_next_step) picked the candidate model for
+-- that specific 'llm' call; outcome is filled in by fn_complete_outbound
+-- once the call resolves, exactly the same operational success/failure
+-- signal fn_submit_result already computes for its own dispatch (an
+-- unrecognized action, a rejected payload, or a final_answer with no
+-- answer count as 'failure'; anything else the model produced counts as
+-- 'success') -- no LLM-judged quality score, on purpose (see KNOWN_ISSUES).
+ALTER TABLE allgres_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS procedure_tool_id uuid REFERENCES allgres_private.procedure_tools(tool_id),
+  ADD COLUMN IF NOT EXISTS procedure_id uuid REFERENCES allgres_private.procedures(procedure_id),
+  ADD COLUMN IF NOT EXISTS experiment_id uuid REFERENCES allgres_private.model_experiments(experiment_id),
+  ADD COLUMN IF NOT EXISTS outcome text CHECK (outcome IN ('success', 'failure'));
+
+CREATE INDEX IF NOT EXISTS outbound_calls_procedure_tool_idx
+  ON allgres_private.outbound_calls (procedure_tool_id) WHERE procedure_tool_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS outbound_calls_experiment_idx
+  ON allgres_private.outbound_calls (experiment_id) WHERE experiment_id IS NOT NULL;
+
 -- 'recall': the new 'recall' agent action's own query text (semantic
 -- memory search, fn_next_step) -- queued and claimed exactly like
 -- 'embedding' above (same provider/auth_kind resolution, same JSON-POST
@@ -2631,6 +2730,45 @@ AS
   FROM allgres_private.permissions p
   JOIN allgres_private.agents a USING (agent_id)
   WHERE allgres_private.agent_may_read('allgres_public.v_permission_audit', allgres_private.current_agent_id());
+
+-- self_improve's own evaluation surface for a tool-model canary experiment --
+-- the same "give it a real completed/failed ratio, not just a config
+-- change" reasoning v_agent_health gives, applied to model_experiments
+-- instead of an agent's own policy history. sample_size/success_count/
+-- candidate_success_rate are plain aggregates over outbound_calls.outcome,
+-- never a maintained counter (see model_experiments' own comment on why);
+-- a NULL candidate_success_rate means no eligible call has resolved yet,
+-- not a 0% rate. baseline_success_rate is the frozen pre-experiment number
+-- fn_decide_proposal captured when the experiment started -- what the
+-- candidate's own rate above should be compared against.
+CREATE OR REPLACE VIEW allgres_public.v_tool_model_experiments
+  WITH (security_barrier = true)
+AS
+  SELECT
+    e.experiment_id,
+    e.tool_id,
+    pt.name AS tool_name,
+    e.candidate_provider,
+    e.candidate_model,
+    e.canary_percent,
+    e.status,
+    e.min_sample_size,
+    e.baseline_success_rate,
+    count(oc.call_id) AS sample_size,
+    count(oc.call_id) FILTER (WHERE oc.outcome = 'success') AS success_count,
+    round(
+      count(oc.call_id) FILTER (WHERE oc.outcome = 'success')::numeric / NULLIF(count(oc.call_id), 0),
+      3
+    ) AS candidate_success_rate,
+    e.reason,
+    e.created_at,
+    e.decided_at
+  FROM allgres_private.model_experiments e
+  JOIN allgres_private.procedure_tools pt USING (tool_id)
+  LEFT JOIN allgres_private.outbound_calls oc
+    ON oc.experiment_id = e.experiment_id AND oc.outcome IS NOT NULL
+  WHERE allgres_private.agent_may_read('allgres_public.v_tool_model_experiments', allgres_private.current_agent_id())
+  GROUP BY e.experiment_id, pt.name;
 
 -- ---------------------------------------------------------------------------
 -- 4. Outbound URL / host guards.
@@ -3383,6 +3521,14 @@ DECLARE
   v_compacted_before timestamptz;
   v_summary_text text;
   v_project_preset text;
+  v_last_log record;
+  v_last_procedure_tool_id uuid;
+  v_last_procedure_id uuid;
+  v_tool_override jsonb;
+  v_proc_override jsonb;
+  v_effective_override jsonb;
+  v_experiment allgres_private.model_experiments%ROWTYPE;
+  v_experiment_id uuid;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -3631,7 +3777,62 @@ BEGIN
     );
   END IF;
 
-  v_cfg := allgres_private.sanitize_llm_config(p.llm_config);
+  -- Per-tool/per-procedure model override (see procedure_tools.llm_override's
+  -- own comment). Only applies to the turn that immediately follows a
+  -- procedure-bound tool call: the most recent log row for *this* task, if
+  -- it is a 'tool' result carrying procedure_tool_id (fn_submit_result's
+  -- call_tool branch stamps this into the row fn_complete_outbound builds,
+  -- which append_log then persists verbatim). Any other last-row shape
+  -- (assistant, user, error, or a tool result with no procedure_tool_id --
+  -- a directly-permitted tool call, not one resolved through a procedure)
+  -- leaves v_last_procedure_tool_id NULL and this whole block a no-op, so
+  -- every turn keeps using the agent's own llm_config exactly as before.
+  SELECT el.role, el.content INTO v_last_log
+  FROM allgres_private.execution_logs el
+  WHERE el.task_id = p_task_id
+  ORDER BY el.step_number DESC, el.created_at DESC
+  LIMIT 1;
+
+  IF v_last_log.role = 'tool' THEN
+    v_last_procedure_tool_id := NULLIF(v_last_log.content->>'procedure_tool_id', '')::uuid;
+    v_last_procedure_id := NULLIF(v_last_log.content->>'procedure_id', '')::uuid;
+  END IF;
+
+  IF v_last_procedure_tool_id IS NOT NULL THEN
+    SELECT llm_override INTO v_tool_override
+    FROM allgres_private.procedure_tools WHERE tool_id = v_last_procedure_tool_id;
+    SELECT llm_override INTO v_proc_override
+    FROM allgres_private.procedures WHERE procedure_id = v_last_procedure_id;
+    -- tool override wins over its procedure's own override, which wins over
+    -- nothing at all (agent default) -- see the column's own comment.
+    v_effective_override := COALESCE(v_tool_override, v_proc_override);
+
+    -- Canary dice roll: a 'running' experiment on this tool redirects
+    -- canary_percent% of these specific turns to the candidate model
+    -- instead of whatever v_effective_override (or the agent default)
+    -- would otherwise apply -- the live override is untouched either way
+    -- until an operator promotes or rejects the experiment
+    -- (fn_decide_proposal). experiment_id is stamped on this turn's own
+    -- outbound_calls row below so fn_complete_outbound can record this
+    -- specific call's outcome against it.
+    SELECT * INTO v_experiment
+    FROM allgres_private.model_experiments
+    WHERE tool_id = v_last_procedure_tool_id AND status = 'running';
+    IF FOUND AND random() * 100 < v_experiment.canary_percent THEN
+      v_effective_override := jsonb_build_object(
+        'provider', v_experiment.candidate_provider, 'model', v_experiment.candidate_model
+      );
+      v_experiment_id := v_experiment.experiment_id;
+    END IF;
+  END IF;
+
+  v_cfg := p.llm_config;
+  IF v_effective_override IS NOT NULL THEN
+    v_cfg := v_cfg || jsonb_build_object(
+      'provider', v_effective_override->>'provider', 'model', v_effective_override->>'model'
+    );
+  END IF;
+  v_cfg := allgres_private.sanitize_llm_config(v_cfg);
 
   RETURN jsonb_build_object(
     'action', 'call_llm',
@@ -3641,6 +3842,9 @@ BEGIN
     'step', t.step_count + 1,
     'messages', v_messages,
     'llm_config', v_cfg,
+    'procedure_tool_id', v_last_procedure_tool_id,
+    'procedure_id', v_last_procedure_id,
+    'experiment_id', v_experiment_id,
     'bounds', jsonb_build_object(
       'views', v_views,
       'tools', v_tools,
@@ -3692,6 +3896,11 @@ DECLARE
   v_req_body jsonb;
   v_procedure_tool allgres_private.procedure_tools%ROWTYPE;
   v_procedure_bound boolean := false;
+  v_bound_procedure_id uuid;
+  v_tool_target uuid;
+  v_op text;
+  v_canary_percent int;
+  v_experiment_ref allgres_private.model_experiments%ROWTYPE;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -3872,6 +4081,18 @@ BEGIN
       LIMIT 1;
       IF FOUND THEN
         v_procedure_bound := true;
+        -- Which specific procedure this tool resolved through (a tool may
+        -- be bound to more than one procedure_tool_bindings row) -- picked
+        -- with the exact same WHERE/LIMIT 1 as just above so it always
+        -- names the one that actually granted this call, not just any
+        -- procedure the tool happens to also be bound to.
+        SELECT pr.procedure_id INTO v_bound_procedure_id
+        FROM allgres_private.procedure_tool_bindings pb
+        JOIN allgres_private.procedures pr USING (procedure_id)
+        WHERE pb.tool_id = v_procedure_tool.tool_id
+          AND pr.is_active
+          AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'))
+        LIMIT 1;
         v_tool := v_procedure_tool.handler;
         v_args := v_procedure_tool.args_template;
         v_allowed := true;
@@ -4025,11 +4246,14 @@ BEGIN
 
     INSERT INTO allgres_private.outbound_calls (
       task_id, kind, tool, url, method, request_headers, request_body, status,
-      allow_private, connection_id, auth_kind, idempotency_key
+      allow_private, connection_id, auth_kind, idempotency_key,
+      procedure_tool_id, procedure_id
     ) VALUES (
       p_task_id, 'tool', v_tool, v_url, v_method, v_req_headers, v_req_body, 'queued',
       COALESCE(v_conn.allow_private_network, false), v_conn.connection_id, v_conn_auth,
-      v_req_headers->>'idempotency-key'
+      v_req_headers->>'idempotency-key',
+      CASE WHEN v_procedure_bound THEN v_procedure_tool.tool_id END,
+      CASE WHEN v_procedure_bound THEN v_bound_procedure_id END
     ) RETURNING call_id INTO v_call;
 
     UPDATE allgres_private.tasks
@@ -4307,6 +4531,111 @@ BEGIN
   -- await_human: proposing an improvement for future turns has nothing to
   -- do with whether the current task can finish.
   IF v_action = 'propose_change' THEN
+    -- Model-optimizer path (self_improve only): a tool_override proposal is
+    -- shaped nothing like {system_prompt,llm_config} -- it targets a
+    -- procedure_tool, not an agent's own policy -- so it is handled
+    -- entirely separately, before the system_prompt/llm_config field-shape
+    -- check below (which would otherwise reject it outright). Reuses the
+    -- same change_proposals table and fn_decide_proposal approval step
+    -- every other consequential self_improve action already goes through,
+    -- just a different 'kind'.
+    IF v_parsed ? 'target_tool_id' THEN
+      IF a.name <> 'self_improve' THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'propose_change_cross_agent_not_permitted')
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+
+      v_tool_target := NULLIF(v_parsed->>'target_tool_id', '')::uuid;
+      IF v_tool_target IS NULL OR NOT EXISTS (
+        SELECT 1 FROM allgres_private.procedure_tools WHERE tool_id = v_tool_target AND is_active
+      ) THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'propose_change_target_not_found', 'target_tool_id', v_tool_target)
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+
+      v_op := v_parsed->>'op';
+      IF v_op IS NULL OR v_op NOT IN ('start_experiment', 'promote', 'reject') THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'tool_override_invalid_op', 'op', v_op)
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+
+      IF v_op = 'start_experiment' THEN
+        IF NULLIF(btrim(COALESCE(v_parsed->>'candidate_provider', '')), '') IS NULL
+           OR NULLIF(btrim(COALESCE(v_parsed->>'candidate_model', '')), '') IS NULL
+           OR NULLIF(v_parsed->>'canary_percent', '') IS NULL THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'tool_override_incomplete', 'parsed', v_parsed)
+          );
+          UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
+        v_canary_percent := (v_parsed->>'canary_percent')::int;
+        IF v_canary_percent <= 0 OR v_canary_percent > 100 THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'tool_override_bad_canary_percent', 'canary_percent', v_canary_percent)
+          );
+          UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
+        IF EXISTS (
+          SELECT 1 FROM allgres_private.model_experiments WHERE tool_id = v_tool_target AND status = 'running'
+        ) THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'tool_override_experiment_already_running', 'target_tool_id', v_tool_target)
+          );
+          UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
+      ELSE
+        -- 'promote'/'reject': must name a currently running experiment on
+        -- this exact tool -- never one already decided, and never one on a
+        -- different tool (a proposal cannot promote a candidate onto a tool
+        -- it was never trialled against).
+        SELECT * INTO v_experiment_ref
+        FROM allgres_private.model_experiments
+        WHERE experiment_id = NULLIF(v_parsed->>'experiment_id', '')::uuid
+          AND tool_id = v_tool_target AND status = 'running';
+        IF NOT FOUND THEN
+          PERFORM allgres_private.append_log(
+            p_task_id, t.step_count + 1, 'error',
+            jsonb_build_object('reason', 'tool_override_experiment_not_running', 'experiment_id', v_parsed->>'experiment_id')
+          );
+          UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'continue');
+        END IF;
+      END IF;
+
+      INSERT INTO allgres_private.change_proposals
+        (agent_id, task_id, proposed_changes, reason, base_generation, kind, target_tool_id)
+      VALUES (
+        t.agent_id, p_task_id, (v_parsed - 'action' - 'target_tool_id'),
+        NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), ''), 0, 'tool_override', v_tool_target
+      )
+      RETURNING proposal_id INTO v_proposal;
+
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'assistant',
+        jsonb_build_object('proposed_tool_override', v_parsed, 'proposal_id', v_proposal, 'target_tool_id', v_tool_target)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
+    END IF;
+
     v_changes := v_parsed->'changes';
     IF v_changes IS NULL OR jsonb_typeof(v_changes) <> 'object' OR v_changes = '{}'::jsonb THEN
       PERFORM allgres_private.append_log(
@@ -4738,7 +5067,15 @@ BEGIN
     'body', v_body,
     'allow_private', v_prov.allow_private_network,
     'provider_id', v_prov.provider_id,
-    'auth_kind', CASE WHEN v_prov.kind = 'anthropic' THEN 'x-api-key' ELSE 'authorization' END
+    'auth_kind', CASE WHEN v_prov.kind = 'anthropic' THEN 'x-api-key' ELSE 'authorization' END,
+    -- Passed straight through from p_spec, untouched -- this function only
+    -- resolves the provider/model into a real HTTP request, it does not
+    -- decide which tool/procedure/experiment (if any) this turn belongs to;
+    -- that is fn_next_step's job. fn_dispatch_tasks copies these three back
+    -- onto the outbound_calls row it inserts for this call.
+    'procedure_tool_id', p_spec->'procedure_tool_id',
+    'procedure_id', p_spec->'procedure_id',
+    'experiment_id', p_spec->'experiment_id'
   );
 END;
 $fn$;
@@ -4833,13 +5170,19 @@ BEGIN
     -- request_headers holds only what build_llm_http returned -- no
     -- credential; provider_id/auth_kind are what fn_claim_outbound needs to
     -- inject one later, at claim time, without ever writing it here.
+    -- procedure_tool_id/procedure_id/experiment_id are fn_next_step's own
+    -- resolution, carried through build_llm_http untouched -- see that
+    -- column's own comment on outbound_calls.
     INSERT INTO allgres_private.outbound_calls (
       task_id, kind, url, request_headers, request_body, status, allow_private,
-      provider_id, auth_kind
+      provider_id, auth_kind, procedure_tool_id, procedure_id, experiment_id
     ) VALUES (
       t.task_id, 'llm', http->>'url', http->'headers', http->'body', 'queued',
       COALESCE((http->>'allow_private')::boolean, false),
-      (http->>'provider_id')::uuid, http->>'auth_kind'
+      (http->>'provider_id')::uuid, http->>'auth_kind',
+      NULLIF(http->>'procedure_tool_id', '')::uuid,
+      NULLIF(http->>'procedure_id', '')::uuid,
+      NULLIF(http->>'experiment_id', '')::uuid
     ) RETURNING call_id INTO v_id;
     v_out := v_out || jsonb_build_array(jsonb_build_object('call_id', v_id, 'task_id', t.task_id));
     v_n := v_n + 1;
@@ -5068,11 +5411,19 @@ BEGIN
   WHERE call_id = p_call_id;
 
   IF c.kind = 'tool' THEN
+    -- procedure_tool_id/procedure_id ride along in the logged content itself
+    -- (not just this row) so fn_next_step's *next* call for this task can
+    -- resolve a model override/experiment from the execution_logs entry
+    -- alone, with no extra join back to outbound_calls -- see that
+    -- function's own comment. NULL for a directly-permitted (non-procedure)
+    -- tool call, same as the row itself.
     v_payload := jsonb_build_object(
       'type', 'tool_result',
       'content', jsonb_build_object(
         'status', p_status,
-        'body', left(COALESCE(p_body, ''), 16000)
+        'body', left(COALESCE(p_body, ''), 16000),
+        'procedure_tool_id', c.procedure_tool_id,
+        'procedure_id', c.procedure_id
       )
     );
   -- fn_search_agents' own query embedding (item: semantic delegate
@@ -5209,6 +5560,29 @@ BEGIN
     END;
   ELSE
     v_result := jsonb_build_object('action', 'skipped', 'reason', 'task_not_running');
+  END IF;
+
+  -- Operational success/failure for a model-override-eligible turn (see
+  -- outbound_calls.procedure_tool_id's own comment): reuses exactly the
+  -- outcome fn_submit_result's own dispatch already computed above, no
+  -- separate quality judgment. 'error' (an exception escaped fn_submit_
+  -- result) and the three "the model's own output was unusable" reasons
+  -- count as failure; a recognized, dispatched action of any kind --
+  -- including a plain 'continue' for something unrelated -- counts as
+  -- success. This is what allgres_public.v_tool_model_experiments and a
+  -- tool's own baseline_success_rate are computed from (both plain
+  -- aggregates over this column, never a maintained counter -- see
+  -- model_experiments' own comment on why).
+  IF c.kind = 'llm' AND c.procedure_tool_id IS NOT NULL THEN
+    UPDATE allgres_private.outbound_calls
+    SET outcome = CASE
+      WHEN v_result->>'action' = 'error' THEN 'failure'
+      WHEN v_result->>'action' = 'continue'
+        AND v_result->>'reason' IN ('unknown_action', 'payload_rejected', 'final_answer_missing_answer')
+        THEN 'failure'
+      ELSE 'success'
+    END
+    WHERE call_id = p_call_id;
   END IF;
 
   RETURN jsonb_build_object('submit', v_result, 'call_id', p_call_id);
