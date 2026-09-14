@@ -2280,6 +2280,30 @@ BEGIN
   ));
   v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_dashboard_rpc_call_records_origin_web', 'ok', ok));
 
+  -- The gap an outside production-readiness review actually found: origin/
+  -- db_role above prove *that* a call went through the web surface with
+  -- *some* real Postgres role, but neither says *which logged-in person*
+  -- did it -- audit_log's own comment used to describe that as answering
+  -- "who claimed responsibility," not "who was authenticated." Once a real
+  -- account exists and its session_token is presented, this row must also
+  -- carry that account's own user_id/username -- checked against the same
+  -- 'allowlist.add' row the previous case already produced and left in
+  -- place (audit_log is append-only; nothing here needs to insert a new
+  -- one). Skipped, not failed, when pgcrypto made v_audit_tok NULL above --
+  -- there is no real account to have resolved in that case either.
+  IF v_audit_tok IS NOT NULL THEN
+    SELECT user_id = (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_audit_admin')
+       AND username = 'selftest_audit_admin'
+    INTO detail_bool
+    FROM allgres_private.audit_log
+    WHERE action = 'allowlist.add' AND details->>'resource_ref' = 'selftest_audit_origin_marker_web'
+    ORDER BY created_at DESC LIMIT 1;
+    ok := COALESCE(detail_bool, false);
+  ELSE
+    ok := true;
+  END IF;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'audit_log_records_real_logged_in_user_id', 'ok', ok));
+
   IF v_audit_tok IS NOT NULL THEN
     PERFORM allgres_public.fn_logout(v_audit_tok);
     DELETE FROM allgres_private.users WHERE username = 'selftest_audit_admin';

@@ -1323,6 +1323,11 @@ ALTER TABLE allgres_private.agent_memories
 -- anyone holding the one shared token can type any name, or none. See
 -- KNOWN_ISSUES.md, item 10, for what a real accounts system would need
 -- instead, and item 28 for why this lighter version was built first.
+-- Item 28's own accounts eventually landed (below), and this table's
+-- user_id/username columns -- added later, once web_sessions existed to
+-- resolve one from -- are that real identity; this original comment
+-- describes only operator_name, the column that predates accounts
+-- entirely and still behaves exactly as described here.
 CREATE TABLE IF NOT EXISTS allgres_private.audit_log (
   audit_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   operator_name text,
@@ -1376,12 +1381,23 @@ ALTER TABLE allgres_private.audit_log
 -- either that same '__sql__' baseline or a genuine NULL (a connection
 -- that has never touched this GUC at all) -- both mean 'sql' in
 -- allgres_private.audit below.
-CREATE OR REPLACE FUNCTION allgres_private.set_audit_context(p_operator_name text)
+-- p_user_id is the *real* identity, resolved server-side by dashboard_rpc
+-- from session_token via allgres_private.session_user before this is ever
+-- called -- never trust a user_id handed in directly the way operator_name
+-- is trusted, or this would be exactly as spoofable as operator_name
+-- already admits to being. Carries the same '__sql__'-sentinel double-SET
+-- shape as allgres.audit_operator, for the identical reason that comment
+-- gives: a custom GUC's first-ever SET in a session does not roll back to
+-- NULL the way SET LOCAL normally would, and this is a second, independent
+-- GUC with the exact same first-reference edge case.
+CREATE OR REPLACE FUNCTION allgres_private.set_audit_context(p_operator_name text, p_user_id uuid DEFAULT NULL)
 RETURNS void
 LANGUAGE sql
 AS $fn$
   SELECT set_config('allgres.audit_operator', '__sql__', false);
   SELECT set_config('allgres.audit_operator', COALESCE(NULLIF(btrim(p_operator_name), ''), ''), true);
+  SELECT set_config('allgres.audit_user_id', '__sql__', false);
+  SELECT set_config('allgres.audit_user_id', COALESCE(p_user_id::text, ''), true);
 $fn$;
 
 -- The one place every consequential mutating function writes its own
@@ -1394,14 +1410,17 @@ CREATE OR REPLACE FUNCTION allgres_private.audit(p_action text, p_details jsonb 
 RETURNS void
 LANGUAGE sql
 AS $fn$
-  INSERT INTO allgres_private.audit_log (operator_name, action, details, origin, db_role)
+  INSERT INTO allgres_private.audit_log (operator_name, action, details, origin, db_role, user_id, username)
   VALUES (
     NULLIF(NULLIF(current_setting('allgres.audit_operator', true), '__sql__'), ''),
     p_action,
     COALESCE(p_details, '{}'::jsonb),
     CASE WHEN COALESCE(current_setting('allgres.audit_operator', true), '__sql__') = '__sql__'
          THEN 'sql' ELSE 'web' END,
-    session_user
+    session_user,
+    NULLIF(NULLIF(current_setting('allgres.audit_user_id', true), '__sql__'), '')::uuid,
+    (SELECT u.username FROM allgres_private.users u
+     WHERE u.user_id = NULLIF(NULLIF(current_setting('allgres.audit_user_id', true), '__sql__'), '')::uuid)
   );
 $fn$;
 
@@ -1434,6 +1453,28 @@ CREATE TABLE IF NOT EXISTS allgres_private.web_sessions (
 );
 CREATE INDEX IF NOT EXISTS web_sessions_user_idx ON allgres_private.web_sessions (user_id);
 CREATE INDEX IF NOT EXISTS web_sessions_expiry_idx ON allgres_private.web_sessions (expires_at);
+
+-- Real login identity for an audit row, on top of operator_name's own
+-- self-report (that table's own comment) -- item 10's "what a real
+-- accounts system would need instead", finally wired up now that item 28
+-- built the accounts themselves. NULL in exactly the cases operator_name
+-- alone already covered before this: no session_token presented, no
+-- accounts exist yet, or the call came in over plain SQL rather than
+-- dashboard_rpc. Deliberately no FK to users(user_id): audit_log is
+-- append-only (forbid_audit_mutation below) and this table's own point is
+-- to freeze what was true at the time regardless of what happens to the
+-- user account afterward -- an ON DELETE SET NULL, the obvious first
+-- instinct, would itself be an UPDATE on this table and get rejected by
+-- that exact trigger the moment a user row it referenced was ever
+-- deleted (there is no fn_delete_user today, only deactivation, but nothing
+-- should depend on that staying true). username is captured alongside for
+-- the same reason operator_name already is: a plain, permanent label that
+-- reads correctly on its own, independent of whatever the users table
+-- looks like by the time anyone reads this row back.
+ALTER TABLE allgres_private.audit_log
+  ADD COLUMN IF NOT EXISTS user_id uuid,
+  ADD COLUMN IF NOT EXISTS username text;
+CREATE INDEX IF NOT EXISTS audit_log_user_idx ON allgres_private.audit_log (user_id) WHERE user_id IS NOT NULL;
 
 -- Which agents a regular user may see or talk to at all -- an admin needs
 -- no row here (see require_agent_access); this table only ever narrows a

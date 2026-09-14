@@ -430,8 +430,17 @@ BEGIN
   -- dashboard does, psql can do too" in the README). This one call is all
   -- dashboard_rpc itself still does: it stamps the current transaction
   -- with this request's self-reported operator_name so every audit() call
-  -- reached from here on is correctly recorded as 'web', not 'sql'.
-  PERFORM allgres_private.set_audit_context(p_request->>'operator_name');
+  -- reached from here on is correctly recorded as 'web', not 'sql' --
+  -- plus, when this request carries a session_token that resolves to a
+  -- real logged-in account, that account's own real user_id, so the
+  -- resulting audit_log row answers "who was actually authenticated to do
+  -- this," not only "who claimed responsibility for it" (audit_log's own
+  -- comment). v_user is resolved fresh again, per branch, by anything
+  -- below that actually needs the full row (auth.me and friends) -- this
+  -- assignment only feeds the audit context and is safely overwritten by
+  -- any of those before they read it.
+  v_user := allgres_private.session_user(p_request->>'session_token');
+  PERFORM allgres_private.set_audit_context(p_request->>'operator_name', v_user.user_id);
 
   CASE v_action
     -- Every count/listing here excludes goal LIKE 'selftest%' (see
@@ -1293,7 +1302,7 @@ BEGIN
       RETURN jsonb_build_object('ok', true, 'entries', COALESCE((
         SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
         FROM (
-          SELECT audit_id, operator_name, action, details, origin, db_role, created_at
+          SELECT audit_id, operator_name, action, details, origin, db_role, user_id, username, created_at
           FROM allgres_private.audit_log
           WHERE details::text NOT ILIKE '%selftest%'
           ORDER BY created_at DESC

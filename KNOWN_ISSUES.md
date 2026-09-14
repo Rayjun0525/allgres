@@ -166,13 +166,50 @@ that's the next layer, not this one.
 
 Deliberately out of scope for this pass, worth revisiting:
 
-- the 24h approval expiry is a hardcoded default, not configurable per call or
-  per agent;
-- neither `fn_decide_approval` nor `projects.*` records *who* decided or
-  created something — there is no per-operator identity anywhere in the
-  system (the dashboard has one shared token, not accounts), so "who approved
-  this" is unanswerable by design, not by oversight. Adding real identity
-  would be a bigger change than this one.
+- the 24h approval expiry is a hardcoded default, not configurable per call
+  or per agent -- still true;
+- ~~neither `fn_decide_approval` nor `projects.*` records *who* decided or
+  created something -- there is no per-operator identity anywhere in the
+  system (the dashboard has one shared token, not accounts), so "who
+  approved this" is unanswerable by design, not by oversight.~~ Closed,
+  once the accounts system this item predates actually existed: see the
+  follow-up below.
+
+**Follow-up (much later, prompted by an outside production-readiness
+review): "who approved this" is answerable now.** `allgres_private.
+audit_log` gained `user_id`/`username`, resolved from `session_token` by
+`dashboard_rpc` itself (`allgres_private.session_user`, the same
+resolution every admin-gated action already used) and stamped alongside
+`operator_name` rather than replacing it -- a row can carry a verified
+`username` and a completely different self-reported `operator_name` at
+once, and the two are shown separately in the dashboard's Audit Log page.
+Deliberately no FK from `audit_log.user_id` to `users`: `audit_log` is
+append-only (a trigger enforces it even against the table's own owner),
+and an `ON DELETE SET NULL` -- the obvious first instinct -- is itself an
+`UPDATE`, which that exact trigger would reject the moment a referenced
+user account was ever deleted; caught by `fn_selftest`'s own fixture
+cleanup the first time this was tried, before it ever became a production
+issue. This closes the gap for every audited mutation uniformly
+(`fn_decide_approval`, `projects.*`, and everything else that already
+calls `allgres_private.audit`) without touching any of those functions
+individually -- the identity now flows through the one place they all
+already record to. One new selftest case
+(`audit_log_records_real_logged_in_user_id`, 317 up from 316); verified
+live over real HTTP too, not only via `fn_selftest`: logged in as a real
+account, made a call with a *different* self-reported `operator_name`, and
+confirmed the resulting row carried the account's own `user_id`/`username`
+rather than the self-reported name. Verified on both a fresh
+`CREATE EXTENSION` and a rerun in the same database; `cargo test --lib`'s
+30 cases unaffected (SQL-only change).
+
+Still not done, and not part of this fix: `human_approvals`/
+`change_proposals` rows themselves still carry no `decided_by`/
+`created_by` column of their own -- the answer lives in `audit_log`, a
+separate table, not on the row it's about. Fine for "who approved this,"
+read as a question about the event; a real column would be needed to
+answer it as a property of the approval/proposal row itself (e.g. to
+`JOIN` and filter approvals by decider directly, without going through
+`audit_log`'s own text-matching on `action`/`details`).
 
 ## 11. Fine-grained operator controls
 
