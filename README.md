@@ -949,10 +949,16 @@ name, a log's own content) — see KNOWN_ISSUES item 31 for the exact scope.
 
 ## Known limitations
 
-Outstanding gaps — secret key rotation, no automatic OAuth token refresh,
-no per-task correctness judge behind [evaluation-gated
+Outstanding gaps — secret key rotation, no per-task correctness judge
+behind [evaluation-gated
 self-improvement](#evaluation-gated-self-improvement), and more — are
 tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Read it before deploying.
+(OAuth token refresh *is* automatic -- `allgres_private.
+queue_oauth_maintenance` queues a `refresh_token` grant on its own before
+an access token expires; see [Secrets at rest](#secrets-at-rest). An
+earlier version of this line and KNOWN_ISSUES.md item 24 both said
+otherwise -- true when item 24 was written, stale once the refresh path
+was actually built, and never updated after.)
 
 `allgres_public.fn_selftest()` exercises the validate/queue/claim/complete state
 machine and every shape that defeated the old text scanner, and runs as part

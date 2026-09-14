@@ -1562,10 +1562,19 @@ plaintext secret or token to begin with: there is no `response_body` column
 on it at all, only a status code and, on failure, the provider's own error
 text.
 
-**Deliberately not built**: token *refresh* — an expired `access_token` has
-to be reconnected from Settings by hand; nothing calls a provider's
-`refresh_token` grant automatically, though `llm_secrets.expires_at` is
-recorded and available for that later. `oauth_scope` has no operator setter
+~~**Deliberately not built**: token *refresh* — an expired `access_token`
+has to be reconnected from Settings by hand; nothing calls a provider's
+`refresh_token` grant automatically~~ -- no longer true and this paragraph
+went stale without anyone coming back to fix it: `allgres_private.
+queue_oauth_maintenance` (called from the same `fn_pump` polling loop as
+everything else in this item) queues a `refresh_token` grant on its own
+once `llm_secrets.expires_at` is within two minutes, using exactly the
+`expires_at` this paragraph originally said was "recorded and available
+for that later." Caught by an outside readiness review of the whole project that checked
+this specific claim against the actual code rather than trusting this
+file; see README's "Known limitations" for the matching fix there.
+
+`oauth_scope` has no operator setter
 (`fn_set_provider` never gained one) — it can only be seeded directly,
 same limitation the schema already had before this pass, just not removed
 by it either. No confirmation dialog before "Connect via OAuth" navigates
