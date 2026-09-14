@@ -3376,3 +3376,81 @@ HTTP the same way the dashboard's own JS calls them --
 `tool_experiments.list` returns the expected shape and
 `agents.set_tool_override_autonomy_preset` actually updates self_improve's
 `agent_config`, visible again through `agents.list`.
+
+## 41. Cost/usage budgets, closing the "deliberately not here" gap `schedules` carried since item 6
+
+Prompted by an outside production-readiness review's P0 finding, verified
+against the code first: `schedules`' own header comment admitted nothing
+in this codebase parsed token usage out of an LLM response or priced a
+provider/model, so a cost cap on a schedule would only ever compare
+against a number nothing populated. For an agent running unattended
+overnight on a schedule, that was named as the real accident path -- a
+runaway or misconfigured schedule with no dollar ceiling, only `max_runs`/
+`ends_at`.
+
+**Usage.** `allgres_private.llm_usage_from_http(p_body)` is a sibling to
+the existing `llm_text_from_http`: same two response shapes (OpenAI-
+compatible `usage.prompt_tokens`/`completion_tokens`, Anthropic
+`usage.input_tokens`/`output_tokens`), normalized to one shape, `NULL` --
+not a jsonb of `NULL`s -- when neither is present. `fn_complete_outbound`
+calls it only for a genuinely successful `'llm'` completion and stores the
+result on `outbound_calls.prompt_tokens`/`completion_tokens`.
+
+**Price sheet.** `allgres_private.llm_model_prices` (`provider_id`,
+`model`, `input_price_per_1k`, `output_price_per_1k`) is a manual table an
+admin maintains (`fn_set_model_price`/`fn_delete_model_price`, Settings'
+new "Model prices" panel) -- there is no live pricing API this reads from,
+by design; an unpriced model is invisible to every dollar figure this
+feature computes, never silently treated as free. `cost_usd` on each
+`outbound_calls` row is computed against whatever price was on file at
+completion time and frozen there, so a later price edit can never reprice
+a call that already happened -- the same reasoning `audit_log`'s
+denormalized `username` snapshot already uses (item 40's own follow-up)
+applied to a second, unrelated feature independently.
+
+**Schedule attribution and the budget itself.** `sessions` gained
+`schedule_id`, stamped by `fn_create_session` the moment
+`fn_run_schedules`/`fn_run_schedule_now` spawns a session on a schedule's
+behalf (nullable -- every other session, the dashboard's Run page
+included, is completely unaffected). `schedules` gained `max_cost_usd`
+(optional, same shape as `max_runs`) and `spent_cost_usd` (a running
+total). `fn_complete_outbound` adds a completed call's own `cost_usd` into
+its task's schedule, if any, and deactivates that schedule the instant
+`spent_cost_usd` crosses `max_cost_usd` -- eagerly, in the same
+transaction the cost was recorded in, not only the next time
+`fn_run_schedules` ticks. `fn_run_schedules`/`fn_run_schedule_now` both
+also check the same three stop conditions (`max_runs`/`ends_at`/
+`max_cost_usd`) before firing, exactly the existing "honoured between
+ticks, not just at create time" pattern `max_runs`/`ends_at` already had
+-- `fn_run_schedule_now` needed the identical fix (it had never checked
+`max_runs`/`ends_at` symmetrically with `fn_run_schedules` either, a small
+pre-existing gap in the "Run now" button caught while wiring this through
+it).
+
+Deliberately not in this pass: a per-agent or per-session budget
+independent of a schedule (every `cost_usd` this computes is queryable
+directly for that today, just not enforced as its own stop condition); any
+live pricing API integration (the price sheet stays something an operator
+types in by hand, on purpose); and a `retry_safe`/`needs_operator`
+classification for tool calls with real external side effects, a
+different gap the same outside review named that this item does not
+address.
+
+Five new selftest cases (322, up from 317): `llm_usage_from_http` parses
+both dialects and returns `NULL` for neither; a schedule-spawned call's
+usage becomes a real `cost_usd` on the row and accrues into
+`spent_cost_usd`; that crossing `max_cost_usd` deactivates the schedule
+immediately, not just on schedule-list's own is_active bit; and an
+unpriced model leaves `cost_usd` `NULL` and never accrues anything.
+Verified on both a fresh `CREATE EXTENSION` and a rerun in the same
+database; `cargo test --lib`'s 30 cases unaffected. Also verified live
+over real HTTP end to end, not only via `fn_selftest`: created a real
+provider and price via the dashboard RPC actions, created a schedule with
+`max_cost_usd` set, fired it (`schedules.run_now`), confirmed the spawned
+session carried the schedule's own `schedule_id`, completed a synthetic
+`'llm'` outbound call for that task with a real `usage` block, and
+confirmed the resulting `cost_usd`/`spent_cost_usd` matched the expected
+arithmetic and the schedule deactivated itself in the same request --
+`schedules.list` reflected all of it immediately afterward, exactly as the
+dashboard's own Schedules panel (updated with a Cost column and a max-cost
+field) would show it.

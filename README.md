@@ -764,25 +764,53 @@ recomputed as `now() + interval_seconds`, never by walking forward in fixed
 steps from where it was.
 
 A schedule's own `name`/`goal` plus its `run_count`/`last_run_at`/
-`last_session_id` *are* the durable long-term-goal-tracking record — how
-many times has this actually been checked on, most recently when, against
-which session — queryable in PostgreSQL like everything else here, not a
-separate concept kept anywhere else. Two independent, optional stop
-conditions — `max_runs` (a run budget) and `ends_at` (a wall-clock deadline)
-— are enforced on every tick, not only at create time: a schedule that
-reaches either is deactivated (`is_active = false`) rather than fired one
-run past the limit. `schedules.run_now` fires one immediately regardless of
-`next_run_at`, still subject to both stop conditions — the closest thing in
-this slice to a genuinely event-driven trigger (an operator, or an external
-system calling the same RPC action, is the "event").
+`last_session_id`/`spent_cost_usd` *are* the durable long-term-goal-tracking
+record — how many times has this actually been checked on, most recently
+when, against which session, how much has it spent — queryable in
+PostgreSQL like everything else here, not a separate concept kept anywhere
+else. Three independent, optional stop conditions — `max_runs` (a run
+budget), `ends_at` (a wall-clock deadline), and `max_cost_usd` (a dollar
+budget, below) — are enforced on every tick, not only at create time: a
+schedule that reaches any of them is deactivated (`is_active = false`)
+rather than fired one run past the limit. `schedules.run_now` fires one
+immediately regardless of `next_run_at`, still subject to all three stop
+conditions — the closest thing in this slice to a genuinely event-driven
+trigger (an operator, or an external system calling the same RPC action, is
+the "event").
 
-Deliberately not in this slice: a real *cost*-based stop condition (a
-dollar or token budget) — nothing in this codebase parses token usage out
-of an LLM response or prices a provider/model today, so a cost cap would
-only ever compare against a number nothing populates; and a genuinely
-event/webhook-triggered schedule (fired by an external condition, not a
-timer or a manual call) — `schedules.run_now` covers the manual case today,
-a real inbound trigger is future work.
+**Cost budget.** Every successful `'llm'` outbound call has its response
+body's own `usage` field parsed (`allgres_private.llm_usage_from_http` —
+OpenAI-compatible `usage.prompt_tokens`/`completion_tokens` and Anthropic
+`usage.input_tokens`/`output_tokens` are both recognized, normalized to one
+shape) and stored on the call itself
+(`outbound_calls.prompt_tokens`/`completion_tokens`). Priced against a
+manual price sheet an admin maintains in Settings → Model prices
+(`allgres_private.llm_model_prices`, one row per provider/model actually
+priced — nothing populates this from a live pricing API), the resulting
+dollar figure is frozen onto that same call as `cost_usd` at the moment it
+completes, so a later price edit can never silently reprice a call that
+already happened. A model with no price row leaves `cost_usd` — and every
+budget computed from it — `NULL`, never a false `0`: an unpriced model's
+spend is invisible to this feature entirely, not silently treated as free.
+
+If the task that call belongs to traces back (via its session's
+`schedule_id`, set the moment `fn_run_schedules`/`schedules.run_now` spawns
+that session) to a schedule with `max_cost_usd` set, that cost accrues into
+the schedule's own `spent_cost_usd` — and crossing `max_cost_usd` deactivates
+the schedule immediately, in `fn_complete_outbound` itself, not only at
+`fn_run_schedules`' next tick. An hourly schedule must not be able to run
+for most of a day past its own budget before anything notices just because
+nothing rechecked it until the next scheduled fire.
+
+Deliberately not in this slice: a genuinely event/webhook-triggered
+schedule (fired by an external condition, not a timer or a manual call) —
+`schedules.run_now` covers the manual case today, a real inbound trigger is
+future work. Also out of scope: a *per-agent* or *per-session* cost budget
+independent of a schedule (every `outbound_calls.cost_usd` this feature
+computes is queryable directly for that today, just not enforced as a stop
+condition outside the schedule case above), and any live pricing API
+integration — the price sheet is, and is expected to stay, something an
+operator types in by hand.
 
 ## Evaluation-gated self-improvement
 

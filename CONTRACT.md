@@ -36,13 +36,13 @@ scope the branch then checks.
 - **`require_admin`** (8 actions: `users.*`, `assignments.*`) — always
   requires a logged-in admin. No bootstrap exception; these only exist
   once the accounts system does.
-- **`require_admin_if_accounts_exist`** (31 actions: most
+- **`require_admin_if_accounts_exist`** (34 actions: most
   platform-configuration surface — `agents.create`/`.update`,
   `permissions.grant`/`.revoke`, `provider.*`, `connections.*`,
   `procedures.*`, `procedure_tools.*`, `schedules.*`, `allowlist.add`/
   `.remove`, `projects.create`/`.update`, `sessions.list`/`.get`,
   `tasks.list`, `logs.list`, `providers.oauth_*`, `tool_experiments.list`,
-  `agents.set_tool_override_autonomy_preset`, …) — a no-op while
+  `agents.set_tool_override_autonomy_preset`, `model_prices.*`, …) — a no-op while
   `allgres_private.users` is empty (single-operator, shared-token-only
   deployment), otherwise requires a logged-in admin. Checked fresh on
   every call, never cached.

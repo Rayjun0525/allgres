@@ -1287,6 +1287,96 @@ BEGIN
     AND (SELECT run_count FROM allgres_private.schedules WHERE schedule_id = v_call) = 2;
   v := v || jsonb_build_array(jsonb_build_object('name', 'inactive_schedule_never_fires', 'ok', ok));
 
+  -- Cost/usage budget (KNOWN_ISSUES.md's own "deliberately not here" on
+  -- max_cost_usd, closed): llm_usage_from_http normalizes both provider
+  -- dialects to one shape and returns NULL, not a jsonb of NULLs, when
+  -- neither is present -- "unknown," never a false zero.
+  ok := allgres_private.llm_usage_from_http('{"usage":{"prompt_tokens":100,"completion_tokens":50}}')
+          = jsonb_build_object('prompt_tokens', 100, 'completion_tokens', 50)
+    AND allgres_private.llm_usage_from_http('{"usage":{"input_tokens":10,"output_tokens":5}}')
+          = jsonb_build_object('prompt_tokens', 10, 'completion_tokens', 5)
+    AND allgres_private.llm_usage_from_http('{"no_usage_field_here":true}') IS NULL
+    AND allgres_private.llm_usage_from_http('not json at all') IS NULL;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'llm_usage_from_http_parses_both_dialects', 'ok', ok));
+
+  -- End to end: a schedule-spawned call's own usage becomes a real dollar
+  -- figure on the outbound_calls row (frozen at completion time against
+  -- whatever price was on file then) and accrues into the schedule's own
+  -- running total -- crossing max_cost_usd deactivates the schedule
+  -- immediately, in fn_complete_outbound itself, not only at
+  -- fn_run_schedules' next tick (the same "honoured the moment it
+  -- happens" reasoning max_runs/ends_at already get elsewhere in this
+  -- section, sharpened here because a schedule could otherwise run for a
+  -- full interval past its own budget before anything noticed).
+  DELETE FROM allgres_private.llm_secrets WHERE provider_id IN (
+    SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_cost_provider'
+  );
+  DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_cost_provider';
+  v_provider := (allgres_public.fn_create_provider(
+    'selftest_cost_provider', 'openai_compat', 'https://selftest.invalid/v1', NULL, false
+  )->>'provider_id')::uuid;
+  PERFORM allgres_public.fn_set_model_price(v_provider, 'selftest-cost-model', 0.01, 0.03);
+
+  UPDATE allgres_private.schedules
+  SET is_active = true, max_runs = NULL, ends_at = NULL,
+      max_cost_usd = 0.02, spent_cost_usd = 0,
+      next_run_at = now() - interval '1 minute'
+  WHERE schedule_id = v_call;
+  r := allgres_public.fn_run_schedule_now(v_call);
+  v_sid := (r->>'session_id')::uuid;
+  ok := (SELECT schedule_id FROM allgres_private.sessions WHERE session_id = v_sid) = v_call;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'schedule_run_now_stamps_session_with_schedule_id', 'ok', ok));
+
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+  INSERT INTO allgres_private.outbound_calls (
+    task_id, kind, url, request_headers, request_body, status, provider_id, auth_kind
+  ) VALUES (
+    v_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb,
+    jsonb_build_object('model', 'selftest-cost-model'), 'in_flight', v_provider, 'authorization'
+  ) RETURNING call_id INTO v_call2;
+  -- 1000 prompt + 500 completion tokens against 0.01/0.03 per 1k =
+  -- 0.01*1 + 0.03*0.5 = 0.025, deliberately over max_cost_usd (0.02) set
+  -- above so the eager deactivation is actually exercised, not just the
+  -- arithmetic.
+  PERFORM allgres_public.fn_complete_outbound(v_call2, 200, jsonb_build_object(
+    'choices', jsonb_build_array(jsonb_build_object('message', jsonb_build_object(
+      'content', '{"action":"final_answer","answer":"ok"}'
+    ))),
+    'usage', jsonb_build_object('prompt_tokens', 1000, 'completion_tokens', 500)
+  )::text);
+  ok := (SELECT prompt_tokens FROM allgres_private.outbound_calls WHERE call_id = v_call2) = 1000
+    AND (SELECT completion_tokens FROM allgres_private.outbound_calls WHERE call_id = v_call2) = 500
+    AND (SELECT cost_usd FROM allgres_private.outbound_calls WHERE call_id = v_call2) = 0.025;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'outbound_call_records_usage_and_cost', 'ok', ok));
+
+  ok := (SELECT spent_cost_usd FROM allgres_private.schedules WHERE schedule_id = v_call) = 0.025
+    AND (SELECT is_active FROM allgres_private.schedules WHERE schedule_id = v_call) IS FALSE;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'schedule_deactivates_immediately_on_crossing_max_cost_usd', 'ok', ok));
+
+  -- An unpriced model must leave cost_usd NULL -- never a false 0 -- and
+  -- therefore never accrue anything into a schedule's spent_cost_usd
+  -- either, exactly the "unknown, not free" contract this whole feature
+  -- depends on to avoid understating real spend.
+  INSERT INTO allgres_private.outbound_calls (
+    task_id, kind, url, request_headers, request_body, status, provider_id, auth_kind
+  ) VALUES (
+    v_tid, 'llm', 'https://selftest.invalid/v1/chat/completions', '{}'::jsonb,
+    jsonb_build_object('model', 'selftest-unpriced-model'), 'in_flight', v_provider, 'authorization'
+  ) RETURNING call_id INTO v_call2;
+  PERFORM allgres_public.fn_complete_outbound(v_call2, 200, jsonb_build_object(
+    'choices', jsonb_build_array(jsonb_build_object('message', jsonb_build_object(
+      'content', '{"action":"final_answer","answer":"ok"}'
+    ))),
+    'usage', jsonb_build_object('prompt_tokens', 1000, 'completion_tokens', 500)
+  )::text);
+  ok := (SELECT cost_usd FROM allgres_private.outbound_calls WHERE call_id = v_call2) IS NULL
+    AND (SELECT spent_cost_usd FROM allgres_private.schedules WHERE schedule_id = v_call) = 0.025;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'unpriced_model_leaves_cost_null_not_free', 'ok', ok));
+
+  DELETE FROM allgres_private.outbound_calls WHERE provider_id = v_provider;
+  PERFORM allgres_public.fn_delete_model_price(v_provider, 'selftest-cost-model');
+  DELETE FROM allgres_private.llm_secrets WHERE provider_id = v_provider;
+  DELETE FROM allgres_private.llm_providers WHERE provider_id = v_provider;
   DELETE FROM allgres_private.schedules WHERE schedule_id = v_call;
 
   -- 25. build_llm_http fails closed on an unconfigured/disabled provider
@@ -4563,7 +4653,7 @@ BEGIN
     'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
     'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
-    'approvals.decide', 'tool_experiments.list', 'selftest'
+    'approvals.decide', 'tool_experiments.list', 'model_prices.list', 'model_prices.set', 'model_prices.delete', 'selftest'
   ]::text[]) a
   WHERE a <> ALL(COALESCE(v_live_rpc_actions, ARRAY[]::text[]));
   SELECT array_agg(a ORDER BY a) INTO v_extra_rpc_actions
@@ -4585,7 +4675,7 @@ BEGIN
     'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
     'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
-    'approvals.decide', 'tool_experiments.list', 'selftest'
+    'approvals.decide', 'tool_experiments.list', 'model_prices.list', 'model_prices.set', 'model_prices.delete', 'selftest'
   ]::text[]);
   ok := v_missing_rpc_actions IS NULL AND v_extra_rpc_actions IS NULL;
   v := v || jsonb_build_array(jsonb_build_object(

@@ -604,6 +604,37 @@
     ]
   },
   {
+    "action": "model_prices.list",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "session_token"
+    ]
+  },
+  {
+    "action": "model_prices.set",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "model",
+      "provider_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "model_prices.delete",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "model",
+      "provider_id",
+      "session_token"
+    ]
+  },
+  {
     "action": "connections.list",
     "guards": [],
     "params": []
@@ -737,6 +768,7 @@
       "ends_at",
       "goal",
       "interval_seconds",
+      "max_cost_usd",
       "max_runs",
       "name",
       "session_token",
@@ -750,11 +782,13 @@
     ],
     "params": [
       "clear_ends_at",
+      "clear_max_cost_usd",
       "clear_max_runs",
       "ends_at",
       "goal",
       "interval_seconds",
       "is_active",
+      "max_cost_usd",
       "max_runs",
       "schedule_id",
       "session_token"

@@ -12,7 +12,8 @@
 CREATE OR REPLACE FUNCTION allgres_public.fn_create_session(
   p_agent_id uuid,
   p_goal text,
-  p_project_id uuid DEFAULT NULL
+  p_project_id uuid DEFAULT NULL,
+  p_schedule_id uuid DEFAULT NULL
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -34,8 +35,13 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'project inactive or missing' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO allgres_private.sessions (agent_id, project_id, goal, status)
-  VALUES (p_agent_id, p_project_id, btrim(p_goal), 'open')
+  -- p_schedule_id is deliberately not dashboard_rpc-reachable (only
+  -- fn_run_schedules passes it, with its own row's real schedule_id) --
+  -- see sessions.schedule_id's own comment for what it's for. No existence
+  -- check needed the way project_id gets one: the only caller already has
+  -- the row FOR UPDATE.
+  INSERT INTO allgres_private.sessions (agent_id, project_id, schedule_id, goal, status)
+  VALUES (p_agent_id, p_project_id, p_schedule_id, btrim(p_goal), 'open')
   RETURNING session_id INTO v_sid;
   INSERT INTO allgres_private.tasks (session_id, agent_id, status, input, policy_generation)
   VALUES (v_sid, p_agent_id, 'queued', jsonb_build_object('goal', btrim(p_goal)),
@@ -120,7 +126,8 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_create_schedule(
   p_interval_seconds int,
   p_max_runs int DEFAULT NULL,
   p_ends_at timestamptz DEFAULT NULL,
-  p_start_at timestamptz DEFAULT NULL
+  p_start_at timestamptz DEFAULT NULL,
+  p_max_cost_usd numeric DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -144,9 +151,15 @@ BEGIN
   IF p_max_runs IS NOT NULL AND p_max_runs <= 0 THEN
     RAISE EXCEPTION 'max_runs must be a positive number' USING ERRCODE = 'P0001';
   END IF;
+  IF p_max_cost_usd IS NOT NULL AND p_max_cost_usd <= 0 THEN
+    RAISE EXCEPTION 'max_cost_usd must be a positive number' USING ERRCODE = 'P0001';
+  END IF;
 
-  INSERT INTO allgres_private.schedules (name, agent_id, goal, interval_seconds, next_run_at, max_runs, ends_at)
-  VALUES (trim(p_name), p_agent_id, trim(p_goal), p_interval_seconds, COALESCE(p_start_at, now()), p_max_runs, p_ends_at)
+  INSERT INTO allgres_private.schedules
+    (name, agent_id, goal, interval_seconds, next_run_at, max_runs, ends_at, max_cost_usd)
+  VALUES
+    (trim(p_name), p_agent_id, trim(p_goal), p_interval_seconds, COALESCE(p_start_at, now()),
+     p_max_runs, p_ends_at, p_max_cost_usd)
   RETURNING schedule_id INTO v_id;
   PERFORM allgres_private.audit('schedules.create', jsonb_build_object(
     'schedule_id', v_id, 'name', trim(p_name), 'agent_id', p_agent_id, 'interval_seconds', p_interval_seconds
@@ -163,7 +176,9 @@ CREATE OR REPLACE FUNCTION allgres_public.fn_set_schedule(
   p_max_runs int DEFAULT NULL,
   p_clear_max_runs boolean DEFAULT false,
   p_ends_at timestamptz DEFAULT NULL,
-  p_clear_ends_at boolean DEFAULT false
+  p_clear_ends_at boolean DEFAULT false,
+  p_max_cost_usd numeric DEFAULT NULL,
+  p_clear_max_cost_usd boolean DEFAULT false
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -179,6 +194,9 @@ BEGIN
   IF p_interval_seconds IS NOT NULL AND p_interval_seconds <= 0 THEN
     RAISE EXCEPTION 'interval_seconds must be a positive number of seconds' USING ERRCODE = 'P0001';
   END IF;
+  IF p_max_cost_usd IS NOT NULL AND p_max_cost_usd <= 0 THEN
+    RAISE EXCEPTION 'max_cost_usd must be a positive number' USING ERRCODE = 'P0001';
+  END IF;
 
   UPDATE allgres_private.schedules
   SET goal = COALESCE(NULLIF(p_goal, ''), goal),
@@ -186,6 +204,7 @@ BEGIN
       is_active = COALESCE(p_is_active, is_active),
       max_runs = CASE WHEN p_clear_max_runs THEN NULL ELSE COALESCE(p_max_runs, max_runs) END,
       ends_at = CASE WHEN p_clear_ends_at THEN NULL ELSE COALESCE(p_ends_at, ends_at) END,
+      max_cost_usd = CASE WHEN p_clear_max_cost_usd THEN NULL ELSE COALESCE(p_max_cost_usd, max_cost_usd) END,
       updated_at = now()
   WHERE schedule_id = p_schedule_id;
   PERFORM allgres_private.audit('schedules.update', jsonb_build_object('schedule_id', p_schedule_id, 'is_active', p_is_active));
@@ -236,24 +255,27 @@ DECLARE
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
   FOR r IN
-    SELECT schedule_id, agent_id, goal, interval_seconds, max_runs, run_count, ends_at
+    SELECT schedule_id, agent_id, goal, interval_seconds, max_runs, run_count, ends_at,
+           max_cost_usd, spent_cost_usd
     FROM allgres_private.schedules
     WHERE is_active AND next_run_at <= now()
     FOR UPDATE SKIP LOCKED
   LOOP
     -- A stop condition reached between ticks (an operator lowering max_runs,
-    -- or ends_at simply arriving) is honoured here too, not only at create/
-    -- set time -- deactivate and skip firing rather than run one more time
-    -- past the limit.
+    -- ends_at simply arriving, or fn_complete_outbound's own eager check
+    -- below having already caught spent_cost_usd crossing max_cost_usd) is
+    -- honoured here too, not only at create/set time -- deactivate and
+    -- skip firing rather than run one more time past the limit.
     IF (r.max_runs IS NOT NULL AND r.run_count >= r.max_runs)
-       OR (r.ends_at IS NOT NULL AND r.ends_at <= now()) THEN
+       OR (r.ends_at IS NOT NULL AND r.ends_at <= now())
+       OR (r.max_cost_usd IS NOT NULL AND r.spent_cost_usd >= r.max_cost_usd) THEN
       UPDATE allgres_private.schedules SET is_active = false, updated_at = now()
       WHERE schedule_id = r.schedule_id;
       CONTINUE;
     END IF;
 
     BEGIN
-      v_created := allgres_public.fn_create_session(r.agent_id, r.goal);
+      v_created := allgres_public.fn_create_session(r.agent_id, r.goal, NULL, r.schedule_id);
     EXCEPTION WHEN others THEN
       -- The agent went inactive, or some other transient failure -- push
       -- next_run_at forward anyway so a permanently-broken schedule cannot
@@ -275,6 +297,7 @@ BEGIN
         is_active = NOT (
           (max_runs IS NOT NULL AND run_count + 1 >= max_runs)
           OR (ends_at IS NOT NULL AND ends_at <= now())
+          OR (max_cost_usd IS NOT NULL AND spent_cost_usd >= max_cost_usd)
         ),
         updated_at = now()
     WHERE schedule_id = r.schedule_id;
@@ -309,11 +332,13 @@ BEGIN
   IF NOT s.is_active THEN
     RAISE EXCEPTION 'schedule is not active' USING ERRCODE = 'P0001';
   END IF;
-  IF (s.max_runs IS NOT NULL AND s.run_count >= s.max_runs) OR (s.ends_at IS NOT NULL AND s.ends_at <= now()) THEN
+  IF (s.max_runs IS NOT NULL AND s.run_count >= s.max_runs)
+     OR (s.ends_at IS NOT NULL AND s.ends_at <= now())
+     OR (s.max_cost_usd IS NOT NULL AND s.spent_cost_usd >= s.max_cost_usd) THEN
     RAISE EXCEPTION 'schedule has already reached a stop condition' USING ERRCODE = 'P0001';
   END IF;
 
-  v_created := allgres_public.fn_create_session(s.agent_id, s.goal);
+  v_created := allgres_public.fn_create_session(s.agent_id, s.goal, NULL, s.schedule_id);
 
   UPDATE allgres_private.schedules
   SET run_count = run_count + 1,
@@ -322,6 +347,7 @@ BEGIN
       is_active = NOT (
         (max_runs IS NOT NULL AND run_count + 1 >= max_runs)
         OR (ends_at IS NOT NULL AND ends_at <= now())
+        OR (max_cost_usd IS NOT NULL AND spent_cost_usd >= max_cost_usd)
       ),
       updated_at = now()
   WHERE schedule_id = p_schedule_id;
@@ -507,6 +533,63 @@ BEGIN
     'provider_id', p_provider_id, 'base_url', v_url, 'enabled', p_enabled,
     'allow_private_network', v_allow, 'oauth_client_secret_set', (p_oauth_client_secret IS NOT NULL AND p_oauth_client_secret <> '')
   ));
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+-- Manual price sheet for allgres_private.llm_model_prices -- see that
+-- table's own comment. Upsert by (provider_id, model), the same shape a
+-- price list naturally has (one row per model actually priced, "set it
+-- again" replaces rather than needing a separate update path).
+CREATE OR REPLACE FUNCTION allgres_public.fn_set_model_price(
+  p_provider_id uuid,
+  p_model text,
+  p_input_price_per_1k numeric,
+  p_output_price_per_1k numeric
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  IF NULLIF(trim(p_model), '') IS NULL THEN
+    RAISE EXCEPTION 'model is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.llm_providers WHERE provider_id = p_provider_id) THEN
+    RAISE EXCEPTION 'provider not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF COALESCE(p_input_price_per_1k, -1) < 0 OR COALESCE(p_output_price_per_1k, -1) < 0 THEN
+    RAISE EXCEPTION 'prices must be zero or a positive number' USING ERRCODE = 'P0001';
+  END IF;
+
+  INSERT INTO allgres_private.llm_model_prices
+    (provider_id, model, input_price_per_1k, output_price_per_1k, updated_at)
+  VALUES (p_provider_id, trim(p_model), p_input_price_per_1k, p_output_price_per_1k, now())
+  ON CONFLICT (provider_id, model) DO UPDATE
+    SET input_price_per_1k = EXCLUDED.input_price_per_1k,
+        output_price_per_1k = EXCLUDED.output_price_per_1k,
+        updated_at = now();
+  PERFORM allgres_private.audit('model_prices.set', jsonb_build_object(
+    'provider_id', p_provider_id, 'model', trim(p_model),
+    'input_price_per_1k', p_input_price_per_1k, 'output_price_per_1k', p_output_price_per_1k
+  ));
+  RETURN jsonb_build_object('ok', true);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_delete_model_price(p_provider_id uuid, p_model text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+BEGIN
+  DELETE FROM allgres_private.llm_model_prices
+  WHERE provider_id = p_provider_id AND model = p_model;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'price not found' USING ERRCODE = 'P0001';
+  END IF;
+  PERFORM allgres_private.audit('model_prices.delete', jsonb_build_object('provider_id', p_provider_id, 'model', p_model));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;

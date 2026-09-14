@@ -1011,15 +1011,13 @@ CREATE INDEX IF NOT EXISTS sessions_project_idx
 -- restart-survives-for-free property every other queue in this file
 -- already has: state is a row, not a timer running somewhere.
 --
--- Two independent stop conditions, both optional: max_runs (a run budget)
--- and ends_at (a wall-clock deadline) -- fn_run_schedules auto-deactivates
--- a schedule that has hit either, so "still is_active" itself means
--- "still eligible to fire," not just "was never turned off." A real
--- *cost*-based stop condition (a dollar or token budget) is deliberately
--- not here: nothing in this codebase parses token usage out of an LLM
--- response or prices a provider/model today, so a cost cap here would only
--- ever compare against a number nothing ever populates. That is real
--- follow-up work, not something to fake with an unenforced column.
+-- Three independent stop conditions, all optional: max_runs (a run
+-- budget), ends_at (a wall-clock deadline), and max_cost_usd (a dollar
+-- budget, added later once outbound_calls.cost_usd existed for it to
+-- compare against -- see that column's own comment) -- fn_run_schedules
+-- auto-deactivates a schedule that has hit any of them, so "still
+-- is_active" itself means "still eligible to fire," not just "was never
+-- turned off."
 CREATE TABLE IF NOT EXISTS allgres_private.schedules (
   schedule_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name             text NOT NULL UNIQUE,
@@ -1040,6 +1038,35 @@ CREATE TABLE IF NOT EXISTS allgres_private.schedules (
 CREATE INDEX IF NOT EXISTS schedules_due_idx
   ON allgres_private.schedules (next_run_at)
   WHERE is_active;
+
+-- The cost-based stop condition this table's own header comment used to
+-- say was deliberate future work -- now that outbound_calls.cost_usd
+-- exists to add up. max_cost_usd is optional, same shape as max_runs;
+-- spent_cost_usd is a running total fn_complete_outbound adds each
+-- completed 'llm' call's own cost_usd into (only ever for a call whose
+-- task's session actually has this schedule's schedule_id -- see
+-- sessions.schedule_id below), and fn_run_schedules checks it the exact
+-- same way it already checks max_runs/ends_at, both at the next tick and,
+-- like those two, the moment it's crossed rather than waiting for one --
+-- see fn_complete_outbound's own comment for why cost is checked eagerly
+-- there too. Starts at 0, not NULL, so "no spend recorded yet" and "spend
+-- was recorded but happened to be exactly 0" are never confused with "not
+-- tracked" -- unlike cost_usd on a single call, which does distinguish
+-- unknown (NULL) from free (0).
+ALTER TABLE allgres_private.schedules
+  ADD COLUMN IF NOT EXISTS max_cost_usd numeric CHECK (max_cost_usd IS NULL OR max_cost_usd > 0),
+  ADD COLUMN IF NOT EXISTS spent_cost_usd numeric NOT NULL DEFAULT 0;
+
+-- Which schedule (if any) spawned this session -- fn_run_schedules sets it
+-- the same way it always set last_session_id on the schedules row itself,
+-- just recorded here too so a completed 'llm' call's own task can be
+-- traced back to the schedule whose max_cost_usd/spent_cost_usd it should
+-- count against (fn_complete_outbound). NULL for every session that was
+-- never spawned by a schedule at all -- the dashboard's Run page, a smoke
+-- test, delegate/continue -- exactly as it always has been; nothing about
+-- ordinary session creation changes.
+ALTER TABLE allgres_private.sessions
+  ADD COLUMN IF NOT EXISTS schedule_id uuid REFERENCES allgres_private.schedules(schedule_id) ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS allgres_private.tasks (
   task_id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2095,6 +2122,39 @@ CREATE INDEX IF NOT EXISTS outbound_calls_procedure_tool_idx
   ON allgres_private.outbound_calls (procedure_tool_id) WHERE procedure_tool_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS outbound_calls_experiment_idx
   ON allgres_private.outbound_calls (experiment_id) WHERE experiment_id IS NOT NULL;
+
+-- Cost/usage tracking (KNOWN_ISSUES.md's own "deliberately not here" on
+-- schedules.max_cost_usd below, closed): prompt_tokens/completion_tokens
+-- are parsed out of a successful 'llm' call's own response body
+-- (allgres_private.llm_usage_from_http, fn_complete_outbound) -- NULL
+-- when the provider's response shape wasn't one of the two this was
+-- taught to read, not a false zero. cost_usd is computed from those
+-- token counts against llm_model_prices (below) at the moment this row
+-- completes and frozen here -- a later price edit must not silently
+-- reprice a call that already happened, the same reasoning audit_log's
+-- own denormalized username snapshot already uses elsewhere. NULL
+-- whenever either the token counts or a matching price row aren't
+-- available, which must read as "unknown," never as "free."
+ALTER TABLE allgres_private.outbound_calls
+  ADD COLUMN IF NOT EXISTS prompt_tokens int,
+  ADD COLUMN IF NOT EXISTS completion_tokens int,
+  ADD COLUMN IF NOT EXISTS cost_usd numeric;
+
+-- Manual price sheet, one row per (provider, model) actually priced --
+-- nothing populates this automatically, there is no live pricing API this
+-- extension calls. An unpriced model is not an error anywhere: it just
+-- means cost_usd stays NULL for calls against it and a schedule's own
+-- max_cost_usd, if set, can never observe spend it has no price for (see
+-- that column's own comment). updated_at is informational only, for an
+-- operator to judge how stale a price might be -- nothing reads it back.
+CREATE TABLE IF NOT EXISTS allgres_private.llm_model_prices (
+  provider_id          uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
+  model                text NOT NULL,
+  input_price_per_1k   numeric NOT NULL CHECK (input_price_per_1k >= 0),
+  output_price_per_1k  numeric NOT NULL CHECK (output_price_per_1k >= 0),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider_id, model)
+);
 
 -- 'recall': the new 'recall' agent action's own query text (semantic
 -- memory search, fn_next_step) -- queued and claimed exactly like
@@ -5584,6 +5644,53 @@ BEGIN
 END;
 $fn$;
 
+-- Sibling to llm_text_from_http above -- same two response shapes, same
+-- "IMMUTABLE, tolerate anything, NULL means unrecognized" contract, this
+-- time pulling out token counts instead of the reply text. Normalizes both
+-- provider dialects to one shape ({"prompt_tokens":N,"completion_tokens":N})
+-- so fn_complete_outbound and the cost math built on it never need to know
+-- which provider a given call was sent to. Returns NULL, not a jsonb with
+-- NULL fields, when neither shape is present at all -- outbound_calls.
+-- prompt_tokens/completion_tokens stay NULL in that case (a provider this
+-- was never taught to parse, or the field genuinely wasn't in the
+-- response), which is the correct "we don't know," not a false zero a cost
+-- budget could be silently computed against.
+CREATE OR REPLACE FUNCTION allgres_private.llm_usage_from_http(p_body text)
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+AS $fn$
+DECLARE
+  j jsonb;
+  v_prompt int;
+  v_completion int;
+BEGIN
+  BEGIN
+    j := p_body::jsonb;
+  EXCEPTION WHEN others THEN
+    RETURN NULL;
+  END;
+  -- OpenAI-compatible: {"usage":{"prompt_tokens":N,"completion_tokens":N}}
+  IF j #>> '{usage,prompt_tokens}' IS NOT NULL THEN
+    v_prompt := NULLIF(j #>> '{usage,prompt_tokens}', '')::int;
+    v_completion := NULLIF(j #>> '{usage,completion_tokens}', '')::int;
+    RETURN jsonb_build_object('prompt_tokens', v_prompt, 'completion_tokens', v_completion);
+  END IF;
+  -- Anthropic: {"usage":{"input_tokens":N,"output_tokens":N}}
+  IF j #>> '{usage,input_tokens}' IS NOT NULL THEN
+    v_prompt := NULLIF(j #>> '{usage,input_tokens}', '')::int;
+    v_completion := NULLIF(j #>> '{usage,output_tokens}', '')::int;
+    RETURN jsonb_build_object('prompt_tokens', v_prompt, 'completion_tokens', v_completion);
+  END IF;
+  RETURN NULL;
+EXCEPTION WHEN others THEN
+  -- A malformed usage block (non-numeric field, unexpected shape) must
+  -- never fail the completion of a real LLM response over it -- same
+  -- "tolerate anything" contract llm_text_from_http already has.
+  RETURN NULL;
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_complete_outbound(
   p_call_id uuid,
   p_status int,
@@ -5603,6 +5710,10 @@ DECLARE
   v_query_vec double precision[];
   v_requester uuid;
   v_expected_model text;
+  v_usage jsonb;
+  v_price allgres_private.llm_model_prices%ROWTYPE;
+  v_cost_usd numeric;
+  v_schedule_id uuid;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -5770,6 +5881,57 @@ BEGIN
       'content', v_text,
       'parsed', v_parsed
     );
+
+    -- Cost/usage (KNOWN_ISSUES.md's own "deliberately not here" on
+    -- schedules.max_cost_usd, closed): parsed only for a genuinely
+    -- successful 'llm' call -- an error response has no usage worth
+    -- recording. cost_usd stays NULL, not a false 0, unless BOTH the
+    -- provider's response actually carried a recognized usage shape AND
+    -- this (provider_id, model) pair has a price row -- an unpriced model
+    -- must never look free.
+    v_usage := allgres_private.llm_usage_from_http(p_body);
+    v_cost_usd := NULL;
+    IF v_usage IS NOT NULL THEN
+      SELECT * INTO v_price
+      FROM allgres_private.llm_model_prices
+      WHERE provider_id = c.provider_id AND model = (c.request_body->>'model');
+      IF FOUND THEN
+        v_cost_usd :=
+          (COALESCE((v_usage->>'prompt_tokens')::numeric, 0) / 1000.0) * v_price.input_price_per_1k
+          + (COALESCE((v_usage->>'completion_tokens')::numeric, 0) / 1000.0) * v_price.output_price_per_1k;
+      END IF;
+    END IF;
+    UPDATE allgres_private.outbound_calls
+    SET prompt_tokens = (v_usage->>'prompt_tokens')::int,
+        completion_tokens = (v_usage->>'completion_tokens')::int,
+        cost_usd = v_cost_usd
+    WHERE call_id = p_call_id;
+
+    -- Attribute that cost to the schedule (if any) whose own run spawned
+    -- this call's task, and let it cross max_cost_usd the moment it
+    -- happens rather than only at fn_run_schedules' next tick -- a
+    -- schedule firing hourly must not be able to run up to 23 hours past
+    -- its own budget before anything notices. No-op (both the UPDATE and
+    -- the deactivation check) when v_cost_usd is NULL -- an unpriced
+    -- model's calls are invisible to a cost budget the same way they are
+    -- to every other cost figure this feature computes, not silently
+    -- treated as free spend.
+    IF v_cost_usd IS NOT NULL THEN
+      SELECT s.schedule_id INTO v_schedule_id
+      FROM allgres_private.tasks t
+      JOIN allgres_private.sessions s ON s.session_id = t.session_id
+      WHERE t.task_id = c.task_id AND s.schedule_id IS NOT NULL;
+      IF v_schedule_id IS NOT NULL THEN
+        UPDATE allgres_private.schedules
+        SET spent_cost_usd = spent_cost_usd + v_cost_usd,
+            updated_at = now()
+        WHERE schedule_id = v_schedule_id;
+        UPDATE allgres_private.schedules
+        SET is_active = false, updated_at = now()
+        WHERE schedule_id = v_schedule_id
+          AND max_cost_usd IS NOT NULL AND spent_cost_usd >= max_cost_usd;
+      END IF;
+    END IF;
   END IF;
 
   -- The task may have been failed by the watchdog or by max_steps while this

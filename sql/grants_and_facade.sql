@@ -1385,6 +1385,36 @@ BEGIN
         COALESCE((p_request->>'response_format_json_object')::boolean, true)
       );
 
+    -- Manual price sheet (allgres_private.llm_model_prices' own comment) --
+    -- same platform-configuration guard class as provider.*, not open
+    -- listing: unlike settings.get's has_secret booleans, a price is a
+    -- real operational number worth restricting to admins once accounts
+    -- exist, not just a shape check.
+    WHEN 'model_prices.list' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'prices', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'provider_id', mp.provider_id, 'provider', p.name, 'model', mp.model,
+          'input_price_per_1k', mp.input_price_per_1k, 'output_price_per_1k', mp.output_price_per_1k,
+          'updated_at', mp.updated_at
+        ) ORDER BY p.name, mp.model)
+        FROM allgres_private.llm_model_prices mp
+        JOIN allgres_private.llm_providers p USING (provider_id)
+      ), '[]'::jsonb));
+
+    WHEN 'model_prices.set' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_set_model_price(
+        (p_request->>'provider_id')::uuid,
+        p_request->>'model',
+        (p_request->>'input_price_per_1k')::numeric,
+        (p_request->>'output_price_per_1k')::numeric
+      );
+
+    WHEN 'model_prices.delete' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_delete_model_price((p_request->>'provider_id')::uuid, p_request->>'model');
+
     -- Roadmap item 2: named external HTTP endpoints the 'http_request' tool
     -- can call with a stored credential (see allgres_private.api_connections'
     -- own comment). Never returns api_key -- only has_secret, the same as
@@ -1529,7 +1559,8 @@ BEGIN
           'schedule_id', sc.schedule_id, 'name', sc.name, 'agent_id', sc.agent_id, 'agent', a.name,
           'goal', sc.goal, 'interval_seconds', sc.interval_seconds, 'next_run_at', sc.next_run_at,
           'is_active', sc.is_active, 'max_runs', sc.max_runs, 'run_count', sc.run_count,
-          'ends_at', sc.ends_at, 'last_run_at', sc.last_run_at, 'last_session_id', sc.last_session_id
+          'ends_at', sc.ends_at, 'last_run_at', sc.last_run_at, 'last_session_id', sc.last_session_id,
+          'max_cost_usd', sc.max_cost_usd, 'spent_cost_usd', sc.spent_cost_usd
         ) ORDER BY sc.name)
         FROM allgres_private.schedules sc
         JOIN allgres_private.agents a USING (agent_id)
@@ -1544,7 +1575,8 @@ BEGIN
         (p_request->>'interval_seconds')::int,
         NULLIF(p_request->>'max_runs', '')::int,
         NULLIF(p_request->>'ends_at', '')::timestamptz,
-        NULLIF(p_request->>'start_at', '')::timestamptz
+        NULLIF(p_request->>'start_at', '')::timestamptz,
+        NULLIF(p_request->>'max_cost_usd', '')::numeric
       );
 
     WHEN 'schedules.update' THEN
@@ -1557,7 +1589,9 @@ BEGIN
         NULLIF(p_request->>'max_runs', '')::int,
         COALESCE((p_request->>'clear_max_runs')::boolean, false),
         NULLIF(p_request->>'ends_at', '')::timestamptz,
-        COALESCE((p_request->>'clear_ends_at')::boolean, false)
+        COALESCE((p_request->>'clear_ends_at')::boolean, false),
+        NULLIF(p_request->>'max_cost_usd', '')::numeric,
+        COALESCE((p_request->>'clear_max_cost_usd')::boolean, false)
       );
 
     WHEN 'schedules.delete' THEN
