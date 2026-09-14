@@ -53,6 +53,7 @@ DECLARE
   v_deleg_a uuid;
   v_deleg_b uuid;
   v_provider uuid;
+  v_rotate_provider uuid;
   v_device_provider uuid;
   v_device_session uuid;
   v_state text;
@@ -2010,6 +2011,63 @@ BEGIN
   DELETE FROM allgres_private.oauth_calls WHERE provider_id=v_device_provider;
   DELETE FROM allgres_private.oauth_device_sessions WHERE provider_id=v_device_provider;
   DELETE FROM allgres_private.llm_secrets WHERE provider_id=v_device_provider;
+
+  -- Secret key rotation (KNOWN_ISSUES.md item 7, closed): changing
+  -- allgres.secret_key used to make every existing 'enc:v1:' value
+  -- silently undecryptable, with re-entering every secret by hand as the
+  -- only recovery. fn_rotate_secret_key re-wraps everything from one key
+  -- to another in one call. Only meaningful with pgcrypto actually
+  -- installed; a bare install without it (README, "Runtime requirements")
+  -- has nothing here to exercise.
+  IF allgres_private.pgcrypto_schema() IS NOT NULL THEN
+    DELETE FROM allgres_private.llm_secrets WHERE provider_id IN (
+      SELECT provider_id FROM allgres_private.llm_providers WHERE name = 'selftest_rotate_provider'
+    );
+    DELETE FROM allgres_private.llm_providers WHERE name = 'selftest_rotate_provider';
+
+    -- allgres.secret_key is a placeholder GUC (never DefineCustomStringVariable'd
+    -- in Rust -- postgresql.conf/ALLGRES_SECRET_KEY are the real configuration
+    -- surface), which is exactly why a plain, transaction-scoped set_config works
+    -- here to stand up a real encrypted round trip regardless of what key (if
+    -- any) the surrounding live database actually has configured -- reset back
+    -- to empty at the end of this block so nothing after it is affected.
+    PERFORM set_config('allgres.secret_key', 'selftest-rotate-key-old', true);
+    v_rotate_provider := (allgres_public.fn_create_provider(
+      'selftest_rotate_provider', 'openai_compat', 'https://selftest.invalid/v1',
+      'selftest-rotate-secret-value', false
+    )->>'provider_id')::uuid;
+    ok := allgres_private.secret_storage_mode() = 'encrypted'
+      AND allgres_private.provider_secret(v_rotate_provider) = 'selftest-rotate-secret-value';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'rotate_setup_encrypts_under_old_key', 'ok', ok));
+
+    sub := allgres_public.fn_rotate_secret_key('selftest-rotate-key-old', 'selftest-rotate-key-new');
+    ok := (sub->>'ok')::boolean AND (sub->>'rewrapped')::int >= 1;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_rotate_secret_key_reports_rewrapped_count', 'ok', ok));
+
+    -- The point of rotation: readable under the new key now...
+    PERFORM set_config('allgres.secret_key', 'selftest-rotate-key-new', true);
+    ok := allgres_private.provider_secret(v_rotate_provider) = 'selftest-rotate-secret-value';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'rotated_secret_readable_under_new_key', 'ok', ok));
+
+    -- ...and genuinely, not just additionally, unreadable under the old one --
+    -- a real rotation, not a second copy left behind.
+    PERFORM set_config('allgres.secret_key', 'selftest-rotate-key-old', true);
+    ok := allgres_private.provider_secret(v_rotate_provider) IS NULL;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'rotated_secret_unreadable_under_old_key', 'ok', ok));
+
+    -- A wrong "old" key must leave the stored value untouched and be
+    -- reported as failed, never silently corrupt or drop it.
+    PERFORM set_config('allgres.secret_key', 'selftest-rotate-key-new', true);
+    sub := allgres_public.fn_rotate_secret_key('definitely-the-wrong-old-key', 'selftest-rotate-key-third');
+    ok := (sub->>'failed')::int >= 1;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'fn_rotate_secret_key_reports_wrong_old_key_as_failed', 'ok', ok));
+    ok := allgres_private.provider_secret(v_rotate_provider) = 'selftest-rotate-secret-value';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'value_untouched_after_failed_rotation_attempt', 'ok', ok));
+
+    DELETE FROM allgres_private.llm_secrets WHERE provider_id = v_rotate_provider;
+    DELETE FROM allgres_private.llm_providers WHERE provider_id = v_rotate_provider;
+    PERFORM set_config('allgres.secret_key', '', true);
+  END IF;
 
   -- 27. Long-term agent memory (item 25). Starts from a clean slate for the
   --     analyst agent so the recall test below can assert on content, not

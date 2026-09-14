@@ -1194,29 +1194,44 @@ token is injected into xAI inference requests through the same path as a
 provider API key. An xAI account may still return `403` for inference if its
 subscription does not include API/Grok CLI access.
 
-**Rotating the key.** There is no key-versioning scheme -- every stored
-secret is a single `enc:v1:`-prefixed value encrypted with whatever key is
-currently set, and there is exactly one active key at a time. Changing
-`ALLGRES_SECRET_KEY`/`allgres.secret_key` does not re-encrypt anything
-already stored: every existing `enc:v1:` value becomes silently
-undecryptable under the new key (`decrypt_secret` returns `NULL`, and the
-provider it belonged to loses its credential with no error surfaced until
-something tries to use it). Rotating today means, in this order:
+**Rotating the key.** There is no key-*versioning* scheme -- every stored
+secret is still a single `enc:v1:`-prefixed value, and there is exactly
+one key the live server currently reads (`ALLGRES_SECRET_KEY`/
+`allgres.secret_key`) at any moment. But `allgres_public.
+fn_rotate_secret_key(old_key, new_key)` re-encrypts everything already
+stored (`llm_secrets.api_key`/`oauth_client_secret`/`access_token`/
+`refresh_token`, `api_connection_secrets.api_key`,
+`oauth_device_sessions.device_code`) from the old key to the new one, in
+one transaction, using both keys as plain arguments -- it never reads or
+writes the live GUC itself. Rotating for real, in this order:
 
-1. Note which providers currently have a secret set (Settings shows
-   `has_secret` per provider/connection -- it does not show which key
-   encrypted it).
-2. Set the new key and restart (Docker: change `ALLGRES_SECRET_KEY` and
-   recreate the container; bare-metal: change `allgres.secret_key` in
-   `postgresql.conf` and reload).
-3. Re-enter every provider/connection API key, OAuth client secret, and
-   reconnect every OAuth provider (Settings -> the same field you'd use to
-   set one for the first time) -- there is nothing to migrate, this writes
-   a fresh `enc:v1:` value under the new key exactly like a first-time
-   setup would.
+1. `psql -c "SELECT allgres_public.fn_rotate_secret_key('<old key>', '<new key>')"`
+   **while the live config still says the old key** -- it returns
+   `{"ok": true, "rewrapped": N, "failed": M}`; `failed` counts a value
+   that didn't decrypt under the old key you gave it (a typo in that
+   argument, or ciphertext from some earlier key already) and leaves that
+   one row completely untouched, not corrupted or dropped.
+2. Immediately update the actual configured value to the new key (Docker:
+   change `ALLGRES_SECRET_KEY` and recreate the container; bare-metal:
+   change `allgres.secret_key` in `postgresql.conf` and reload) and
+   restart/reload.
 
-This is a real, tracked limitation, not the intended end state -- see
-KNOWN_ISSUES.md, item 7.
+Between those two steps, what's stored is encrypted under the new key
+while the live config still says the old one -- any decrypt attempted in
+that exact window fails closed the same way an unset key always has (a
+provider looks like it silently lost its credential, exactly the failure
+mode this function exists to eliminate everywhere *except* this one short
+window). Make the window as short as operationally possible; stopping the
+runtime/web workers first removes it entirely, if that matters more than
+avoiding a restart.
+
+Deliberately **not** reachable through `dashboard_rpc` the way almost
+every other mutating function in this file is (see [Everything the
+dashboard does, `psql` can do too](#everything-the-dashboard-does-psql-can-do-too))
+-- both key values passed to this function are the real encryption key,
+not one provider's own credential the way `provider.update`'s `api_key`
+already is, and must never transit the HTTP layer at all. `psql` only, by
+an operator who already holds both keys.
 
 ### Privileges
 

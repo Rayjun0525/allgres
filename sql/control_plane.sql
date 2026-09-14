@@ -3185,6 +3185,177 @@ BEGIN
 END;
 $fn$;
 
+-- Re-wraps one already-encrypted value under a different key without ever
+-- exposing the plaintext to a caller -- the building block for
+-- fn_rotate_secret_key below. Returns the value UNCHANGED (not
+-- re-encrypted at all) when it is NULL or not an 'enc:v1:' value to begin
+-- with -- a plaintext fallback value (no key was ever configured when it
+-- was written) has nothing to rotate. Returns NULL, distinguishable from
+-- "nothing to do" only by the caller having already checked the input was
+-- 'enc:v1:'-prefixed, when decryption under p_old_key fails -- the wrong
+-- old key, or ciphertext already under some other key entirely. Never
+-- raises: a single bad row must not abort rotating everything else.
+CREATE OR REPLACE FUNCTION allgres_private.rewrap_secret(p_stored text, p_old_key text, p_new_key text)
+RETURNS text
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_ns text := allgres_private.pgcrypto_schema();
+  v_plain text;
+  v_out text;
+BEGIN
+  IF p_stored IS NULL OR left(p_stored, 7) <> 'enc:v1:' THEN
+    RETURN p_stored;
+  END IF;
+  IF v_ns IS NULL THEN
+    RETURN NULL;
+  END IF;
+  BEGIN
+    EXECUTE format('SELECT %I.pgp_sym_decrypt(%I.dearmor($1), $2)', v_ns, v_ns)
+      INTO v_plain USING substr(p_stored, 8), p_old_key;
+  EXCEPTION WHEN others THEN
+    RETURN NULL;
+  END;
+  IF v_plain IS NULL THEN
+    RETURN NULL;
+  END IF;
+  EXECUTE format('SELECT %I.armor(%I.pgp_sym_encrypt($1, $2))', v_ns, v_ns)
+    INTO v_out USING v_plain, p_new_key;
+  RETURN 'enc:v1:' || v_out;
+END;
+$fn$;
+
+-- KNOWN_ISSUES.md item 7, closed: changing allgres.secret_key used to make
+-- every existing 'enc:v1:' value silently undecryptable -- decrypt_secret
+-- returns NULL, a provider loses its credential with no error until
+-- something tries to use it, and the only recovery was re-entering every
+-- secret by hand. This re-encrypts everything currently stored under
+-- p_old_key so it becomes readable under p_new_key instead, in one
+-- transaction, using both keys as explicit arguments -- it never reads or
+-- writes the live allgres.secret_key GUC itself.
+--
+-- Deliberately NOT reachable through dashboard_rpc, unlike almost every
+-- other mutating function in this file (see README, "Everything the
+-- dashboard does, psql can do too") -- both key values are the actual
+-- encryption key, not a single provider's own credential the way
+-- provider.update's api_key already is, and must never transit the HTTP
+-- layer at all. psql only, by an operator who already holds both keys.
+--
+-- Operational sequence (README, "Rotating the key" -- read it before
+-- calling this): call this FIRST, while allgres.secret_key in
+-- postgresql.conf/ALLGRES_SECRET_KEY is still the OLD key, then update
+-- that configured value to the NEW key and reload/restart. Between those
+-- two steps, anything already stored is encrypted under the new key while
+-- the live GUC still says the old one -- any decrypt attempted in that
+-- exact window fails closed the same way an unset key always has, which
+-- is why the window should be made as short as operationally possible
+-- (stopping the runtime/web workers first, if a guaranteed zero-failure
+-- window matters more than avoiding a restart).
+CREATE OR REPLACE FUNCTION allgres_public.fn_rotate_secret_key(p_old_key text, p_new_key text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_new text;
+  v_rewrapped int := 0;
+  v_failed int := 0;
+BEGIN
+  IF NULLIF(trim(p_old_key), '') IS NULL OR NULLIF(trim(p_new_key), '') IS NULL THEN
+    RAISE EXCEPTION 'both the current and new key are required' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_old_key = p_new_key THEN
+    RAISE EXCEPTION 'new key must be different from the current key' USING ERRCODE = 'P0001';
+  END IF;
+  IF allgres_private.pgcrypto_schema() IS NULL THEN
+    RAISE EXCEPTION 'pgcrypto is not installed' USING ERRCODE = 'P0001';
+  END IF;
+
+  FOR r IN
+    SELECT provider_id, api_key, oauth_client_secret, access_token, refresh_token
+    FROM allgres_private.llm_secrets
+    FOR UPDATE
+  LOOP
+    IF r.api_key IS NOT NULL AND left(r.api_key, 7) = 'enc:v1:' THEN
+      v_new := allgres_private.rewrap_secret(r.api_key, p_old_key, p_new_key);
+      IF v_new IS NOT NULL THEN
+        UPDATE allgres_private.llm_secrets SET api_key = v_new WHERE provider_id = r.provider_id;
+        v_rewrapped := v_rewrapped + 1;
+      ELSE
+        v_failed := v_failed + 1;
+      END IF;
+    END IF;
+    IF r.oauth_client_secret IS NOT NULL AND left(r.oauth_client_secret, 7) = 'enc:v1:' THEN
+      v_new := allgres_private.rewrap_secret(r.oauth_client_secret, p_old_key, p_new_key);
+      IF v_new IS NOT NULL THEN
+        UPDATE allgres_private.llm_secrets SET oauth_client_secret = v_new WHERE provider_id = r.provider_id;
+        v_rewrapped := v_rewrapped + 1;
+      ELSE
+        v_failed := v_failed + 1;
+      END IF;
+    END IF;
+    IF r.access_token IS NOT NULL AND left(r.access_token, 7) = 'enc:v1:' THEN
+      v_new := allgres_private.rewrap_secret(r.access_token, p_old_key, p_new_key);
+      IF v_new IS NOT NULL THEN
+        UPDATE allgres_private.llm_secrets SET access_token = v_new WHERE provider_id = r.provider_id;
+        v_rewrapped := v_rewrapped + 1;
+      ELSE
+        v_failed := v_failed + 1;
+      END IF;
+    END IF;
+    IF r.refresh_token IS NOT NULL AND left(r.refresh_token, 7) = 'enc:v1:' THEN
+      v_new := allgres_private.rewrap_secret(r.refresh_token, p_old_key, p_new_key);
+      IF v_new IS NOT NULL THEN
+        UPDATE allgres_private.llm_secrets SET refresh_token = v_new WHERE provider_id = r.provider_id;
+        v_rewrapped := v_rewrapped + 1;
+      ELSE
+        v_failed := v_failed + 1;
+      END IF;
+    END IF;
+  END LOOP;
+
+  FOR r IN
+    SELECT connection_id, api_key
+    FROM allgres_private.api_connection_secrets
+    WHERE api_key IS NOT NULL AND left(api_key, 7) = 'enc:v1:'
+    FOR UPDATE
+  LOOP
+    v_new := allgres_private.rewrap_secret(r.api_key, p_old_key, p_new_key);
+    IF v_new IS NOT NULL THEN
+      UPDATE allgres_private.api_connection_secrets SET api_key = v_new WHERE connection_id = r.connection_id;
+      v_rewrapped := v_rewrapped + 1;
+    ELSE
+      v_failed := v_failed + 1;
+    END IF;
+  END LOOP;
+
+  -- oauth_device_sessions.device_code: short-lived by nature (the flow's
+  -- own expires_at), but still worth rewrapping rather than left to expire
+  -- readable under the old key only, on the same "no exceptions" reasoning
+  -- as the other two tables.
+  FOR r IN
+    SELECT session_id, device_code
+    FROM allgres_private.oauth_device_sessions
+    WHERE device_code IS NOT NULL AND left(device_code, 7) = 'enc:v1:'
+    FOR UPDATE
+  LOOP
+    v_new := allgres_private.rewrap_secret(r.device_code, p_old_key, p_new_key);
+    IF v_new IS NOT NULL THEN
+      UPDATE allgres_private.oauth_device_sessions SET device_code = v_new WHERE session_id = r.session_id;
+      v_rewrapped := v_rewrapped + 1;
+    ELSE
+      v_failed := v_failed + 1;
+    END IF;
+  END LOOP;
+
+  -- Never the key values themselves -- only counts.
+  PERFORM allgres_private.audit('secrets.rotate_key', jsonb_build_object('rewrapped', v_rewrapped, 'failed', v_failed));
+  RETURN jsonb_build_object('ok', true, 'rewrapped', v_rewrapped, 'failed', v_failed);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_private.provider_secret(p_provider_id uuid)
 RETURNS text
 LANGUAGE sql

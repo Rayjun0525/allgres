@@ -121,12 +121,13 @@ No test covers these; they are wired up but unexercised:
 see item 10. Neither is task/session cancellation, permission and allowlist
 management, or per-agent concurrency/wall-clock limits — see item 11.
 
-## 7. Secret key rotation
+## 7. ~~Secret key rotation~~ — fixed
 
-Changing `allgres.secret_key` makes every existing `enc:v1:` value undecryptable;
-`decrypt_secret` returns NULL and the provider silently loses its credential.
-There is no re-encryption path and no warning. An operator rotating the key today
-has to re-enter every provider secret.
+Changing `allgres.secret_key` used to make every existing `enc:v1:` value
+undecryptable; `decrypt_secret` returned NULL and the provider silently
+lost its credential, with re-entering every secret by hand as the only
+recovery. Fixed much later (prompted by an outside production-readiness
+review) -- see item 42.
 
 ## 8. ~~No rate limiting on the dashboard API~~ — fixed
 
@@ -3454,3 +3455,77 @@ arithmetic and the schedule deactivated itself in the same request --
 `schedules.list` reflected all of it immediately afterward, exactly as the
 dashboard's own Schedules panel (updated with a Cost column and a max-cost
 field) would show it.
+
+## 42. Secret key rotation, for real -- item 7 closed
+
+Item 7 named the gap the day it was found and it sat open the longest of
+anything in this file: changing `allgres.secret_key` made every existing
+`enc:v1:` value silently undecryptable, and the only recovery was
+re-entering every provider secret by hand. The same outside
+production-readiness review that prompted items 40's follow-up and 41
+named this the more urgent of the two remaining gaps once cost/usage
+budgets landed -- a key that can't be rotated without an operational
+incident isn't really rotatable at all.
+
+`allgres_private.rewrap_secret(p_stored, p_old_key, p_new_key)` is the
+building block: decrypts one `enc:v1:` value under an explicit old key and
+re-encrypts it under an explicit new key, never touching the live
+`allgres.secret_key` GUC, returning the value unchanged if it wasn't an
+`enc:v1:` value to begin with (a plaintext fallback has nothing to
+rotate) and `NULL` -- distinguishable from "nothing to do" only because
+the caller already checked the prefix -- when decryption under the given
+old key fails outright, never raising on a single bad row.
+
+`allgres_public.fn_rotate_secret_key(p_old_key, p_new_key)` calls it
+across every table that ever holds an `enc:v1:` value --
+`llm_secrets.api_key`/`oauth_client_secret`/`access_token`/`refresh_token`,
+`api_connection_secrets.api_key`, `oauth_device_sessions.device_code` --
+in one transaction, and reports `{"rewrapped": N, "failed": M}` (`failed`
+rows are left completely untouched, not corrupted or dropped -- a wrong
+old key argument is a safe no-op per row, not data loss). Only the counts
+are audited (`secrets.rotate_key`), never either key value.
+
+Deliberately **not** wired into `dashboard_rpc`, unlike nearly everything
+else mutating in this codebase (see README, "Everything the dashboard
+does, `psql` can do too") -- both arguments to this function are the
+actual encryption key, not a single credential the way `provider.update`'s
+own `api_key` already flows through that same HTTP surface, and must never
+transit it. `psql` only, by an operator who already holds both keys, same
+posture as `ALLGRES_SECRET_KEY` itself always having been an environment
+variable/`postgresql.conf` entry, never something sent over HTTP.
+
+What this does not attempt: true zero-downtime rotation. This function
+re-encrypts what's *stored*; the live `allgres.secret_key`
+(`postgresql.conf`/`ALLGRES_SECRET_KEY`) still has to be updated and the
+server restarted/reloaded as a separate step immediately after, and any
+decrypt attempted in the window between those two steps fails closed the
+same way an unset key always has. README's "Rotating the key" names this
+window explicitly and says how to make it as short as operationally
+possible (stop the runtime/web workers first, if a guaranteed zero-failure
+window matters more than avoiding a restart) rather than overclaiming a
+guarantee this single-function, no-external-coordinator design cannot
+actually make.
+
+Six new selftest cases (328, up from 322), gated behind pgcrypto actually
+being installed (nothing to rotate otherwise) and using a
+transaction-scoped `set_config` on the placeholder `allgres.secret_key`
+GUC to stand up a real encrypted round trip regardless of what the
+surrounding live database happens to have configured, reset back to empty
+before anything later in the same run could be affected: a real secret
+encrypts under an old key, `fn_rotate_secret_key` reports it rewrapped,
+the value reads correctly under the new key, the same value genuinely
+stops decrypting under the old key (a real rotation, not a second copy
+left behind), and a wrong old-key argument is reported as failed while
+leaving the stored value provably untouched. Verified on both a fresh
+`CREATE EXTENSION` and a rerun in the same database; `cargo test --lib`'s
+30 cases unaffected. Also verified live, across genuinely separate `psql`
+sessions rather than only inside one `fn_selftest` transaction: created a
+real provider with a real secret under one key, confirmed it decrypted,
+rotated to a second key in a fresh session, confirmed the secret decrypted
+correctly under the new key and no longer decrypted under the old one, and
+confirmed the audit trail recorded only counts, never either key value.
+Also confirmed directly that the `operator` role (a human's own direct
+database access) can call this function while the sandboxed `worker` role
+cannot, and that `dashboard_rpc`'s own dispatch has no branch that reaches
+it at all -- the HTTP surface cannot trigger this regardless of role
+grants, by construction, not just by omission.
