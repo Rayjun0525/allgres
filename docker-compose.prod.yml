@@ -1,0 +1,30 @@
+services:
+  allgres:
+    environment:
+      # docker-compose.yml's own defaults exist so a first `docker compose up`
+      # works with zero configuration for local evaluation -- exactly the
+      # posture README's "Docker install, in detail" warns is not a
+      # production one. This override makes that posture impossible to boot
+      # by accident: an unset value here fails `docker compose config`/`up`
+      # outright (Compose's own `${VAR:?msg}` syntax) instead of silently
+      # falling back to the insecure default.
+      ALLGRES_DASHBOARD_TOKEN: ${ALLGRES_DASHBOARD_TOKEN:?set a real ALLGRES_DASHBOARD_TOKEN before using this override -- see README, "Exposure"}
+      ALLGRES_SECRET_KEY: ${ALLGRES_SECRET_KEY:?set a real ALLGRES_SECRET_KEY before using this override -- see README, "Secrets at rest"}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a real POSTGRES_PASSWORD before using this override}
+      # A real token is required above, so the loopback-or-token check
+      # allgres_web_main's check_exposure() already runs is satisfied without
+      # this -- explicitly unset (not just overridden) the base file's own
+      # unconditional "1", which otherwise stays merged in from
+      # docker-compose.yml regardless of what this override sets elsewhere.
+      ALLGRES_ALLOW_INSECURE_HTTP: null
+      # /mock/chat/completions is a test fixture; never on in this profile,
+      # regardless of what the environment happens to have set.
+      ALLGRES_ENABLE_MOCK: "0"
+    # Postgres itself has no business being reachable from outside the
+    # container in production -- psql/backup access goes through
+    # `docker compose exec`, not a published host port. The dashboard port
+    # stays loopback-only by default too, same as docker-compose.yml (see
+    # README, "Exposure"): put a TLS-terminating reverse proxy on the same
+    # docker network in front of it before changing this to a real bind.
+    ports: !override
+      - "127.0.0.1:8088:8088"

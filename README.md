@@ -9,7 +9,8 @@ embedded browser control panel into one PostgreSQL extension.
 Version 0.1.0 -- pre-release; the version number tracks an actual release,
 not every development milestone (see KNOWN_ISSUES.md's versioning note).
 This is an early alpha: read [Security model](#security-model) before
-putting it anywhere that matters.
+putting it anywhere that matters. Found a vulnerability? See
+[SECURITY.md](SECURITY.md) rather than opening a public issue.
 
 ## Quick start
 
@@ -180,6 +181,23 @@ docker compose up -d --build       # allgres_pgdata is a named volume (docker-co
 
 Both published ports (`5432`, `8088`) are bound to host loopback only; see
 [Exposure](#exposure) before changing that.
+
+Anything meant to serve real traffic should layer `docker-compose.prod.yml`
+on top instead of hand-editing `docker-compose.yml`'s own defaults:
+
+```bash
+ALLGRES_DASHBOARD_TOKEN=... ALLGRES_SECRET_KEY=... POSTGRES_PASSWORD=... \
+  docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+It refuses to boot at all (`docker compose config`/`up` fails outright) if
+any of those three are left unset, turns `ALLGRES_ENABLE_MOCK` off
+unconditionally, unsets the base file's `ALLGRES_ALLOW_INSECURE_HTTP=1` (a
+real token makes it unnecessary -- see [Exposure](#exposure)), and stops
+publishing PostgreSQL's own port to the host at all (`docker compose exec`
+is the intended access path for `psql`/backups). The dashboard port stays
+loopback-only, same as the base file; put a TLS-terminating reverse proxy
+on the same Docker network in front of it before changing that.
 
 `scripts/bootstrap.sh` is the install's actual completion criterion: a
 container reporting healthy only means PostgreSQL accepted a connection,
@@ -1123,6 +1141,30 @@ token is injected into xAI inference requests through the same path as a
 provider API key. An xAI account may still return `403` for inference if its
 subscription does not include API/Grok CLI access.
 
+**Rotating the key.** There is no key-versioning scheme -- every stored
+secret is a single `enc:v1:`-prefixed value encrypted with whatever key is
+currently set, and there is exactly one active key at a time. Changing
+`ALLGRES_SECRET_KEY`/`allgres.secret_key` does not re-encrypt anything
+already stored: every existing `enc:v1:` value becomes silently
+undecryptable under the new key (`decrypt_secret` returns `NULL`, and the
+provider it belonged to loses its credential with no error surfaced until
+something tries to use it). Rotating today means, in this order:
+
+1. Note which providers currently have a secret set (Settings shows
+   `has_secret` per provider/connection -- it does not show which key
+   encrypted it).
+2. Set the new key and restart (Docker: change `ALLGRES_SECRET_KEY` and
+   recreate the container; bare-metal: change `allgres.secret_key` in
+   `postgresql.conf` and reload).
+3. Re-enter every provider/connection API key, OAuth client secret, and
+   reconnect every OAuth provider (Settings -> the same field you'd use to
+   set one for the first time) -- there is nothing to migrate, this writes
+   a fresh `enc:v1:` value under the new key exactly like a first-time
+   setup would.
+
+This is a real, tracked limitation, not the intended end state -- see
+KNOWN_ISSUES.md, item 7.
+
 ### Privileges
 
 Five fixed roles: `allgres_owner` (owns every schema, table, view, and
@@ -1365,6 +1407,32 @@ extension does that a generic `pg_dump` would otherwise miss silently:
   allow_private_network, a stored secret) does not survive a
   `pg_dump`-based restore — only a wholly new provider row would. Physical
   backup has no such gap.
+
+**Schedule and retention.** Neither strategy is scheduled or pruned by
+anything in this repo — that part is standard PostgreSQL operations, not
+Allgres-specific, so it isn't automated here. A starting point for a
+single-operator install, to adjust to your own RPO/RTO rather than treat
+as a mandate: continuous WAL archiving plus a daily `pg_basebackup`,
+keeping enough of both to restore to any point in the last 7-14 days
+(a base backup is only as useful as the WAL segments after it are kept
+alongside it), and a daily logical `pg_dump` kept for the same window as a
+second, independent copy that doesn't depend on WAL continuity. Whatever
+you pick, restore it somewhere non-production on a schedule too — a
+backup nobody has restored is a hope, not a plan.
+
+**Restore checklist (logical, the two-pass restore above):**
+
+```bash
+pg_dumpall --globals-only -f globals.sql          # 1. roles first
+psql -f globals.sql                               #    onto the fresh cluster
+pg_restore --schema-only -d <db> backup.dump       # 2. extension + seed data
+pg_restore --data-only --disable-triggers -d <db> backup.dump  # 3. everything else
+```
+
+Then run `SELECT allgres_public.fn_selftest();` once against the restored
+database — it's a live diagnostic safe to run against real data (see
+[Tests](#tests)), and a clean pass is a real signal the restore actually
+landed in a working state, not just that the commands returned success.
 
 ## Tests
 
