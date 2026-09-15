@@ -6255,7 +6255,7 @@ DECLARE
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
   FOR r IN
-    SELECT call_id, task_id
+    SELECT call_id, task_id, kind, method, tool, url
     FROM allgres_private.outbound_calls
     WHERE status = 'in_flight'
       AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
@@ -6280,14 +6280,48 @@ BEGIN
         outcome = CASE WHEN procedure_tool_id IS NOT NULL THEN 'failure' ELSE outcome END
     WHERE call_id = r.call_id;
     IF EXISTS (SELECT 1 FROM allgres_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
-      BEGIN
-        PERFORM allgres_public.fn_submit_result(
-          r.task_id,
-          jsonb_build_object('type', 'error', 'message', 'outbound timeout')
+      -- A GET (or anything that isn't a 'tool' call at all -- an 'llm'/
+      -- 'embedding'/'recall' completion has no side effect on an external
+      -- system beyond redundant inference cost) is idempotent by HTTP
+      -- semantics: retrying it can never duplicate a real-world effect, so
+      -- reporting it as a plain retryable error, same as always, is
+      -- correct. A mutating http_request call (POST/PUT/PATCH/DELETE)
+      -- whose worker never came back is genuinely ambiguous -- it may
+      -- already have executed on the destination -- and feeding that back
+      -- as an ordinary "error, try again" risks a real duplicate side
+      -- effect (README, "External call idempotency" already names the
+      -- idempotency-key header as a mitigation, not a guarantee the
+      -- destination actually honors it). This pauses the task for a human
+      -- to confirm instead of letting the agent retry blindly, reusing
+      -- the exact waiting_human/human_approvals shape fn_submit_result's
+      -- own await_human branch already uses -- not a new mechanism, the
+      -- same one, triggered by the watchdog instead of the model.
+      IF r.kind = 'tool' AND COALESCE(r.method, 'GET') <> 'GET' THEN
+        UPDATE allgres_private.tasks
+        SET status = 'waiting_human', updated_at = now()
+        WHERE task_id = r.task_id;
+        INSERT INTO allgres_private.human_approvals (task_id, status, payload, expires_at)
+        VALUES (
+          r.task_id, 'pending',
+          jsonb_build_object(
+            'reason', format(
+              'An outbound %s call to %s timed out without confirmation -- it may already have executed on the destination. Confirm whether it is safe to retry before the agent proceeds.',
+              r.method, COALESCE(r.url, r.tool)
+            ),
+            'ambiguous_outbound_call_id', r.call_id
+          ),
+          now() + interval '24 hours'
         );
-      EXCEPTION WHEN others THEN
-        RAISE WARNING 'fn_watchdog: fn_submit_result failed for task % after outbound timeout: %', r.task_id, SQLERRM;
-      END;
+      ELSE
+        BEGIN
+          PERFORM allgres_public.fn_submit_result(
+            r.task_id,
+            jsonb_build_object('type', 'error', 'message', 'outbound timeout')
+          );
+        EXCEPTION WHEN others THEN
+          RAISE WARNING 'fn_watchdog: fn_submit_result failed for task % after outbound timeout: %', r.task_id, SQLERRM;
+        END;
+      END IF;
     END IF;
     n := n + 1;
   END LOOP;

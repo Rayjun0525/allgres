@@ -1156,11 +1156,27 @@ is inert: sent, ignored, and the underlying at-least-once-delivery risk
 above is unchanged. There is also no cross-check on this extension's own
 side — nothing here calls back to ask "did you already see this key," so
 a `'lost'` call's true outcome (delivered, or never sent at all) stays
-genuinely unknown until an operator checks the destination system
-directly or the agent's own next turn does. Treat a `'lost'` outbound call
-as *ambiguous*, not *failed*, for anything with a real external side
-effect — deciding whether to retry a specific one is a judgment call this
-extension cannot make for you.
+genuinely unknown to this extension.
+
+What changed (another outside review, same finding pressed further): that
+"deciding whether to retry is a judgment call this extension cannot make
+for you" used to mean the agent's own retry logic just fired again anyway
+-- `fn_watchdog` fed every `'lost'` call back as a plain
+`{"type":"error","message":"outbound timeout"}`, indistinguishable from
+any other failure, and the agent had no signal that *this* retry might
+duplicate a real side effect. `fn_watchdog` now tells the two cases apart
+by HTTP method: a `GET` (or an `'llm'`/`'embedding'`/`'recall'` call,
+which has no external side effect to duplicate in the first place) is
+idempotent, so it still gets the same plain retryable error as always. A
+mutating `http_request` call (`POST`/`PUT`/`PATCH`/`DELETE`) that never
+came back instead pauses the *task itself* for a human to confirm --
+`waiting_human`, a `human_approvals` row explaining which call and why,
+visible in the dashboard's Approvals tab exactly like any other
+`await_human` pause -- rather than letting the agent retry blindly. This
+still cannot answer "did it actually execute" (only checking the
+destination system can); it stops the extension from *guessing* on the
+agent's behalf when a wrong guess means a duplicate ticket, charge, or
+message.
 
 ### Secrets at rest
 

@@ -3529,3 +3529,58 @@ database access) can call this function while the sandboxed `worker` role
 cannot, and that `dashboard_rpc`'s own dispatch has no branch that reaches
 it at all -- the HTTP surface cannot trigger this regardless of role
 grants, by construction, not just by omission.
+
+## 43. A `'lost'` mutating outbound call pauses for a human instead of retrying blindly
+
+The same outside production-readiness review, working down its own
+priority list once items 41/42 closed: README's "External call
+idempotency" already named the real risk -- a `'lost'` outbound call
+(the worker crashed or a network drop, not a real HTTP response) is
+genuinely ambiguous, it may already have executed on the destination --
+but `fn_watchdog` fed every single one back to the agent as a plain
+`{"type":"error","message":"outbound timeout"}`, identical to any other
+failure. A `GET` or an `'llm'`/`'embedding'`/`'recall'` call has no
+external side effect to duplicate, so retrying it is always safe; a
+mutating `http_request` call (`POST`/`PUT`/`PATCH`/`DELETE`) does, and an
+agent that just sees "error, try again" has every reason to reissue the
+identical call -- the idempotency-key mitigation only helps if the
+destination happens to honor it.
+
+`fn_watchdog` now branches on `outbound_calls.kind`/`method` at the exact
+point it reclaims a timed-out `'in_flight'` row: `kind <> 'tool'` or
+`method = 'GET'` keeps the existing plain-error path unchanged, byte for
+byte. Anything else -- a mutating `http_request` call -- instead pauses
+the task (`tasks.status = 'waiting_human'`) and inserts a
+`human_approvals` row explaining which call, which method, which URL, and
+why, with a 24h `expires_at` the same as any other approval. This is
+*not* a new mechanism: it is the identical `waiting_human`/
+`human_approvals` shape `fn_submit_result`'s own `await_human` branch
+already uses when the *agent itself* asks to pause, just triggered by the
+watchdog instead of a model turn -- `fn_decide_approval` needed zero
+changes to resume it correctly, and the dashboard's existing Approvals
+tab renders it with no changes either (it already surfaces
+`payload->>'reason'` generically for any pending approval, whoever
+created it).
+
+What this still cannot do, and does not claim to: know whether the call
+actually executed. Only checking the destination system answers that; an
+operator (or the agent, once resumed with the operator's reply as
+context) still has to make that call. The fix is about who gets asked --
+a human before any retry, instead of nobody until a duplicate side effect
+already happened -- not about resolving the ambiguity itself, which no
+information inside this database can resolve on its own.
+
+Three new selftest cases (331, up from 328):
+`watchdog_lost_get_call_still_reports_plain_retryable_error` (the
+existing behavior, unchanged, for the safe case), `watchdog_lost_
+mutating_call_pauses_for_human_instead_of_retrying` (a lost `POST` pauses
+the task and records the right reason/call-id instead of logging a plain
+error), and `ambiguous_outbound_approval_resumes_task_normally` (approving
+it resumes the task through the ordinary `fn_decide_approval` path, no
+special-casing needed). Verified on both a fresh `CREATE EXTENSION` and a
+rerun in the same database; `cargo test --lib`'s 30 cases unaffected. Also
+verified live over real HTTP end to end: created a real task, simulated a
+lost `POST` outbound call directly, ran `fn_watchdog`, confirmed
+`approvals.list` surfaced the exact reason text with no dashboard changes
+needed, and confirmed `approvals.decide` resumed the task
+(`status = 'queued'`) the normal way.

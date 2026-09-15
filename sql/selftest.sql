@@ -54,6 +54,7 @@ DECLARE
   v_deleg_b uuid;
   v_provider uuid;
   v_rotate_provider uuid;
+  v_watchdog_tid uuid;
   v_device_provider uuid;
   v_device_session uuid;
   v_state text;
@@ -3308,6 +3309,55 @@ BEGIN
     ok := (SELECT status FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'lost'
       AND (SELECT outcome FROM allgres_private.outbound_calls WHERE call_id = v_ovr_call) = 'failure';
     v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_reclaimed_baseline_call_records_failure_outcome', 'ok', ok));
+
+    -- 'lost' outbound calls, ambiguous vs safe to retry (an outside
+    -- production-readiness review's own top P0): a GET that never comes
+    -- back is idempotent, so it's still fine to hand the task a plain
+    -- retryable error the way every 'lost' call always has. A mutating
+    -- http_request call that never comes back may have already executed
+    -- on the destination -- retrying it blindly risks a real duplicate
+    -- side effect -- so it must pause the task for a human instead
+    -- (reusing await_human's own waiting_human/human_approvals shape, not
+    -- a new mechanism).
+    v_watchdog_tid := (allgres_public.fn_create_session(v_agent, 'selftest watchdog lost get')->>'task_id')::uuid;
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_watchdog_tid;
+    INSERT INTO allgres_private.outbound_calls
+      (task_id, kind, tool, method, url, request_headers, request_body, status, updated_at)
+    VALUES (
+      v_watchdog_tid, 'tool', 'http_get', 'GET', 'https://selftest.invalid/read',
+      '{}'::jsonb, '{}'::jsonb, 'in_flight', now() - interval '1 hour'
+    );
+    PERFORM allgres_public.fn_watchdog(1);
+    ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_watchdog_tid) = 'running'
+      AND EXISTS (SELECT 1 FROM allgres_private.execution_logs WHERE task_id = v_watchdog_tid AND role = 'error')
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.human_approvals WHERE task_id = v_watchdog_tid);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_lost_get_call_still_reports_plain_retryable_error', 'ok', ok));
+
+    v_watchdog_tid := (allgres_public.fn_create_session(v_agent, 'selftest watchdog lost post')->>'task_id')::uuid;
+    UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_watchdog_tid;
+    INSERT INTO allgres_private.outbound_calls
+      (task_id, kind, tool, method, url, request_headers, request_body, status, updated_at)
+    VALUES (
+      v_watchdog_tid, 'tool', 'http_request', 'POST', 'https://selftest.invalid/create-ticket',
+      '{}'::jsonb, '{}'::jsonb, 'in_flight', now() - interval '1 hour'
+    ) RETURNING call_id INTO v_call;
+    PERFORM allgres_public.fn_watchdog(1);
+    SELECT approval_id, payload INTO v_approval, r FROM allgres_private.human_approvals
+    WHERE task_id = v_watchdog_tid AND status = 'pending';
+    ok := (SELECT status FROM allgres_private.tasks WHERE task_id = v_watchdog_tid) = 'waiting_human'
+      AND v_approval IS NOT NULL
+      AND (r->>'ambiguous_outbound_call_id')::uuid = v_call
+      AND r->>'reason' LIKE '%POST%'
+      AND NOT EXISTS (SELECT 1 FROM allgres_private.execution_logs WHERE task_id = v_watchdog_tid AND role = 'error');
+    v := v || jsonb_build_array(jsonb_build_object('name', 'watchdog_lost_mutating_call_pauses_for_human_instead_of_retrying', 'ok', ok));
+
+    -- Approving it resumes the task through the exact same path any other
+    -- await_human decision already does -- no special-casing needed once
+    -- the pause itself used the shared mechanism.
+    comp := allgres_public.fn_decide_approval(v_approval, true, 'Confirmed not executed on the destination -- safe to retry.');
+    ok := (comp->>'ok')::boolean
+      AND (SELECT status FROM allgres_private.tasks WHERE task_id = v_watchdog_tid) = 'queued';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'ambiguous_outbound_approval_resumes_task_normally', 'ok', ok));
 
     -- promote must re-check the candidate provider is still enabled at
     -- decision time, not only at propose time -- an operator can disable a
