@@ -69,7 +69,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker')
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;
@@ -80,6 +80,14 @@ BEGIN
       AND p.proowner <> 'allgres_role_admin'::regrole
   ) THEN
     ALTER FUNCTION allgres_private.fn_provision_agent_role(uuid) OWNER TO allgres_role_admin;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'allgres_public' AND p.proname = 'fn_start_dynamic_workers'
+      AND p.proowner <> 'allgres_settings_reader'::regrole
+  ) THEN
+    ALTER FUNCTION allgres_public.fn_start_dynamic_workers() OWNER TO allgres_settings_reader;
   END IF;
 
   IF EXISTS (
@@ -392,7 +400,7 @@ SELECT project_id, name, description, is_active, created_at, updated_at
 FROM allgres_private.projects;
 
 REVOKE ALL ON SCHEMA allgres FROM PUBLIC;
-GRANT USAGE ON SCHEMA allgres TO operator, worker;
+GRANT USAGE ON SCHEMA allgres TO operator, worker, allgres_settings_reader;
 GRANT SELECT ON allgres.agents, allgres.tasks, allgres.projects TO operator;
 
 -- Same PUBLIC-EXECUTE-by-default gap the blanket revoke earlier in this
@@ -1711,6 +1719,26 @@ GRANT EXECUTE ON FUNCTION allgres.dashboard_rpc(jsonb) TO operator, worker;
 REVOKE ALL ON FUNCTION allgres.analyze_sql(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION allgres.analyze_sql(text) TO operator, worker;
 
+-- native_start_dynamic_workers is PUBLIC-revoked along with the rest of this
+-- schema (section 12) and owned by allgres_owner like any other native
+-- function (it is deliberately NOT in the ownership-exclusion list above --
+-- unlike its SQL wrapper, its own owner has no bearing on what it can read,
+-- since it is SECURITY INVOKER and simply runs as whichever caller reached
+-- it). Only allgres_public.fn_start_dynamic_workers calls it -- that
+-- wrapper's own owner (allgres_settings_reader, set above) is what actually
+-- needs the grant.
+GRANT EXECUTE ON FUNCTION allgres.native_start_dynamic_workers() TO allgres_settings_reader;
+
+-- fn_start_dynamic_workers is owned by allgres_settings_reader (not
+-- allgres_owner, unlike everything else in allgres_public -- see the
+-- ownership-exclusion lists above), so the blanket "GRANT EXECUTE ON ALL
+-- FUNCTIONS IN SCHEMA allgres_public TO operator" a few lines up already
+-- covers operator regardless of who owns it, but fn_selftest itself (which
+-- calls it directly) runs as allgres_owner and needs its own explicit
+-- grant, same as any other allgres_owner-owned function calling out to one
+-- it doesn't own.
+GRANT EXECUTE ON FUNCTION allgres_public.fn_start_dynamic_workers() TO allgres_owner;
+
 -- ---------------------------------------------------------------------------
 -- 14. Final ownership pass.
 -- ---------------------------------------------------------------------------
@@ -1760,7 +1788,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker')
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;

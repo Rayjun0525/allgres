@@ -2070,6 +2070,22 @@ BEGIN
     PERFORM set_config('allgres.secret_key', '', true);
   END IF;
 
+  -- Dynamic (no-restart) worker start (README, "Installing without a
+  -- restart"). Both cases actually reachable here always exercise the
+  -- gate, not the launch itself -- this cluster runs with
+  -- shared_preload_libraries='allgres' (Dockerfile), so a real dynamic
+  -- launch is never reachable from inside fn_selftest; that path is
+  -- verified live, separately, against a cluster that does not preload
+  -- allgres (KNOWN_ISSUES.md item 44).
+  ok := (allgres_public.fn_start_dynamic_workers()->>'ok')::boolean = false;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'dynamic_start_refused_when_reloadable_not_on', 'ok', ok));
+
+  PERFORM set_config('allgres.reloadable', 'on', true);
+  sub := allgres_public.fn_start_dynamic_workers();
+  ok := (sub->>'ok')::boolean = false AND sub->>'reason' LIKE '%shared_preload_libraries%';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'dynamic_start_refused_when_already_preloaded', 'ok', ok));
+  PERFORM set_config('allgres.reloadable', '', true);
+
   -- 27. Long-term agent memory (item 25). Starts from a clean slate for the
   --     analyst agent so the recall test below can assert on content, not
   --     just presence.

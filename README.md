@@ -1430,6 +1430,55 @@ Open the address `ALLGRES_HTTP_ADDR` defaults to
 [Configuration](#configuration) for every environment variable the
 runtime worker reads.
 
+### Installing without a restart
+
+The `shared_preload_libraries` restart above is a real PostgreSQL
+constraint, not an Allgres choice: both background workers (`allgres
+runtime`, `allgres web`) are registered from `_PG_init`, which only runs
+during preload processing, and only a postmaster restart re-runs that.
+For an operator who cannot restart the server they're installing onto — a
+managed instance where changing `shared_preload_libraries` means a
+maintenance window, or simply one they'd rather not schedule for a first
+try — there's a second path that needs no restart at all:
+
+```conf
+allgres.reloadable = on
+```
+
+`allgres.reloadable` is a placeholder GUC, exactly like `allgres.secret_key`
+(README, [Secrets at rest](#secrets-at-rest)) — settable in
+`postgresql.conf` or via `SET` for one session, no preload required to read
+it. With it `on`, skip the `shared_preload_libraries` line and the restart
+entirely:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION allgres;
+SELECT allgres_public.fn_start_dynamic_workers();
+```
+
+That last call registers both workers with PostgreSQL's own
+`RegisterDynamicBackgroundWorker`, the same mechanism `pg_cron` and similar
+extensions use for on-demand workers, instead of the static path
+`shared_preload_libraries` takes. It is safe to call more than once — a
+second call finds both already running and is a no-op — and it is a no-op,
+not an error, when `allgres` actually is preloaded (the postmaster already
+owns the workers there).
+
+The tradeoff is real and worth stating plainly: a crash of either worker
+self-heals exactly the way it does under `shared_preload_libraries` (the
+postmaster honors the same restart timer regardless of how a worker was
+registered), but nothing persists a dynamic registration anywhere, so a
+full PostgreSQL restart — for any reason, planned or not — drops both
+workers and does not bring them back on its own. There is no watchdog that
+notices and calls `fn_start_dynamic_workers()` again automatically; that
+call is the operator's own to make, after `CREATE EXTENSION` and again
+after every subsequent restart. For a deployment where PostgreSQL itself
+restarts often (or where "came back up quiet" needs to mean the dashboard
+actually came back too), `shared_preload_libraries` remains the better
+default — this path exists for the specific case where the one restart it
+saves is the one that matters.
+
 ### Upgrades
 
 `sql/control_plane.sql`, `sql/operator_agents_and_policies.sql`,

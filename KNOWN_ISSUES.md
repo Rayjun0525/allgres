@@ -3584,3 +3584,91 @@ lost `POST` outbound call directly, ran `fn_watchdog`, confirmed
 `approvals.list` surfaced the exact reason text with no dashboard changes
 needed, and confirmed `approvals.decide` resumed the task
 (`status = 'queued'`) the normal way.
+
+## 44. A no-restart install path -- `allgres.reloadable` and dynamic background workers
+
+Both workers (`allgres runtime`, `allgres web`) are registered from
+`_PG_init`, gated on `process_shared_preload_libraries_in_progress` --
+legal only during preload, which is why installing onto an already-running
+PostgreSQL server has always meant `shared_preload_libraries = 'allgres'`
+plus a full restart (a plain reload does not re-run preload processing).
+Raised as a direct operational question, not a review finding: an operator
+who cannot get a restart window onto the server they're installing onto
+has had no path in at all.
+
+PostgreSQL has a second, un-taken registration path for exactly this:
+`RegisterDynamicBackgroundWorker`, callable from any ordinary backend, no
+preload involved -- the same mechanism `pg_cron` and similar extensions use
+for on-demand workers. `runtime_worker_builder()`/`web_worker_builder()`
+(`src/lib.rs`) now build the identical `BackgroundWorkerBuilder`
+configuration either way; `_PG_init` still finishes with `.load()`, and the
+new `allgres.native_start_dynamic_workers()` finishes with
+`.load_dynamic()` instead. `allgres_public.fn_start_dynamic_workers()`
+wraps it, gated on a new placeholder GUC (`allgres.reloadable`, exactly the
+`allgres.secret_key` pattern -- no `DefineCustomStringVariable`, no preload
+needed to read it): `CREATE EXTENSION allgres;` with `allgres.reloadable =
+on` set, then one call, and both workers are running -- no restart, ever,
+for the initial install.
+
+Two real gaps found and fixed while wiring this up, both caught live before
+they ever shipped:
+
+- Reading `shared_preload_libraries` (to refuse cleanly when `allgres`
+  actually is preloaded, rather than fight the postmaster for ownership of
+  the same worker names) needs `pg_read_all_settings` membership -- a PG14+
+  restriction; a plain `current_setting()` on it raises "permission denied
+  to examine..." for any role that isn't a member. Checking whether
+  `allgres runtime` is already running (so a second call is a no-op, not a
+  duplicate launch) needs `pg_read_all_stats` too -- without it,
+  `pg_stat_activity` doesn't error, it silently returns *zero rows* for any
+  backend belonging to a different user, which is worse: this was caught
+  live by the exact failure it was supposed to prevent -- a second call to
+  `fn_start_dynamic_workers()` believed nothing was running and launched a
+  real duplicate pair of workers alongside the first, still-alive one.
+  Fixed with a new role, `allgres_settings_reader` (`NOLOGIN NOINHERIT`,
+  same shape as `allgres_signal_admin`), holding both memberships `WITH
+  INHERIT TRUE` (PG16+ syntax -- a NOINHERIT role's own memberships are
+  invisible even to itself without it) and owning nothing but
+  `fn_start_dynamic_workers` -- neither broad-read privilege reaches
+  `allgres_owner`, and therefore not the many other `SECURITY DEFINER`
+  functions it owns either.
+- The project's own two-pass ownership-fixing convention (`sql/
+  grants_and_facade.sql`, "12. Grants" and its later re-run in "14. Final
+  ownership pass" -- the second exists specifically to catch native
+  functions pgrx splices in after the first pass already ran, item 32's own
+  precedent, `native_host_stats`) has an exclusion list in *each* pass
+  for functions with a narrow, non-`allgres_owner` owner
+  (`fn_provision_agent_role`, `fn_signal_cancel_worker`). Adding
+  `fn_start_dynamic_workers` to only the first list left the second pass
+  silently reassigning it straight back to `allgres_owner` moments later --
+  caught live the same way as the grant gap above, by the function raising
+  the exact permission error the new role was supposed to prevent. Both
+  lists needed the addition, not one.
+
+Two new selftest cases (333, up from 331) cover what a `shared_preload_
+libraries = 'allgres'` cluster (every CI run, the Docker image) can
+actually reach: `dynamic_start_refused_when_reloadable_not_on` and
+`dynamic_start_refused_when_already_preloaded`. The dynamic launch itself
+is not reachable from inside `fn_selftest` on such a cluster by
+construction, so it was verified live instead, against a real, separate,
+non-preloaded cluster stood up for exactly this: `allgres.reloadable = on`
+set, `CREATE EXTENSION` with no `shared_preload_libraries` entry,
+`fn_start_dynamic_workers()` returning real PIDs for both workers, the web
+worker actually answering `curl` on its configured port, a second call
+correctly reporting `already_running: true` with no duplicate processes,
+and the `off`/`preloaded` refusal cases confirmed on that same cluster and
+the normal preloaded one respectively. Verified on both a fresh `CREATE
+EXTENSION` and a rerun in the same database; `cargo test --lib`'s 30 cases
+unaffected (Rust-only refactor of the builder setup, no behavior change to
+the static path).
+
+Not solved, by design (README, "Installing without a restart"): a dynamic
+registration does not survive a full PostgreSQL restart, for any reason --
+nothing persists it anywhere, unlike `shared_preload_libraries`, which the
+postmaster re-reads and re-registers from on every start. There is no
+watchdog that notices and re-calls `fn_start_dynamic_workers()`
+automatically; that stays the operator's own step, after install and again
+after every subsequent restart. A crash of either worker *without* a full
+restart still self-heals exactly like the static path does, though -- the
+postmaster's restart timer is honored the same way regardless of which
+registration method started the worker.

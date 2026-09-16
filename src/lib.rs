@@ -208,6 +208,95 @@ mod allgres {
             "rpc_socket": crate::config::rpc_socket_path().display().to_string(),
         }))
     }
+
+    /// The no-restart alternative to `shared_preload_libraries = 'allgres'`
+    /// (README, "Installing without a restart"): registers both workers with
+    /// `RegisterDynamicBackgroundWorker` instead of the static path `_PG_init`
+    /// takes at preload time, so it can run from any ordinary backend, no
+    /// postmaster restart involved. Only `allgres_public.fn_start_dynamic_
+    /// workers` (gated on `allgres.reloadable = 'on'`) calls this; it is not
+    /// itself granted to any role.
+    ///
+    /// A no-op, not an error, when already preloaded (the postmaster already
+    /// owns these workers there) or already running dynamically -- the
+    /// latter checked via `allgres runtime`'s own pg_stat_activity row.
+    /// `allgres web` is not checked the same way: it never connects to a
+    /// database (see `v_system_health`'s own comment on this), so it never
+    /// appears in pg_stat_activity at all; since the two are only ever
+    /// started together by this function, `allgres runtime`'s presence
+    /// stands in for both.
+    #[pg_extern]
+    fn native_start_dynamic_workers() -> JsonB {
+        let preload = Spi::get_one::<String>("SELECT current_setting('shared_preload_libraries', true)")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if preload.split(',').any(|x| x.trim() == "allgres") {
+            return JsonB(json!({
+                "ok": false,
+                "reason": "allgres is already in shared_preload_libraries; the postmaster owns these workers, dynamic start does not apply",
+            }));
+        }
+
+        let already_running: i64 = Spi::get_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'allgres runtime'",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        if already_running > 0 {
+            return JsonB(json!({"ok": true, "already_running": true}));
+        }
+
+        let notify_pid = unsafe { *(&raw const pg_sys::MyProcPid) };
+        let mut results = Vec::new();
+        for (label, builder) in [
+            ("allgres runtime", crate::runtime_worker_builder()),
+            ("allgres web", crate::web_worker_builder()),
+        ] {
+            let outcome = match builder.set_notify_pid(notify_pid).load_dynamic() {
+                Ok(handle) => match handle.wait_for_startup() {
+                    Ok(pid) => json!({"worker": label, "started": true, "pid": pid}),
+                    Err(status) => {
+                        json!({"worker": label, "started": false, "reason": format!("{status:?}")})
+                    }
+                },
+                Err(_) => json!({
+                    "worker": label,
+                    "started": false,
+                    "reason": "postmaster could not register the worker -- check max_worker_processes",
+                }),
+            };
+            results.push(outcome);
+        }
+
+        JsonB(json!({"ok": true, "already_running": false, "results": results}))
+    }
+}
+
+// Shared by both registration paths: `_PG_init`'s static `.load()` at
+// preload time, and `native_start_dynamic_workers`'s `.load_dynamic()` from
+// an ordinary backend (README, "Installing without a restart"). Identical
+// configuration either way -- `set_restart_time` is honored by the
+// postmaster the same way regardless of how a worker was registered, so a
+// dynamically-started worker that crashes is relaunched exactly like a
+// statically-started one; only a full Postgres restart drops a dynamic
+// registration, since nothing persists it anywhere.
+fn runtime_worker_builder() -> BackgroundWorkerBuilder {
+    BackgroundWorkerBuilder::new("allgres runtime")
+        .set_function("allgres_runtime_main")
+        .set_library("allgres")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(Duration::from_secs(5)))
+        .enable_spi_access()
+}
+
+fn web_worker_builder() -> BackgroundWorkerBuilder {
+    BackgroundWorkerBuilder::new("allgres web")
+        .set_function("allgres_web_main")
+        .set_library("allgres")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(Duration::from_secs(5)))
 }
 
 #[pg_guard]
@@ -219,20 +308,8 @@ pub extern "C-unwind" fn _PG_init() {
         return;
     }
 
-    BackgroundWorkerBuilder::new("allgres runtime")
-        .set_function("allgres_runtime_main")
-        .set_library("allgres")
-        .set_start_time(BgWorkerStartTime::RecoveryFinished)
-        .set_restart_time(Some(Duration::from_secs(5)))
-        .enable_spi_access()
-        .load();
-
-    BackgroundWorkerBuilder::new("allgres web")
-        .set_function("allgres_web_main")
-        .set_library("allgres")
-        .set_start_time(BgWorkerStartTime::RecoveryFinished)
-        .set_restart_time(Some(Duration::from_secs(5)))
-        .load();
+    runtime_worker_builder().load();
+    web_worker_builder().load();
 }
 
 mod config;

@@ -201,6 +201,25 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_signal_admin') THEN
     CREATE ROLE allgres_signal_admin NOLOGIN NOINHERIT;
   END IF;
+  -- Same reasoning again, for fn_start_dynamic_workers (README, "Installing
+  -- without a restart"): reading shared_preload_libraries needs
+  -- pg_read_all_settings membership (a PG14+ restriction -- plain
+  -- current_setting() on it raises "permission denied to examine..." for
+  -- any role that isn't a member, confirmed live), and checking whether
+  -- `allgres runtime` is already running needs pg_read_all_stats too --
+  -- without it, pg_stat_activity silently returns zero rows for any
+  -- backend_type belonging to a different user, rather than an error,
+  -- which is worse: confirmed live, this made a second call to
+  -- fn_start_dynamic_workers() think nothing was running and launch a real
+  -- duplicate pair alongside the first, still-alive one. Both memberships
+  -- read broadly (every GUC; every backend's query text and stats), not
+  -- just what this one function needs. Scoped to a role that owns nothing
+  -- but this one function, same as allgres_signal_admin, rather than
+  -- handed to allgres_owner and therefore every other SECURITY DEFINER
+  -- function in this file too.
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_settings_reader') THEN
+    CREATE ROLE allgres_settings_reader NOLOGIN NOINHERIT;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator') THEN
     CREATE ROLE operator LOGIN;
   END IF;
@@ -225,6 +244,16 @@ $$;
 ALTER ROLE allgres_owner NOLOGIN NOINHERIT;
 ALTER ROLE allgres_role_admin NOLOGIN NOINHERIT CREATEROLE;
 ALTER ROLE allgres_signal_admin NOLOGIN NOINHERIT;
+ALTER ROLE allgres_settings_reader NOLOGIN NOINHERIT;
+
+-- WITH INHERIT TRUE (PG16+, matching this project's minimum supported
+-- version): allgres_settings_reader is itself NOINHERIT, so without this a
+-- plain membership grant would not actually apply either predefined role's
+-- privileges when running as allgres_settings_reader -- only membership
+-- grants marked INHERIT TRUE bypass the member role's own NOINHERIT
+-- default.
+GRANT pg_read_all_settings TO allgres_settings_reader WITH INHERIT TRUE;
+GRANT pg_read_all_stats TO allgres_settings_reader WITH INHERIT TRUE;
 
 -- The sandbox never resolves an unqualified relation name: the runtime worker
 -- narrows search_path to pg_temp before running model-generated SQL, and this
@@ -3353,6 +3382,31 @@ BEGIN
   -- Never the key values themselves -- only counts.
   PERFORM allgres_private.audit('secrets.rotate_key', jsonb_build_object('rewrapped', v_rewrapped, 'failed', v_failed));
   RETURN jsonb_build_object('ok', true, 'rewrapped', v_rewrapped, 'failed', v_failed);
+END;
+$fn$;
+
+-- The no-restart alternative to `shared_preload_libraries = 'allgres'`
+-- (README, "Installing without a restart"). `allgres.reloadable` is a
+-- placeholder GUC -- settable in postgresql.conf or via SET, exactly like
+-- allgres.secret_key, no DefineCustomStringVariable and no preload required
+-- to read it -- so an operator who cannot (or does not want to) restart
+-- Postgres to install allgres sets it to 'on', runs `CREATE EXTENSION
+-- allgres;`, then calls this once to bring both workers up. Deliberately
+-- NOT wired into dashboard_rpc, same as fn_rotate_secret_key above: this is
+-- a rare operational action, not something the dashboard's own operator/
+-- worker roles need day to day.
+CREATE OR REPLACE FUNCTION allgres_public.fn_start_dynamic_workers()
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres, pg_temp
+AS $fn$
+BEGIN
+  IF coalesce(nullif(current_setting('allgres.reloadable', true), ''), 'off') <> 'on' THEN
+    RETURN jsonb_build_object('ok', false,
+      'reason', 'allgres.reloadable is not ''on'' -- set it in postgresql.conf (or SET for this session) first');
+  END IF;
+  RETURN allgres.native_start_dynamic_workers();
 END;
 $fn$;
 
