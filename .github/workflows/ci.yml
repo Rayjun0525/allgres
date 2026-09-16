@@ -277,10 +277,16 @@ jobs:
             ~/.cargo/git
           key: makefile-smoke-cargo-${{ hashFiles('Cargo.lock') }}
 
-      - name: make build, attempt 1 -- Rust genuinely absent, expected to install rustup and stop there
+      # GitHub's own ubuntu-latest image preinstalls Rust via rustup at
+      # $HOME/.cargo/bin and $HOME/.rustup/... -- confirmed live, the first
+      # time this job ever ran, `make build` just found that cargo and
+      # succeeded outright, never touching the rustup-bootstrap branch this
+      # job exists to prove. A minimal PATH hides it the same way a genuine
+      # from-scratch machine would never have it in the first place.
+      - name: make build, attempt 1 -- Rust hidden from PATH, expected to install rustup and stop there
         id: first_attempt
         continue-on-error: true
-        run: make build PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+        run: PATH=/usr/bin:/bin:/usr/sbin:/sbin make build PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
 
       - name: Confirm the first attempt failed the documented way, not some other way
         if: steps.first_attempt.outcome != 'failure'
