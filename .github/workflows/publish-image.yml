@@ -49,15 +49,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # arm64 runs under QEMU emulation on this amd64 runner -- the Rust/pgrx
+      # compile is real CPU work, so this leg of the build takes noticeably
+      # longer than the native amd64 leg, not a sign anything is stuck.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - uses: docker/setup-buildx-action@v3
 
-      # linux/amd64 only for now, matching the runner's own platform and
-      # ci.yml's docker-smoke job -- arm64 would need the Rust/pgrx build
-      # under QEMU emulation, real extra CI time for a platform nothing has
-      # asked for yet, not a limitation of the image itself.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tag.outputs.tags }}
