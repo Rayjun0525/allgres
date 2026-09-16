@@ -245,3 +245,70 @@ jobs:
       - name: PostgreSQL log on failure
         if: failure()
         run: sudo tail -n 300 /var/log/postgresql/postgresql-16-main.log || true
+
+  # The Makefile (README, "Extension installation") is the actual onboarding
+  # surface for anyone building from source without Docker: `make install`
+  # then `make quickstart`, no restart needed. Every other job in this file
+  # pre-installs Rust via dtolnay/rust-toolchain, which would silently skip
+  # right past the Makefile's own rustup-bootstrap branch and never prove it
+  # actually works -- this job starts from a runner with no Rust and no
+  # cargo-pgrx at all, the same as a real first-time machine, specifically to
+  # exercise that branch rather than assume it.
+  makefile-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 16 (PGDG) and OS build prerequisites -- no Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev pkg-config curl ca-certificates \
+            postgresql-common
+          yes '' | sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+          sudo apt-get install -y --no-install-recommends postgresql-16 postgresql-server-dev-16
+          sudo chown "$(id -un)" /usr/lib/postgresql/16/lib /usr/share/postgresql/16/extension
+
+      - name: Cache cargo registry (not rustup or cargo-pgrx themselves -- this job's whole point is installing both from nothing)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: makefile-smoke-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: make build, attempt 1 -- Rust genuinely absent, expected to install rustup and stop there
+        id: first_attempt
+        continue-on-error: true
+        run: make build PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+
+      - name: Confirm the first attempt failed the documented way, not some other way
+        if: steps.first_attempt.outcome != 'failure'
+        run: |
+          echo "make build succeeded on the very first try -- Rust must already have been on this runner, which defeats the point of this job" >&2
+          exit 1
+
+      - name: make build, attempt 2 -- same as opening a new shell after rustup finished, as the Makefile's own message says to
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          make build PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+
+      - name: make install
+        run: make install PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+
+      - name: make quickstart -- the "no restart needed" claim, proven end to end
+        run: |
+          sudo pg_ctlcluster 16 main start || true
+          for _ in $(seq 1 30); do sudo -u postgres pg_isready -q && break; sleep 1; done
+          sudo -u postgres bash -c "cd '$PWD' && make quickstart"
+          ok=0
+          for _ in $(seq 1 15); do
+            curl -sf -o /dev/null http://127.0.0.1:8088/ && { ok=1; break; }
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "dashboard never answered on 127.0.0.1:8088 after make quickstart" >&2; exit 1; }
+
+      - name: PostgreSQL log on failure
+        if: failure()
+        run: sudo tail -n 300 /var/log/postgresql/postgresql-16-main.log || true
