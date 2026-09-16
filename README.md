@@ -160,13 +160,12 @@ required at runtime.
 
 This is what [Quick start](#quick-start)'s `./scripts/bootstrap.sh` actually
 does, for anyone who wants to run the steps by hand or understand what just
-happened. It builds the image locally from this repo's own `Dockerfile`
-(there is no published image to pull — `docker-compose.yml`'s `build: .`
-is the whole story), starts it on its own named data volume, and the
-defaults below (`docker-compose.yml`) are chosen so this works with zero
-configuration for a first run and local evaluation — `ALLGRES_ENABLE_MOCK`
-on, `ALLGRES_ALLOW_INSECURE_HTTP` set, no `ALLGRES_SECRET_KEY` — **none of
-that is a production posture**; see [Exposure](#exposure) and [Secrets at
+happened. It builds the image locally from this repo's own `Dockerfile`,
+starts it on its own named data volume, and the defaults below
+(`docker-compose.yml`) are chosen so this works with zero configuration for
+a first run and local evaluation — `ALLGRES_ENABLE_MOCK` on,
+`ALLGRES_ALLOW_INSECURE_HTTP` set, no `ALLGRES_SECRET_KEY` — **none of that
+is a production posture**; see [Exposure](#exposure) and [Secrets at
 rest](#secrets-at-rest) for what to change before this ever serves real
 traffic or real provider keys.
 
@@ -177,6 +176,20 @@ docker compose up -d --build       # allgres_pgdata is a named volume (docker-co
 ./scripts/bootstrap.sh             # waits for healthy, makes sure a first admin exists,
                                     # then runs one real agent task through to completion
 ```
+
+A pre-built image is also published to GHCR (GitHub Container Registry) for
+every tagged release, so a local build isn't required to try it:
+
+```bash
+docker pull ghcr.io/rayjun0525/allgres:latest   # or a specific tag, e.g. :v0.1.0-alpha.1
+```
+
+It's the same image `docker-compose.yml`'s `build: .` produces — swap
+`build: .` for `image: ghcr.io/rayjun0525/allgres:latest` in a compose file
+to use it directly, or `docker run` it against your own PostgreSQL setup.
+Published by `.github/workflows/publish-image.yml` on every `v*` tag push
+(and available on demand via that workflow's manual dispatch); `:latest`
+tracks the most recent tag, not `main`.
 
 Both published ports (`5432`, `8088`) are bound to host loopback only; see
 [Exposure](#exposure) before changing that.

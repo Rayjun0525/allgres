@@ -21,6 +21,14 @@ RUN cargo pgrx install --release --features pg17
 RUN cp -f sql/allgres--*.sql /usr/share/postgresql/17/extension/ 2>/dev/null || true
 
 FROM postgres:17-bookworm
+# org.opencontainers.image.source is what GHCR (.github/workflows/publish-
+# image.yml) uses to link a pushed package back to this repository -- the
+# same label GitHub's own docs recommend for that, present in the image
+# itself so it holds regardless of which workflow or manual `docker push`
+# actually publishes a given build.
+LABEL org.opencontainers.image.source="https://github.com/Rayjun0525/allgres" \
+      org.opencontainers.image.description="Allgres -- Postgres Is All You Need. PostgreSQL-native agent control plane." \
+      org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=builder /usr/lib/postgresql/17/lib/allgres.so /usr/lib/postgresql/17/lib/allgres.so
 COPY --from=builder /usr/share/postgresql/17/extension/allgres* /usr/share/postgresql/17/extension/
 
