@@ -21,15 +21,81 @@ permissions:
   packages: write
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  # linux/amd64 and linux/arm64 are each built on a real runner for that
+  # architecture (ubuntu-24.04-arm is GitHub's free-for-public-repos native
+  # Arm runner) rather than QEMU-emulating arm64 on an amd64 box -- an
+  # emulated Rust/pgrx compile from scratch ran past an hour with no end in
+  # sight before this was ever merged; native hardware is the fix, not a
+  # longer timeout. Each leg pushes its own image by digest only (no tag),
+  # and the 'merge' job below stitches the two digests into one real
+  # multi-arch manifest, so nothing but the final tags is ever user-visible.
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs_on: ubuntu-latest
+          - platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Determine image name from the repository
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Save this platform's digest for the merge job
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Combines the amd64 and arm64 digests from the build job into one
+  # multi-arch manifest list under the real tags -- this is the only job
+  # that determines what tag a user actually pulls.
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
 
       # Docker/OCI image names must be all-lowercase, but github.repository
       # preserves this repo's real casing (Rayjun0525/allgres) -- pushing
       # ghcr.io/Rayjun0525/allgres would just fail outright, so this is
-      # computed once here rather than assumed.
+      # computed once here rather than assumed. A tag push publishes both
+      # the tag-named image and :latest; anything else (workflow_dispatch on
+      # a branch) publishes only under the branch name, never touching
+      # :latest.
       - name: Determine image name and tag(s) from the git ref
         id: tag
         run: |
@@ -41,6 +107,7 @@ jobs:
             REF="${GITHUB_REF#refs/heads/}"
             echo "tags=${IMAGE}:${REF}" >> "$GITHUB_OUTPUT"
           fi
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -49,19 +116,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # arm64 runs under QEMU emulation on this amd64 runner -- the Rust/pgrx
-      # compile is real CPU work, so this leg of the build takes noticeably
-      # longer than the native amd64 leg, not a sign anything is stuck.
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.tag.outputs.tags }}
+      - name: Create and push the multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          IMAGE="${{ steps.tag.outputs.image }}"
+          IFS=',' read -ra TAGS <<< "${{ steps.tag.outputs.tags }}"
+          TAG_ARGS=()
+          for t in "${TAGS[@]}"; do TAG_ARGS+=(--tag "$t"); done
+          docker buildx imagetools create "${TAG_ARGS[@]}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect the published manifest
+        run: |
+          FIRST_TAG="${{ steps.tag.outputs.tags }}"
+          docker buildx imagetools inspect "${FIRST_TAG%%,*}"
