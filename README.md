@@ -1400,35 +1400,63 @@ bypass of the dashboard token.
 ## Extension installation
 
 No Docker: install straight onto an existing PostgreSQL 16, 17, or 18
-server. You need `cargo-pgrx` (`cargo install --locked cargo-pgrx --version
-0.19.2`) and that PostgreSQL version's own `-dev`/`-server-dev` package
-installed first (`pg_config` must be on `PATH`), then:
+server. The guiding principle is the same as Docker's `./scripts/
+bootstrap.sh` above — a working instance in a handful of commands, not a
+multi-page install guide to work through by hand. You need that PostgreSQL
+version's own `-dev`/`-server-dev` package installed first (`pg_config`
+must be on `PATH`; Rust and `cargo-pgrx` are handled for you if they
+aren't already there):
 
 ```bash
-cargo pgrx install --release --features pg17   # or --features pg16 / pg18
+git clone https://github.com/Rayjun0525/allgres.git
+cd allgres
+make install     # add `sudo` if this PostgreSQL's own lib/share dirs need it
+make quickstart  # CREATE EXTENSION + start, no restart -- see below
 ```
 
-This compiles the extension and copies the `.so`/`.control`/`.sql` files
-into that PostgreSQL installation's own extension directory — no manual
-file copying. Then set:
+Four commands, and the last two are only two because `install` and
+*running* it are kept deliberately separate (`install` only ever touches
+this machine's PostgreSQL installation, the same as any extension's own
+`make install`; `quickstart` is the one step that touches a live database,
+so it stays opt-in rather than a side effect of building). `make` alone
+(no target) stages a build under `target/release/allgres-pgNN/` without
+touching the system at all, if you just want to compile first and decide
+later. `make install` explains its own next steps when it finishes, in
+case you'd rather run them by hand or against a different database than
+`quickstart`'s default of `postgres`.
+
+What the Makefile is actually doing, for anyone who wants to run the
+underlying commands directly instead, or already has `cargo-pgrx`
+installed and configured: it installs `cargo-pgrx` if missing (`cargo
+install --locked cargo-pgrx --version 0.19.2`, pinned to whatever this
+crate's own `Cargo.toml` requires), runs `cargo pgrx init` for the one
+PostgreSQL version `pg_config` resolves to, then `cargo pgrx install
+--release --features pgNN`, which compiles the extension and copies the
+`.so`/`.control`/`.sql` files into that installation's own extension
+directory — no manual file copying either way.
+
+Open the address `ALLGRES_HTTP_ADDR` defaults to
+(`http://127.0.0.1:8088`) the same as the Docker path above. See
+[Configuration](#configuration) for every environment variable the
+runtime worker reads.
+
+`make quickstart` uses the no-restart path (`allgres.reloadable`) covered
+in detail just below, in [Installing without a
+restart](#installing-without-a-restart) — worth reading once for what it
+actually trades off. The classic path still works exactly as it always
+has, and is what a from-scratch production install should default to:
 
 ```conf
 shared_preload_libraries = 'allgres'
 ```
 
 restart PostgreSQL (a plain reload is not enough — this registers a
-background worker, which only happens at postmaster start), and create
-the extension:
+background worker, which only happens at postmaster start), then
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- optional, encrypts secrets at rest
 CREATE EXTENSION allgres;
 ```
-
-Open the address `ALLGRES_HTTP_ADDR` defaults to
-(`http://127.0.0.1:8088`) the same as the Docker path above. See
-[Configuration](#configuration) for every environment variable the
-runtime worker reads.
 
 ### Installing without a restart
 
@@ -1456,6 +1484,9 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION allgres;
 SELECT allgres_public.fn_start_dynamic_workers();
 ```
+
+(exactly what `make quickstart` runs, against the `postgres` database, if
+`allgres` is already installed).
 
 That last call registers both workers with PostgreSQL's own
 `RegisterDynamicBackgroundWorker`, the same mechanism `pg_cron` and similar
