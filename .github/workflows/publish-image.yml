@@ -132,3 +132,108 @@ jobs:
         run: |
           FIRST_TAG="${{ steps.tag.outputs.tags }}"
           docker buildx imagetools inspect "${FIRST_TAG%%,*}"
+
+  # cnpg/Dockerfile (README, "CNPG (CloudNativePG)") builds a completely
+  # separate, much smaller artifact -- just allgres.so plus its .control/
+  # .sql files, for CNPG's Image Volume Extensions mechanism -- so it gets
+  # its own image name (allgres-cnpg-ext) rather than another tag on the
+  # full-Postgres image above; the two are not interchangeable and
+  # publishing them under the same name would make that invisible. Same
+  # native-per-arch-then-merge shape as the jobs above, for the same
+  # reason: this Dockerfile does a real cargo-pgrx compile from source too,
+  # and QEMU-emulating that for arm64 already proved impractically slow
+  # once in this repo's own history.
+  build-cnpg-ext:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs_on: ubuntu-latest
+          - platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine image name from the repository
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-cnpg-ext" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cnpg/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Save this platform's digest for the merge job
+        run: |
+          mkdir -p /tmp/cnpg-ext-digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/cnpg-ext-digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnpg-ext-digest-${{ strategy.job-index }}
+          path: /tmp/cnpg-ext-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-cnpg-ext:
+    needs: build-cnpg-ext
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/cnpg-ext-digests
+          pattern: cnpg-ext-digest-*
+          merge-multiple: true
+
+      - name: Determine image name and tag(s) from the git ref
+        id: tag
+        run: |
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')-cnpg-ext"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            REF="${GITHUB_REF#refs/tags/}"
+            echo "tags=${IMAGE}:${REF},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          else
+            REF="${GITHUB_REF#refs/heads/}"
+            echo "tags=${IMAGE}:${REF}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Create and push the multi-arch manifest
+        working-directory: /tmp/cnpg-ext-digests
+        run: |
+          IMAGE="${{ steps.tag.outputs.image }}"
+          IFS=',' read -ra TAGS <<< "${{ steps.tag.outputs.tags }}"
+          TAG_ARGS=()
+          for t in "${TAGS[@]}"; do TAG_ARGS+=(--tag "$t"); done
+          docker buildx imagetools create "${TAG_ARGS[@]}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect the published manifest
+        run: |
+          FIRST_TAG="${{ steps.tag.outputs.tags }}"
+          docker buildx imagetools inspect "${FIRST_TAG%%,*}"

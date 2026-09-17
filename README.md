@@ -1562,6 +1562,17 @@ This needs PostgreSQL 18+ (the mechanism relies on a `postgresql`-conf-
 this, only there from PG18 on) and Kubernetes 1.33+ (with the `ImageVolume`
 feature gate enabled manually on 1.33–1.34; default-on from 1.35).
 
+A pre-built image is published to GHCR the same way the plain-Docker image
+is (`.github/workflows/publish-image.yml`, on every `v*` tag push):
+
+```bash
+docker pull ghcr.io/rayjun0525/allgres-cnpg-ext:latest
+```
+
+Use that directly as `cnpg/cluster-example.yaml`'s `image.reference` and
+skip building anything yourself. To build it yourself instead (a fork, a
+local change to try before it's tagged):
+
 ```bash
 # Run from the repo root -- the build context (the trailing `.`) must be
 # the whole repo (Cargo.toml, Cargo.lock, src/, sql/), not the cnpg/
