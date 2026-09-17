@@ -307,7 +307,16 @@ jobs:
         run: |
           sudo pg_ctlcluster 16 main start || true
           for _ in $(seq 1 30); do sudo -u postgres pg_isready -q && break; sleep 1; done
-          sudo -u postgres bash -c "cd '$PWD' && make quickstart"
+          # No explicit `cd` here: sudo inherits the caller's cwd as-is (the
+          # checkout directory), the same way every other job's own
+          # `sudo -u postgres psql -f tests/smoke.sql` already relies on. An
+          # explicit `cd /home/runner/work/...` forces path *resolution*
+          # through every ancestor directory, including /home/runner itself
+          # (owned by, and traversable only by, the runner user) -- confirmed
+          # live, that failed with "Permission denied" the first time this
+          # job ever reached this step, where the inherited-cwd form does not
+          # hit the same check at all.
+          sudo -u postgres make quickstart
           ok=0
           for _ in $(seq 1 15); do
             curl -sf -o /dev/null http://127.0.0.1:8088/ && { ok=1; break; }
