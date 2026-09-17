@@ -3918,3 +3918,50 @@ just client-side state); then switched to Project mode and confirmed the
 same project-bound agent's saved provider/model shows there too. `fn_
 selftest()` 333/0 on two separate connections (unaffected, as expected for
 a web-only change).
+
+## 49. Link visibility and a small design pass after a full page sweep
+
+Raised alongside item 48's own spacing regression: "다른곳들도 확인해줘. 그리고
+링크 같은것들 가시성도 안좋아" (check the other pages too, and link visibility
+is bad). Swept every page (Overview, Agents + its edit modal, Chat's three
+modes, Approvals' three tabs, Projects + its New project modal, Run,
+Memories, Audit's four tabs, Settings' full scroll) with real screenshots
+against the live dashboard -- confirmed no other instance of item 46's
+"row touching the panel below it" pattern (already fixed everywhere it
+existed), so this narrowed to two real, scoped gaps:
+
+- **No `a` rule existed at all.** The one real link in the app (the
+  device-code flow's verification URL, item 46) fell back to the browser
+  default blue/purple, which does not match this app's own palette at
+  all and reads poorly against the dark theme. Added `a{color:var(
+  --accent2)}` (`a:hover` underlines, `a:visited` stays the same color --
+  a login-gated internal tool has no reason to fade a previously-opened
+  link) using the same `--accent2` token already defined for both themes;
+  computed WCAG contrast confirms it clears AA comfortably against both
+  the dark (`5.92:1`) and light (`4.74:1`) background.
+- **Flat, borderless list rows and panels.** Added a subtle `.table
+  tbody tr:hover{background:var(--panel2)}` (list scanability -- Apple's
+  own store page, given as a loose reference, uses hover feedback
+  throughout, though nothing here approaches copying its visual language)
+  and a soft `box-shadow` on `.panel`/`.dialog` for a touch of depth
+  instead of perfectly flat cards.
+
+Deliberately did **not** touch the primary-button/badge `--accent` token
+itself, despite it measuring under WCAG AA (`3.56:1`) for normal-weight
+white-on-accent text: `.btn.primary` is bold (`font-weight:650`), which
+places it under WCAG's large-text threshold (`3:1`) instead, where it
+passes; darkening `--accent` to fix that ratio would only trade it for a
+worse one against the dark background everywhere `--accent` is used as a
+foreground color instead (status text, the online dot) -- not a genuine
+gap the way the missing `a` rule was, and `web/index.html`'s own comment
+on this override layer ("Keep this override separate ... so future
+refactors cannot accidentally reintroduce neon accents") is a deliberate
+guardrail against exactly this kind of speculative palette change.
+
+No SQL changed. Verified: rebuilt, reinstalled, restarted the cluster,
+`fn_selftest()` 333/0 on two separate connections, `cargo test --lib`
+30/30, and the link/hover/shadow changes checked visually in a real
+browser (Playwright) -- a link injected into the actual running page (the
+real device-code path needs live xAI network access this sandbox's own
+egress policy blocks, per item 46/47) renders in the new color, and an
+Agents-table row hover shows the new background.
