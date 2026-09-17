@@ -796,6 +796,33 @@ function assignmentsModal(userId){
 // channel), and Project (a preset system prompt + agent, item 42) as three
 // modes of one page, switched with buttons instead of three separate nav
 // entries. ---
+// Shared inline Provider/Model control for whichever single agent a chat
+// mode is currently talking to (General always talks to 'general'; Project
+// mode's bound agent -- see require_project_access's own comment: reaching
+// a project still requires that same agent be assigned to the user, so it
+// is always present in agents.mine too). Same fn_set_my_model surface My
+// Agents already exposed on its own page (agents.js's myAgentsPage), just
+// inline where the conversation actually happens instead of a separate
+// page -- messenger mode has no single agent to point this at (a mention
+// can route to any of several), so it stays out of that mode.
+function chatModelPicker(agent,providerOpts){
+  if(!agent)return '';
+  return `<div class="row wrap" style="margin-bottom:14px;gap:8px;align-items:flex-end"><div class="field" style="margin:0;min-width:180px"><label>Provider</label><select class="select" id="cmProvider">${providerOpts.length?(!agent.provider?'<option value="">— select —</option>':'')+providerOpts.map(p=>`<option value="${esc(p.name)}" ${p.name===agent.provider?'selected':''}>${esc(p.name)} (${esc(p.kind)})</option>`).join(''):'<option value="">No provider configured -- ask an admin</option>'}</select></div><div class="field" style="margin:0;min-width:180px"><label>Model</label><input class="input" id="cmModel" value="${esc(agent.model||'')}" placeholder="e.g. gpt-4o, claude-sonnet-5" list="cmModelOptions">${modelDatalist('cmModelOptions',providerOpts.find(p=>p.name===agent.provider)?.available_models||[])}</div><button class="btn small" id="cmSave">Save</button></div>`;
+}
+function wireChatModelPicker(agent,providerOpts,onSaved){
+  if(!agent||!$('#cmProvider'))return;
+  $('#cmProvider').onchange=()=>{
+    const p=providerOpts.find(x=>x.name===$('#cmProvider').value);
+    $('#cmModelOptions').innerHTML=(p?.available_models||[]).map(m=>`<option value="${esc(m)}">`).join('')
+  };
+  $('#cmSave').onclick=async()=>{
+    try{
+      await rpc('agents.set_my_model',{agent_id:agent.agent_id,provider:$('#cmProvider').value,model:$('#cmModel').value.trim()});
+      toast('Saved');
+      if(onSaved)onSaved();
+    }catch(e){toast(e.message)}
+  };
+}
 async function chatPage(){
   const modes=[['general','general'],['messenger','messenger'],['project','project']];
   $('#view').innerHTML=`<div class="row" style="margin-bottom:22px">${modes.map(([m,k])=>`<button class="btn small chatModeBtn${state.chatMode===m?' primary':''}" data-mode="${m}">${esc(t(k))}</button>`).join('')}</div><div id="chatModeBody"></div>`;
@@ -820,7 +847,10 @@ async function generalChatMode(target){
   const d=await rpc('agents.mine'); state.myAgents=d.agents||[];
   const general=state.myAgents.find(a=>a.name==='general');
   state.chatAgentId=general?general.agent_id:null;
-  target.innerHTML=`<div class="panel"><div id="chatThread" style="max-height:55vh;overflow:auto;margin-bottom:14px"></div><div class="row"><input class="input" id="chatInput" placeholder="Message…" ${general?'':'disabled'}><button class="btn primary" id="chatSend" ${general?'':'disabled'}>${esc(t('send'))}</button></div></div>`;
+  const ds=await api('/api/v1/settings').catch(()=>({providers:[]}));
+  const providerOpts=(ds.providers||[]).filter(p=>p.is_enabled&&p.purpose!=='embedding');
+  target.innerHTML=`<div class="panel">${chatModelPicker(general,providerOpts)}<div id="chatThread" style="max-height:55vh;overflow:auto;margin-bottom:14px"></div><div class="row"><input class="input" id="chatInput" placeholder="Message…" ${general?'':'disabled'}><button class="btn primary" id="chatSend" ${general?'':'disabled'}>${esc(t('send'))}</button></div></div>`;
+  wireChatModelPicker(general,providerOpts,()=>generalChatMode(target));
   $('#chatSend').onclick=sendChat;
   $('#chatInput').onkeydown=e=>{if(e.key==='Enter')sendChat()};
   await renderChatThread();
@@ -836,8 +866,18 @@ async function projectChatMode(target){
   if((!state.chatProjectId||!opts_.some(p=>p.project_id===state.chatProjectId))&&opts_.length)
     state.chatProjectId=opts_[0].project_id;
   const opts=opts_.map(p=>`<option value="${esc(p.project_id)}" ${p.project_id===state.chatProjectId?'selected':''}>${esc(p.name)} (${esc(p.agent)})</option>`).join('');
-  target.innerHTML=`<div class="panel"><div class="row" style="margin-bottom:22px"><label class="muted" style="font-size:12px">Project</label><select class="select" id="chatProjectSel" style="max-width:300px">${opts||'<option value="">No project configured for chat yet</option>'}</select></div><div id="projectChatThread" style="max-height:55vh;overflow:auto;margin-bottom:14px"></div><div class="row"><input class="input" id="projectChatInput" placeholder="Message…" ${opts_.length?'':'disabled'}><button class="btn primary" id="projectChatSend" ${opts_.length?'':'disabled'}>${esc(t('send'))}</button></div></div>`;
-  $('#chatProjectSel').onchange=()=>{state.chatProjectId=$('#chatProjectSel').value;renderProjectChatThread()};
+  // require_project_access's own comment: a project is only reachable once
+  // its bound agent is assigned to this user the same way General mode's
+  // agent would be, so that agent is always present in agents.mine too --
+  // no separate lookup needed for the provider/model picker below.
+  const md=await rpc('agents.mine').catch(()=>({agents:[]})); state.myAgents=md.agents||[];
+  const curProject=opts_.find(p=>p.project_id===state.chatProjectId);
+  const projectAgent=curProject?state.myAgents.find(a=>a.agent_id===curProject.agent_id):null;
+  const ds=await api('/api/v1/settings').catch(()=>({providers:[]}));
+  const providerOpts=(ds.providers||[]).filter(p=>p.is_enabled&&p.purpose!=='embedding');
+  target.innerHTML=`<div class="panel"><div class="row" style="margin-bottom:22px"><label class="muted" style="font-size:12px">Project</label><select class="select" id="chatProjectSel" style="max-width:300px">${opts||'<option value="">No project configured for chat yet</option>'}</select></div>${chatModelPicker(projectAgent,providerOpts)}<div id="projectChatThread" style="max-height:55vh;overflow:auto;margin-bottom:14px"></div><div class="row"><input class="input" id="projectChatInput" placeholder="Message…" ${opts_.length?'':'disabled'}><button class="btn primary" id="projectChatSend" ${opts_.length?'':'disabled'}>${esc(t('send'))}</button></div></div>`;
+  $('#chatProjectSel').onchange=()=>{state.chatProjectId=$('#chatProjectSel').value;projectChatMode(target)};
+  wireChatModelPicker(projectAgent,providerOpts,()=>projectChatMode(target));
   $('#projectChatSend').onclick=sendProjectChat;
   $('#projectChatInput').onkeydown=e=>{if(e.key==='Enter')sendProjectChat()};
   await renderProjectChatThread();

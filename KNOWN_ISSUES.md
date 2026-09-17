@@ -3883,3 +3883,38 @@ transport failure (`io: invalid peer certificate: UnknownIssuer` -- this
 sandbox's own egress proxy, not a bug) as `last_probe_status='error'`
 rather than crashing or hanging, which is exactly the failure-handling
 this was meant to guarantee.
+
+## 48. Chat had no way to change provider/model inline -- only a separate "My Agents" page did
+
+Raised directly: "채팅쪽에서도 모델을 자유롭게 바꿀 수 있게" (let Chat change the
+model freely too). `fn_set_my_model`/`agents.set_my_model` already existed
+and already let any user (admin included, via `require_agent_access`'s
+admin bypass) repoint an agent they can reach at a different provider/
+model -- but the only place that surface was wired up in the dashboard was
+the regular-user-only "My Agents" page, a separate screen from the actual
+conversation.
+
+Added the same Provider/Model row (a `<select>` + a model `<input>` backed
+by the same `available_models` datalist item 47 introduced, + Save) inline
+above the message thread in Chat's General mode (the seeded `general`
+agent) and Project mode (whichever agent that project is bound to) --
+`chatModelPicker`/`wireChatModelPicker` in `web/index.html`, shared by
+both since each mode always talks to exactly one agent. Messenger mode
+stays without one: a mention can route to any of several agents, so there
+is no single agent to point a picker at. Project mode's picker needed
+`agents.mine` fetched there too (previously only General mode called it) --
+`require_project_access`'s own comment already established that a
+project's bound agent must be assigned to the user the same way General
+mode's agent is, so it is always present in that same list, no separate
+lookup required.
+
+No SQL changed -- pure `web/index.html` UI wiring onto an existing,
+already-tested backend function. Verified live: rebuilt, reinstalled,
+restarted the cluster, then in a real browser (Playwright) against the
+actual dashboard -- picked `anthropic`/`claude-sonnet-5` for the `general`
+agent from Chat's General mode, saved, reloaded the page from scratch, and
+confirmed the choice was still there (a real `fn_set_my_model` write, not
+just client-side state); then switched to Project mode and confirmed the
+same project-bound agent's saved provider/model shows there too. `fn_
+selftest()` 333/0 on two separate connections (unaffected, as expected for
+a web-only change).

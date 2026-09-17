@@ -671,7 +671,12 @@ agent the same way Chat would, sharing the same conversation rather than
 starting a second, divergent one — `fn_messenger_post`/`messenger.list`),
 and **My Agents** (their assigned agents, each with an inline Provider/
 Model editor — `fn_set_my_model` — never the full agent editor's
-prompt/budget/permission fields). Which agents a regular user can reach at
+prompt/budget/permission fields). Chat's own General and Project modes now
+carry that same inline Provider/Model editor above the message thread --
+General for the seeded `general` agent, Project for whichever agent that
+project is bound to -- so switching model/provider no longer means
+leaving the conversation for My Agents first; Messenger has no picker,
+since an `@mention` can route to any of several agents. Which agents a regular user can reach at
 all is an explicit allow-list (`allgres_private.user_agent_assignments`,
 managed by an admin from the Users page), not everything minus a
 block-list. See KNOWN_ISSUES.md, item 30, for what this deliberately does
