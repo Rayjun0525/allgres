@@ -1,5 +1,21 @@
 # Example CNPG (CloudNativePG) wiring for the extension image built from
-# cnpg/Dockerfile. Two separate CRs, two separate concerns:
+# cnpg/Dockerfile.
+#
+# PREREQUISITE: the CNPG operator itself must already be installed on the
+# target cluster -- `Cluster`/`Database` are CRDs it registers, so without
+# it `kubectl apply` on this file fails with "no matches for kind Cluster
+# in version postgresql.cnpg.io/v1 -- ensure CRDs are installed first"
+# (confirmed live, this is the first thing anyone applying this file for
+# the first time will hit). Install it once per cluster, e.g.:
+#
+#   helm repo add cnpg https://cloudnative-pg.github.io/charts
+#   helm upgrade --install cnpg --namespace cnpg-system --create-namespace cnpg/cloudnative-pg
+#
+# then confirm with `kubectl get pods -n cnpg-system` before applying this
+# file. See https://cloudnative-pg.io for other install methods (a plain
+# kubectl manifest, the krew plugin).
+#
+# Two separate CRs below, two separate concerns:
 #
 #   Cluster.spec.postgresql.extensions   mounts the image's files at
 #                                         /extensions/allgres so PostgreSQL

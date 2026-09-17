@@ -3725,7 +3725,23 @@ had no Docker daemon either) -- two rounds:
   instead of surfacing as a confusing `cargo-pgrx` internal error. README's
   own build instructions gained the same warning inline.
 
-Still open: whether the produced image actually loads correctly once
-mounted by a real CNPG `Cluster` (file layout, `shared_preload_libraries`
-wiring, the `Database` CR's `CREATE EXTENSION` step) is unverified past
-the image build succeeding.
+The built image is now published to GHCR too
+(`ghcr.io/rayjun0525/allgres-cnpg-ext`), same `publish-image.yml` workflow
+and same native-per-arch-then-merge shape as the plain-Docker image, so
+using it no longer requires building it locally at all.
+
+A second real-testing round, applying `cnpg/cluster-example.yaml` against
+an actual cluster, hit the next real prerequisite gap: the CNPG operator
+itself wasn't installed, so `kubectl apply` failed with "no matches for
+kind Cluster in version postgresql.cnpg.io/v1 -- ensure CRDs are installed
+first" -- `Cluster`/`Database` are CRDs the operator registers, not
+built into Kubernetes itself. Neither the example file nor this README
+said so anywhere. Both now document the one-line Helm install
+(`helm upgrade --install cnpg --namespace cnpg-system --create-namespace
+cnpg/cloudnative-pg`, after `helm repo add cnpg
+https://cloudnative-pg.github.io/charts`) as an explicit prerequisite.
+
+Still open: whether the Cluster actually comes up correctly once the
+operator is present (file layout inside the mounted image,
+`shared_preload_libraries` wiring, the `Database` CR's `CREATE EXTENSION`
+step) is unverified past this point.

@@ -1560,7 +1560,13 @@ at `/extensions/allgres` alongside it.
 This needs PostgreSQL 18+ (the mechanism relies on a `postgresql`-conf-
 `extension_control_path`-style GUC CNPG contributed upstream for exactly
 this, only there from PG18 on) and Kubernetes 1.33+ (with the `ImageVolume`
-feature gate enabled manually on 1.33–1.34; default-on from 1.35).
+feature gate enabled manually on 1.33–1.34; default-on from 1.35), plus the
+CNPG operator itself already installed on the target cluster —
+`Cluster`/`Database` are CRDs it registers, so applying
+`cnpg/cluster-example.yaml` against a cluster without it fails with "no
+matches for kind Cluster ... ensure CRDs are installed first" (confirmed
+live). See that file's own header comment for the one-line Helm install if
+you don't already have it running.
 
 A pre-built image is published to GHCR the same way the plain-Docker image
 is (`.github/workflows/publish-image.yml`, on every `v*` tag push):
