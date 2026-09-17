@@ -3741,7 +3741,33 @@ said so anywhere. Both now document the one-line Helm install
 cnpg/cloudnative-pg`, after `helm repo add cnpg
 https://cloudnative-pg.github.io/charts`) as an explicit prerequisite.
 
-Still open: whether the Cluster actually comes up correctly once the
-operator is present (file layout inside the mounted image,
+With the operator installed, two more real findings from the same testing
+round:
+
+- **Runtime requirement, not just a Kubernetes version**: the `Cluster`'s
+  `bootstrap-controller` init container failed with `Error response from
+  daemon: invalid volume specification: ':/extensions/allgres:ro'` --
+  that exact wording is Docker Engine's (`dockerd`), not containerd's or
+  CRI-O's. `ImageVolume` is a CRI feature only containerd 2.1+ and CRI-O
+  1.31+ implement; Rancher Desktop's `dockerd` (moby) container engine
+  does not support it at all, and there is no workaround for that short
+  of switching Rancher Desktop's engine to containerd. README and
+  `cnpg/cluster-example.yaml` both now call this out explicitly rather
+  than only listing a Kubernetes version.
+- **A personally-pushed image is private by default**: after switching
+  engines, the next failure was `403 Forbidden` pulling a build pushed to
+  a personal GHCR namespace (`ghcr.io/<user>/allgres:...`) -- GHCR
+  packages default to private, and an anonymous Kubernetes pull has no
+  credentials to authenticate with. Since `ghcr.io/rayjun0525/allgres-
+  cnpg-ext` (this repo's own published image, added the same day) is
+  confirmed public and multi-arch (`docker buildx imagetools`/an
+  anonymous-token `curl` both checked it), pointing at that instead of a
+  personal build sidesteps this rather than needing to fix package
+  visibility. Note it currently only carries a `:main` tag (no version has
+  been tagged yet), not `:latest` -- README and the example file corrected
+  to say so.
+
+Still open: whether the Cluster actually comes up correctly on a properly
+configured (containerd) runtime -- file layout inside the mounted image,
 `shared_preload_libraries` wiring, the `Database` CR's `CREATE EXTENSION`
-step) is unverified past this point.
+step -- is unverified past this point.

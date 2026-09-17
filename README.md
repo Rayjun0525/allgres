@@ -1560,24 +1560,35 @@ at `/extensions/allgres` alongside it.
 This needs PostgreSQL 18+ (the mechanism relies on a `postgresql`-conf-
 `extension_control_path`-style GUC CNPG contributed upstream for exactly
 this, only there from PG18 on) and Kubernetes 1.33+ (with the `ImageVolume`
-feature gate enabled manually on 1.33–1.34; default-on from 1.35), plus the
-CNPG operator itself already installed on the target cluster —
-`Cluster`/`Database` are CRDs it registers, so applying
-`cnpg/cluster-example.yaml` against a cluster without it fails with "no
-matches for kind Cluster ... ensure CRDs are installed first" (confirmed
-live). See that file's own header comment for the one-line Helm install if
-you don't already have it running.
+feature gate enabled manually on 1.33–1.34; default-on from 1.35) running
+on a **containerd 2.1+ or CRI-O 1.31+** node specifically — confirmed live,
+Rancher Desktop's `dockerd` (moby) container engine does not support
+`ImageVolume` at all and fails the mount with "invalid volume
+specification"; switch Rancher Desktop's engine to containerd (Preferences
+→ Container Engine) if you hit that. Also needs the CNPG operator itself
+already installed on the target cluster — `Cluster`/`Database` are CRDs
+it registers, so applying `cnpg/cluster-example.yaml` against a cluster
+without it fails with "no matches for kind Cluster ... ensure CRDs are
+installed first" (confirmed live too). See that file's own header comment
+for the one-line Helm install if you don't already have it running.
 
 A pre-built image is published to GHCR the same way the plain-Docker image
-is (`.github/workflows/publish-image.yml`, on every `v*` tag push):
+is (`.github/workflows/publish-image.yml`): `:main` on every push to
+main, plus a real version tag and `:latest` once one is actually pushed
+(no version has been tagged yet as of this writing, so use `:main` for
+now):
 
 ```bash
-docker pull ghcr.io/rayjun0525/allgres-cnpg-ext:latest
+docker pull ghcr.io/rayjun0525/allgres-cnpg-ext:main
 ```
 
 Use that directly as `cnpg/cluster-example.yaml`'s `image.reference` and
-skip building anything yourself. To build it yourself instead (a fork, a
-local change to try before it's tagged):
+skip building anything yourself. A personal build pushed to your own GHCR
+namespace defaults to **private** — Kubernetes pulling it anonymously
+fails with `403 Forbidden` (confirmed live) unless you make that package
+public yourself or configure an image pull secret; using the
+project-published image above avoids that entirely. To build it yourself
+instead (a fork, a local change to try before it's tagged):
 
 ```bash
 # Run from the repo root -- the build context (the trailing `.`) must be

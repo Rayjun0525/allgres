@@ -41,12 +41,16 @@
 #                                         against the target database.
 #
 # Requires PostgreSQL 18+ and Kubernetes 1.33+ (with the ImageVolume
-# feature gate enabled manually on 1.33-1.34; default-on from 1.35) --
-# see cnpg/Dockerfile's own header for why. The image reference below
-# (ghcr.io/rayjun0525/allgres-cnpg-ext) is published by .github/workflows/
-# publish-image.yml on every v* tag push, same as the plain-Docker image;
-# point it at your own build instead if you're testing a local change
-# before it's tagged.
+# feature gate enabled manually on 1.33-1.34; default-on from 1.35, AND a
+# containerd 2.1+ or CRI-O 1.31+ runtime specifically -- confirmed live,
+# Rancher Desktop's dockerd (moby) engine does not support ImageVolume at
+# all and fails the mount with "invalid volume specification"), plus the
+# CNPG operator itself already installed -- see below. The image
+# reference below (ghcr.io/rayjun0525/allgres-cnpg-ext) is published by
+# .github/workflows/publish-image.yml, same as the plain-Docker image:
+# `:main` (used below) on every push to main, plus a real version tag and
+# `:latest` once one is actually pushed. Point it at your own build
+# instead if you're testing a local change before either exists.
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -59,7 +63,7 @@ spec:
     extensions:
       - name: allgres
         image:
-          reference: ghcr.io/rayjun0525/allgres-cnpg-ext:latest
+          reference: ghcr.io/rayjun0525/allgres-cnpg-ext:main
     shared_preload_libraries:
       - allgres
 
