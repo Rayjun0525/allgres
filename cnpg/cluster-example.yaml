@@ -108,10 +108,15 @@ spec:
 # `role: primary` targets only the read/write instance, matching CNPG's
 # own -rw Service -- the dashboard needs to reach the instance that can
 # actually write (creating agents, tasks, etc.), and a replica's own copy
-# of `allgres web` would otherwise just serve reads. Confirm this label
-# actually matches your pods first (`kubectl get pods -l cnpg.io/cluster=
-# allgres --show-labels`) -- CNPG has used both `role` and the newer
-# `cnpg.io/instanceRole` for this across versions.
+# of `allgres web` would otherwise just serve reads. `role: primary` alone
+# is confirmed present on both community CNPG pods and EDB Postgres for
+# Kubernetes pods (`postgresql.k8s.enterprisedb.io/v1`, a separate
+# operator/CRD group EDB ships) -- the cluster-scoping label is NOT the
+# same between them, though (`cnpg.io/cluster` vs
+# `k8s.enterprisedb.io/cluster`), so it's left out here to work on either
+# without editing; add it back (whichever variant matches your `kubectl
+# get pods --show-labels`) if more than one Cluster shares this namespace,
+# since `role: primary` alone would then match more than one.
 apiVersion: v1
 kind: Service
 metadata:
@@ -119,7 +124,6 @@ metadata:
 spec:
   type: NodePort
   selector:
-    cnpg.io/cluster: allgres
     role: primary
   ports:
     - port: 8088
