@@ -3705,13 +3705,27 @@ contributed upstream for locating extension files, only present from
 PG18) and Kubernetes 1.33+ (`ImageVolume` feature gate, default-on from
 1.35).
 
-Explicitly **not verified end to end**, unlike every other install path
-this README documents: this environment had no Docker daemon and no
-Kubernetes cluster to actually build the image or apply the CR against.
-The one real assumption `cnpg/Dockerfile` itself flags for whoever tests
-this for real: that the CNPG operand image's own apt sources carry
-`postgresql-server-dev-${PG_MAJOR}` the same way they're confirmed (read
-directly from the real `pgvector` Dockerfile in `postgres-extensions-
-containers`) to carry the prebuilt `postgresql-${PG_MAJOR}-pgvector`
-package -- if the build fails on "Unable to locate package," that is the
-first thing to check.
+Not verified end to end against a real running cluster: this environment
+had no Kubernetes cluster to apply the CR against. The image build itself
+*has* been tested for real since, though (not by this environment, which
+had no Docker daemon either) -- two rounds:
+
+- The one assumption flagged at the time (that the CNPG operand image's
+  own apt sources carry `postgresql-server-dev-${PG_MAJOR}`, not just the
+  prebuilt `postgresql-${PG_MAJOR}-pgvector` package `pgvector`'s own
+  Dockerfile installs) held up: `apt-get install` for it succeeded.
+- The actual failure hit was a build-context mistake: `COPY . .` only ever
+  sees the build *context*, and building with `cnpg/` itself as the
+  context (rather than the repo root) copies just that directory's own two
+  files, so `cargo pgrx package` fails with "could not find `Cargo.toml`"
+  -- a real, easy mistake given the Dockerfile lives in a subdirectory.
+  Fixed with an explicit `test -f Cargo.toml` check right after `COPY . .`
+  in `cnpg/Dockerfile`, so this now fails immediately with a clear message
+  naming the fix (`docker build -f cnpg/Dockerfile .` from the repo root)
+  instead of surfacing as a confusing `cargo-pgrx` internal error. README's
+  own build instructions gained the same warning inline.
+
+Still open: whether the produced image actually loads correctly once
+mounted by a real CNPG `Cluster` (file layout, `shared_preload_libraries`
+wiring, the `Database` CR's `CREATE EXTENSION` step) is unverified past
+the image build succeeding.

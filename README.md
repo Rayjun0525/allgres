@@ -1563,6 +1563,12 @@ this, only there from PG18 on) and Kubernetes 1.33+ (with the `ImageVolume`
 feature gate enabled manually on 1.33–1.34; default-on from 1.35).
 
 ```bash
+# Run from the repo root -- the build context (the trailing `.`) must be
+# the whole repo (Cargo.toml, Cargo.lock, src/, sql/), not the cnpg/
+# directory itself. Building with cnpg/ as the context (e.g. running this
+# from inside cnpg/) fails immediately with a clear "Cargo.toml not found"
+# error -- confirmed live, this is the one mistake real testing against
+# this Dockerfile actually hit.
 docker build -t ghcr.io/you/allgres:0.1.0 -f cnpg/Dockerfile .
 docker push ghcr.io/you/allgres:0.1.0
 ```
@@ -1576,14 +1582,16 @@ own), and a companion `Database` CR is what actually runs `CREATE
 EXTENSION allgres;` once CNPG reconciles it. Read that file's own header
 comment for what each field does before applying it.
 
-Not verified end to end against a real cluster as of this writing — no
-Kubernetes cluster or Docker daemon was available in the environment this
-was built in (unlike every other install path in this README, which is).
-`cnpg/Dockerfile`'s own comments flag the one real assumption worth
-checking first if the build fails: that the base image's apt sources
-carry `postgresql-server-dev-${PG_MAJOR}` the same way they carry the
+Not verified end to end against a real running cluster as of this
+writing — no Kubernetes cluster was available in the environment this was
+built in. The image build itself has since been confirmed by a real test:
+the assumption that the base image's apt sources carry
+`postgresql-server-dev-${PG_MAJOR}` the same way they carry the
 `postgresql-${PG_MAJOR}` packages CNPG's own extension images (e.g.
-`pgvector`) already install from there.
+`pgvector`) install from there held up fine; the one real mistake that
+build hit was passing the wrong build context (see the `docker build`
+block above), now caught early by `cnpg/Dockerfile`'s own check instead of
+surfacing as a confusing `cargo-pgrx` error.
 
 ## Backup and restore
 

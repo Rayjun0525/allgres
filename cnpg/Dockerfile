@@ -45,6 +45,23 @@ RUN cargo pgrx init --pg${PG_MAJOR}=$(command -v pg_config)
 
 WORKDIR /src/allgres
 COPY . .
+# `COPY . .` only ever sees the build *context*, not this Dockerfile's own
+# directory -- confirmed live: building with `cnpg/` itself as the context
+# (e.g. running `docker build` from inside `cnpg/`, or `-f cnpg/Dockerfile
+# cnpg/`) copies just this directory's two files and fails here with
+# "could not find `Cargo.toml`", since Cargo.toml/Cargo.lock/src/sql never
+# arrive at all. The context must be the repo root: `docker build -f
+# cnpg/Dockerfile .` run from the repo root, exactly as README.md's own
+# "CNPG (CloudNativePG)" section shows it. This check exists so that
+# mistake fails here, with this message, instead of inside cargo-pgrx with
+# a much less obvious one.
+RUN test -f Cargo.toml || { \
+      echo >&2 "ERROR: Cargo.toml not found at the build context root."; \
+      echo >&2 "Build this from the repo root with the repo root as the"; \
+      echo >&2 "context, e.g.: docker build -f cnpg/Dockerfile . -- not"; \
+      echo >&2 "from inside cnpg/ itself."; \
+      exit 1; \
+    }
 RUN cargo pgrx package --pg-config $(command -v pg_config) --no-default-features --features pg${PG_MAJOR}
 
 # `FROM scratch`, not the CNPG base again: this image is never itself run
