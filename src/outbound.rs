@@ -26,6 +26,7 @@ pub(crate) enum OutboundQueue {
     Outbound,
     Oauth,
     AgentEmbedding,
+    ProviderProbe,
 }
 
 pub(crate) struct OutboundJob {

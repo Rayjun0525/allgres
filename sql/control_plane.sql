@@ -2042,6 +2042,20 @@ ALTER TABLE allgres_private.llm_providers
     CHECK (oauth_flow IN ('authorization_code', 'device_code')),
   ADD COLUMN IF NOT EXISTS oauth_device_url text;
 
+-- Connectivity/model-listing probe (Settings' "Test connection" button): a
+-- real GET against the provider's own /models endpoint, not just
+-- is_enabled -- an operator previously had no way to tell "configured" from
+-- "actually reachable with this credential" short of running an agent turn
+-- and watching it fail. available_models also backs the Model fields'
+-- datalist (agent editor, bulk-apply, model prices) instead of pure free
+-- text, once at least one probe has succeeded.
+ALTER TABLE allgres_private.llm_providers
+  ADD COLUMN IF NOT EXISTS last_probe_status text
+    CHECK (last_probe_status IS NULL OR last_probe_status IN ('ok', 'error')),
+  ADD COLUMN IF NOT EXISTS last_probe_at timestamptz,
+  ADD COLUMN IF NOT EXISTS last_probe_error text,
+  ADD COLUMN IF NOT EXISTS available_models jsonb;
+
 CREATE TABLE IF NOT EXISTS allgres_private.oauth_states (
   state        text PRIMARY KEY,
   provider_id  uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
@@ -2332,6 +2346,34 @@ CREATE INDEX IF NOT EXISTS embedding_calls_ready_idx
   WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS embedding_calls_inflight_idx
   ON allgres_private.embedding_calls (updated_at)
+  WHERE status = 'in_flight';
+
+-- A provider connectivity/model-listing check, queued the same way as
+-- embedding_calls above (no task_id -- a dashboard action, not an agent
+-- turn) and claimed by the same runtime worker HTTP pool. GET {base_url}/
+-- models (Anthropic's /v1/models included -- same {"data":[{"id":...}]}
+-- shape as OpenAI's) doubles as both signals at once: 2xx means the
+-- provider is actually reachable with the stored credential, and its
+-- response body is the model list fn_complete_provider_probe writes into
+-- llm_providers.available_models.
+CREATE TABLE IF NOT EXISTS allgres_private.provider_probes (
+  call_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id      uuid NOT NULL REFERENCES allgres_private.llm_providers(provider_id) ON DELETE CASCADE,
+  url              text NOT NULL,
+  request_headers  jsonb NOT NULL DEFAULT '{}'::jsonb,
+  allow_private    boolean NOT NULL DEFAULT false,
+  status           text NOT NULL CHECK (status IN ('queued', 'in_flight', 'harvested', 'lost')),
+  response_status  int,
+  error            text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS provider_probes_ready_idx
+  ON allgres_private.provider_probes (created_at)
+  WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS provider_probes_inflight_idx
+  ON allgres_private.provider_probes (updated_at)
   WHERE status = 'in_flight';
 
 -- Semantic memory recall (allgres_private.queue_memory_embedding /
@@ -6440,6 +6482,24 @@ BEGIN
     FOR UPDATE SKIP LOCKED
   LOOP
     UPDATE allgres_private.embedding_calls
+    SET status = 'lost', error = 'timeout', updated_at = now()
+    WHERE call_id = r.call_id;
+    n := n + 1;
+  END LOOP;
+
+  -- Same reclaim, for a provider probe the worker never came back from.
+  -- Deliberately does not touch llm_providers.last_probe_* -- an ambiguous
+  -- timeout is not evidence the provider is actually unreachable, so the
+  -- last real result (if any) stands until a probe actually completes one
+  -- way or the other, same tolerance as embedding_calls above.
+  FOR r IN
+    SELECT call_id
+    FROM allgres_private.provider_probes
+    WHERE status = 'in_flight'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE allgres_private.provider_probes
     SET status = 'lost', error = 'timeout', updated_at = now()
     WHERE call_id = r.call_id;
     n := n + 1;

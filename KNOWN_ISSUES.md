@@ -3818,3 +3818,68 @@ configured with a plain API key, same as `anthropic`/`ollama`/
 `openai_compat`. Verified via a fresh `fn_selftest()` run (`"failed": 0`)
 after the `web/index.html` change; no SQL changed, so no rebuild/reinstall
 cycle was needed for this fix.
+
+## 47. A real "Test connection" and fetched model list for LLM providers, closing the is_enabled-vs-actually-reachable gap
+
+Raised directly after item 46's OAuth fix: `is_enabled` in the providers
+list was the only signal an operator had for whether a provider actually
+works, and it only ever meant "an operator turned this on" -- a typo'd API
+key, a wrong base URL, or a provider that has since started rejecting the
+stored credential all still showed the same green-ish "running" badge as a
+provider that genuinely answers. Separately, every Model field (agent
+editor, bulk-apply-to-all-agents, model prices) was pure free text with no
+way to see what models a provider actually serves -- an operator had to
+already know or go look it up externally.
+
+Both gaps share one real fix: an actual `GET {base_url}/models` (`/v1/
+models` for `anthropic`, matching `fn_dispatch_tasks`' own URL shape for
+that kind) against the provider's own listing endpoint, queued the same
+way the OAuth device-flow calls in item 46 are (no `task_id` -- a dashboard
+action, not an agent turn), and claimed by the same runtime worker HTTP
+pool everything else uses. OpenAI, xAI, and Anthropic's `/models`/`/v1/
+models` endpoints all return the identical `{"data":[{"id":...}]}` shape,
+so one parse in `fn_complete_provider_probe` covers every seeded kind. A
+2xx response is both a live-reachability signal (`last_probe_status='ok'`)
+and a model list (`available_models`) at once; anything else is stored as
+`last_probe_status='error'` with the response body (or a transport error)
+as `last_probe_error`, without touching a previously-fetched model list --
+one bad probe should not make a working model list disappear.
+
+New: `allgres_private.provider_probes` (queued/claimed/completed exactly
+like `embedding_calls` -- no `task_id`, not registered for `pg_dump`, same
+precedent as `embedding_calls` itself: re-triggerable at will, nothing an
+operator needs preserved across a restore); `llm_providers.last_probe_
+status`/`last_probe_at`/`last_probe_error`/`available_models`;
+`fn_provider_probe_start`/`fn_claim_provider_probe`/
+`fn_complete_provider_probe`, and dashboard_rpc actions `providers.
+probe_start`/`providers.probe_status` (`sql/rpc_catalog.json` regenerated,
+`sql/selftest.sql`'s frozen-catalog arrays updated, both in the same
+commit per this project's own contract). A new `OutboundQueue::
+ProviderProbe` variant in `src/outbound.rs`/`src/runtime_worker.rs` mirrors
+`AgentEmbedding` exactly, with one difference: the queued call's `kind` is
+forced to `"tool"` (not left at `perform_http`'s `"llm"` default), because
+a probe is a plain GET with no body, and the default branch for anything
+that isn't `"tool"`/`"oauth"` always sends a JSON-POST body.
+
+Verified with the full loop: `cargo pgrx install` (PG16), fresh
+`DROP EXTENSION`/`CREATE EXTENSION`, `fn_selftest()` 333/0 on two separate
+connections (including `dashboard_rpc_actions_match_frozen_catalog`
+specifically), `cargo test --lib` 30/30. Then live, against the actual
+`allgres runtime` background worker (not just `fn_selftest`, per this
+project's own rule for anything touching a new external call) -- caught a
+real test-setup mistake in the process, not a code bug: the worker
+connects to `ALLGRES_DATABASE` (default `postgres`), not whatever database
+`psql` happens to be pointed at, so a first round of manual testing against
+a different database never got claimed at all (looked identical to the
+worker silently doing nothing). Once corrected, a local mock HTTP server
+returning `{"data":[{"id":"mock-model-a"},{"id":"mock-model-b"}]}` on `/v1/
+models` confirmed the full success path end to end (`last_probe_status`
+`'ok'`, `available_models` populated, table row `harvested`) and the
+failure path (a 404 on a wrong path: `last_probe_status` `'error'`,
+`last_probe_error` `'not found'`, previous `available_models` left
+intact). Also probed the real `anthropic` provider with no stored key:
+correctly built `https://api.anthropic.com/v1/models` and reported a real
+transport failure (`io: invalid peer certificate: UnknownIssuer` -- this
+sandbox's own egress proxy, not a bug) as `last_probe_status='error'`
+rather than crashing or hanging, which is exactly the failure-handling
+this was meant to guarantee.

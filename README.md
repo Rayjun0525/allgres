@@ -621,7 +621,26 @@ existing one, including OAuth fields and connecting via the OAuth flow (see
 above). In the agent editor, Provider is a dropdown populated from
 currently-enabled providers, not a free-text field an agent could be
 pointed at a nonexistent name with; Model stays free text, since one
-provider can host many model names.
+provider can host many model names, but every Model field (agent editor,
+bulk-apply, model prices) offers real fetched names through a `<datalist>`
+once a provider has been probed at least once.
+
+**Test connection** (`providers.probe_start`/`providers.probe_status`,
+`fn_provider_probe_start`/`fn_claim_provider_probe`/
+`fn_complete_provider_probe`) queues a plain `GET {base_url}/models`
+(`/v1/models` for an `anthropic`-kind provider) through the same runtime
+worker HTTP pool as everything else, for any provider kind, not just
+OAuth -- `is_enabled` only ever meant "an operator turned this on," never
+"this endpoint actually answers with the stored credential," and an
+operator previously had no way to tell the two apart short of running an
+agent turn and watching it fail. A 2xx response is stored as
+`last_probe_status='ok'` (the Settings list's Status column reflects this,
+not just `is_enabled`) and its body -- OpenAI, xAI, and Anthropic's
+`/models`/`/v1/models` all return the same `{"data":[{"id":...}]}` shape --
+becomes `available_models`, which is exactly what backs the datalist above.
+An error is stored as `last_probe_status='error'` with the response body
+(or a transport error, e.g. a TLS failure) as `last_probe_error`, and never
+overwrites a previously-fetched model list.
 
 A session is no longer a single one-shot exchange. `fn_continue_session`
 adds a follow-up message to an existing session — a new task in the same

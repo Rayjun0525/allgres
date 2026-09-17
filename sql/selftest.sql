@@ -4776,7 +4776,8 @@ BEGIN
     'procedures.create', 'procedures.update', 'procedures.rollback', 'procedure_tools.list',
     'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
-    'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
+    'providers.oauth_device_status', 'providers.oauth_callback', 'providers.probe_start', 'providers.probe_status',
+    'events', 'approvals.list',
     'approvals.decide', 'tool_experiments.list', 'model_prices.list', 'model_prices.set', 'model_prices.delete', 'selftest'
   ]::text[]) a
   WHERE a <> ALL(COALESCE(v_live_rpc_actions, ARRAY[]::text[]));
@@ -4798,7 +4799,8 @@ BEGIN
     'procedures.create', 'procedures.update', 'procedures.rollback', 'procedure_tools.list',
     'procedure_tools.create', 'procedure_tools.bind', 'schedules.list', 'schedules.create',
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
-    'providers.oauth_device_status', 'providers.oauth_callback', 'events', 'approvals.list',
+    'providers.oauth_device_status', 'providers.oauth_callback', 'providers.probe_start', 'providers.probe_status',
+    'events', 'approvals.list',
     'approvals.decide', 'tool_experiments.list', 'model_prices.list', 'model_prices.set', 'model_prices.delete', 'selftest'
   ]::text[]);
   ok := v_missing_rpc_actions IS NULL AND v_extra_rpc_actions IS NULL;

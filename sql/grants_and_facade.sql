@@ -272,6 +272,8 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_oauth(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_agent_embedding(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_agent_embedding(uuid, int, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_provider_probe(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_provider_probe(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_schedules() TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
@@ -1351,7 +1353,11 @@ BEGIN
               SELECT 1 FROM allgres_private.llm_secrets s
               WHERE s.provider_id=p.provider_id AND s.access_token IS NOT NULL
                 AND (s.expires_at IS NULL OR s.expires_at>now())
-            )
+            ),
+            'last_probe_status', p.last_probe_status,
+            'last_probe_at', p.last_probe_at,
+            'last_probe_error', p.last_probe_error,
+            'available_models', p.available_models
           ) ORDER BY p.name)
           FROM allgres_private.llm_providers p
           WHERE p.name NOT LIKE 'selftest%'
@@ -1637,6 +1643,17 @@ BEGIN
       RETURN allgres_public.fn_oauth_token_request(
         p_request->>'state', p_request->>'code', p_request->>'redirect'
       );
+
+    -- "Test connection" in Settings, for any provider kind (not just
+    -- oauth) -- queues a GET against the provider's own /models endpoint;
+    -- fn_provider_probe_status is what the dashboard polls until it lands.
+    WHEN 'providers.probe_start' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_provider_probe_start((p_request->>'provider_id')::uuid);
+
+    WHEN 'providers.probe_status' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_provider_probe_status((p_request->>'call_id')::uuid);
 
     WHEN 'events' THEN
       RETURN jsonb_build_object(

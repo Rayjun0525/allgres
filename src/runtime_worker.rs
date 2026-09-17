@@ -178,6 +178,27 @@ fn claim_agent_embedding_jobs(limit: i32) -> Value {
     })
 }
 
+/// Claims queued provider connectivity/model-listing probes -- same claim
+/// shape as claim_agent_embedding_jobs, a different table (provider_probes)
+/// with no task_id, feeding the same HTTP pool. See allgres_private.
+/// fn_provider_probe_start's own comment for what queues these (Settings'
+/// "Test connection" button) and why.
+fn claim_provider_probe_jobs(limit: i32) -> Value {
+    BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            return json!({ "count": 0, "calls": [] });
+        }
+        Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_claim_provider_probe($1)",
+            &[limit.into()],
+        )
+        .ok()
+        .flatten()
+        .map(|j| j.0)
+        .unwrap_or_else(|| json!({ "count": 0, "calls": [] }))
+    })
+}
+
 fn submit_http_result(call_id: &str, status: i32, body: &str) {
     // Postgres text cannot hold NUL; this is sanitisation, not escaping.
     let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
@@ -249,6 +270,29 @@ fn submit_agent_embedding_result(call_id: &str, status: i32, body: &str) {
     });
 }
 
+/// Same completion shape again, for a provider connectivity/model-listing
+/// probe. fn_complete_provider_probe has no task_id to fall back on either,
+/// so the same "leave it in_flight, let fn_watchdog reclaim it as lost"
+/// reasoning applies on a privilege-drop failure.
+fn submit_provider_probe_result(call_id: &str, status: i32, body: &str) {
+    let body = truncate_utf8(&body.replace('\0', ""), MAX_RESPONSE_BYTES).to_string();
+    BackgroundWorker::transaction(|| {
+        if !drop_privileges() {
+            pgrx::warning!(
+                "Allgres: skipping fn_complete_provider_probe for call {} -- privilege drop failed",
+                call_id
+            );
+            return;
+        }
+        if let Err(e) = Spi::get_one_with_args::<JsonB>(
+            "SELECT allgres_public.fn_complete_provider_probe($1::uuid, $2, $3)",
+            &[call_id.into(), status.into(), body.as_str().into()],
+        ) {
+            pgrx::warning!("Allgres: fn_complete_provider_probe failed for call {}: {}", call_id, e);
+        }
+    });
+}
+
 pub(crate) fn dashboard_rpc(request: &str) -> String {
     BackgroundWorker::transaction(|| {
         if !drop_privileges() {
@@ -313,6 +357,9 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
                         OutboundQueue::Oauth => submit_oauth_result(&r.call_id, r.status, &r.body),
                         OutboundQueue::AgentEmbedding => {
                             submit_agent_embedding_result(&r.call_id, r.status, &r.body)
+                        }
+                        OutboundQueue::ProviderProbe => {
+                            submit_provider_probe_result(&r.call_id, r.status, &r.body)
                         }
                     }
                 }
@@ -398,6 +445,36 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
                         obj.insert("kind".to_string(), json!("embedding"));
                     }
                     let job = OutboundJob { call_id: id.to_string(), queue: OutboundQueue::AgentEmbedding, call };
+                    if jobs.send(job).is_err() {
+                        break;
+                    }
+                    in_flight += 1;
+                    queued += 1;
+                }
+            }
+        }
+
+        // 3d. Provider connectivity/model-listing probes ("Test connection"
+        // in Settings) -- same shape as 3c, a different table with no
+        // task_id (fn_claim_provider_probe, not fn_claim_outbound), sharing
+        // the same HTTP threads and capacity budget. kind is forced to
+        // "tool" here (not left to perform_http's "llm" default) because
+        // this is a plain GET with no body -- the default POST-JSON branch
+        // perform_http takes for "llm"/anything-not-"tool"/"oauth" would
+        // send this GET request a body it neither needs nor should have.
+        if ready && in_flight < capacity {
+            let claimed = claim_provider_probe_jobs((capacity - in_flight) as i32);
+            if let Some(calls) = claimed.get("calls").and_then(Value::as_array) {
+                for call in calls {
+                    let Some(id) = call.get("call_id").and_then(Value::as_str) else { continue };
+                    if !valid_uuid(id) {
+                        continue;
+                    }
+                    let mut call = call.clone();
+                    if let Some(obj) = call.as_object_mut() {
+                        obj.insert("kind".to_string(), json!("tool"));
+                    }
+                    let job = OutboundJob { call_id: id.to_string(), queue: OutboundQueue::ProviderProbe, call };
                     if jobs.send(job).is_err() {
                         break;
                     }

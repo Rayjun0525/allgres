@@ -858,6 +858,26 @@
     ]
   },
   {
+    "action": "providers.probe_start",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "provider_id",
+      "session_token"
+    ]
+  },
+  {
+    "action": "providers.probe_status",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "call_id",
+      "session_token"
+    ]
+  },
+  {
     "action": "events",
     "guards": [],
     "params": []

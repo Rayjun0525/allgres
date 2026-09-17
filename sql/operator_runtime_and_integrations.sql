@@ -1533,3 +1533,210 @@ BEGIN
   END IF;
 END;
 $fn$;
+
+-- Queues a provider connectivity/model-listing probe (Settings' "Test
+-- connection" button) -- GET {base_url}/models, or {base_url}/v1/models for
+-- an anthropic-kind provider, same URL shape fn_dispatch_tasks' own
+-- anthropic branch uses for /v1/messages. Superseding an unfinished probe
+-- for the same provider mirrors fn_oauth_device_start: a second click
+-- before the first call lands must not leave two races both writing
+-- llm_providers.last_probe_* out of order; the eventual completion of the
+-- superseded row is a no-op anyway (fn_complete_provider_probe's own
+-- in_flight fence), this just avoids a stale result winning a race it
+-- didn't need to run.
+CREATE OR REPLACE FUNCTION allgres_public.fn_provider_probe_start(p_provider_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v allgres_private.llm_providers%ROWTYPE;
+  v_url text;
+  v_headers jsonb;
+  v_reason text;
+  v_call uuid;
+BEGIN
+  SELECT * INTO v FROM allgres_private.llm_providers WHERE provider_id = p_provider_id;
+  IF v.provider_id IS NULL THEN
+    RAISE EXCEPTION 'provider not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_url := rtrim(v.base_url, '/') || CASE WHEN v.kind = 'anthropic' THEN '/v1/models' ELSE '/models' END;
+  v_reason := allgres_private.check_outbound_url(v_url, v.allow_private_network);
+  IF v_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'provider endpoint rejected: %', v_reason USING ERRCODE = 'P0001';
+  END IF;
+
+  v_headers := CASE WHEN v.kind = 'anthropic'
+    THEN jsonb_build_object('anthropic-version', '2023-06-01')
+    ELSE '{}'::jsonb
+  END;
+
+  UPDATE allgres_private.provider_probes
+  SET status = 'lost', error = 'superseded by a newer probe', updated_at = now()
+  WHERE provider_id = p_provider_id AND status IN ('queued', 'in_flight');
+
+  INSERT INTO allgres_private.provider_probes (provider_id, url, request_headers, allow_private, status)
+  VALUES (p_provider_id, v_url, v_headers, v.allow_private_network, 'queued')
+  RETURNING call_id INTO v_call;
+
+  PERFORM allgres_private.audit('providers.probe_start', jsonb_build_object('provider_id', p_provider_id, 'call_id', v_call));
+  RETURN jsonb_build_object('ok', true, 'call_id', v_call);
+END;
+$fn$;
+
+-- Claims queued provider probes for the runtime worker's HTTP pool -- same
+-- claim shape as fn_claim_agent_embedding, credential resolved and merged
+-- into the response right here (never written back to provider_probes.
+-- request_headers), with the header *name* chosen the same way
+-- fn_claim_outbound's own auth_kind does (x-api-key for anthropic,
+-- authorization otherwise) since provider_probes has no auth_kind column
+-- of its own to carry that choice from queue time.
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_provider_probe(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+  v_key text;
+  v_auth_kind text;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT pp.call_id, pp.provider_id, pp.url, pp.request_headers, pp.allow_private, p.kind
+    FROM allgres_private.provider_probes pp
+    JOIN allgres_private.llm_providers p ON p.provider_id = pp.provider_id
+    WHERE pp.status = 'queued'
+    ORDER BY pp.created_at
+    FOR UPDATE OF pp SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE allgres_private.provider_probes
+    SET status = 'in_flight', updated_at = now()
+    WHERE call_id = r.call_id;
+
+    v_key := allgres_private.provider_secret(r.provider_id);
+    v_auth_kind := CASE WHEN r.kind = 'anthropic' THEN 'x-api-key' ELSE 'authorization' END;
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'call_id', r.call_id,
+      'method', 'GET',
+      'url', r.url,
+      'headers', r.request_headers || jsonb_build_object(
+        v_auth_kind,
+        CASE WHEN v_auth_kind = 'x-api-key' THEN COALESCE(v_key, '') ELSE 'Bearer ' || COALESCE(v_key, '') END
+      ),
+      'allow_private', r.allow_private
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'calls', v_out);
+END;
+$fn$;
+
+-- Fenced identically to fn_complete_agent_embedding/fn_complete_oauth: only
+-- ever completes from 'in_flight', so a belated response for a call
+-- fn_watchdog or a superseding fn_provider_probe_start already reclaimed
+-- cannot overwrite a newer probe's result. OpenAI, xAI, and Anthropic's own
+-- /v1/models all return the identical {"data":[{"id":...}, ...]} shape, so
+-- one parse covers every seeded kind -- a provider whose response doesn't
+-- match this shape (a non-conforming openai_compat server) still gets a
+-- correct last_probe_status='ok' from the 2xx alone, just with available_
+-- models left at whatever it was before (NULL the first time).
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_provider_probe(
+  p_call_id uuid,
+  p_status int,
+  p_body text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  c allgres_private.provider_probes%ROWTYPE;
+  v_parsed jsonb;
+  v_models jsonb;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+
+  SELECT * INTO c FROM allgres_private.provider_probes WHERE call_id = p_call_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_complete_provider_probe: not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF c.status <> 'in_flight' THEN
+    RETURN jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status);
+  END IF;
+
+  IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+    UPDATE allgres_private.provider_probes
+    SET status = 'harvested', response_status = p_status,
+        error = left(COALESCE(p_body, ''), 2000), updated_at = now()
+    WHERE call_id = p_call_id;
+    UPDATE allgres_private.llm_providers
+    SET last_probe_status = 'error', last_probe_at = now(),
+        last_probe_error = left(COALESCE(NULLIF(p_body, ''), 'request failed'), 500)
+    WHERE provider_id = c.provider_id;
+    RETURN jsonb_build_object('action', 'error', 'status', p_status);
+  END IF;
+
+  BEGIN
+    v_parsed := p_body::jsonb;
+    SELECT jsonb_agg(x->>'id' ORDER BY x->>'id')
+    INTO v_models
+    FROM jsonb_array_elements(COALESCE(v_parsed->'data', '[]'::jsonb)) AS x
+    WHERE x->>'id' IS NOT NULL;
+  EXCEPTION WHEN others THEN
+    v_models := NULL;
+  END;
+
+  UPDATE allgres_private.provider_probes
+  SET status = 'harvested', response_status = p_status, updated_at = now()
+  WHERE call_id = p_call_id;
+
+  UPDATE allgres_private.llm_providers
+  SET last_probe_status = 'ok', last_probe_at = now(), last_probe_error = NULL,
+      available_models = COALESCE(v_models, available_models)
+  WHERE provider_id = c.provider_id;
+
+  RETURN jsonb_build_object(
+    'action', 'ok', 'provider_id', c.provider_id,
+    'model_count', COALESCE(jsonb_array_length(v_models), 0)
+  );
+END;
+$fn$;
+
+-- Dashboard polling target for a probe fn_provider_probe_start queued --
+-- same shape as fn_oauth_device_status: call_id/status report the queue
+-- row itself (still 'queued'/'in_flight' means "keep polling"), while
+-- last_probe_*/available_models are always the provider's current
+-- (possibly older) values so a "checking..." dashboard has something to
+-- show even before this particular probe finishes.
+CREATE OR REPLACE FUNCTION allgres_public.fn_provider_probe_status(p_call_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  c allgres_private.provider_probes%ROWTYPE;
+  p allgres_private.llm_providers%ROWTYPE;
+BEGIN
+  SELECT * INTO c FROM allgres_private.provider_probes WHERE call_id = p_call_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'provider probe not found' USING ERRCODE = 'P0001';
+  END IF;
+  SELECT * INTO p FROM allgres_private.llm_providers WHERE provider_id = c.provider_id;
+  RETURN jsonb_build_object(
+    'ok', true, 'call_id', c.call_id, 'status', c.status,
+    'last_probe_status', p.last_probe_status,
+    'last_probe_at', p.last_probe_at,
+    'last_probe_error', p.last_probe_error,
+    'available_models', p.available_models
+  );
+END;
+$fn$;
