@@ -525,19 +525,69 @@ async function settings(){
 }
 function providerModal(p){
   const isOauth=p.kind==='oauth';
+  // xai_oauth is seeded with oauth_flow='device_code' (RFC 8628); every other
+  // oauth provider uses the ordinary authorization-code redirect below.
+  // fn_oauth_start itself rejects a device_code provider outright ("provider
+  // uses device-code oauth"), so this branch is not optional polish -- without
+  // it, clicking Connect on a device-code provider always fails.
+  const isDeviceFlow=isOauth&&p.oauth_flow==='device_code';
   const isEmbedding=p.purpose==='embedding';
-  const oauthFields=isOauth?`<div class="field"><label>Authorization URL</label><input class="input" id="pAuthUrl" value="${esc(p.oauth_auth_url||'')}"></div><div class="field"><label>Token URL</label><input class="input" id="pTokenUrl" value="${esc(p.oauth_token_url||'')}"></div><div class="field"><label>Client ID</label><input class="input" id="pClientId" value="${esc(p.oauth_client_id||'')}"></div><div class="field"><label>Client secret (leave blank to keep existing)</label><input type="password" class="input" id="pClientSecret" autocomplete="new-password"></div>`:'';
-  const connectRow=isOauth?`<div class="row" style="margin:14px 0"><button class="btn" id="connectOauth">Connect via OAuth</button><span class="spacer"></span><span class="muted" style="font-size:12px">${p.has_secret?'A token is stored for this provider.':'Not connected yet.'}</span></div>`:'';
+  const oauthFields=isOauth?`<div class="field"><label>Authorization URL</label><input class="input" id="pAuthUrl" value="${esc(p.oauth_auth_url||'')}" ${isDeviceFlow?'disabled':''}></div><div class="field"><label>Token URL</label><input class="input" id="pTokenUrl" value="${esc(p.oauth_token_url||'')}"></div><div class="field"><label>Client ID</label><input class="input" id="pClientId" value="${esc(p.oauth_client_id||'')}"></div><div class="field"><label>Client secret (leave blank to keep existing)</label><input type="password" class="input" id="pClientSecret" autocomplete="new-password"></div>`:'';
+  // Authorization-code providers redirect back to whatever URL is registered
+  // with the provider's own OAuth app -- that has to be this dashboard's own
+  // URL exactly, and there was previously no way to see that value without
+  // reading the source. Device-code providers never redirect anywhere, so no
+  // URI to register exists for them.
+  const redirectUri=location.origin+location.pathname;
+  const connectRow=isOauth?(isDeviceFlow
+    ?`<div class="row" style="margin:14px 0;flex-direction:column;align-items:stretch;gap:8px"><div class="row"><button class="btn" id="connectOauth">Connect via OAuth</button><span class="spacer"></span><span class="muted" style="font-size:12px">${p.has_secret?'A token is stored for this provider.':'Not connected yet.'}</span></div><div class="muted" style="font-size:12px">Device login: click Connect, then open the link that appears on any device (this one or your phone) and enter the code shown. This tab keeps checking automatically -- no redirect happens.</div><div id="deviceFlowOut" class="mono" style="font-size:13px"></div></div>`
+    :`<div class="row" style="margin:14px 0"><button class="btn" id="connectOauth">Connect via OAuth</button><span class="spacer"></span><span class="muted" style="font-size:12px">${p.has_secret?'A token is stored for this provider.':'Not connected yet.'}</span></div><div class="muted" style="font-size:12px">Register this exact redirect URI with the provider's OAuth app before connecting: <span class="mono">${esc(redirectUri)}</span></div>`
+  ):'';
   const embedField=isEmbedding?`<div class="field"><label>Embedding model</label><input class="input" id="pEmbedModel" value="${esc(p.embedding_model||'')}"></div>`:'';
   const jsonModeField=isOauth?'':`<div class="field"><label><input type="checkbox" id="pJsonMode" ${p.response_format_json_object!==false?'checked':''}> Send OpenAI response_format</label><div class="muted" style="font-size:12px">Most servers accept it and it improves reply quality. Uncheck for a local server that rejects it outright (confirmed live against LM Studio: HTTP 400, "response_format.type must be 'json_schema' or 'text'"); already off for the seeded Ollama provider.</div></div>`;
   $('#modal').classList.remove('hidden');$('#modal').innerHTML=`<div class="dialog"><div class="row"><h3>${esc(p.name)}</h3><span class="spacer"></span><button class="btn" id="closeM">Close</button></div><div class="field"><label>Purpose</label><div class="muted" style="font-size:12px">${isEmbedding?'embedding -- powers search_agents only':'chat -- serves an agent\'s own turns'} (set at creation, cannot be changed here)</div></div>${embedField}<div class="field"><label>Base URL</label><input class="input" id="pUrl" value="${esc(p.base_url)}"></div>${isOauth?'':'<div class="field"><label>API key (leave blank to keep existing)</label><input type="password" class="input" id="pKey" autocomplete="new-password"></div>'}${oauthFields}<div class="field"><label><input type="checkbox" id="pEnabled" ${p.is_enabled?'checked':''}> Enabled</label></div><div class="field"><label><input type="checkbox" id="pPrivate" ${p.allow_private_network?'checked':''}> Allow loopback / private-network endpoint</label><div class="muted" style="font-size:12px">Needed for a local Ollama or an in-cluster gateway. Leaving this off is what stops this endpoint from being pointed at an internal address.</div></div>${jsonModeField}${connectRow}<button class="btn primary" id="saveP">Save</button></div>`;
   $('#closeM').onclick=closeModal;
   $('#saveP').onclick=async()=>{try{const body={provider_id:p.provider_id,base_url:$('#pUrl').value,is_enabled:$('#pEnabled').checked,allow_private_network:$('#pPrivate').checked,operator_name:opName(),session_token:sessTok()};if(!isOauth)body.response_format_json_object=$('#pJsonMode').checked;if(isOauth){body.oauth_auth_url=$('#pAuthUrl').value;body.oauth_token_url=$('#pTokenUrl').value;body.oauth_client_id=$('#pClientId').value;body.oauth_client_secret=$('#pClientSecret').value}else{body.api_key=$('#pKey').value}if(isEmbedding)body.embedding_model=$('#pEmbedModel').value;await api('/api/v1/settings/provider',{method:'POST',body:JSON.stringify(body)});closeModal();toast('Provider saved');settings()}catch(e){toast(e.message)}};
-  // Full-page redirect to the provider's own login page, same as any other
-  // OAuth "Connect" button -- the provider redirects back to this same
-  // dashboard URL with ?code=&state=, which the boot-time handler below
-  // (oauthCallbackOnLoad) picks up and completes via providers.oauth_callback.
-  if(isOauth)$('#connectOauth').onclick=async()=>{try{const redirect=location.origin+location.pathname;const r=await rpc('providers.oauth_start',{provider_id:p.provider_id,redirect});if(r.redirect_url)location.href=r.redirect_url}catch(e){toast(e.message)}};
+  if(isDeviceFlow){
+    // Device-code flow (RFC 8628): oauth_device_start only queues the
+    // provider's own device-authorization request -- the runtime worker's
+    // HTTP pool performs it and fn_complete_oauth fills in user_code/
+    // verification_uri, so the first oauth_device_status call or two can
+    // still show 'starting' before those fields exist. Poll every 2-3s
+    // (well under the provider's own minimum interval) until the session
+    // reaches a terminal or user-actionable state.
+    $('#connectOauth').onclick=async()=>{
+      const out=$('#deviceFlowOut');
+      out.textContent='Starting…';
+      try{
+        const start=await rpc('providers.oauth_device_start',{provider_id:p.provider_id});
+        const sessionId=start.session_id;
+        const poll=async()=>{
+          let s;
+          try{s=await rpc('providers.oauth_device_status',{session_id:sessionId})}
+          catch(e){out.textContent=e.message;return}
+          if(s.status==='awaiting_user'){
+            const link=s.verification_uri_complete||s.verification_uri;
+            out.innerHTML=`Open <a href="${esc(link)}" target="_blank" rel="noopener">${esc(s.verification_uri)}</a> and enter code <b>${esc(s.user_code)}</b>`;
+            setTimeout(poll,3000);
+          }else if(s.status==='connected'){
+            out.textContent='Connected.';toast('Provider connected');settings();
+          }else if(s.status==='denied'||s.status==='expired'||s.status==='error'){
+            out.textContent='Failed: '+(s.error||s.status);
+          }else{
+            setTimeout(poll,2000);
+          }
+        };
+        poll();
+      }catch(e){out.textContent=e.message}
+    };
+  }else if(isOauth){
+    // Full-page redirect to the provider's own login page, same as any other
+    // OAuth "Connect" button -- the provider redirects back to this same
+    // dashboard URL with ?code=&state=, which the boot-time handler below
+    // (oauthCallbackOnLoad) picks up and completes via providers.oauth_callback.
+    $('#connectOauth').onclick=async()=>{try{const redirect=location.origin+location.pathname;const r=await rpc('providers.oauth_start',{provider_id:p.provider_id,redirect});if(r.redirect_url)location.href=r.redirect_url}catch(e){toast(e.message)}};
+  }
 }
 // Adds a brand new provider row -- until fn_create_provider existed, the
 // only providers that could ever exist were the fixed seeded list (xai,

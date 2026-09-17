@@ -3771,3 +3771,50 @@ Still open: whether the `Database` CR's `CREATE EXTENSION allgres;` step
 and the dashboard's actual runtime behavior are correct once reachable --
 verification against a properly configured (containerd) runtime and the
 community operand image is in progress.
+
+## 46. The dashboard's "Connect via OAuth" button never worked for the seeded `xai_oauth` device-code provider
+
+Raised as "there's nothing about where/how to connect" for the OpenAI/xAI
+OAuth providers. The SQL side was already complete and already documented
+as working (README, "Secrets at rest": "the dashboard displays xAI's
+verification link") -- but `web/index.html`'s `providerModal` only ever
+called `providers.oauth_start`, the authorization-code redirect flow.
+`fn_oauth_start` itself rejects a device-code provider outright (`RAISE
+EXCEPTION 'provider uses device-code oauth'`), and the dashboard had no
+call to `providers.oauth_device_start`/`providers.oauth_device_status`
+anywhere (confirmed by grep before fixing -- zero matches). So clicking
+Connect on the seeded `xai_oauth` provider -- the only oauth-kind provider
+seeded out of the box -- always failed with that exact backend error, with
+no path to complete it from the dashboard at all. This was pure doc lag:
+the backend (`fn_oauth_device_start`/`fn_oauth_device_status`, both already
+wired into `dashboard_rpc`) and the README description were both correct;
+only the dashboard's own JS never called them.
+
+Fixed by branching `providerModal` on `p.oauth_flow==='device_code'`:
+that path now calls `providers.oauth_device_start`, then polls
+`providers.oauth_device_status` every 2-3s, showing the returned
+`verification_uri`/`user_code` once the session reaches `awaiting_user`
+and a final "Connected."/failure message once it reaches `connected` or a
+terminal failure status (`denied`/`expired`/`error`). The pre-existing
+authorization-code path is unchanged, but now also shows the exact
+`redirect_uri` (`location.origin+location.pathname`) an operator must
+register with their own OAuth app -- previously computed only in client-
+side JS an operator would have had to read to find out, which was the
+other half of "where/how to connect."
+
+There is still no dashboard path to set `oauth_flow`/`oauth_device_url`
+for a custom provider added via "Add provider" -- `fn_create_provider`/
+`fn_set_provider` only ever accept authorization-code fields
+(`oauth_auth_url`/`oauth_token_url`/`oauth_client_id`/`oauth_client_secret`);
+device-code flow only exists for the seeded `xai_oauth` row today. Not
+fixed here, since no second real device-code provider exists yet to design
+that surface against.
+
+`openai`'s own provider row is seeded `kind='openai_compat'`, not
+`'oauth'` -- OpenAI does not publish a public device/authorization-code
+OAuth flow for direct API access the way xAI does for Grok CLI, so there
+is deliberately no "openai oauth" to connect: the `openai` provider is
+configured with a plain API key, same as `anthropic`/`ollama`/
+`openai_compat`. Verified via a fresh `fn_selftest()` run (`"failed": 0`)
+after the `web/index.html` change; no SQL changed, so no rebuild/reinstall
+cycle was needed for this fix.
