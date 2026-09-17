@@ -1,0 +1,69 @@
+# Example CNPG (CloudNativePG) wiring for the extension image built from
+# cnpg/Dockerfile. Two separate CRs, two separate concerns:
+#
+#   Cluster.spec.postgresql.extensions   mounts the image's files at
+#                                         /extensions/allgres so PostgreSQL
+#                                         can find allgres.so/.control/.sql
+#                                         -- this alone does NOT run
+#                                         CREATE EXTENSION anywhere.
+#   Cluster.spec.postgresql.
+#     shared_preload_libraries           still required and separate from
+#                                         the extensions mount above --
+#                                         allgres registers two background
+#                                         workers from _PG_init at preload
+#                                         time (README, "Extension
+#                                         installation"), which the image-
+#                                         volume mechanism does not provide
+#                                         on its own. Adding/changing this
+#                                         list triggers CNPG's own rolling
+#                                         restart automatically.
+#   Database.spec.extensions             the actual `CREATE EXTENSION
+#                                         allgres;` (and pgcrypto, optional
+#                                         but recommended -- README,
+#                                         "Secrets at rest"), run once CNPG
+#                                         reconciles this Database CR
+#                                         against the target database.
+#
+# Requires PostgreSQL 18+ and Kubernetes 1.33+ (with the ImageVolume
+# feature gate enabled manually on 1.33-1.34; default-on from 1.35) --
+# see cnpg/Dockerfile's own header for why. Replace
+# ghcr.io/you/allgres:0.1.0 with wherever you actually publish the image
+# cnpg/Dockerfile builds; this repo does not publish it for you the way
+# it does the plain-Docker image (README, "Docker install, in detail").
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: allgres
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie
+
+  postgresql:
+    extensions:
+      - name: allgres
+        image:
+          reference: ghcr.io/you/allgres:0.1.0
+    shared_preload_libraries:
+      - allgres
+
+  storage:
+    size: 1Gi
+
+  bootstrap:
+    initdb:
+      database: app
+      owner: app
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: allgres-app
+spec:
+  name: app
+  owner: app
+  cluster:
+    name: allgres
+  extensions:
+    - name: pgcrypto
+    - name: allgres
+      version: "0.1.0"

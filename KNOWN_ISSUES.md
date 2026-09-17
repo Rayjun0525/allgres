@@ -3672,3 +3672,46 @@ after every subsequent restart. A crash of either worker *without* a full
 restart still self-heals exactly like the static path does, though -- the
 postmaster's restart timer is honored the same way regardless of which
 registration method started the worker.
+
+## 45. CNPG (CloudNativePG) deployment via Image Volume Extensions -- not verified live
+
+README's own "Not yet built" list named Helm charts, Kubernetes manifests,
+and CNPG support as a flat gap. Raised as a direct request: don't build a
+whole custom CNPG operand image the classic way (`FROM ghcr.io/
+cloudnative-pg/postgresql:...`, `COPY` allgres in, replacing what CNPG
+actually runs) -- CNPG's newer Image Volume Extensions mechanism lets
+allgres ship as its own small extension-only image instead, mounted
+read-only alongside the *unmodified* official operand image, so there is
+nothing of CNPG's own release cadence to keep this image in sync with.
+
+`cnpg/Dockerfile` builds that extension image: a `cargo pgrx package`
+build stage FROM the exact CNPG operand image being targeted (so the
+compiled `.so` links against that image's own libpq/postgres internals,
+not a generic `postgres:18` build that could silently mismatch), then a
+`FROM scratch` final stage carrying only `allgres.so` (`/lib/`) and the
+`.control`/`.sql` files (`/share/extension/`) -- the exact layout CNPG's
+own `postgres-extensions-containers` repo's `pgvector` image uses, read
+directly from that repo rather than guessed. `cnpg/cluster-example.yaml`
+wires it up: `Cluster.spec.postgresql.extensions` mounts the image,
+`Cluster.spec.postgresql.shared_preload_libraries` is *still* required
+separately (allgres's two background workers need preload-time
+registration same as ever; the image-volume mechanism only makes files
+discoverable, it doesn't touch `shared_preload_libraries` for you), and a
+companion `Database` CR's `spec.extensions` is what actually runs `CREATE
+EXTENSION allgres;`.
+
+Requires PostgreSQL 18+ (the mechanism needs a preload-time GUC CNPG
+contributed upstream for locating extension files, only present from
+PG18) and Kubernetes 1.33+ (`ImageVolume` feature gate, default-on from
+1.35).
+
+Explicitly **not verified end to end**, unlike every other install path
+this README documents: this environment had no Docker daemon and no
+Kubernetes cluster to actually build the image or apply the CR against.
+The one real assumption `cnpg/Dockerfile` itself flags for whoever tests
+this for real: that the CNPG operand image's own apt sources carry
+`postgresql-server-dev-${PG_MAJOR}` the same way they're confirmed (read
+directly from the real `pgvector` Dockerfile in `postgres-extensions-
+containers`) to carry the prebuilt `postgresql-${PG_MAJOR}-pgvector`
+package -- if the build fails on "Unable to locate package," that is the
+first thing to check.

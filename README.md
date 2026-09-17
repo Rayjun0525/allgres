@@ -137,8 +137,9 @@ limitations](#known-limitations) for what is genuinely still open.
 
 Not yet built:
 
-- Helm charts, Kubernetes manifests, and CNPG dynamic loading — only a
-  native install and `docker-compose` exist today.
+- Helm charts and general Kubernetes manifests — `docker-compose`, a plain
+  native install, and (for CNPG specifically) [CNPG
+  (CloudNativePG)](#cnpg-cloudnativepg) below are what exist today.
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the complete, itemized list.
 
@@ -1542,6 +1543,47 @@ an actual prior version, and `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from
 there is the same operation an in-place production upgrade would run. See
 KNOWN_ISSUES.md, item 18, for how this was verified and what version 0.2.0
 meant before this file existed.
+
+## CNPG (CloudNativePG)
+
+CNPG doesn't take a full custom Postgres image the way plain Docker does
+(README, "Docker install, in detail") — its own operand images
+(`ghcr.io/cloudnative-pg/postgresql:*`) are what actually run, and building
+a whole separate one just to add allgres would mean keeping that image in
+sync with CNPG's own releases forever. Instead, `cnpg/Dockerfile` builds
+allgres as its own small **extension image** — just `allgres.so` and its
+`.control`/`.sql` files, nothing else — using CNPG's [Image Volume
+Extensions](https://cloudnative-pg.io) mechanism: the official operand
+image runs unmodified, and Kubernetes mounts this image's files read-only
+at `/extensions/allgres` alongside it.
+
+This needs PostgreSQL 18+ (the mechanism relies on a `postgresql`-conf-
+`extension_control_path`-style GUC CNPG contributed upstream for exactly
+this, only there from PG18 on) and Kubernetes 1.33+ (with the `ImageVolume`
+feature gate enabled manually on 1.33–1.34; default-on from 1.35).
+
+```bash
+docker build -t ghcr.io/you/allgres:0.1.0 -f cnpg/Dockerfile .
+docker push ghcr.io/you/allgres:0.1.0
+```
+
+`cnpg/cluster-example.yaml` wires the built image into a real `Cluster`:
+`.spec.postgresql.extensions` mounts it (and alone is not enough —
+`shared_preload_libraries` in the same `postgresql` block is still
+required separately, since allgres registers two background workers at
+preload time, which the image-volume mechanism doesn't provide on its
+own), and a companion `Database` CR is what actually runs `CREATE
+EXTENSION allgres;` once CNPG reconciles it. Read that file's own header
+comment for what each field does before applying it.
+
+Not verified end to end against a real cluster as of this writing — no
+Kubernetes cluster or Docker daemon was available in the environment this
+was built in (unlike every other install path in this README, which is).
+`cnpg/Dockerfile`'s own comments flag the one real assumption worth
+checking first if the build fails: that the base image's apt sources
+carry `postgresql-server-dev-${PG_MAJOR}` the same way they carry the
+`postgresql-${PG_MAJOR}` packages CNPG's own extension images (e.g.
+`pgvector`) already install from there.
 
 ## Backup and restore
 
