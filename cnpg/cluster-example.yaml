@@ -39,6 +39,12 @@
 #                                         "Secrets at rest"), run once CNPG
 #                                         reconciles this Database CR
 #                                         against the target database.
+#   Service (NodePort, allgres-dashboard) exposes the dashboard's port 8088
+#                                         directly, for reaching it without
+#                                         a `kubectl port-forward` -- see
+#                                         that Service's own comment for
+#                                         why this isn't a production
+#                                         posture.
 #
 # Requires PostgreSQL 18+ and Kubernetes 1.33+ (with the ImageVolume
 # feature gate enabled manually on 1.33-1.34; default-on from 1.35, AND a
@@ -88,3 +94,34 @@ spec:
     - name: pgcrypto
     - name: allgres
       version: "0.1.0"
+---
+# CNPG's own auto-created Services (allgres-rw/-ro/-r) only ever expose
+# Postgres itself (port 5432) -- the allgres dashboard is a plain HTTP
+# listener the `allgres web` worker opens on port 8088 inside the same
+# pod, which nothing exposes on its own. NodePort here is for reaching it
+# straight from outside the cluster with no extra `kubectl port-forward`
+# step (e.g. a local Rancher Desktop cluster) -- not a production
+# posture: see README's own "Exposure" section for what a real deployment
+# should do instead (a token, TLS, and *not* a raw NodePort onto an
+# untrusted network).
+#
+# `role: primary` targets only the read/write instance, matching CNPG's
+# own -rw Service -- the dashboard needs to reach the instance that can
+# actually write (creating agents, tasks, etc.), and a replica's own copy
+# of `allgres web` would otherwise just serve reads. Confirm this label
+# actually matches your pods first (`kubectl get pods -l cnpg.io/cluster=
+# allgres --show-labels`) -- CNPG has used both `role` and the newer
+# `cnpg.io/instanceRole` for this across versions.
+apiVersion: v1
+kind: Service
+metadata:
+  name: allgres-dashboard
+spec:
+  type: NodePort
+  selector:
+    cnpg.io/cluster: allgres
+    role: primary
+  ports:
+    - port: 8088
+      targetPort: 8088
+      nodePort: 30088
