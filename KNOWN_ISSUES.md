@@ -3767,37 +3767,7 @@ round:
   been tagged yet), not `:latest` -- README and the example file corrected
   to say so.
 
-With a properly configured (containerd) runtime, two more real findings,
-both from the same operand-image swap:
-
-- **EDB Postgres for Kubernetes is not community CNPG, and its default
-  operand image is not Debian-based**: the tester's cluster used
-  `apiVersion: postgresql.k8s.enterprisedb.io/v1` (EDB's own
-  operator/CRD group, API-compatible with but distinct from community
-  CNPG's `postgresql.cnpg.io/v1`) with `imageName:
-  docker.enterprisedb.com/k8s/edb-postgres-advanced:18-standard-ubi9` --
-  a UBI9 (RHEL-family) image. The extension image built from
-  `cnpg/Dockerfile` links against Debian trixie's glibc, and the instance
-  failed to start with `could not load library ".../allgres.so": /lib64/
-  libc.so.6: version 'GLIBC_2.39' not found` -- exactly the ABI mismatch
-  `cnpg/Dockerfile`'s own header comment named as the risk of building
-  against anything other than the exact targeted operand image. Fixed for
-  this round by switching `imageName` to the community
-  `ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie` this image was
-  actually built against (EDB's operator runs that operand image fine);
-  a real UBI9-built variant is unaddressed if EDB Postgres Advanced Server
-  specifically is ever a hard requirement rather than a default.
-- **Pod label prefixes differ between the two operators**: `cnpg/cluster-
-  example.yaml`'s dashboard `Service` originally selected `cnpg.io/
-  cluster: allgres, role: primary`, giving zero endpoints on an EDB-
-  managed pod -- its cluster-scoping label is `k8s.enterprisedb.io/
-  cluster`, not `cnpg.io/cluster` (confirmed via `kubectl get pods
-  --show-labels`), though plain `role: primary` is present on both.
-  The example now selects on `role: primary` alone (works on either
-  operator for a single Cluster in the namespace) with a comment on
-  adding the operator-specific cluster label back if more than one
-  Cluster shares the namespace.
-
 Still open: whether the `Database` CR's `CREATE EXTENSION allgres;` step
 and the dashboard's actual runtime behavior are correct once reachable --
-verification stopped at the Service actually having endpoints.
+verification against a properly configured (containerd) runtime and the
+community operand image is in progress.
