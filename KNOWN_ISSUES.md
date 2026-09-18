@@ -4293,3 +4293,65 @@ distro-specific `dnf`/`subscription-manager` branch into the condensed
 version would undercut the whole point of the docs split from item 50.
 No `Makefile`, SQL, or Rust changed; this is a documentation-only fix,
 one step upstream of anything `make check` can reach.
+
+## 55. `make install` prompted for an unusable password — "add `sudo`" didn't say *where*
+
+The very next step after items 51–54's prerequisites were all sorted,
+same live RHEL9-family install: `make install` (run as the `postgres`
+system account, where `cargo`/`cargo-pgrx` had already been installed
+and used successfully for the whole `build` step) stopped mid-install on
+an interactive password prompt it had no way to satisfy:
+
+```
+Using sudo to copy extension files from ...
+       Running sudo cp .../allgres.control /usr/pgsql-18/share/extension/allgres.control
+[sudo] password for postgres:
+```
+
+Root cause: `install`'s own recipe already does the right thing --
+`cargo pgrx install $(if $(filter 0,$(shell id -u)),,--sudo) ...` only
+adds `--sudo` when not already root -- but the Quick start's own comment
+next to `make install`, `# add \`sudo\` if this PostgreSQL's own lib/share
+dirs need it`, never said *where* to add it. Read literally it suggests
+`sudo make install`; running plain `make install` as a non-root account
+instead (exactly what following the docs' own earlier "no Docker" path
+leads to, since `cargo`/`cargo-pgrx` and the whole build were already
+done as the `postgres` service account) makes the Makefile fall back to
+its own `--sudo`-flag branch, and `cargo-pgrx` then shells out to a real
+interactive `sudo cp` *per copied file*. A `postgres` system account
+typically has no usable login password at all (locked/nologin, meant
+only for PostgreSQL's own peer authentication) -- so that prompt isn't
+just an inconvenience, it can have no correct answer to type in.
+
+Fixed by making the recommended invocation explicit instead of
+"add `sudo`" left to guesswork:
+
+- `Makefile`'s own comment above the `install` target now spells out
+  `sudo env "PATH=$PATH" make install` as the way to run the whole
+  install as root from the start -- which makes the Makefile's existing
+  `id -u`-based branch take its empty-flag path, so `cargo-pgrx` never
+  needs a nested `sudo` call at all, and the single outer `sudo` prompt
+  is asked once, for whichever account actually has real sudo rights,
+  not for a service account's unusable password. `env "PATH=$PATH"`
+  matters specifically for the `postgres`-service-account workflow this
+  project's own docs walk through: `cargo`/`cargo-pgrx`/`pg_config` were
+  installed under that account's own `$HOME`, and root's own default
+  `$PATH` won't include them without it.
+- README.md's and `docs/deployment/source-install.md`'s Quick start
+  comments next to `make install` now point at "the note just below"
+  instead of the ambiguous "add `sudo`", and `docs/deployment/
+  source-install.md` spells out the full `sudo env "PATH=$PATH" make
+  install` form plus why the naive alternative (a bare, non-root `make
+  install`) triggers a per-file prompt a service account often can't
+  answer.
+
+Verified: `make check` still passes clean and `make -n install` (dry
+run) still shows the expected recipe after the comment-only `Makefile`
+change; no functional line changed, so no rebuild or `fn_selftest()`
+re-run was needed. Not reproduced against a real passwordless `postgres`
+service account in this sandbox (this sandbox's own `postgres` role has
+no OS-level login account at all, so `sudo -u postgres` here behaves
+differently) -- the fix follows directly from reading the Makefile's own
+already-correct `id -u` branch alongside the live transcript of what the
+user's `make install` actually printed, not from reproducing the exact
+prompt locally.

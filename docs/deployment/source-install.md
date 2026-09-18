@@ -71,9 +71,23 @@ Rust and `cargo-pgrx` are handled for you if they aren't already there:
 ```bash
 git clone https://github.com/Rayjun0525/allgres.git
 cd allgres
-make install     # add `sudo` if this PostgreSQL's own lib/share dirs need it
+make install     # needs root? see the note just below, not a bare `sudo`
 make quickstart  # CREATE EXTENSION + start, no restart -- see below
 ```
+
+**If `lib`/`share` aren't writable by your own account** (the common
+case running as the `postgres` service account itself, which usually has
+no usable login password): run the whole thing as root from the start,
+`sudo env "PATH=$PATH" make install`, rather than a plain `make install`.
+Without the `sudo` prefix, `install`'s own recipe still tries to recover
+by adding `cargo pgrx install`'s `--sudo` flag whenever it detects it
+isn't already root — but that makes `cargo-pgrx` shell out to a real
+interactive `sudo cp` *per file*, prompting for a password that a
+service account frequently can't supply at all. Running the entire
+command as root from the outset avoids that nested prompt entirely
+(`env "PATH=$PATH"` just carries over wherever `cargo`/`cargo-pgrx`/
+`pg_config` were installed under the non-root account's own `$HOME`, so
+root's shell still finds them).
 
 Four commands, and the last two are only two because `install` and
 *running* it are kept deliberately separate (`install` only ever touches

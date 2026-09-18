@@ -68,7 +68,7 @@ Rust and `cargo-pgrx` are handled for you if they aren't already there:
 ```bash
 git clone https://github.com/Rayjun0525/allgres.git
 cd allgres
-make install     # add `sudo` if this PostgreSQL's own lib/share dirs need it
+make install     # needs root? see Source install for why a bare `sudo` isn't enough
 make quickstart  # CREATE EXTENSION + start, no restart required
 ```
 

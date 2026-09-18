@@ -106,6 +106,18 @@ build: check
 # root avoids a `sudo: command not found` failure in a container that has
 # no sudo binary at all, which is exactly the environment this project's
 # own Dockerfile builds in.
+#
+# The flip side, hit live: running plain `make install` as a non-root
+# *service* account (the `postgres` system user itself, cargo/cargo-pgrx
+# installed under its own $HOME) makes this add `--sudo`, and cargo-pgrx
+# then shells out to a real interactive `sudo cp` per file -- which can
+# have no valid password to satisfy at all, since that account's own
+# login is typically locked/nologin. Prefer running the entire `make
+# install` as root to begin with (so this branch takes the empty-string
+# path and cargo-pgrx never needs its own nested sudo call):
+#   sudo env "PATH=$PATH" make install
+# preserving PATH so root's shell still finds cargo/cargo-pgrx/pg_config
+# wherever the non-root account's own install put them.
 install: build
 	cargo pgrx install $(if $(filter 0,$(shell id -u)),,--sudo) \
 	  --pg-config $(PG_CONFIG) --release --no-default-features --features pg$(PG_MAJOR)
