@@ -5028,3 +5028,58 @@ re-check through the real dashboard UI as a genuine admin account:
 `SELECT 3 AS zebra, 1 AS apple, 2 AS mango` now renders columns
 `ZEBRA | APPLE | MANGO`, in that order. A throwaway admin account
 created for this verification was deactivated and deleted afterward.
+
+## 64. `<select>` dropdowns rendered visibly taller than buttons and inputs next to them
+
+Reported directly: dropdown boxes looked inconsistent in height next to
+other controls on the same row (the SQL console page's own provider
+picker, Settings' "Apply provider/model to every agent" panel, and every
+other `<select class="select">` in the file, all sharing one CSS rule).
+Measured before touching anything, rather than guessing at a fix: on the
+same row, `.select` rendered `38px`, `.input` `41px`, `.btn` `36px` --
+`.btn` already had an explicit `min-height:36px` in the file's own
+"override" stylesheet (added, per that stylesheet's own header comment,
+specifically to restore consistency after the dashboard source split);
+`.input`/`.textarea`/`.select` never got the same treatment, left at
+whatever `padding:9px 10px` plus each element's own native rendering
+happened to produce.
+
+Adding `min-height:36px` alone (matching `.btn`) closed most of the gap
+(`.select` `38px` → still `38px`, `.input` `41px` → `36.8px`) but not all
+of it for `<select>` specifically -- confirmed live via `getComputedStyle`
+that `line-height` wasn't actually taking effect on the `<select>`
+element the way it does on `<input>`/`<button>`, and that `appearance:
+auto` (the browser's own native dropdown chrome, arrow icon included) was
+still driving the element's real height independent of the CSS box model
+PostgreSQL's -- Allgres's own stylesheet -- was trying to set. Confirmed
+directly: setting `appearance:none` plus an explicit `height:36px` (not
+just `min-height`) closed the remaining gap to an exact match, in an
+isolated test page before touching the real file.
+
+Fixed by giving `.select` `-webkit-appearance:none;-moz-appearance:none;
+appearance:none` (removing the native dropdown chrome entirely, which is
+what was resisting a pure-CSS height match) plus an explicit `height:
+36px`, with a small inline SVG chevron (`background-image`, a data URI,
+inside the file's own nonce'd `<style>` block -- not an inline `style=`
+attribute, so item 60's CSP fix doesn't apply here and doesn't need to)
+replacing the native arrow that `appearance:none` removes, positioned via
+`background-position` with matching right-padding so text never runs
+under it. One fixed arrow color (`#8b949e`) rather than a separate one
+per theme -- confirmed live it reads clearly against both the dark and
+light theme's own panel backgrounds, and a single value is simpler to
+maintain than duplicating the rule under `:root[data-theme="light"]` for
+a purely decorative affordance.
+
+Verified: `getBoundingClientRect().height` on the same three elements
+(`#bulkProvider` select, `#bulkModel` input, `#bulkApply` button) now
+reads `36 / 36.8 / 36` (was `38 / 41 / 36`) -- the remaining sub-pixel
+input difference is font-metric rounding, not a visible gap. Live
+Playwright screenshots in both dark and light theme confirm the chevron
+renders correctly and the row reads as one consistent height by eye, not
+just by the numbers. `cargo test --lib --no-default-features --features
+pg16` still 30/30; `fn_selftest()` still `"failed": 0, "passed": 333`
+(sanity-checked even though this is a CSS-only change touching no SQL).
+No CSP violation traced to the new rule specifically -- confirmed by
+diffing the unique violation set before and after, all pre-existing item
+60 noise. A throwaway admin account created for this verification was
+deactivated and deleted afterward.
