@@ -51,7 +51,7 @@ const state={page:'Overview',me:null,agents:[],myAgents:[],users:[],chatAgentId:
 // Approvals page (as tabs, open to regular users too -- item 41); Chat/
 // Messenger/Project folded into one Chat page (as a mode switch -- item
 // 43). Nav is simpler because of it, not because anything was removed.
-const adminPages=['Overview','Agents','Chat','Approvals','Projects','Run','Memories','Audit','Settings'];
+const adminPages=['Overview','Agents','Chat','Approvals','Projects','Run','Memories','Audit','SQL','Settings'];
 const userPages=['Chat','Approvals','My Agents'];
 function pagesForRole(){return state.me?.role==='admin'?adminPages:userPages}
 const $=s=>document.querySelector(s); const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -186,6 +186,7 @@ async function loadPage(){
   if(state.page==='Approvals')await approvalsPage();
   if(state.page==='Memories')await memoriesPage();
   if(state.page==='Audit')await auditPage();
+  if(state.page==='SQL')await sqlConsolePage();
   if(state.page==='Settings')await settings();
   if(state.page==='Chat')await chatPage();
   if(state.page==='My Agents')await myAgentsPage();
@@ -560,6 +561,51 @@ async function settings(){
   $('#runSelftest').onclick=async()=>{try{$('#selftestOut').textContent='running…';const r=await api('/api/v1/selftest',{method:'POST'});$('#selftestOut').textContent=`passed ${r.passed}, failed ${r.failed}`+(r.failed?': '+(r.cases||[]).filter(c=>!c.ok).map(c=>c.name).join(', '):'')}catch(e){$('#selftestOut').textContent=e.message}}
   document.querySelectorAll('.themeBtn').forEach(b=>b.onclick=()=>{setTheme(b.dataset.theme);settings()});
   await usersPage($('#usersSection'));
+}
+
+// The admin SQL console (dashboard_rpc action sql.execute, allgres_public.
+// fn_admin_execute_sql's own comment covers what it runs as and why) --
+// no query history/tabs/multi-statement support, on purpose: this exists
+// so an admin never has to open a separate client for one query, not to
+// replace one. Ctrl/Cmd+Enter runs the query, the same shortcut every
+// real SQL client uses.
+async function sqlConsolePage(){
+  $('#view').innerHTML=`<div class="panel"><h3>SQL console</h3><div class="muted" style="font-size:12px;margin-bottom:10px">Runs as <code>allgres_owner</code> -- the role that owns essentially all of allgres's own schemas and functions, not a read-only sandbox. One statement per run (Ctrl/Cmd+Enter). Every query reaches the audit log before it runs, whether it succeeds or not.</div><textarea class="textarea mono" id="sqlInput" placeholder="SELECT * FROM allgres_public.v_agent_health" style="min-height:140px"></textarea><div class="row" style="margin-top:12px"><button class="btn primary" id="sqlRun">Run</button><span class="spacer"></span><span class="muted mono" id="sqlMeta" style="font-size:12px"></span></div></div><div id="sqlResultPanel"></div>`;
+  const run=async()=>{
+    const sql=$('#sqlInput').value.trim();
+    if(!sql)return;
+    $('#sqlRun').disabled=true;$('#sqlMeta').textContent='running…';
+    const t0=performance.now();
+    try{
+      const r=await rpc('sql.execute',{sql});
+      $('#sqlMeta').textContent=`${(performance.now()-t0).toFixed(0)} ms`;
+      renderSqlResult(r.rows||[]);
+    }catch(e){
+      $('#sqlMeta').textContent='';
+      renderSqlResult(null,e.message);
+    }finally{
+      $('#sqlRun').disabled=false;
+    }
+  };
+  $('#sqlRun').onclick=run;
+  $('#sqlInput').onkeydown=e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();run()}};
+}
+function renderSqlResult(rows,errMsg){
+  const panel=$('#sqlResultPanel');
+  if(errMsg){panel.innerHTML=`<div class="banner">${esc(errMsg)}</div>`;return}
+  if(!rows.length){panel.innerHTML=`<div class="panel muted">No rows.</div>`;return}
+  // fn_admin_execute_sql's own shape for a statement with no output rows
+  // (DDL, or DML with no RETURNING) -- a count, not a real row set.
+  if(rows.length===1&&'rows_affected' in rows[0]){
+    panel.innerHTML=`<div class="panel">ok -- ${esc(rows[0].rows_affected)} row(s) affected.</div>`;return;
+  }
+  const cols=Object.keys(rows[0]);
+  panel.innerHTML=`<div class="panel"><div class="muted" style="font-size:12px;margin-bottom:10px">${esc(rows.length)} row(s)</div><table class="table"><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td class="mono">${esc(fmtSqlCell(r[c]))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+function fmtSqlCell(v){
+  if(v===null||v===undefined)return '—';
+  if(typeof v==='object')return JSON.stringify(v);
+  return String(v);
 }
 function providerModal(p){
   const isOauth=p.kind==='oauth';

@@ -567,6 +567,16 @@
     "params": []
   },
   {
+    "action": "sql.execute",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "session_token",
+      "sql"
+    ]
+  },
+  {
     "action": "provider.update",
     "guards": [
       "require_admin_if_accounts_exist"

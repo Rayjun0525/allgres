@@ -4778,7 +4778,7 @@ BEGIN
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
     'providers.oauth_device_status', 'providers.oauth_callback', 'providers.probe_start', 'providers.probe_status',
     'events', 'approvals.list',
-    'approvals.decide', 'tool_experiments.list', 'model_prices.list', 'model_prices.set', 'model_prices.delete', 'selftest'
+    'approvals.decide', 'tool_experiments.list', 'model_prices.list', 'model_prices.set', 'model_prices.delete', 'sql.execute', 'selftest'
   ]::text[]) a
   WHERE a <> ALL(COALESCE(v_live_rpc_actions, ARRAY[]::text[]));
   SELECT array_agg(a ORDER BY a) INTO v_extra_rpc_actions
@@ -4801,7 +4801,7 @@ BEGIN
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
     'providers.oauth_device_status', 'providers.oauth_callback', 'providers.probe_start', 'providers.probe_status',
     'events', 'approvals.list',
-    'approvals.decide', 'tool_experiments.list', 'model_prices.list', 'model_prices.set', 'model_prices.delete', 'selftest'
+    'approvals.decide', 'tool_experiments.list', 'model_prices.list', 'model_prices.set', 'model_prices.delete', 'sql.execute', 'selftest'
   ]::text[]);
   ok := v_missing_rpc_actions IS NULL AND v_extra_rpc_actions IS NULL;
   v := v || jsonb_build_array(jsonb_build_object(

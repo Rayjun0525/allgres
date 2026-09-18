@@ -4724,3 +4724,104 @@ Agents, Chat, Approvals, Projects, Run, Memories, Audit, Settings)
 turned up no declared `style="..."` value without a matching rule. A
 throwaway admin account created for this verification (`admin_probe`)
 was deactivated and deleted afterward. No SQL changed.
+
+## 61. Added a built-in admin SQL console (its own nav page) -- one query, no separate DB client
+
+Requested directly: an admin wanted to run ad hoc queries against the
+database without opening a separate client (DBeaver named specifically)
+just for that. Before building anything, the real open design question
+was put to the user rather than assumed: what privilege level should an
+admin-run query actually have? Three options, materially different in
+blast radius -- full superuser (equivalent to a real DBeaver connection:
+`ALTER SYSTEM`, other databases, everything), read-only `SELECT`-only, or
+scoped to `allgres_owner` (full DDL/DML over everything allgres's own
+schemas contain, no server-wide reach). Chosen: `allgres_owner`.
+
+Built as `allgres_public.fn_admin_execute_sql(p_sql text)`
+(`sql/operator_accounts_and_chat.sql`), a `SECURITY DEFINER` function
+owned by `allgres_owner` -- no new privilege granted to that role to make
+this possible, it only ever exercises what it already has -- reached
+through a new `sql.execute` dashboard_rpc action, gated by
+`require_admin_if_accounts_exist` like the rest of the
+platform-configuration surface, confirmed live rejected for a real
+logged-in non-admin session token. Design notes worth recording:
+
+- **One statement per call, for free.** PL/pgSQL's `EXECUTE` uses the
+  extended query protocol under the hood, which refuses a string
+  containing more than one command -- no separate parsing/validation
+  needed to enforce "one query at a time," unlike `execute_sql`'s own
+  `allgres.analyze_sql` gate (sql-sandbox.md), which exists for a
+  different reason (deciding what a *sandboxed* statement may touch, not
+  how many of them there are).
+- **Row-shaped results, including `RETURNING`.** A plain `SELECT`, a
+  `WITH ... SELECT`, and `INSERT`/`UPDATE`/`DELETE ... RETURNING` are all
+  tried first, wrapped as `WITH __q AS (<sql>) SELECT to_jsonb(t) FROM
+  __q t` -- the `WITH`-CTE form specifically because a data-modifying
+  statement can only appear as a CTE body in real PostgreSQL syntax, not
+  a plain `FROM (...)` subquery, which is what makes a `RETURNING`
+  clause's own output come back as real rows instead of just a count.
+  Confirmed live across five shapes: plain `SELECT`, a multi-row
+  `SELECT`, bare `CREATE TABLE`, `INSERT` with no `RETURNING`, and
+  `UPDATE ... RETURNING` -- the last one correctly returned the updated
+  rows, not just an affected-count.
+- **A statement that cannot be a CTE body (DDL, or DML with no
+  `RETURNING`) fails that wrap at PostgreSQL's own parse stage, before
+  anything executes.** The inner `BEGIN`/`EXCEPTION WHEN OTHERS` around
+  just the wrap attempt is a real PL/pgSQL savepoint, so *any* failure
+  there -- parse-time or a genuine runtime error -- rolls back cleanly
+  and falls through to running the statement directly, reporting rows
+  affected via `GET DIAGNOSTICS` instead. This was reasoned through
+  rather than assumed: PL/pgSQL's savepoint-per-exception-block semantics
+  are what make it safe to catch broadly here without any risk of a
+  doomed statement's partial effects leaking past the retry.
+- **A genuine error (bad SQL, a constraint violation) is deliberately
+  left uncaught inside the function itself** -- it propagates out to
+  `dashboard_rpc`'s own pre-existing top-level `EXCEPTION WHEN OTHERS`
+  handler, the same path every other dashboard_rpc action's errors
+  already take, turning it into a clean `{"ok":false,"error":SQLERRM,
+  "sqlstate":SQLSTATE}` instead of a second, redundant error-handling
+  layer. Confirmed live: a bad table name came back as
+  `{"ok":false,"error":"relation \"...\" does not exist",...}` through
+  the full dashboard_rpc path, not a raw exception or a 500.
+- **Audited before running, not after** (`allgres_private.audit`,
+  action `sql_console.execute`, the SQL text itself in `details`) -- a
+  query that errors, or that runs out the 60s `statement_timeout` this
+  function sets, still leaves a record of what was attempted, matching
+  this project's own "every consequential mutation" audit-log standard
+  rather than treating this one surface as exempt because it's already
+  gated. Confirmed live via a direct `audit_log` query, correctly
+  distinguishing `web`-origin (username attached) from `sql`-origin
+  (called directly) calls.
+
+Frontend: a new `SQL` admin-only nav page (`adminPages`, not
+`userPages`) -- a textarea, a Run button (Ctrl/Cmd+Enter, matching every
+real SQL client's own shortcut), and a result panel that renders a real
+table for row-shaped results or a plain "N row(s) affected" line for the
+DDL/DML-without-`RETURNING` shape, reusing existing `.table`/`.panel`/
+`.banner` classes throughout. Every `style="..."` value the new markup
+needed was already covered by item 60's own attribute-selector rules
+(confirmed programmatically, not just by eye, before shipping this) --
+the first real test of that fix's own warning comment actually being
+followed by later code, not just describing the problem it fixed.
+
+`CONTRACT.md`'s own `require_admin_if_accounts_exist` action count was
+also stale independent of this change -- it said 34, the real
+(pre-this-feature) count was already 40 -- fixed to the current 41 (with
+`sql.execute` added to the representative list) alongside this feature
+rather than left for a future, unrelated discovery.
+
+Verified: `sql/rpc_catalog.json` regenerated (`scripts/gen_rpc_catalog.py`)
+and both of `fn_selftest`'s `dashboard_rpc_actions_match_frozen_catalog`
+arrays updated in the same commit, per `CONTRACT.md`'s own rule. Fresh
+install (`DROP EXTENSION ... CASCADE` → `CREATE EXTENSION`) plus
+`fn_selftest()` across two separate `psql` connections both report
+`"failed": 0, "passed": 333`; `cargo test --lib --no-default-features
+--features pg16` still 30/30. Live Playwright pass through the actual
+dashboard UI (not just direct SQL calls): logged in as a real admin
+account, ran a `SELECT`, a `CREATE TABLE`, a query against a
+nonexistent table (clean error banner, not a crash), and a cleanup
+`DROP TABLE` -- all rendered correctly, no CSP style-src violations
+traced back to any of the new markup. A second, non-admin account
+confirmed `sql.execute` rejected server-side (`"admin role required"`),
+not merely hidden from that account's own nav. Both throwaway accounts
+deactivated and deleted afterward.

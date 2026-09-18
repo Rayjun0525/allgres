@@ -128,10 +128,13 @@ end to end, and `scripts/smoke.sh`).
   computed `improved`/`regressed` verdict from real task outcomes. See
   [Evaluation-gated self-improvement](docs/self-improvement.md).
 - **Dashboard** — a single static HTML file (no build step) covering
-  Overview, Agents, Chat, Projects, Run, Approvals, Memories, Audit, and
-  Settings, all reachable through one generic `/api/v1/rpc` route, plus
-  OAuth login/device-code connect and per-provider connectivity checks.
-  See [Model configuration and chat](docs/chat-and-models.md).
+  Overview, Agents, Chat, Projects, Run, Approvals, Memories, Audit, SQL,
+  and Settings, all reachable through one generic `/api/v1/rpc` route,
+  plus OAuth login/device-code connect and per-provider connectivity
+  checks. See [Model configuration and chat](docs/chat-and-models.md).
+- **An admin SQL console, built in** — one query at a time, `allgres_owner`
+  privileges, no separate DB client needed. See [Security model, "The SQL
+  console"](docs/security.md#the-sql-console).
 - **Real accounts and an operator audit log** — username/password login,
   admin/user roles, per-user agent assignment, and an append-only audit
   trail for every consequential mutation. See [Operator audit

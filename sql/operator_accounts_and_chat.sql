@@ -1040,3 +1040,75 @@ BEGIN
   );
 END;
 $fn$;
+
+-- The admin SQL console (dashboard_rpc action sql.execute) -- an admin
+-- asked for this specifically so they never need a separate client
+-- (DBeaver etc.) just to run one query. Deliberately scoped to what this
+-- function's own owner (allgres_owner) can already do, not superuser or
+-- cross-database reach: allgres_owner owns essentially all of allgres's
+-- own schemas/tables/functions, so this is still enough rope to drop any
+-- table in allgres_public/allgres_private or rewrite this security
+-- model's own enforcement functions -- a real, admin-only power tool,
+-- not a sandboxed analyst surface like execute_sql (sql-sandbox.md). No
+-- new privilege is granted to allgres_owner to make this possible; it
+-- only ever exercises privileges that role already has.
+--
+-- One statement per call, by construction: PL/pgSQL's EXECUTE uses the
+-- extended query protocol under the hood, which refuses a string
+-- containing more than one command ("cannot insert multiple commands
+-- into a prepared statement") -- exactly the restriction wanted here,
+-- for free, with no separate parsing/validation step.
+--
+-- Row-shaped statements (SELECT, WITH ... SELECT, and INSERT/UPDATE/
+-- DELETE ... RETURNING) are tried first, wrapped as a data-modifying CTE
+-- feeding a to_jsonb() projection -- this is what lets a RETURNING
+-- clause's own output come back as rows too, not just a count. A
+-- statement that cannot be a CTE body at all (DDL, or DML with no
+-- RETURNING) fails that wrap at parse time, before anything executes;
+-- the inner BEGIN/EXCEPTION block is a real PL/pgSQL savepoint, so that
+-- failure (whatever its cause) rolls back cleanly and falls through to
+-- running the statement directly, reporting rows affected instead of
+-- rows returned. A genuine error from that direct run (bad SQL, a
+-- constraint violation, anything) is deliberately left uncaught here --
+-- it propagates out to dashboard_rpc's own top-level `EXCEPTION WHEN
+-- OTHERS` handler, which is what turns it into a real
+-- {"ok":false,"error":SQLERRM,"sqlstate":SQLSTATE} response, the same
+-- path every other dashboard_rpc action's own errors already take.
+--
+-- statement_timeout is set generously, not omitted: this is meant to run
+-- real admin work (an ad hoc backfill, a CREATE INDEX), not just quick
+-- lookups, but a single stuck query would otherwise tie up one of the
+-- web worker's own limited HTTP threads (MAX_WEB_THREADS) indefinitely.
+CREATE OR REPLACE FUNCTION allgres_public.fn_admin_execute_sql(p_sql text)
+RETURNS TABLE(row_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  v_rows bigint;
+BEGIN
+  IF btrim(COALESCE(p_sql, '')) = '' THEN
+    RAISE EXCEPTION 'sql required' USING ERRCODE = 'P0001';
+  END IF;
+  -- Logged before running, not after: what was attempted matters at least
+  -- as much as what succeeded, and a query that errors out (or one that
+  -- runs the statement_timeout below out of time) would otherwise leave
+  -- no trace at all.
+  PERFORM allgres_private.audit('sql_console.execute', jsonb_build_object('sql', p_sql));
+  SET LOCAL statement_timeout = '60s';
+
+  BEGIN
+    RETURN QUERY EXECUTE format(
+      'WITH __allgres_console_q AS (%s) SELECT to_jsonb(t) FROM __allgres_console_q t', p_sql
+    );
+    RETURN;
+  EXCEPTION WHEN OTHERS THEN
+    NULL; -- not row-shaped -- fall through to a direct run below
+  END;
+
+  EXECUTE p_sql;
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  RETURN QUERY SELECT jsonb_build_object('ok', true, 'rows_affected', v_rows);
+END;
+$fn$;

@@ -3,6 +3,11 @@
 Part of the [documentation index](../README.md). See also: [Security
 model](security.md) for the roles this executes under.
 
+This page is about *agent*-issued SQL, gated the way the rest of it
+describes. The dashboard's own admin SQL console (its own nav page) is a
+different, deliberately unsandboxed thing — see [Security model,
+"The SQL console"](security.md#the-sql-console).
+
 Agents can emit `{"action":"execute_sql","sql":"SELECT ..."}`. What that
 statement is allowed to touch is decided from **PostgreSQL's own parse tree**:
 `allgres.analyze_sql` calls `raw_parser` and reads the resulting nodes. Nothing

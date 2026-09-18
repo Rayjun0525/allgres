@@ -1364,6 +1364,16 @@ BEGIN
         ), '[]'::jsonb)
       );
 
+    WHEN 'sql.execute' THEN
+      -- allgres_public.fn_admin_execute_sql's own comment covers the
+      -- design (scope, one-statement-per-call, error propagation); this
+      -- is admin-gated the same way as every other platform-configuration
+      -- action, nothing looser.
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN jsonb_build_object('ok', true, 'rows', COALESCE((
+        SELECT jsonb_agg(row_data) FROM allgres_public.fn_admin_execute_sql(p_request->>'sql')
+      ), '[]'::jsonb));
+
     WHEN 'provider.update' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       v_id := (p_request->>'provider_id')::uuid;

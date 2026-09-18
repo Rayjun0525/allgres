@@ -300,6 +300,34 @@ exactly this reason.
 
 `execution_logs` is append-only, enforced by trigger and by `REVOKE`.
 
+### The SQL console
+
+`allgres_public.fn_admin_execute_sql` (`dashboard_rpc` action
+`sql.execute`, the dashboard's own SQL nav page) is the one deliberate
+exception to "everything reachable from the dashboard is `SECURITY
+DEFINER`-scoped, never a raw SQL surface" — an admin asked for a query
+console so they never need a separate client (DBeaver etc.) just to run
+one query. It
+runs as `allgres_owner`, not `sandbox` and not the bootstrap superuser:
+full `DDL`/`DML` power over everything `allgres_owner` owns — which is
+essentially every table, function, and schema this extension creates,
+this security model's own enforcement code included — but no server-wide
+reach (`ALTER SYSTEM`, other databases, filesystem access). No new
+privilege is granted to `allgres_owner` to make this possible; the
+function only ever exercises privileges that role already has, the same
+way every other `SECURITY DEFINER` function here does.
+
+Gated by `require_admin_if_accounts_exist`, the same guard as every other
+platform-configuration action — nothing looser, and confirmed rejected
+live for a non-admin session token (`{"ok": false, "error": "admin role
+required"}`) even with a real, logged-in account. Every call is written
+to `allgres_private.audit_log` (action `sql_console.execute`, the SQL
+text itself in `details`) *before* it runs, not after, so a query that
+errors or times out still leaves a record of what was attempted. One
+statement per call — PL/pgSQL's `EXECUTE` refuses a string containing
+more than one command, so this falls out of the implementation for free
+rather than needing its own validation step.
+
 ## Self-modification
 
 An agent can emit `{"action":"propose_change","changes":{...},"reason":"..."}`
