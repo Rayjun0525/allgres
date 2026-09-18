@@ -10,9 +10,22 @@ bootstrap.sh` — a working instance in a handful of commands, not a
 multi-page install guide to work through by hand. You need three things on
 `PATH` before the first command below:
 
-- That PostgreSQL version's own `-dev`/`-server-dev` package
-  (`pg_config`) — e.g. `apt install postgresql-server-dev-17` on
-  Debian/Ubuntu, matching whichever major version you're targeting.
+- That PostgreSQL version's own `-dev`/`-server-dev`/`-devel` package,
+  which provides both `pg_config` and the C header files (`include/
+  server`) `cargo-pgrx` compiles against — e.g. `apt install
+  postgresql-server-dev-17` on Debian/Ubuntu, or `dnf install
+  postgresql17-devel` on RHEL/Rocky/Alma/Fedora via the PGDG yum/dnf
+  repo, matching whichever major version you're targeting. **`pg_config`
+  being on `PATH` is not proof this is actually installed** — confirmed
+  live on a PGDG RPM install where `pg_config` resolved and reported a
+  valid version, but its own `--includedir-server` pointed at
+  `/usr/pgsql-18/include/server`, which didn't exist, because only
+  `postgresql18-server` (runtime) was installed, not the separate
+  `postgresql18-devel` package headers actually live under; `make check`
+  now runs `pg_config --includedir-server` itself and fails fast if that
+  directory is missing, instead of `cargo-pgrx`'s own bindgen step dying
+  deep inside `cargo install cargo-pgrx` with "cannot find ...
+  include/server for C header files".
 - A C toolchain: `cc`/`gcc` and `clang`/`libclang-dev` specifically —
   `cargo-pgrx` itself (the tool, before it ever touches this extension's
   own source) needs one to build, via `bindgen`'s use of libclang for

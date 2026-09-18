@@ -4167,3 +4167,73 @@ clean after the `Makefile` change, and `fn_selftest()` still reports
 connections (not two calls in one `SELECT` -- see this file's own
 variable-hygiene notes on why that distinction matters here too). No SQL
 or Rust changed.
+
+## 53. `make install` failed with `bindgen`'s own "cannot find include/server" — `pg_config` on `PATH` isn't proof the dev headers are actually there
+
+A third, distinct failure in the same sequence as items 51 and 52, on a
+PGDG RPM-style install (home directory `/var/lib/pgsql`, `pg_config`
+resolving PostgreSQL 18 under `/usr/pgsql-18/`):
+
+```
+Error: bindgen failed for pg18
+Caused by:
+   0: cannot find "/usr/pgsql-18/include/server" for C header files
+   1: No such file or directory (os error 2)
+make: *** [Makefile:80: build] Error 1
+```
+
+Root cause: unlike items 51/52 (a whole tool or library genuinely
+missing), here `pg_config` itself was found, resolved a supported major
+version, and even reported `CLANG = Some("/usr/bin/clang")` correctly —
+the `check` target's existing `pg_config`-on-`PATH` test passed cleanly.
+The actual gap was one level deeper: `pg_config --includedir-server`
+pointed at a directory that doesn't exist, because on this machine only
+the PostgreSQL 18 *server/runtime* package was installed, not the
+separate `-devel` package that ships the C headers `cargo-pgrx`'s own
+`bindgen` step compiles against (PGDG's RPM naming splits these into
+`postgresql18-server` and `postgresql18-devel`; Debian/Ubuntu's single
+`postgresql-server-dev-NN` package happens to cover both, which is
+exactly why this class of gap hadn't surfaced on the Debian-based
+sandbox this project's own tooling was developed and tested in).
+
+Fixed the same way as items 51 and 52 — extend `check`, don't just
+document around it:
+
+- **Fail fast with a clear message.** `Makefile` now also computes
+  `PG_INCLUDEDIR_SERVER := $(shell $(PG_CONFIG) --includedir-server
+  2>/dev/null)` and verifies that directory actually exists on disk,
+  with a `$(error ...)` naming both the Debian/Ubuntu package and the
+  RHEL/Rocky/Alma/Fedora PGDG one (`postgresql$(PG_MAJOR)-devel`,
+  explicitly distinguished from `postgresql$(PG_MAJOR)-server`, since
+  conflating the two is the exact mistake this item exists to catch).
+  Verified live with the same non-destructive technique as items 51/52:
+  a wrapper `pg_config` script (`/tmp/fake-pg-config-badinclude/
+  pg_config`) that forwards every real flag to the system `pg_config`
+  except `--includedir-server`, which it hardcodes to the user's own
+  bogus `/usr/pgsql-18/include/server` path — `make check
+  PG_CONFIG=/tmp/fake-pg-config-badinclude/pg_config` correctly fired
+  the new error with that exact path quoted back, and a plain `make
+  check` (real `pg_config`, real existing includedir) still passed
+  clean immediately after. Cleaned up (`rm -rf`) once confirmed.
+- **Document it.** Both README.md's Quick start "Source" path and
+  `docs/deployment/source-install.md`'s first prerequisite bullet now
+  name the RHEL/Fedora PGDG package (`postgresqlNN-devel`) alongside
+  Debian/Ubuntu's `postgresql-server-dev-NN`, and say explicitly that
+  `pg_config` being on `PATH` is not itself proof the headers are
+  installed — this was the one prerequisite this project's docs had
+  always implicitly conflated with "`pg_config` resolves," across all
+  three prior doc passes (the original README, item 50's split, and
+  item 51/52's own additions), because the Debian-based dev environment
+  this project has always been built and tested in never had a reason
+  to separate them.
+
+Verified live: `make check` and `make install` both pass clean in this
+(Debian-based) sandbox after the `Makefile` change, and `fn_selftest()`
+still reports `"failed": 0, "passed": 333` across two genuinely separate
+`psql` connections. No SQL or Rust changed. The RHEL/PGDG package name
+itself (`postgresqlNN-devel`) is documented from PGDG's own well-known
+packaging convention, not independently verified against a live RPM
+install in this sandbox (no RPM-based PostgreSQL install available
+here) — if it turns out wrong for some PGDG release, `make check`'s own
+error message (which prints the actual missing path, not just the
+package name) is still the thing that catches the underlying problem.

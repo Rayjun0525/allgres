@@ -22,6 +22,7 @@ QUICKSTART_DB ?= postgres
 
 CARGO_PGRX_VERSION := $(shell grep -E '^pgrx = ' Cargo.toml | sed -E 's/.*version = "=?([0-9.]+)".*/\1/')
 PG_MAJOR := $(shell $(PG_CONFIG) --version 2>/dev/null | sed -E 's/PostgreSQL ([0-9]+).*/\1/')
+PG_INCLUDEDIR_SERVER := $(shell $(PG_CONFIG) --includedir-server 2>/dev/null)
 
 .PHONY: build install quickstart clean check
 
@@ -36,6 +37,21 @@ endif
 ifeq ($(filter $(PG_MAJOR),16 17 18),)
 	$(error PostgreSQL $(PG_MAJOR) (from $(PG_CONFIG)) is not supported -- \
 	  Allgres targets 16, 17, and 18)
+endif
+ifeq ($(shell test -d "$(PG_INCLUDEDIR_SERVER)" && echo yes),)
+	$(error $(PG_CONFIG) reports --includedir-server as \
+	  "$(PG_INCLUDEDIR_SERVER)", but that directory does not exist -- \
+	  pg_config being on PATH is not enough by itself; this PostgreSQL's \
+	  own C header files (include/server) come from a separate -devel/-dev \
+	  package, distinct from the server/runtime package pg_config itself \
+	  ships with on some distros. Install it (Debian/Ubuntu: `apt install \
+	  postgresql-server-dev-$(PG_MAJOR)`; RHEL/Rocky/Alma/Fedora via the \
+	  PGDG yum/dnf repo: `dnf install postgresql$(PG_MAJOR)-devel`, \
+	  distinct from postgresql$(PG_MAJOR)-server which ships only the \
+	  server binaries). Without it, cargo-pgrx's own bindgen step fails \
+	  deep inside `cargo install cargo-pgrx` with "cannot find ... \
+	  include/server for C header files" instead of failing here with \
+	  this message)
 endif
 ifeq ($(shell command -v cc 2>/dev/null || command -v gcc 2>/dev/null),)
 	$(error no C compiler found on PATH -- cargo-pgrx itself needs one to \
