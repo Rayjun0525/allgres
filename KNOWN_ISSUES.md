@@ -4409,3 +4409,127 @@ setup matching the user's exact container arrangement) -- confirmed
 instead directly from `src/web.rs`'s own `check_exposure`/
 `configured_http_addr` source and the user's own live `ss`/`ps` output,
 which is what the fix is written from.
+
+## 57. `make quickstart` silently never created `allgres` when `pgcrypto` was genuinely unavailable, not just uncreated
+
+Found live while chasing item 56: the same user's PostgreSQL log, a few
+lines above the restart sequence, had this sitting unexamined:
+
+```
+2026-09-18 01:51:35.860 UTC [34523] ERROR:  extension "pgcrypto" is not available
+HINT:  The extension must first be installed on the system where PostgreSQL is running.
+STATEMENT:  SET allgres.reloadable = 'on';   CREATE EXTENSION IF NOT EXISTS pgcrypto;
+  CREATE EXTENSION IF NOT EXISTS allgres;   SELECT allgres_public.fn_start_dynamic_workers();
+```
+
+No further lines followed for that statement -- no `CREATE EXTENSION`
+success, no `fn_start_dynamic_workers` result -- meaning the *real* `make
+install`/`make quickstart` an operator ran earlier in this same
+troubleshooting session had never actually created the `allgres`
+extension at all, despite both background workers showing up in `ps -ef`
+(explained by `shared_preload_libraries` registering them unconditionally
+at postmaster start, independent of whether `CREATE EXTENSION allgres`
+ever ran anywhere).
+
+Root cause: `quickstart`'s Makefile recipe sent all four statements
+(`SET`, two `CREATE EXTENSION`s, the `SELECT`) as one `psql -c` string.
+PostgreSQL's simple query protocol wraps a multi-statement string like
+that in a single implicit transaction; when `pgcrypto` isn't just
+uncreated but genuinely missing from the system (no `postgresqlNN-
+contrib` package, e.g.), `CREATE EXTENSION IF NOT EXISTS pgcrypto`
+errors regardless of `IF NOT EXISTS` (there's no control file for it to
+find), which aborts the whole implicit transaction -- silently taking
+`CREATE EXTENSION allgres` down with it, even though pgcrypto is
+explicitly optional (README's own Runtime requirements: "pgcrypto
+(optional, for encrypted provider secrets)"). An operator whose system
+never had pgcrypto installed would run `make install && make quickstart`
+exactly as the Quick start instructs, see workers listed in `ps -ef`,
+and have no working `allgres_public.*`/`allgres_private.*` schema at all
+-- with no obvious signal beyond a single `ERROR` line buried in the
+PostgreSQL log, several statements before the point where troubleshooting
+would normally start.
+
+Reproduced live in this sandbox without touching any real package or
+extension: rather than uninstalling pgcrypto (this sandbox's shared, and
+removing system packages isn't something to do to chase a docs bug), the
+same failure mode was reproduced by substituting a genuinely nonexistent
+extension name (`nonexistent_ext_xyz`) for `pgcrypto` in the old
+combined-statement form, on a disposable scratch database
+(`allgres_quickstart_test`, dropped again once done) -- confirmed the old
+form left `allgres` uncreated (`SELECT extname FROM pg_extension WHERE
+extname='allgres'` came back empty), then confirmed the fixed form
+created it successfully even with the same missing-extension failure in
+play.
+
+Fixed by splitting `pgcrypto` into its own, independently-failable `psql`
+call ahead of the essential one:
+
+```makefile
+quickstart:
+	@psql -d $(QUICKSTART_DB) -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;" >/dev/null 2>&1 || \
+	  echo "pgcrypto not available on this system -- skipping it (optional; ...)"
+	psql -v ON_ERROR_STOP=1 -d $(QUICKSTART_DB) -c "SET allgres.reloadable = 'on'; \
+	  CREATE EXTENSION IF NOT EXISTS allgres; \
+	  SELECT allgres_public.fn_start_dynamic_workers();"
+```
+
+so a missing `pgcrypto` can never again abort `CREATE EXTENSION allgres`
+in the same implicit transaction -- the two calls are now genuinely
+independent statements/transactions from PostgreSQL's own point of view.
+
+Verified: `make check` still passes clean (comment/recipe-only change to
+`quickstart`, nothing `check` touches); `make -n quickstart` shows the
+expected two-call recipe; live-tested both the normal case (`pgcrypto`
+already installed -- ran clean, `"already exists, skipping"` then the
+real `CREATE EXTENSION allgres`/`fn_start_dynamic_workers` calls
+succeeded) and the substituted-missing-extension case on the disposable
+scratch database described above, both confirmed by directly querying
+`pg_extension` afterward rather than trusting `psql`'s own exit status
+alone. No SQL or Rust changed -- this is a `Makefile`-only fix; nothing
+about `fn_selftest` exercises `make quickstart` itself, so no selftest
+re-run was needed or would have caught this class of bug in the first
+place.
+
+## 58. `export` + `pg_ctl restart` never changed `ALLGRES_HTTP_ADDR` — PostgreSQL was systemd-managed
+
+Immediately after item 56's fix was suggested, on the same live install:
+the user reported `export ALLGRES_HTTP_ADDR=0.0.0.0:8088; pg_ctl restart`
+had no effect at all -- `ss -tlnp | grep 8088` still showed
+`127.0.0.1:8088` after several restarts. Asking directly surfaced the
+reason: PostgreSQL on this machine was started via `systemctl`, not a
+bare `pg_ctl start` from an interactive shell.
+
+Root cause: a systemd service's process environment comes entirely from
+its own unit (`Environment=`/`EnvironmentFile=` directives), never from
+whatever happens to be `export`ed in the shell that runs `systemctl
+restart` -- `export` only affects the current shell and its direct
+children, and `systemctl` talks to PID 1's systemd manager over a socket
+rather than forking the service as its own child, so the exported
+variable never reaches the new `postgres` process at all. Item 56's own
+fix, written and verified from `src/web.rs` alone without knowing how
+this specific user's PostgreSQL was actually being started, silently
+assumed a bare `pg_ctl`-managed install -- a reasonable default (it's
+what `make quickstart`'s own docs assume throughout), but wrong for a
+PGDG RPM install, where the packaged install very commonly *is*
+systemd-managed from the start.
+
+Fixed by extending the same `docs/deployment/source-install.md`
+paragraph item 56 added, rather than opening a new one, with the systemd
+case right after the plain `pg_ctl` form: `sudo systemctl edit
+postgresql-NN` to create a drop-in (never hand-edit the vendor unit --
+a package upgrade overwrites it) with
+
+```ini
+[Service]
+Environment=ALLGRES_HTTP_ADDR=0.0.0.0:8088
+Environment=ALLGRES_ALLOW_INSECURE_HTTP=1
+```
+
+followed by `systemctl daemon-reload && systemctl restart postgresql-NN`.
+
+Not independently reproduced in this sandbox (PostgreSQL here runs under
+`pg_ctlcluster`, Debian's own cluster-management wrapper, not systemd) --
+written directly from the user's own confirmation of how their instance
+starts, the same way item 55's `sudo`-placement fix was derived from a
+live transcript rather than a local repro. No `Makefile`, SQL, or Rust
+changed; purely an extension of item 56's own documentation-only fix.

@@ -134,6 +134,34 @@ export ALLGRES_ALLOW_INSECURE_HTTP=1   # required for a non-loopback bind with n
 pg_ctl restart -D /path/to/your/data/dir
 ```
 
+**If PostgreSQL itself is managed by systemd** (a PGDG RPM install
+typically is — `systemctl status postgresql-17`, or whatever your major
+version's unit is named), `export` in your own shell has no effect on
+it at all: a systemd service only sees environment variables defined in
+its own unit, never whatever happens to be exported in the shell you
+ran `systemctl restart` from. Add a drop-in instead of editing the
+vendor unit file directly (a drop-in survives package upgrades that
+would otherwise overwrite an edited unit):
+
+```bash
+sudo systemctl edit postgresql-17
+```
+
+add:
+
+```ini
+[Service]
+Environment=ALLGRES_HTTP_ADDR=0.0.0.0:8088
+Environment=ALLGRES_ALLOW_INSECURE_HTTP=1
+```
+
+then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart postgresql-17
+```
+
 `ALLGRES_ALLOW_INSECURE_HTTP=1` is exactly as permissive as it sounds —
 anyone who can reach the port can create agents, rewrite prompts, and
 register provider keys with no token at all — so treat it the same way

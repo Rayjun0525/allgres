@@ -134,9 +134,21 @@ install: build
 	@echo ""
 	@echo "See docs/deployment/source-install.md for the full picture."
 
+# pgcrypto is optional (only used to encrypt provider secrets at rest, see
+# docs/security.md) but genuinely absent -- not just uncreated -- on a
+# system missing the OS package that ships it (postgresqlNN-contrib on
+# PGDG RPM installs); `CREATE EXTENSION IF NOT EXISTS pgcrypto` still
+# errors in that case despite `IF NOT EXISTS`, since there's no control
+# file for it to find at all. Kept in its own psql call, allowed to fail
+# on its own, so that failure can never abort the second call's implicit
+# transaction -- confirmed live: with all three statements in one `-c`
+# string, a missing pgcrypto aborted `CREATE EXTENSION allgres` right
+# along with it, silently, since PostgreSQL's simple query protocol wraps
+# a multi-statement string in one implicit transaction block.
 quickstart:
+	@psql -d $(QUICKSTART_DB) -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;" >/dev/null 2>&1 || \
+	  echo "pgcrypto not available on this system -- skipping it (optional; provider secrets are stored unencrypted without it)"
 	psql -v ON_ERROR_STOP=1 -d $(QUICKSTART_DB) -c "SET allgres.reloadable = 'on'; \
-	  CREATE EXTENSION IF NOT EXISTS pgcrypto; \
 	  CREATE EXTENSION IF NOT EXISTS allgres; \
 	  SELECT allgres_public.fn_start_dynamic_workers();"
 	@echo ""
