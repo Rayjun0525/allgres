@@ -4825,3 +4825,109 @@ traced back to any of the new markup. A second, non-admin account
 confirmed `sql.execute` rejected server-side (`"admin role required"`),
 not merely hidden from that account's own nav. Both throwaway accounts
 deactivated and deleted afterward.
+
+## 62. `SELECT now();` in the new SQL console came back as a row count, not a timestamp -- and how it was upgraded made it worse
+
+Two real, distinct problems surfaced in quick succession after item 61
+shipped, both live-reported by the same admin trying to actually use it.
+
+**First: `permission denied for function fn_admin_execute_sql`,
+immediately after upgrading.** The advice given at the time -- pull the
+two changed `sql/*.sql` files and re-apply them directly with `psql -f`,
+to avoid `DROP EXTENSION ... CASCADE` destroying real data -- was itself
+wrong in a way only obvious in hindsight. `grants_and_facade.sql`'s own
+ownership-fixing pass (its own comment: "CREATE EXTENSION ... records
+every object this file creates as an extension member as it creates it")
+only reassigns ownership for objects PostgreSQL's `pg_depend` already
+knows belong to the `allgres` extension -- a brand-new function created
+by running its defining file directly via `psql -f`, outside `CREATE
+EXTENSION`/`ALTER EXTENSION`, is never recorded as an extension member at
+all, so that pass silently skipped it, leaving it owned by whichever
+role ran the file (not `allgres_owner`) with no `EXECUTE` grant for the
+role `dashboard_rpc` actually runs as. Reproduced live by deliberately
+recreating the same state (`ALTER EXTENSION allgres DROP FUNCTION ...`
++ `ALTER FUNCTION ... OWNER TO postgres`) and confirming the identical
+error, then confirming the real fix resolves it with no data loss:
+
+```sql
+ALTER EXTENSION allgres ADD FUNCTION allgres_public.fn_admin_execute_sql(text);
+ALTER FUNCTION allgres_public.fn_admin_execute_sql(text) OWNER TO allgres_owner;
+```
+
+Only relevant the *first* time a brand-new function is deployed this way
+-- modifying an *existing*, already-registered function's body via a
+plain `CREATE OR REPLACE FUNCTION` (as the second bug below needed) does
+not touch ownership or extension membership at all, confirmed live
+later in this same item with no `ALTER EXTENSION ADD FUNCTION` step
+needed.
+
+**Second, after that was fixed: `SELECT now();` -- the single most
+ordinary query anyone would type first, semicolon included out of sheer
+habit -- came back `{"ok": true, "rows_affected": 1}` instead of the
+actual timestamp.** Root cause: `fn_admin_execute_sql`'s row-shaped-query
+wrap is `WITH __allgres_console_q AS (%s) SELECT to_jsonb(t) FROM
+__allgres_console_q t` -- and `(SELECT now();)` is not valid SQL, a
+statement terminator *inside* the parentheses ends the statement
+prematurely. That parse failure was indistinguishable, from inside the
+function, from "this isn't a row-shaped statement at all" (DDL, or DML
+with no `RETURNING`), so it silently took the exact same fallback path a
+`CREATE TABLE` takes -- correct behavior for a `CREATE TABLE`, wrong for
+a `SELECT` with nothing more than a habitual trailing `;`.
+
+While fixing it, a second, independent mistake in item 61's own design
+was caught: its "one statement per call, by construction" claim --
+"PL/pgSQL's `EXECUTE` uses the extended query protocol under the hood,
+which refuses a string containing more than one command" -- is simply
+false, confirmed directly (`DO $$ BEGIN EXECUTE 'SELECT 1; SELECT 2';
+END $$;` succeeds, running both). That restriction is real for a
+parameterized `EXECUTE ... USING`, not for a bare literal SQL string,
+which is exactly what this function passes. Nothing in item 61's own
+testing had actually tried a genuine multi-statement string against the
+*fallback* path specifically (only against the wrap-then-fallback flow
+as a whole, where the earlier trailing-semicolon-shaped test cases never
+exercised it) -- so this sat undetected through that item's own
+verification.
+
+Fixed together, since both come from the same place -- normalizing
+`p_sql` before either code path sees it:
+
+- A single trailing `;` (plus any trailing whitespace) is stripped with
+  `regexp_replace(btrim(p_sql), ';\s*$', '')` before anything else --
+  leaves a genuine multi-statement attempt (`SELECT 1; SELECT 2`, with
+  no trailing `;` of its own on the second statement) completely
+  unaffected, since only the outermost terminator is ever a style
+  artifact, never a second statement.
+- The statement count is now checked for real: `allgres.analyze_sql`
+  (the same native `raw_parser` call `execute_sql`'s own validation
+  already relies on, sql-sandbox.md) reports a `statements` field
+  directly; anything other than exactly `1` is rejected with a clear
+  `exactly one SQL statement per run (found N)` error before either
+  execution path runs. `analyze_sql` also raises a real syntax error for
+  genuinely unparseable input, which is treated as a feature here, not a
+  gap to guard against -- it propagates out to `dashboard_rpc`'s own
+  top-level exception handler exactly like any other genuine error this
+  function produces, just discovered one step earlier than before.
+
+Verified: reproduced the exact `SELECT now();` failure live before the
+fix (`{"ok": true, "rows_affected": 1}`) and confirmed it now returns the
+real row after; confirmed `SELECT 1; SELECT 2` is now cleanly rejected
+(`exactly one SQL statement per run (found 2)`) where before it silently
+ran both; confirmed DDL, DML-without-`RETURNING`, and DML-with-
+`RETURNING` (each with and without a trailing `;`) all still behave
+exactly as item 61 originally verified. Function ownership stayed
+`allgres_owner` after re-applying via `CREATE OR REPLACE FUNCTION`
+against the already-registered function (no `ALTER EXTENSION ADD
+FUNCTION` step needed this time -- confirmed directly, closing the loop
+on the first bug in this item). Fresh install (`DROP EXTENSION ...
+CASCADE` → `CREATE EXTENSION`) plus `fn_selftest()` across two separate
+connections both report `"failed": 0, "passed": 333`; `cargo test --lib
+--no-default-features --features pg16` still 30/30. Live Playwright
+re-check through the real dashboard UI, logged in as a genuine admin
+account: `SELECT now();` now renders the actual timestamp in a real
+table, not a row count. A throwaway admin account created for this
+verification was deactivated and deleted afterward.
+
+The corrected claim about `allgres.analyze_sql`'s role here is also now
+reflected in [Security model, "The SQL
+console"](docs/security.md#the-sql-console), replacing the false one
+item 61 originally shipped.

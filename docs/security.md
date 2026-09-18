@@ -324,9 +324,15 @@ required"}`) even with a real, logged-in account. Every call is written
 to `allgres_private.audit_log` (action `sql_console.execute`, the SQL
 text itself in `details`) *before* it runs, not after, so a query that
 errors or times out still leaves a record of what was attempted. One
-statement per call — PL/pgSQL's `EXECUTE` refuses a string containing
-more than one command, so this falls out of the implementation for free
-rather than needing its own validation step.
+statement per call, checked explicitly against `allgres.analyze_sql`'s
+own `statements` count (the same native `raw_parser` call `execute_sql`'s
+own validation already uses, [sql-sandbox.md](sql-sandbox.md)) — not left
+to `EXECUTE` to enforce on its own, which it does not: `EXECUTE 'SELECT
+1; SELECT 2'` runs both statements silently, reporting only the last
+one's outcome, confirmed live after an admin's own `SELECT now();`
+(trailing `;` alone, not a deliberate multi-statement attempt) reached
+that exact path and came back as a row *count* instead of the actual
+timestamp.
 
 ## Self-modification
 

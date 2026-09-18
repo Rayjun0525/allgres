@@ -1053,11 +1053,16 @@ $fn$;
 -- new privilege is granted to allgres_owner to make this possible; it
 -- only ever exercises privileges that role already has.
 --
--- One statement per call, by construction: PL/pgSQL's EXECUTE uses the
--- extended query protocol under the hood, which refuses a string
--- containing more than one command ("cannot insert multiple commands
--- into a prepared statement") -- exactly the restriction wanted here,
--- for free, with no separate parsing/validation step.
+-- One statement per call -- checked explicitly via allgres.analyze_sql's
+-- own `statements` count (sql-sandbox.md; the same native raw_parser
+-- call execute_sql's own validation already uses), not left to EXECUTE
+-- to enforce on its own. It does not: confirmed live, `EXECUTE 'SELECT
+-- 1; SELECT 2'` runs both statements without error, silently, reporting
+-- only the last one's outcome -- a real, tested-wrong assumption in an
+-- earlier version of this function, caught by an admin pasting an
+-- ordinary `SELECT now();` (the trailing `;` alone was enough to reach
+-- the fallback path this bug lived in) rather than a deliberate
+-- multi-statement attempt.
 --
 -- Row-shaped statements (SELECT, WITH ... SELECT, and INSERT/UPDATE/
 -- DELETE ... RETURNING) are tried first, wrapped as a data-modifying CTE
@@ -1087,15 +1092,37 @@ SET search_path = allgres_private, allgres_public, pg_temp
 AS $fn$
 DECLARE
   v_rows bigint;
+  v_analysis jsonb;
 BEGIN
   IF btrim(COALESCE(p_sql, '')) = '' THEN
     RAISE EXCEPTION 'sql required' USING ERRCODE = 'P0001';
   END IF;
+  -- A trailing `;` -- what anyone typing a query out of habit includes --
+  -- breaks the WITH-wrap below outright: `(SELECT now();)` is invalid
+  -- syntax with a statement terminator *inside* the parens, not just a
+  -- style nit. That failure was indistinguishable from "not row-shaped"
+  -- and silently took the row-count fallback path instead, confirmed
+  -- live: `SELECT now();` came back as "1 row(s) affected" instead of
+  -- the actual timestamp. Stripping one trailing `;` (and any trailing
+  -- whitespace after it) leaves a genuine multi-statement attempt
+  -- (`SELECT 1; SELECT 2`, no trailing `;` of its own) exactly as
+  -- rejected below -- only the outermost terminator is a style artifact,
+  -- not a second statement.
+  p_sql := regexp_replace(btrim(p_sql), ';\s*$', '');
   -- Logged before running, not after: what was attempted matters at least
   -- as much as what succeeded, and a query that errors out (or one that
   -- runs the statement_timeout below out of time) would otherwise leave
   -- no trace at all.
   PERFORM allgres_private.audit('sql_console.execute', jsonb_build_object('sql', p_sql));
+  -- allgres.analyze_sql also raises a real syntax error for unparseable
+  -- input, which is fine here (not just tolerated): it propagates out to
+  -- dashboard_rpc's own top-level exception handler exactly like any
+  -- other genuine error from this function, just discovered earlier.
+  v_analysis := allgres.analyze_sql(p_sql);
+  IF (v_analysis->>'statements')::int <> 1 THEN
+    RAISE EXCEPTION 'exactly one SQL statement per run (found %)',
+      v_analysis->>'statements' USING ERRCODE = 'P0001';
+  END IF;
   SET LOCAL statement_timeout = '60s';
 
   BEGIN
