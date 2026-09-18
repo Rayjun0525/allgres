@@ -5149,3 +5149,73 @@ all 40 bubbles and read `scrollTop === scrollHeight - clientHeight`
 the screenshot, not message 1. No SQL changed; no Rust rebuild needed
 (the same `include_str!`-embedded `web/index.html` a real `allgres web`
 worker serves, verified once already for item 65's CSP/nonce handling).
+
+## 67. Chat page centered into a Claude-style column, with a themed thin scrollbar
+
+Requested directly: the chat page's panel stretched to `.main`'s full
+width (up to 1500px), so message bubbles spread edge to edge on a wide
+screen instead of reading as a narrow, centered conversation column the
+way claude.ai's own chat does; the request also asked for a Chrome-style
+scrollbar rather than each browser's own default. Asked which of two
+scrollbar directions before building anything (a plain themed
+Chrome-style scrollbar vs. a VSCode-style content-minimap one) rather
+than picking one unasked -- the minimap direction doesn't map cleanly
+onto a bubble list anyway (nothing to miniaturize the way a minimap
+condenses lines of code); confirmed: the plain themed scrollbar.
+
+Fixed in `web/index.html`:
+- `chatPage()`'s own top-level markup now wraps the mode-switch buttons
+  and `#chatModeBody` in one `<div class="chatPanel">` instead of
+  rendering them straight into `#view` -- General/Messenger/Project all
+  share this one wrapper, so switching modes doesn't need its own
+  per-mode centering.
+- New rule `.chatPanel{max-width:760px;margin:0 auto;width:100%}` in the
+  file's override `<style>` block. `width:100%` alongside `max-width` is
+  what makes this responsive with no media query needed: it centers with
+  fixed side margins once the viewport is wider than 760px, and simply
+  fills the available width below that (down to the existing `.main`
+  breakpoints) -- confirmed live rather than assumed.
+- Thin, themed scrollbars on the three chat scroll boxes
+  (`#chatThread`, `#projectChatThread`, `#msgFeed`) via ID-selector
+  `::-webkit-scrollbar*` rules (10px, transparent track, `--line`
+  thumb, `--muted` on hover, rounded via `border-radius` +
+  `background-clip:padding-box`) plus `scrollbar-width:thin` for
+  Firefox. Targeting these by ID rather than a shared class needed no
+  new `style="..."` attribute, so none of this touches item 60's
+  CSP/attribute-selector list.
+
+One bug caught before shipping: the thumb rules were first written as
+the `background:var(--line)` shorthand: `getComputedStyle` on the real
+pseudo-element (`getComputedStyle(el, '::-webkit-scrollbar-thumb')`,
+which Chromium does support querying) came back with `background-color`
+resolving to nothing even though the rule parsed -- rewriting it as the
+`background-color:var(--line)` longhand fixed it. Root cause not fully
+chased down (the shorthand expands fine in ordinary elements; something
+about mixing it with the following `border`/`background-clip`
+declarations on this vendor pseudo-element specifically didn't resolve
+it) -- the longhand form is what every browser's own devtools examples
+for this exact pattern use anyway, so this is the more idiomatic fix,
+not just a workaround.
+
+Verified live: served the built `web/index.html` (nonce substituted,
+real CSP header) under Playwright with `/api/v1/rpc` mocked to a
+logged-in admin and 40 synthetic messages, same harness as item 66.
+- Wide viewport (1600px): `.chatPanel` measured `760px` wide with an
+  equal `312px` gap on both sides of `.main` -- true centering, not
+  eyeballed.
+- Narrow viewport (500px, below the existing 900px sidebar-collapse
+  breakpoint): `.chatPanel` filled the available width with equal
+  `14px` margins matching `.main`'s own padding -- confirmed the same
+  markup degrades correctly with no separate mobile-specific rule.
+- `getComputedStyle(chatThreadEl, '::-webkit-scrollbar-thumb')
+  .backgroundColor` read `rgb(50, 57, 70)`, matching
+  `getPropertyValue('--line')` (`#323946`) exactly; `::-webkit-scrollbar`
+  width read `10px`. This headless Chromium renders overlay scrollbars
+  (`offsetWidth === clientWidth`, no reserved gutter), so a plain
+  screenshot doesn't show the thumb the way a classic-scrollbar browser
+  would -- the computed-style check above is what actually confirms the
+  rule takes effect, not a screenshot by eye.
+
+No SQL changed; no Rust rebuild needed (HTML/CSS-only, same
+`include_str!`-embedded file items 65/66 already established this
+verification method for).

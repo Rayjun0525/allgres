@@ -23,6 +23,12 @@ body{font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFon
 .input{min-height:36px;line-height:1.2}
 .select{-webkit-appearance:none;-moz-appearance:none;appearance:none;height:36px;padding:9px 28px 9px 10px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238b949e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center}
 .btn:focus-visible,.input:focus-visible,.textarea:focus-visible,.select:focus-visible,.nav button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.chatPanel{max-width:760px;margin:0 auto;width:100%}
+#chatThread,#projectChatThread,#msgFeed{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+#chatThread::-webkit-scrollbar,#projectChatThread::-webkit-scrollbar,#msgFeed::-webkit-scrollbar{width:10px}
+#chatThread::-webkit-scrollbar-track,#projectChatThread::-webkit-scrollbar-track,#msgFeed::-webkit-scrollbar-track{background:transparent}
+#chatThread::-webkit-scrollbar-thumb,#projectChatThread::-webkit-scrollbar-thumb,#msgFeed::-webkit-scrollbar-thumb{background-color:var(--line);border-radius:8px;border:2px solid transparent;background-clip:padding-box}
+#chatThread::-webkit-scrollbar-thumb:hover,#projectChatThread::-webkit-scrollbar-thumb:hover,#msgFeed::-webkit-scrollbar-thumb:hover{background-color:var(--muted);background-clip:padding-box}
 .panel{min-width:0;overflow-x:auto}.table{min-width:620px}.table tr:last-child td{border-bottom:0}
 a{color:var(--accent2);text-decoration:none}a:hover{text-decoration:underline}a:visited{color:var(--accent2)}
 .table tbody tr:hover{background:var(--panel2)}
@@ -892,7 +898,7 @@ function wireChatModelPicker(agent,providerOpts,onSaved){
 }
 async function chatPage(){
   const modes=[['general','general'],['messenger','messenger'],['project','project']];
-  $('#view').innerHTML=`<div class="row" style="margin-bottom:22px">${modes.map(([m,k])=>`<button class="btn small chatModeBtn${state.chatMode===m?' primary':''}" data-mode="${m}">${esc(t(k))}</button>`).join('')}</div><div id="chatModeBody"></div>`;
+  $('#view').innerHTML=`<div class="chatPanel"><div class="row" style="margin-bottom:22px">${modes.map(([m,k])=>`<button class="btn small chatModeBtn${state.chatMode===m?' primary':''}" data-mode="${m}">${esc(t(k))}</button>`).join('')}</div><div id="chatModeBody"></div></div>`;
   document.querySelectorAll('.chatModeBtn').forEach(b=>b.onclick=()=>{state.chatMode=b.dataset.mode;chatPage()});
   const body=$('#chatModeBody');
   if(state.chatMode==='messenger')await messengerPage(body);
