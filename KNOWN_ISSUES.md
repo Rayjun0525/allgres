@@ -4238,7 +4238,7 @@ here) — if it turns out wrong for some PGDG release, `make check`'s own
 error message (which prints the actual missing path, not just the
 package name) is still the thing that catches the underlying problem.
 
-## 54. `dnf install postgresqlNN-devel` itself failed, before `make check` was ever reached — CRB/EPEL not enabled on RHEL9-family systems
+## 54. `dnf install postgresqlNN-devel` itself failed, before `make check` was ever reached — CRB not enabled on RHEL9-family systems
 
 The very next step after item 53's fix, on the same PGDG RPM install
 (`rhel9.8`, aarch64): trying to actually install the `-devel` package
@@ -4256,28 +4256,34 @@ Error:
 Root cause: `postgresqlNN-devel`'s own dependency list includes
 `perl-IPC-Run` (used by PostgreSQL's TAP test tooling that ships
 alongside the dev headers, nothing allgres itself touches), and on a
-default RHEL9-family install (RHEL, Rocky, Alma 9) neither package
-providing it is enabled out of the box: `perl-IPC-Run` lives in EPEL,
-and EPEL's own metadata resolution on EL9 additionally expects CRB
-(CodeReady Builder — the EL9 rename of EL8's PowerTools) to be enabled
-for its own dependency chain to resolve cleanly. This is a step *before*
-anything in this repo's own `Makefile`/`check` target runs — `make
-check` needs `pg_config` to already exist to check anything about it,
-and `dnf` never got that far. Not something a `Makefile` fail-fast check
-can catch or fix; this is purely an OS package-repository-enablement gap
-in the install instructions themselves, the same category as item 53's
+default RHEL9-family install (RHEL, Rocky, Alma 9) it isn't enabled out
+of the box: `perl-IPC-Run` lives in the CRB (CodeReady Builder — the EL9
+rename of EL8's PowerTools) repo. This is a step *before* anything in
+this repo's own `Makefile`/`check` target runs — `make check` needs
+`pg_config` to already exist to check anything about it, and `dnf` never
+got that far. Not something a `Makefile` fail-fast check can catch or
+fix; this is purely an OS package-repository-enablement gap in the
+install instructions themselves, the same category as item 53's
 package-name gap, one step further upstream.
 
-Fixed by documenting the two-command repo-enable step immediately before
-the `-devel` install line in `docs/deployment/source-install.md`'s first
-prerequisite bullet, for RHEL/Rocky/Alma 9 specifically:
+First documented from PostgreSQL's own well-known PGDG yum-repo install
+instructions (which also suggest enabling EPEL alongside CRB on EL9),
+without having reproduced it live. **Confirmed live shortly after, on
+the user's actual RHEL9-family aarch64 machine**: CRB alone, enabled for
+just that one install via `--enablerepo=crb`, was sufficient —
+`perl-IPC-Run` resolved and `postgresql18-devel` installed cleanly with
+no EPEL involved at all. Corrected the docs to match what was actually
+observed rather than the more conservative original guess:
 
 ```bash
-sudo dnf config-manager --set-enabled crb   # Rocky/Alma 9
-# sudo subscription-manager repos --enable codeready-builder-for-rhel-9-$(arch)-rpms   # real RHEL 9
-sudo dnf install -y epel-release
-sudo dnf install -y postgresql17-devel      # retry, now resolvable
+sudo dnf -y --enablerepo=crb install postgresql17-devel
 ```
+
+with permanently enabling CRB (`dnf config-manager --set-enabled crb`,
+or `subscription-manager repos --enable
+codeready-builder-for-rhel-9-$(arch)-rpms` on true RHEL 9) offered as the
+alternative to repeating `--enablerepo=crb` on every future `-devel`
+install.
 
 Not added to README.md's own condensed Quick start — this is exactly the
 kind of RHEL9-specific detail README.md already defers to `docs/
@@ -4285,11 +4291,5 @@ deployment/source-install.md` for (README's Source section already links
 there for "why `pg_config` on `PATH` isn't proof enough"); duplicating a
 distro-specific `dnf`/`subscription-manager` branch into the condensed
 version would undercut the whole point of the docs split from item 50.
-
-Not independently verified against a live RHEL9-family install in this
-sandbox (no RPM-based PostgreSQL install available here, same limitation
-noted in item 53) — the CRB+EPEL requirement for `perl-IPC-Run` on EL9 is
-documented from PostgreSQL's own well-known PGDG yum-repo install
-instructions, not reproduced live. No `Makefile`, SQL, or Rust changed;
-this is a documentation-only fix, one step upstream of anything `make
-check` can reach.
+No `Makefile`, SQL, or Rust changed; this is a documentation-only fix,
+one step upstream of anything `make check` can reach.

@@ -30,12 +30,16 @@ multi-page install guide to work through by hand. You need three things on
   can itself fail first, on `perl(IPC::Run)`/`perl-IPC-Run` — one of
   `postgresqlNN-devel`'s own dependencies (used by PostgreSQL's TAP test
   tooling, not by allgres), which lives in the CRB (CodeReady Builder)
-  and EPEL repos, neither enabled by default on a fresh RHEL9-family
-  install:
+  repo, not enabled by default on a fresh RHEL9-family install. Confirmed
+  live: enabling CRB for just that one install is enough on its own — no
+  EPEL needed —
+  ```bash
+  sudo dnf -y --enablerepo=crb install postgresql17-devel
+  ```
+  or, to enable CRB for good instead of per-command:
   ```bash
   sudo dnf config-manager --set-enabled crb   # Rocky/Alma 9; on real RHEL 9 use:
   # sudo subscription-manager repos --enable codeready-builder-for-rhel-9-$(arch)-rpms
-  sudo dnf install -y epel-release
   sudo dnf install -y postgresql17-devel      # retry, now resolvable
   ```
 - A C toolchain: `cc`/`gcc` and `clang`/`libclang-dev` specifically —
