@@ -5219,3 +5219,76 @@ logged-in admin and 40 synthetic messages, same harness as item 66.
 No SQL changed; no Rust rebuild needed (HTML/CSS-only, same
 `include_str!`-embedded file items 65/66 already established this
 verification method for).
+
+## 68. The 'general' agent's seoul-weather tool call was silently rejected as "not permitted" -- for every user, admin included
+
+Reported directly, from a real chat transcript: asking the 'general'
+agent about Seoul weather made it emit `{"action":"call_tool","name":
+"seoul_weather","args":{}}`, then reply that the tool call "isn't
+permitted" and suggest checking wttr.in manually. Read as a permissions
+bug at first (the human account was admin), but the human's own role was
+never in play here -- tool/procedure grants in this system are per
+*agent*, not inherited from the operator's dashboard role at all (see
+docs/procedures.md), and 'general' already held the right grant
+(`resource_type = 'procedure', resource_ref = 'seoul-weather'`, seeded in
+`sql/seed_data.sql` and asserted by selftest's own
+`general_agent_seeded_with_seoul_weather_procedure` case). So the grant
+was correct; something else was rejecting the call.
+
+Root cause, found by reading `fn_next_step`'s own `call_tool` branch
+(`sql/control_plane.sql`): it reads the tool name from
+`v_parsed->>'tool'` -- but the transcript's own JSON used the key
+`"name"`, not `"tool"`. With `"tool"` absent, `v_tool` is `NULL`,
+`agent_has_permission(..., 'tool', NULL)` is false, the
+procedure-tool-binding fallback lookup (`lower(pt.name) =
+lower(COALESCE(v_tool, ''))`) matches nothing either since there is no
+tool named `''`, and the call falls into the exact same `tool_not_
+permitted` branch a genuinely-unauthorized tool name would -- which is
+why it read like a permissions failure instead of a malformed-request
+one. Traced back further: 'general's own seeded system prompt (`sql/
+seed_data.sql`) never documented `call_tool`'s shape at all -- its
+`Allowed:` block only ever listed `final_answer`/`await_human`, on the
+original design assumption (this agent's own comment, until this fix)
+that 'general' would "never" need `execute_sql`/`call_tool`. The later
+seoul-weather procedure grant (further down the same file) broke that
+assumption without anyone going back to update the prompt: it hands
+'general' a real callable tool and tells it, in the procedure's own
+prose, to "call the `seoul_weather` tool" -- but never shows the model
+the exact JSON field name (`"tool"`, not e.g. `"name"`) required to do
+that, unlike the 'analyst' agent's prompt, which has documented
+`{"action":"call_tool","tool":"http_get","args":{"url":"https://..."}}`
+correctly since it was written. The model picked a plausible key on its
+own and guessed wrong -- not a bug in the model, a gap in what it was
+told.
+
+Fixed in `sql/seed_data.sql`: 'general's seeded prompt now documents
+`{"action":"call_tool","tool":"...","args":{}}` in its `Allowed:` block,
+plus a line telling it to use call_tool with the exact granted tool name
+in the `"tool"` field when a procedure names one -- the same shape
+'analyst' already uses, not a new one invented for this. The stale
+comment claiming 'general' never offers call_tool was corrected in the
+same commit (this file's own create-only-data policy means an existing
+install's already-seeded prompt does not pick this up by re-running the
+file -- see this file's own header comment -- so an operator upgrading an
+existing install needs to update the stored prompt directly, e.g.
+through the dashboard's own SQL console (item 61) or the Agents page's
+edit-policy UI, both of which end up calling the same
+`allgres_public.fn_set_policy`).
+
+Verified: rebuilt and reinstalled (`cargo pgrx install --no-default-
+features --features pg16`); fresh install's `fn_selftest()` read
+`"failed": 0, "passed": 332` across two separate `psql` connections,
+`general_agent_seeded_with_seoul_weather_procedure` still `ok: true`
+(unaffected -- it asserts the permission grant, not the prompt text);
+`cargo test --lib --no-default-features --features pg16` still 30/30.
+Reproduced the exact failure directly against `fn_submit_result` before
+fixing anything: a `call_tool` parsed result using `"name"` instead of
+`"tool"` returned `{"action":"continue"}` with an `execution_logs` row
+`{"reason":"tool_not_permitted","tool":null}` -- the same shape the
+live transcript showed. Then confirmed the fix's target shape actually
+resolves: the same call with `"tool":"seoul_weather"` (what the
+corrected prompt now teaches the model to send) returned a real queued
+call, `{"action":"call_tool","tool":"http_get","args":{"url":
+"https://wttr.in/Seoul?format=j1"},"call_id":"..."}` -- the procedure-
+tool-binding fallback resolving 'seoul_weather' to its bound `http_get`
+handler and fixed URL exactly as designed. No Rust changed.

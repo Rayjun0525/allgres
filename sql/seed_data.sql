@@ -131,8 +131,18 @@ $seed$;
 -- regular user with exactly one thing they want to talk to) shouldn't have
 -- to deal with just to say hello. Unlike 'analyst' it holds no view/tool
 -- permissions and no demo data -- a plain conversational partner, not a
--- data-query one -- so its own prompt only ever offers final_answer/
--- await_human, never execute_sql/call_tool.
+-- data-query one -- so its own prompt never offers execute_sql. It does
+-- offer call_tool, though (see the seoul-weather procedure grant below):
+-- an earlier version of this prompt omitted call_tool entirely on the
+-- assumption this agent would never need it, which meant the model was
+-- never actually told the protocol's required "tool" field name for that
+-- action once seoul-weather granted it a real tool to call -- it guessed a
+-- plausible key ("name") instead, and every such call was then silently
+-- rejected as unpermitted (fn_next_step reads content->>'tool', found
+-- nothing, and fell through the same path a genuinely unauthorized tool
+-- name would). Documenting the exact shape here, the same way 'analyst'
+-- already does for its own call_tool grant, is the fix -- not a
+-- permissions change, since the grant itself was already correct.
 DO $seed$
 DECLARE
   v_agent uuid;
@@ -147,9 +157,10 @@ BEGIN
 
 Allowed:
 {"action":"final_answer","answer":"..."}
+{"action":"call_tool","tool":"...","args":{}}
 {"action":"await_human","reason":"..."}
 
-Have a normal, friendly conversation. When you have a reply, emit final_answer with your answer as plain text.
+Have a normal, friendly conversation. If a procedure you were given names a specific tool (for example seoul_weather), use call_tool with that exact name in the "tool" field and an empty args object, then answer using its result in your own words. When you have a reply, emit final_answer with your answer as plain text.
 $prompt$,
         -- Deliberately no llm_config here, same reason as 'analyst' above.
         updated_at = now()
