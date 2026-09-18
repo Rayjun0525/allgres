@@ -115,6 +115,32 @@ Open the address `ALLGRES_HTTP_ADDR` defaults to
 [Configuration](../configuration.md) for every environment variable the
 runtime worker reads.
 
+That default is loopback-only on purpose — see [Security model,
+"Exposure"](../security.md#exposure) for why — which matters more on a
+source install than the Docker path's own `-p 127.0.0.1:8088:8088` might
+suggest: `ALLGRES_HTTP_ADDR` is a plain process environment variable (not
+a GUC), read once when the web worker starts, so it has to be exported
+into the shell `postgres` itself is started from, then applied with a
+real restart (`pg_ctl restart`, not `SET`/reload — a background worker
+only re-reads its own process environment at the next fork). To reach
+the dashboard from outside the machine `postgres` runs on (including from
+outside a container you're source-installing into, where Docker's own
+port-forwarding targets the container's real network interface and can
+never reach something bound to the container's own loopback):
+
+```bash
+export ALLGRES_HTTP_ADDR=0.0.0.0:8088
+export ALLGRES_ALLOW_INSECURE_HTTP=1   # required for a non-loopback bind with no token set
+pg_ctl restart -D /path/to/your/data/dir
+```
+
+`ALLGRES_ALLOW_INSECURE_HTTP=1` is exactly as permissive as it sounds —
+anyone who can reach the port can create agents, rewrite prompts, and
+register provider keys with no token at all — so treat it the same way
+the Docker path's own compose file does: fine behind a network boundary
+you already trust, never a substitute for `ALLGRES_DASHBOARD_TOKEN` or a
+TLS-terminating reverse proxy on anything actually reachable by others.
+
 `make quickstart` uses the no-restart path (`allgres.reloadable`) covered
 in detail just below, in [Installing without a
 restart](#installing-without-a-restart) — worth reading once for what it

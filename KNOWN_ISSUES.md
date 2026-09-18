@@ -4355,3 +4355,57 @@ differently) -- the fix follows directly from reading the Makefile's own
 already-correct `id -u` branch alongside the live transcript of what the
 user's `make install` actually printed, not from reproducing the exact
 prompt locally.
+
+## 56. Web worker up, port "open," still unreachable — `ALLGRES_HTTP_ADDR`'s loopback default was never mentioned on the Source install path
+
+The install itself finished clean (all of items 51-55 behind it) and both
+workers came up, confirmed live via `ps -ef` (`allgres web`, `allgres
+runtime` both running) -- but the dashboard still wasn't reachable.
+`ss -tlnp | grep 8088` showed why:
+
+```
+LISTEN 0  128  127.0.0.1:8088  0.0.0.0:*  users:(("postgres",pid=34907,fd=6))
+```
+
+Not a bug -- `allgres web` was doing exactly what `src/web.rs`'s
+`check_exposure` is supposed to do: refuse a non-loopback bind unless a
+token is set or `ALLGRES_ALLOW_INSECURE_HTTP=1` says the network already
+protects the port, defaulting to `127.0.0.1:8088` otherwise (see
+[Security model, "Exposure"](docs/security.md#exposure), already
+documented and already correct). The actual gap: this user was source-
+installing *inside a container* (hostname `9bccf441ad3d`, a bare RHEL9
+container, not the project's own prebuilt Docker image), where a loopback
+bind is unreachable from outside the container for a second, independent
+reason on top of the exposure guard -- Docker's own `-p` port-forwarding
+targets the container's real network interface, never its loopback, so
+even a deliberately-relaxed bind still needs `0.0.0.0`, not just a token.
+README's own Docker Quick start already spells out the fix
+(`-e ALLGRES_HTTP_ADDR=0.0.0.0:8088 -e ALLGRES_ALLOW_INSECURE_HTTP=1`) --
+but `docs/deployment/source-install.md`, the page an operator installing
+from source (in or out of a container) actually reads, only ever
+mentioned the default address, never how or why to change it. The same
+recurring shape as items 51-55: real operational information that
+existed for the Docker path never got carried over to the Source path.
+
+Fixed by adding a paragraph to `docs/deployment/source-install.md`
+immediately after where it already mentions the default address,
+covering the two things that tripped this live: `ALLGRES_HTTP_ADDR` is a
+plain process environment variable read once at worker startup (not a
+GUC -- needs exporting into the shell `postgres` itself starts from, then
+a real `pg_ctl restart`, not `SET`/reload), and the concrete `export
+ALLGRES_HTTP_ADDR=0.0.0.0:8088` / `export ALLGRES_ALLOW_INSECURE_HTTP=1`
+/ `pg_ctl restart` sequence, with the same "fine behind a trusted network
+boundary, never a substitute for a real token on anything actually
+reachable by others" caveat the Docker path's own README section already
+carries, so the two pages stay consistent instead of the Source page
+being the permissive one by omission.
+
+No `Makefile`, SQL, or Rust changed -- `check_exposure` and the loopback
+default were already correct; this is a documentation-only fix carrying
+existing, correct behavior across to a page that never mentioned it. Not
+independently re-verified against a real container restart in this
+sandbox (this sandbox's own `postgres` role has no supervising `pg_ctl`
+setup matching the user's exact container arrangement) -- confirmed
+instead directly from `src/web.rs`'s own `check_exposure`/
+`configured_http_addr` source and the user's own live `ss`/`ps` output,
+which is what the fix is written from.
