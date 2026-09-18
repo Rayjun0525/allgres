@@ -97,7 +97,7 @@ scope the branch then checks.
     `.logout` are the login mechanism itself. `events` is the SSE
     endpoint, gated separately by its own single-use ticket. `selftest`
     is a live diagnostic, deliberately safe to run against a real,
-    populated database (see README, "Tests").
+    populated database (see docs/testing.md).
 
 ## Agent-facing actions are a separate, already-fixed set
 

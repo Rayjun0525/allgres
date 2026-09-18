@@ -1,0 +1,149 @@
+# Source install (bare metal)
+
+Part of the [documentation index](../../README.md). See also the main
+[README's Quick start](../../README.md#quick-start) for the condensed version
+of the first part of this page.
+
+No Docker: install straight onto an existing PostgreSQL 16, 17, or 18
+server. The guiding principle is the same as Docker's `./scripts/
+bootstrap.sh` — a working instance in a handful of commands, not a
+multi-page install guide to work through by hand. You need that PostgreSQL
+version's own `-dev`/`-server-dev` package installed first (`pg_config`
+must be on `PATH`; Rust and `cargo-pgrx` are handled for you if they
+aren't already there):
+
+```bash
+git clone https://github.com/Rayjun0525/allgres.git
+cd allgres
+make install     # add `sudo` if this PostgreSQL's own lib/share dirs need it
+make quickstart  # CREATE EXTENSION + start, no restart -- see below
+```
+
+Four commands, and the last two are only two because `install` and
+*running* it are kept deliberately separate (`install` only ever touches
+this machine's PostgreSQL installation, the same as any extension's own
+`make install`; `quickstart` is the one step that touches a live database,
+so it stays opt-in rather than a side effect of building). `make` alone
+(no target) stages a build under `target/release/allgres-pgNN/` without
+touching the system at all, if you just want to compile first and decide
+later. `make install` explains its own next steps when it finishes, in
+case you'd rather run them by hand or against a different database than
+`quickstart`'s default of `postgres`.
+
+What the Makefile is actually doing, for anyone who wants to run the
+underlying commands directly instead, or already has `cargo-pgrx`
+installed and configured: it installs `cargo-pgrx` if missing (`cargo
+install --locked cargo-pgrx --version 0.19.2`, pinned to whatever this
+crate's own `Cargo.toml` requires), runs `cargo pgrx init` for the one
+PostgreSQL version `pg_config` resolves to, then `cargo pgrx install
+--release --features pgNN`, which compiles the extension and copies the
+`.so`/`.control`/`.sql` files into that installation's own extension
+directory — no manual file copying either way.
+
+Open the address `ALLGRES_HTTP_ADDR` defaults to
+(`http://127.0.0.1:8088`) the same as the Docker path. See
+[Configuration](../configuration.md) for every environment variable the
+runtime worker reads.
+
+`make quickstart` uses the no-restart path (`allgres.reloadable`) covered
+in detail just below, in [Installing without a
+restart](#installing-without-a-restart) — worth reading once for what it
+actually trades off. The classic path still works exactly as it always
+has, and is what a from-scratch production install should default to:
+
+```conf
+shared_preload_libraries = 'allgres'
+```
+
+restart PostgreSQL (a plain reload is not enough — this registers a
+background worker, which only happens at postmaster start), then
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- optional, encrypts secrets at rest
+CREATE EXTENSION allgres;
+```
+
+## Installing without a restart
+
+The `shared_preload_libraries` restart above is a real PostgreSQL
+constraint, not an Allgres choice: both background workers (`allgres
+runtime`, `allgres web`) are registered from `_PG_init`, which only runs
+during preload processing, and only a postmaster restart re-runs that.
+For an operator who cannot restart the server they're installing onto — a
+managed instance where changing `shared_preload_libraries` means a
+maintenance window, or simply one they'd rather not schedule for a first
+try — there's a second path that needs no restart at all:
+
+```conf
+allgres.reloadable = on
+```
+
+`allgres.reloadable` is a placeholder GUC, exactly like `allgres.secret_key`
+(see [Secrets at rest](../security.md#secrets-at-rest)) — settable in
+`postgresql.conf` or via `SET` for one session, no preload required to read
+it. With it `on`, skip the `shared_preload_libraries` line and the restart
+entirely:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION allgres;
+SELECT allgres_public.fn_start_dynamic_workers();
+```
+
+(exactly what `make quickstart` runs, against the `postgres` database, if
+`allgres` is already installed).
+
+That last call registers both workers with PostgreSQL's own
+`RegisterDynamicBackgroundWorker`, the same mechanism `pg_cron` and similar
+extensions use for on-demand workers, instead of the static path
+`shared_preload_libraries` takes. It is safe to call more than once — a
+second call finds both already running and is a no-op — and it is a no-op,
+not an error, when `allgres` actually is preloaded (the postmaster already
+owns the workers there).
+
+The tradeoff is real and worth stating plainly: a crash of either worker
+self-heals exactly the way it does under `shared_preload_libraries` (the
+postmaster honors the same restart timer regardless of how a worker was
+registered), but nothing persists a dynamic registration anywhere, so a
+full PostgreSQL restart — for any reason, planned or not — drops both
+workers and does not bring them back on its own. There is no watchdog that
+notices and calls `fn_start_dynamic_workers()` again automatically; that
+call is the operator's own to make, after `CREATE EXTENSION` and again
+after every subsequent restart. For a deployment where PostgreSQL itself
+restarts often (or where "came back up quiet" needs to mean the dashboard
+actually came back too), `shared_preload_libraries` remains the better
+default — this path exists for the specific case where the one restart it
+saves is the one that matters.
+
+## Upgrades
+
+`sql/control_plane.sql`, `sql/operator_agents_and_policies.sql`,
+`sql/operator_runtime_and_integrations.sql`,
+`sql/operator_accounts_and_chat.sql`, `sql/seed_data.sql`,
+`sql/selftest.sql`, and `sql/grants_and_facade.sql`
+(seven files, always loaded together in that order — split out of what used
+to be one file once it grew large enough to trip a real rustc compile-time
+limit; see KNOWN_ISSUES.md item 38) are idempotent — `CREATE OR REPLACE`,
+`IF NOT EXISTS`, `ON CONFLICT DO NOTHING`, create-only seeds (an upgrade
+never overwrites an edited prompt or policy), and explicit `DROP`s for
+anything whose signature or return type changed. `scripts/gen-upgrade.sh
+<from> <to>` concatenates all seven, in that same order, into a versioned
+upgrade script:
+
+```bash
+./scripts/gen-upgrade.sh 0.2.0 0.3.0    # writes sql/allgres--0.2.0--0.3.0.sql
+```
+
+```sql
+ALTER EXTENSION allgres UPDATE TO '0.3.0';
+```
+
+Every released version after 0.2.0 keeps a frozen base install script
+(`sql/allgres--0.2.0.sql`, and one more at each version bump from here on) —
+a real snapshot of what that version's schema actually was, not just the
+generated upgrade diff. That is what makes `ALTER EXTENSION ... UPDATE` a
+real, testable operation: `CREATE EXTENSION allgres VERSION '0.2.0'` installs
+an actual prior version, and `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from
+there is the same operation an in-place production upgrade would run. See
+KNOWN_ISSUES.md, item 18, for how this was verified and what version 0.2.0
+meant before this file existed.

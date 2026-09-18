@@ -1,10 +1,10 @@
 # Security policy
 
 Allgres is early alpha (see README.md's own banner and
-[Security model](README.md#security-model)) -- it has not had an external
+[Security model](docs/security.md)) -- it has not had an external
 security audit, and its default configuration (`docker-compose.yml`) is
 built for local evaluation, not for serving real traffic. Read
-[Security model](README.md#security-model) and
+[Security model](docs/security.md) and
 `docker-compose.prod.yml` before running this anywhere reachable by anyone
 you don't trust.
 
@@ -48,7 +48,7 @@ already known. Also out of scope: denial of service against your own
 self-hosted instance, and social-engineering an operator who already holds
 the dashboard token into misusing their own access -- the token *is* the
 trust boundary in the default single-operator mode (see
-[Exposure](README.md#exposure)).
+[Exposure](docs/security.md#exposure)).
 
 ## What to expect
 

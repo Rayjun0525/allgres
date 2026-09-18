@@ -109,12 +109,21 @@ See `CONTRACT.md` for the full contract this protects and why it exists.
   counts, live verification steps, what broke along the way and how it
   was actually caught). Read a recent entry before writing a new one to
   match the register.
-- `README.md` gets updated in the relevant section, same commit.
-- When closing a gap `README.md`'s "Known limitations" or "Not yet built"
-  section mentions, **update both**, not just one — this exact pair of
-  locations has gone stale independently at least twice (an already-closed
-  gap kept being listed as open in one of the two long after the other was
-  fixed).
+- Detailed, feature-level documentation lives under `docs/` (one markdown
+  file per topic — architecture, security, chat/models, deployment/*, and
+  so on), not in `README.md`. `README.md` itself stays short: intro, the
+  three Quick start paths (Docker/source/CNPG), a condensed feature list,
+  and a table linking out to each `docs/*.md` file — it is the front door,
+  not the manual. When a change touches a topic that already has a
+  `docs/*.md` file, update that file, same commit; only touch `README.md`
+  itself if the change affects the intro, Quick start, the condensed
+  feature list, or the documentation table (a new `docs/` file needs a row
+  there).
+- When closing a gap `README.md`'s "Not yet built" bullet or
+  `KNOWN_ISSUES.md` mentions, **update both**, not just one — this exact
+  pair of locations has gone stale independently at least twice (an
+  already-closed gap kept being listed as open in one of the two long
+  after the other was fixed).
 
 ## What not to do
 

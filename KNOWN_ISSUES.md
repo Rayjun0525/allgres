@@ -3965,3 +3965,63 @@ browser (Playwright) -- a link injected into the actual running page (the
 real device-code path needs live xAI network access this sandbox's own
 egress policy blocks, per item 46/47) renders in the new color, and an
 Agents-table row hover shows the new background.
+
+## 50. README split into docs/, and Quick start rebuilt around three real install paths
+
+Raised as two related complaints: "왜 도커 컴포즈로 올려? 도커이미지 하나면
+되는거 아니야?" (why docker-compose, isn't one image enough?) and "리드미가
+논문수준이야" (README reads like a paper). Both were accurate.
+
+**Docker-compose vs. a single image.** `Dockerfile` already builds one
+self-contained image (official `postgres:17-bookworm` plus the extension
+baked in, one `ENTRYPOINT`) and `docker-compose.yml` already runs exactly
+one service — there was never a real multi-container architecture here.
+Compose's actual job is declaring ~10 env vars, two port mappings, and a
+named volume without a long `docker run` line, plus letting
+`docker-compose.prod.yml` layer production hardening on top without
+hand-editing the base file. But the documented Quick start defaulted to
+`git clone` + `./scripts/bootstrap.sh` (a local `docker compose build`)
+even though a pre-built image was already published to GHCR — a real
+`docker pull`/`docker run` one-liner existed only as a secondary mention
+deep in "Docker install, in detail." Fixed by making that one-liner the
+lead path in the new Quick start (see below), with the scripted/verified
+`docker compose` flow kept as the documented alternative for anyone who
+wants `scripts/bootstrap.sh`'s own end-to-end proof (a real admin, a real
+agent task run to completion) instead of just a running container.
+
+**README length.** 1777 lines across 24 sections, mixing a newcomer's
+"how do I start" with deep internals (the SQL sandbox's parse-tree gates,
+the full security model, backup/restore two-pass restore mechanics, and
+so on). Split into `docs/` (14 topic files) plus `docs/deployment/`
+(docker.md, source-install.md, cnpg.md) — one file per subject, each
+starting with "Part of the [documentation index](../README.md)" and
+cross-linking the others where the original README's own prose already
+did. `README.md` itself dropped to intro + a **three-path Quick start**
+(Docker/Source/CNPG, RPM intentionally not added yet — explicitly
+deferred by request) + a condensed feature list + a documentation table
+linking every `docs/*.md` file + Known limitations (still a KNOWN_ISSUES.md
+pointer) + License: 1777 lines to 188, with the actual content preserved
+in `docs/`, not deleted (1828 lines total across `docs/*.md`, roughly
+matching the original once cross-link scaffolding is subtracted).
+
+Every internal markdown link across `README.md`/`docs/**/*.md`/
+`SECURITY.md`/`CONTRACT.md`/`CLAUDE.md`/`KNOWN_ISSUES.md` was checked
+programmatically (a small script resolving each `[text](path#anchor)`
+against the actual file tree and each target file's real headings) --
+0 broken links/anchors across 21 files. `SECURITY.md`'s three literal
+`README.md#security-model`/`#exposure` links (the only literal
+cross-file anchors outside README.md itself) were repointed to
+`docs/security.md`; its `README.md#known-limitations` link needed no
+change, since that heading stays in README.md itself. `CLAUDE.md`'s own
+doc-maintenance guidance was updated to point future changes at the
+matching `docs/*.md` file instead of "the relevant README section," since
+that section mostly no longer exists in README.md.
+
+No SQL or Rust changed -- pure documentation reorganization. Not run
+through `fn_selftest()` for that reason (nothing it exercises reads these
+files), but `make install`/`make quickstart` and the Docker `docker
+pull`/`docker run` one-liner in the new Quick start were checked against
+this project's own actual `Dockerfile`/`docker-compose.yml`/`src/*.rs`
+defaults (`ALLGRES_ALLOW_INSECURE_HTTP` must be exactly `"1"`,
+`ALLGRES_DATABASE` defaults to `postgres` same as the runtime worker's own
+`DEFAULT_DB`) rather than assumed.
