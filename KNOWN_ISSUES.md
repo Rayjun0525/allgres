@@ -4607,3 +4607,120 @@ from) -- Agents and Settings pages both rendered fully in English, no
 mixed-language strings anywhere, Settings' language row gone and Theme
 row intact. A throwaway admin account created for this test
 (`admin_test`) was deactivated and deleted afterward. No SQL changed.
+
+## 60. Every inline `style="..."` attribute in the dashboard has been dead on arrival, silently, since the CSP was tightened to `style-src 'nonce-...'`
+
+The actual root cause behind this whole session's recurring "boxes are
+still stuck together" reports -- reported again after item 59, this
+time pushed on hard enough ("너가 보내준거 뉴 에이전트랑 간격 붙어있는데?" --
+"the one you sent me still has New Agent stuck to the table") to force
+an actual pixel measurement instead of trusting a screenshot by eye,
+which is what finally surfaced it:
+
+```js
+// Playwright, against this session's own rebuilt worker
+document.getElementById('newAgent').parentElement.getAttribute('style')
+// -> "margin-bottom:22px"   (present in the DOM, exactly as authored)
+getComputedStyle(document.getElementById('newAgent').parentElement).marginBottom
+// -> "0px"                  (never applied)
+```
+
+and the browser console, which nothing in this session had actually
+opened until this point:
+
+```
+Refused to apply inline style because it violates the following Content
+Security Policy directive: "style-src 'nonce-...'". Either the
+'unsafe-inline' keyword, a hash (...), or a nonce ('nonce-...') is
+required to enable inline execution. Note that hashes do not apply to
+... style attributes ... unless the 'unsafe-hashes' keyword is present.
+```
+
+Root cause: `src/web.rs`'s CSP header sends `style-src 'nonce-{n}'` with
+no `'unsafe-inline'` -- a deliberate, extra-strict choice (most CSPs stop
+at nonce'd `script-src`; this one nonced `style-src` too). What nobody
+building or reviewing this had internalized is a real, easy-to-miss CSP
+subtlety: **a nonce on `style-src` only ever authorizes `<style>`
+elements carrying that same nonce (and equivalent `<link>` stylesheets)
+-- it does not, and per spec cannot, authorize the `style="..."` HTML
+*attribute*, on any element, ever.** Only `'unsafe-inline'` (or a
+per-value hash, impractical at this count) covers that attribute. This
+project's own dashboard leans on `style="..."` constantly for one-off
+spacing/sizing -- 139 occurrences across 62 distinct values, all through
+this session's own earlier "spacing fix" and "design sweep" commits
+included -- and every single one of them has silently done nothing in
+any real, CSP-enforcing browser since whenever that policy was first
+tightened this strictly, predating this session's own diagnosis of it by
+an unknown amount. Two of this session's own earlier commits (the
+spacing fixes referenced in the design-sweep summary, and the chat model
+picker's 14px-to-22px fix) *edited* one of these dead attributes,
+correctly, and still fixed nothing -- because the attribute was never
+live to begin with. Every prior screenshot taken this session for
+verification was eyeballed, never pixel-measured or checked against the
+browser console, so this went uncaught through several rounds of "looks
+fixed" -- the actual lesson of item 55's `sudo`-placement bug and this
+one both: verifying a UI change means checking the thing the fix is
+supposed to change (a real computed value, a real console), not the
+overall gestalt of a screenshot.
+
+Fixed in `web/index.html`, without touching the CSP itself (weakening
+`style-src` to `'unsafe-inline'` was the one-line alternative, rejected:
+it would silence this exact protection against a future injected-style
+attack for every one of these 139 call sites at once, and this project
+has clearly invested deliberately in the stricter policy) and without
+rewriting any of the 139 call sites (safer: zero chance of a transcription
+error breaking one of them):
+
+- 62 attribute-selector CSS rules (`[style="exact literal value"]{same
+  declarations}`) added to the second, "override" `<style nonce="...">`
+  block -- one per distinct static `style="..."` string still used
+  anywhere in the file, generated programmatically from the file's own
+  current content (`grep -o 'style="[^"]*"' | sort -u`) so every value
+  is copied verbatim, not retyped. `[style="..."]` is an ordinary CSS
+  *attribute selector*, matching on the attribute's string value like
+  any other attribute selector (`[data-foo="bar"]`) -- entirely distinct
+  from the browser's separate "apply this attribute's own declarations
+  as inline style" mechanism, which is the one thing CSP actually blocks;
+  a rule written this way lives inside a real, nonce-carrying `<style>`
+  element and is therefore fully CSP-compliant.
+- The one dynamic exception (`style="font-size:14px;font-weight:600;
+  color:${color}"`, a verdict badge whose color came from a 3-way
+  lookup) was converted properly instead: two new one-line classes
+  (`.verdict-label`, `.txt-accent`, `.txt-bad`, reusing the existing
+  `.muted` for the third case) and the JS now picks a class name from
+  the same 3-way lookup instead of building a CSS value string.
+- A blunt, impossible-to-miss comment sits directly above the new rule
+  block explaining exactly this trap and what adding a *new*
+  `style="..."` attribute in this file actually requires now (a matching
+  rule here, or -- preferred -- a real class): the fix closes today's
+  139 cases; nothing stops a 140th from being added the same broken way
+  without that warning in the obvious place someone reaches for next.
+
+Deliberately not fixed further in this pass: the browser still logs a
+CSP violation warning for each `style="..."` attribute's own blocked
+"native" application, once per element per page load, since the dead
+attributes themselves are still present in the markup (only the new
+attribute-selector rules elsewhere make them visually effective). This
+is inert console noise, not a functional or visual gap -- confirmed by
+walking every nav tab and comparing declared vs. computed values, all
+13 distinct strings actually rendered live matched their intended CSS
+exactly -- but a fully silent console would mean deleting all 139
+`style="..."` attributes outright (a much larger, no-longer-purely-additive
+edit across the file's giant single-line template strings) for a
+devtools-only cosmetic improvement invisible to every real user; left
+as a known, explicitly-documented trade-off rather than scope creep.
+
+Verified: rebuilt and reinstalled the extension (`cargo pgrx install
+--no-default-features --features pg16`) after confirming the embedded JS
+still parses (`new Function()` against the extracted `<script>` body);
+`cargo test --lib --no-default-features --features pg16` still 30/30;
+`fn_selftest()` still `"failed": 0, "passed": 333` across two separate
+`psql` connections. Live Playwright re-check against the rebuilt worker:
+`getComputedStyle(...).marginBottom` on the Agents page's `New agent`
+row now reads `22px` (was `0px`), the real rendered gap between the
+button and the table panel measures `22px` via `getBoundingClientRect()`
+(not eyeballed), and a full click-through of every nav tab (Overview,
+Agents, Chat, Approvals, Projects, Run, Memories, Audit, Settings)
+turned up no declared `style="..."` value without a matching rule. A
+throwaway admin account created for this verification (`admin_probe`)
+was deactivated and deleted afterward. No SQL changed.
