@@ -26,6 +26,18 @@ multi-page install guide to work through by hand. You need three things on
   directory is missing, instead of `cargo-pgrx`'s own bindgen step dying
   deep inside `cargo install cargo-pgrx` with "cannot find ...
   include/server for C header files".
+  On RHEL/Rocky/Alma **9** specifically, installing `postgresqlNN-devel`
+  can itself fail first, on `perl(IPC::Run)`/`perl-IPC-Run` — one of
+  `postgresqlNN-devel`'s own dependencies (used by PostgreSQL's TAP test
+  tooling, not by allgres), which lives in the CRB (CodeReady Builder)
+  and EPEL repos, neither enabled by default on a fresh RHEL9-family
+  install:
+  ```bash
+  sudo dnf config-manager --set-enabled crb   # Rocky/Alma 9; on real RHEL 9 use:
+  # sudo subscription-manager repos --enable codeready-builder-for-rhel-9-$(arch)-rpms
+  sudo dnf install -y epel-release
+  sudo dnf install -y postgresql17-devel      # retry, now resolvable
+  ```
 - A C toolchain: `cc`/`gcc` and `clang`/`libclang-dev` specifically —
   `cargo-pgrx` itself (the tool, before it ever touches this extension's
   own source) needs one to build, via `bindgen`'s use of libclang for
