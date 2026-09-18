@@ -5083,3 +5083,37 @@ No CSP violation traced to the new rule specifically -- confirmed by
 diffing the unique violation set before and after, all pre-existing item
 60 noise. A throwaway admin account created for this verification was
 deactivated and deleted afterward.
+
+## 65. Login screen showed no "Allgres" branding at all
+
+Reported directly: the login gate (`renderLogin()`, in front of the whole
+app) just showed "Sign in" with no product name anywhere on screen. Root
+cause was structural, not missing markup: the sidebar's own `.brand`
+("Allgres") and `.tag` ("Postgres Is All You Need.") elements already
+exist in the page, but they live inside `<div class="app">`, which
+`renderLogin()` itself hides (`$('.app').classList.add('hidden')`) before
+showing the login `#modal` -- so pre-login, nothing carrying the product
+name was ever visible.
+
+Fixed by reusing the same `.brand`/`.tag` elements (not new ones) inside
+the login dialog itself, in `renderLogin()`
+(`web/index.html`): `<div class="brand">Allgres</div><div class="tag"
+style="margin-bottom:20px">Postgres Is All You Need.</div>` ahead of the
+existing "Sign in" heading. The `margin-bottom:20px` value is a new
+`style="..."` attribute, so per item 60's now-documented rule this
+requires its own attribute-selector rule in the CSP override `<style>`
+block -- added (`[style="margin-bottom:20px"]{margin-bottom:20px}`)
+rather than skipped.
+
+Verified live: served the built `web/index.html` (nonce substituted,
+matching the real `Content-Security-Policy: style-src 'nonce-...'`
+header from `src/web.rs`) and loaded it in Playwright. `boot()`'s own
+`auth.me` RPC fails with no backend running, which already falls through
+to `renderLogin()` the same way a logged-out real session would.
+`getComputedStyle(tagEl).marginBottom` read `20px` (matching the
+attribute, not `0px`) confirming the new attribute-selector rule was
+live, not just present in markup -- the same check item 60 established
+as necessary after a prior fix looked right by eye but wasn't applied.
+Screenshot confirms "Allgres" / "Postgres Is All You Need." render above
+the sign-in form. No SQL changed; no Rust rebuild needed for this
+HTML/CSS-only change.
