@@ -5117,3 +5117,35 @@ as necessary after a prior fix looked right by eye but wasn't applied.
 Screenshot confirms "Allgres" / "Postgres Is All You Need." render above
 the sign-in form. No SQL changed; no Rust rebuild needed for this
 HTML/CSS-only change.
+
+## 66. Long chat/messenger threads looked cut off at the bottom instead of showing the newest message
+
+Reported directly: once a thread (General/Project chat, Messenger) grew
+past the fixed-height scroll box it's rendered into (`#chatThread`/
+`#projectChatThread`/`#msgFeed`, each `max-height:...vh;overflow:auto`),
+the newest message was invisible below the fold. Root cause: each of the
+three render functions (`renderChatThread`, `renderProjectChatThread`,
+`renderMessengerFeed`) fully replaces the container's `innerHTML` on
+every call -- initial page load, right after the viewer's own send, and
+every 1.5s poll tick for an async reply -- and a browser resets a
+scrollable element's `scrollTop` to `0` whenever its content is replaced
+this way, so the box stayed pinned to the *oldest* visible message
+instead of following new ones in.
+
+Fixed with one shared helper (`scrollBottom(id)`, next to `esc`/`toast`)
+setting `el.scrollTop = el.scrollHeight` after each render, called from
+all three functions right after their `innerHTML` assignment -- same
+"stick to bottom" behavior as any ordinary chat UI, no per-thread special
+case.
+
+Verified live: served the built `web/index.html` (nonce substituted,
+real `style-src`/`script-src` CSP header from `src/web.rs`) under
+Playwright, with `/api/v1/rpc` and `/api/v1/settings` intercepted to
+return a logged-in admin and 40 synthetic `chat.history` messages
+(mocking the network layer only -- the served HTML/JS/CSP is the real,
+unmodified shipped file). After navigating to Chat, `#chatThread` showed
+all 40 bubbles and read `scrollTop === scrollHeight - clientHeight`
+(within float rounding) -- pinned to the bottom, message 40 visible in
+the screenshot, not message 1. No SQL changed; no Rust rebuild needed
+(the same `include_str!`-embedded `web/index.html` a real `allgres web`
+worker serves, verified once already for item 65's CSP/nonce handling).

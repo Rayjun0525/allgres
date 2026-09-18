@@ -58,6 +58,13 @@ const userPages=['Chat','Approvals','My Agents'];
 function pagesForRole(){return state.me?.role==='admin'?adminPages:userPages}
 const $=s=>document.querySelector(s); const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function toast(s){const t=$('#toast');t.textContent=s;t.style.display='block';setTimeout(()=>t.style.display='none',2200)}
+// Chat/Messenger threads are fixed-height scroll boxes (see item 65 --
+// max-height + overflow:auto); resetting their content on every render
+// (initial load, own send, and each poll tick) leaves the scroll position
+// wherever it was, which is the top on first render -- so a long thread
+// looked cut off at the newest message instead of showing it. Pin to the
+// bottom after every render instead, same as any chat UI.
+function scrollBottom(id){const el=$(id);if(el)el.scrollTop=el.scrollHeight}
 
 // Theme (item 47) is a plain per-browser preference, kept in
 // localStorage -- nothing server-side to configure, nothing that needs
@@ -948,6 +955,7 @@ async function renderProjectChatThread(){
   try{ const h=await rpc('project_chat.history',{project_id:state.chatProjectId});
     if(!$('#projectChatThread'))return;
     $('#projectChatThread').innerHTML=(h.messages||[]).map(m=>msgBubble(m)).join('')||'<div class="muted">Say hello.</div>';
+    scrollBottom('#projectChatThread');
   }catch(e){if($('#projectChatThread'))$('#projectChatThread').innerHTML=`<div class="muted">${esc(e.message)}</div>`}
 }
 let projectChatPollTimer=null;
@@ -972,6 +980,7 @@ async function renderChatThread(){
   try{ const h=await rpc('chat.history',{agent_id:state.chatAgentId});
     if(!$('#chatThread'))return;
     $('#chatThread').innerHTML=(h.messages||[]).map(m=>msgBubble(m)).join('')||'<div class="muted">Say hello.</div>';
+    scrollBottom('#chatThread');
   }catch(e){if($('#chatThread'))$('#chatThread').innerHTML=`<div class="muted">${esc(e.message)}</div>`}
 }
 let chatPollTimer=null;
@@ -1017,6 +1026,7 @@ async function renderMessengerFeed(){
     return oneReply(null,m.reply_status,m.reply);
   };
   $('#msgFeed').innerHTML=(d.messages||[]).map(m=>`<div class="msg"><div class="row"><b>${esc(m.author)}</b>${m.mentioned_agent?`<span class="mono muted" style="font-size:11px">@${esc(m.mentioned_agent)}</span>`:''}<span class="spacer"></span><span class="mono muted" style="font-size:11px">${esc(m.created_at)}</span></div><div class="msg-body">${esc(m.content)}</div>${replyLine(m)}</div>`).join('')||'<div class="muted">No messages yet.</div>';
+  scrollBottom('#msgFeed');
 }
 let msgPollTimer=null;
 async function sendMessenger(){
