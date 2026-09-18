@@ -42,16 +42,3 @@ every push, covering roadmap item 9's "재시작, 재시도" (restart, retry)
 scenarios the same way `docker-smoke` covers "계정 생성 후 사용, 설정 변경,
 모델 교체" (account-creation-then-use, config change, model swap) via
 `scripts/bootstrap.sh`. See KNOWN_ISSUES.md, item 26.
-
-The one named scenario deliberately not automated: "업그레이드" (upgrade).
-`scripts/gen-upgrade.sh` and `ALTER EXTENSION ... UPDATE` are real and
-manually verified (KNOWN_ISSUES.md, item 18), but there is currently no
-real *next* version to upgrade the checked-in schema to — the version was
-deliberately reset to `0.1.0` with no release ever shipped under it (see
-KNOWN_ISSUES.md's own note on version numbers), so a CI job exercising
-"upgrade" today would have to invent a fake target version and compare
-against it, the same faking-a-metric-with-no-real-data problem this
-project has refused elsewhere (see [Evaluation-gated
-self-improvement](self-improvement.md)'s own deferred-scope
-note). This becomes real, automatable CI coverage the moment an actual
-version is released and a second one begins development against it.

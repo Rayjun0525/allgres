@@ -1,20 +1,15 @@
 # Known issues and future work
 
-Status as of 0.3.0. Verified natively on PostgreSQL 16.15 with pgrx 0.19.2
-(Docker/PG17, this environment's actual deployment target, could not be
-reached to verify against — see item 3): `fn_selftest` 78/78, `tests/smoke.sql`
-and `tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
+Status as of `0.1.0-alpha`, this project's actual first launch (see the
+version-number note below and item 69). Verified natively on PostgreSQL
+16.15 with pgrx 0.19.2: `fn_selftest` 332/332, `tests/smoke.sql` and
+`tests/e2e_mock.sql` pass, and the full path browser → web worker → unix
 socket → runtime SPI thread → PL/pgSQL works end to end over real HTTP
-(`curl` against `/api/v1/rpc`, CSRF checks included), including a live
-`dashboard_rpc` round trip for every action added so far (`projects.*`,
-`approvals.*`, `sessions.cancel`/`.list`/`.get`, `permissions.*`,
-`allowlist.*`, `policy.history`, `policy.rollback`, `proposals.*`) and the
-`web/index.html` pages that call them (`Projects`, `Sessions`, `Approvals`,
-`Proposals`, plus the extended `Agents` and `Settings`). A real
-`ALTER EXTENSION allgres UPDATE TO '0.3.0'` from a real prior version, and a
-physical (`pg_basebackup`/PITR) and logical (`pg_dump`) backup/restore drill,
-are also verified — see item 18. Earlier builds were verified on
-PostgreSQL 18.6; nothing here is PG-version-specific.
+(`curl` against `/api/v1/rpc`, CSRF checks included). A physical
+(`pg_basebackup`/PITR) and logical (`pg_dump`) backup/restore drill are
+also verified — see item 18. Earlier builds were verified on PostgreSQL
+17 and 18; nothing here is PG-version-specific (16, 17, and 18 are all
+supported and CI-checked).
 
 Everything below is either not implemented or not verified. Nothing here is
 believed to be broken in a way that is currently exploitable, but each item is
@@ -26,15 +21,17 @@ development (each bump documented, at the time, in the item below it); none
 of those were ever published anywhere, so none of them are a real prior
 version an operator could actually be running. The version has been reset to
 `0.1.0` and its matching `sql/allgres--<from>--<to>.sql` upgrade scripts for
-those never-shipped versions removed — the version number will move again
-only to mark an actual release, not every development milestone. This does
-**not** touch `sql/allgres--0.2.0.sql`, the frozen pre-rename (Argo-named)
-snapshot item 19 describes, or the `ALTER ROLE`/`SCHEMA ... RENAME`
-migration path built for it: that predates this project's own renaming and
-is a separate, real concern from this version-numbering cleanup. Every item
-below keeps whatever version number was live in the codebase at the time it
-was written — read them as a dated development diary, not as claims about
-the current version.
+those never-shipped versions removed. Item 69 goes one step further: the
+`sql/allgres--0.2.0.sql` frozen pre-rename (Argo-named) snapshot item 19
+describes, the `ALTER ROLE`/`SCHEMA ... RENAME` migration path built for it,
+and `scripts/gen-upgrade.sh` itself are all removed too — none of it ever
+had a real install to protect, so it was carried weight with no real target.
+`0.1.0-alpha` is this project's actual first launch; the version number will
+move again only to mark a real subsequent release. Every item below keeps
+whatever version number was live in the codebase at the time it was
+written — read them as a dated development diary, not as claims about the
+current version, and read items 4, 18, and 19's own upgrade-path/rename
+content as superseded by item 69.
 
 ## 1. ~~Agent SQL does not run as the `sandbox` role~~ — fixed
 
@@ -5292,3 +5289,81 @@ call, `{"action":"call_tool","tool":"http_get","args":{"url":
 "https://wttr.in/Seoul?format=j1"},"call_id":"..."}` -- the procedure-
 tool-binding fallback resolving 'seoul_weather' to its bound `http_get`
 handler and fixed URL exactly as designed. No Rust changed.
+
+## 69. Removed the extension-upgrade-path machinery entirely -- this project never shipped a real release to upgrade from
+
+Requested directly, on explicit direction: this repository's own version
+history (items 4, 18, 19) built a genuinely real, tested `ALTER EXTENSION
+... UPDATE` path -- `scripts/gen-upgrade.sh`, a frozen `sql/allgres--
+0.2.0.sql` base snapshot (item 18), and an `ALTER ROLE`/`SCHEMA ...
+RENAME` migration in `sql/control_plane.sql` (item 19) to carry a real
+prior install's data through the project's own rename from its original
+name, Argo, to Allgres. All of it was already dormant: the version-number
+note at the top of this file already recorded that "this project has
+never had an actual release" and that the crate version was reset to
+`0.1.0` with no release ever shipped under it -- `docs/testing.md` said
+the same thing about why upgrade testing was never wired into CI. There
+was no real Argo-named install anywhere to migrate, and no real 0.2.0
+install to upgrade from; the whole apparatus was protecting against a
+scenario that had never actually happened. Rather than keep carrying
+tested-but-purposeless infrastructure into what is now genuinely this
+project's first real launch (`0.1.0-alpha`), it is gone:
+
+- Deleted `sql/allgres--0.2.0.sql` (the frozen pre-rename snapshot --
+  itself already found stale during an unrelated dead-code sweep this
+  session: it still referenced the old `argo_public.*` names in two
+  places, confirming nothing had touched it in a long time) and
+  `scripts/gen-upgrade.sh`.
+- Removed the `ALTER ROLE argo_owner RENAME`/`ALTER SCHEMA argo_private/
+  argo_public RENAME` migration block from the top of "1. Roles" in
+  `sql/control_plane.sql` (roughly 110 lines including its own review-
+  history comment), and the role-attribute-renormalization block right
+  after it that existed only to fix up a renamed role's `LOGIN`/`INHERIT`
+  attributes -- both now unreachable dead code with the rename path gone,
+  since `CREATE ROLE ... NOLOGIN NOINHERIT` already sets these correctly
+  on first creation and there is no more rename path that could leave
+  them wrong.
+- Removed the `cp -f sql/allgres--*.sql ...` steps that placed frozen
+  base snapshots and generated upgrade scripts into the extension
+  directory, from both `Dockerfile` and `.github/workflows/ci.yml` --
+  `cargo pgrx install` already writes the current version's own
+  fresh-install script; there is nothing else to place now.
+- Removed the "업그레이드 (upgrade)" not-automated note from
+  `docs/testing.md` and the whole "## Upgrades" section from
+  `docs/deployment/source-install.md`, and reworded README.md's feature
+  list and documentation table to drop the upgrade-path claim, keeping
+  the still-real backup/restore drill claim.
+- Rewrote this file's own top "Status as of" line and version-number
+  note: no longer claims `0.3.0` or an `ALTER EXTENSION ... UPDATE TO
+  '0.3.0'` verification: the version is `0.1.0-alpha`, this project's
+  actual first launch, and items 4/18/19's upgrade-path/rename content is
+  now historical record of removed work, not a description of anything
+  still in the codebase.
+
+What was deliberately left alone: the unrelated "Drop objects whose
+signature or return type changed since 0.1.0" block further down in
+`sql/control_plane.sql` (`DROP FUNCTION IF EXISTS ...` for a handful of
+functions) -- that exists so this same file can be safely replayed
+against a database that already has an earlier iteration of *this*
+0.1.0-alpha development cycle installed (ordinary `cargo pgrx install`
+iteration, not a cross-version upgrade), which is still a real, needed
+case; only the cross-version/cross-rename machinery was removed.
+
+Verified: rebuilt and reinstalled (`cargo pgrx install --no-default-
+features --features pg16`) -- confirmed only `allgres--0.1.0.sql` (no
+stray `allgres--0.2.0.sql`) lands in the extension directory now. Fresh
+install's `fn_selftest()` read `"failed": 0, "passed": 332` across two
+separate `psql` connections. Confirmed live that `allgres_private`/
+`allgres_public`/`allgres_owner` and the four scoped roles
+(`allgres_role_admin`, `allgres_signal_admin`, `allgres_settings_reader`,
+plus `operator`/`worker`/`sandbox`) all come out with the correct
+NOLOGIN/NOINHERIT attributes on a fresh install with the renormalization
+block gone. `cargo test --lib --no-default-features --features pg16`
+still 30/30. Grepped every tracked file for `argo`/`Argo` afterward: the
+only remaining hits are this file's own historical entries (items 4, 18,
+19, here) and one unrelated coincidence in `sql/selftest.sql` -- the
+sandbox-allowlist test's fixture list includes the literal string
+`'select * from ARGO_PRIVATE.SESSIONS'` as an example of a schema name
+that is *not* on the allowlist (a plausible-looking name that happens to
+share the old project's name, not a reference to the removed rename
+machinery) -- left as-is.

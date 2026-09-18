@@ -238,36 +238,3 @@ restarts often (or where "came back up quiet" needs to mean the dashboard
 actually came back too), `shared_preload_libraries` remains the better
 default — this path exists for the specific case where the one restart it
 saves is the one that matters.
-
-## Upgrades
-
-`sql/control_plane.sql`, `sql/operator_agents_and_policies.sql`,
-`sql/operator_runtime_and_integrations.sql`,
-`sql/operator_accounts_and_chat.sql`, `sql/seed_data.sql`,
-`sql/selftest.sql`, and `sql/grants_and_facade.sql`
-(seven files, always loaded together in that order — split out of what used
-to be one file once it grew large enough to trip a real rustc compile-time
-limit; see KNOWN_ISSUES.md item 38) are idempotent — `CREATE OR REPLACE`,
-`IF NOT EXISTS`, `ON CONFLICT DO NOTHING`, create-only seeds (an upgrade
-never overwrites an edited prompt or policy), and explicit `DROP`s for
-anything whose signature or return type changed. `scripts/gen-upgrade.sh
-<from> <to>` concatenates all seven, in that same order, into a versioned
-upgrade script:
-
-```bash
-./scripts/gen-upgrade.sh 0.2.0 0.3.0    # writes sql/allgres--0.2.0--0.3.0.sql
-```
-
-```sql
-ALTER EXTENSION allgres UPDATE TO '0.3.0';
-```
-
-Every released version after 0.2.0 keeps a frozen base install script
-(`sql/allgres--0.2.0.sql`, and one more at each version bump from here on) —
-a real snapshot of what that version's schema actually was, not just the
-generated upgrade diff. That is what makes `ALTER EXTENSION ... UPDATE` a
-real, testable operation: `CREATE EXTENSION allgres VERSION '0.2.0'` installs
-an actual prior version, and `ALTER EXTENSION allgres UPDATE TO '0.3.0'` from
-there is the same operation an in-place production upgrade would run. See
-KNOWN_ISSUES.md, item 18, for how this was verified and what version 0.2.0
-meant before this file existed.

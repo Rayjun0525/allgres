@@ -73,8 +73,8 @@ make quickstart  # CREATE EXTENSION + start, no restart required
 ```
 
 See [Source install](docs/deployment/source-install.md) for what the
-Makefile is actually doing, the classic `shared_preload_libraries` +
-restart path, and version upgrades.
+Makefile is actually doing and the classic `shared_preload_libraries` +
+restart path.
 
 ### CNPG (Kubernetes)
 
@@ -139,9 +139,8 @@ end to end, and `scripts/smoke.sh`).
   admin/user roles, per-user agent assignment, and an append-only audit
   trail for every consequential mutation. See [Operator audit
   log](docs/audit-log.md).
-- **A real, tested extension upgrade path and backup/restore drill** — see
-  [Source install](docs/deployment/source-install.md#upgrades) and [Backup
-  and restore](docs/backup-and-restore.md).
+- **A tested backup/restore drill** — see [Backup and
+  restore](docs/backup-and-restore.md).
 
 Not yet built: Helm charts and general Kubernetes manifests beyond the CNPG
 path above, and a native RPM package.
@@ -180,7 +179,7 @@ working instance running.
 | [Evaluation-gated self-improvement](docs/self-improvement.md) | Measuring whether a policy change actually helped |
 | [Configuration](docs/configuration.md) | Every environment variable the runtime worker reads |
 | [Docker install, in detail](docs/deployment/docker.md) | The scripted `docker compose` flow, production hardening |
-| [Source install](docs/deployment/source-install.md) | Bare-metal install, the no-restart path, upgrades |
+| [Source install](docs/deployment/source-install.md) | Bare-metal install, the no-restart path |
 | [CNPG (CloudNativePG)](docs/deployment/cnpg.md) | Kubernetes via Image Volume Extensions |
 | [Backup and restore](docs/backup-and-restore.md) | Physical and logical strategies, the two-pass logical restore |
 | [Tests](docs/testing.md) | `fn_selftest`, the fault-injection drill, what's deliberately not automated |

@@ -88,11 +88,6 @@ jobs:
           # sudo, which would need to preserve rustup's PATH/HOME correctly.
           sudo chown "$(id -un)" "$("$PG_CONFIG" --pkglibdir)" "$("$PG_CONFIG" --sharedir)/extension"
           cargo pgrx install --no-default-features --features pg${{ matrix.pg }} --pg-config "$PG_CONFIG"
-          # cargo-pgrx only writes the current crate version's script
-          # (allgres--<version>.sql); the frozen base snapshot(s) and
-          # generated upgrade script(s) are ours to place too, same as the
-          # Dockerfile does -- see sql/allgres--0.2.0.sql's own header.
-          cp -f sql/allgres--*.sql "$("$PG_CONFIG" --sharedir)/extension/"
 
       - name: Configure and restart the cluster
         run: |
