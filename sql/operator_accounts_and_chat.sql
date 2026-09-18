@@ -1065,27 +1065,44 @@ $fn$;
 -- multi-statement attempt.
 --
 -- Row-shaped statements (SELECT, WITH ... SELECT, and INSERT/UPDATE/
--- DELETE ... RETURNING) are tried first, wrapped as a data-modifying CTE
--- feeding a to_jsonb() projection -- this is what lets a RETURNING
--- clause's own output come back as rows too, not just a count. A
--- statement that cannot be a CTE body at all (DDL, or DML with no
+-- DELETE ... RETURNING) are tried first, wrapped as a data-modifying CTE.
+-- Returns {"cols": [...], "rows": [[...], ...]} -- columns once, each row
+-- as a plain positional array, not {"cols": [...]} per row as a keyed
+-- object -- because `jsonb` (unlike `json`) does not preserve object key
+-- order at all; it sorts and dedups keys as part of its own binary
+-- storage format, by design, not a bug to work around. That is not a
+-- theoretical concern: an admin's own first real multi-column query came
+-- back with columns alphabetized instead of in SELECT order, confirmed
+-- live (`to_jsonb(t)` on `SELECT 3 AS zebra, 1 AS apple, 2 AS mango`
+-- returns `{"apple": 1, "mango": 2, "zebra": 3}`), and this dashboard_rpc
+-- action's own outer response is unavoidably `jsonb` all the way out (the
+-- whole point of `dashboard_rpc` returning `jsonb`), so no amount of
+-- staying in `json` internally survives being embedded in that response
+-- -- only a JSON *array*'s element order survives jsonb storage, object
+-- key order never does. `json_each(to_json(t)) WITH ORDINALITY` is what
+-- extracts a row's fields as an *ordered* set before any of it becomes
+-- jsonb, letting `cols`/each row's own values be built as jsonb arrays
+-- (order-preserving) instead of jsonb objects (order-destroying).
+--
+-- A statement that cannot be a CTE body at all (DDL, or DML with no
 -- RETURNING) fails that wrap at parse time, before anything executes;
 -- the inner BEGIN/EXCEPTION block is a real PL/pgSQL savepoint, so that
 -- failure (whatever its cause) rolls back cleanly and falls through to
 -- running the statement directly, reporting rows affected instead of
--- rows returned. A genuine error from that direct run (bad SQL, a
--- constraint violation, anything) is deliberately left uncaught here --
--- it propagates out to dashboard_rpc's own top-level `EXCEPTION WHEN
--- OTHERS` handler, which is what turns it into a real
--- {"ok":false,"error":SQLERRM,"sqlstate":SQLSTATE} response, the same
--- path every other dashboard_rpc action's own errors already take.
+-- rows returned:  {"ok": true, "rows_affected": N}. A genuine error from
+-- that direct run (bad SQL, a constraint violation, anything) is
+-- deliberately left uncaught here -- it propagates out to dashboard_rpc's
+-- own top-level `EXCEPTION WHEN OTHERS` handler, which is what turns it
+-- into a real {"ok":false,"error":SQLERRM,"sqlstate":SQLSTATE} response,
+-- the same path every other dashboard_rpc action's own errors already
+-- take.
 --
 -- statement_timeout is set generously, not omitted: this is meant to run
 -- real admin work (an ad hoc backfill, a CREATE INDEX), not just quick
 -- lookups, but a single stuck query would otherwise tie up one of the
 -- web worker's own limited HTTP threads (MAX_WEB_THREADS) indefinitely.
 CREATE OR REPLACE FUNCTION allgres_public.fn_admin_execute_sql(p_sql text)
-RETURNS TABLE(row_data jsonb)
+RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = allgres_private, allgres_public, pg_temp
@@ -1093,6 +1110,7 @@ AS $fn$
 DECLARE
   v_rows bigint;
   v_analysis jsonb;
+  v_result jsonb;
 BEGIN
   IF btrim(COALESCE(p_sql, '')) = '' THEN
     RAISE EXCEPTION 'sql required' USING ERRCODE = 'P0001';
@@ -1126,16 +1144,25 @@ BEGIN
   SET LOCAL statement_timeout = '60s';
 
   BEGIN
-    RETURN QUERY EXECUTE format(
-      'WITH __allgres_console_q AS (%s) SELECT to_jsonb(t) FROM __allgres_console_q t', p_sql
-    );
-    RETURN;
+    EXECUTE format(
+      'WITH __allgres_console_q AS (%s) SELECT jsonb_build_object(
+         ''cols'', (SELECT jsonb_agg(key ORDER BY ord) FROM
+           (SELECT to_json(t) AS j FROM __allgres_console_q t LIMIT 1) r,
+           json_each(r.j) WITH ORDINALITY AS e(key, value, ord)),
+         ''rows'', (SELECT jsonb_agg(vals) FROM (
+           SELECT (SELECT jsonb_agg(value ORDER BY ord) FROM
+             json_each(to_json(t)) WITH ORDINALITY AS e(key, value, ord)) AS vals
+           FROM __allgres_console_q t
+         ) x)
+       )', p_sql
+    ) INTO v_result;
+    RETURN v_result;
   EXCEPTION WHEN OTHERS THEN
     NULL; -- not row-shaped -- fall through to a direct run below
   END;
 
   EXECUTE p_sql;
   GET DIAGNOSTICS v_rows = ROW_COUNT;
-  RETURN QUERY SELECT jsonb_build_object('ok', true, 'rows_affected', v_rows);
+  RETURN jsonb_build_object('ok', true, 'rows_affected', v_rows);
 END;
 $fn$;

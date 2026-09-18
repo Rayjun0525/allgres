@@ -307,8 +307,8 @@ exactly this reason.
 exception to "everything reachable from the dashboard is `SECURITY
 DEFINER`-scoped, never a raw SQL surface" — an admin asked for a query
 console so they never need a separate client (DBeaver etc.) just to run
-one query. It
-runs as `allgres_owner`, not `sandbox` and not the bootstrap superuser:
+one query. It runs as `allgres_owner`, not `sandbox` and not the
+bootstrap superuser:
 full `DDL`/`DML` power over everything `allgres_owner` owns — which is
 essentially every table, function, and schema this extension creates,
 this security model's own enforcement code included — but no server-wide

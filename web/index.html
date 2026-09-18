@@ -579,7 +579,7 @@ async function sqlConsolePage(){
     try{
       const r=await rpc('sql.execute',{sql});
       $('#sqlMeta').textContent=`${(performance.now()-t0).toFixed(0)} ms`;
-      renderSqlResult(r.rows||[]);
+      renderSqlResult(r);
     }catch(e){
       $('#sqlMeta').textContent='';
       renderSqlResult(null,e.message);
@@ -590,17 +590,23 @@ async function sqlConsolePage(){
   $('#sqlRun').onclick=run;
   $('#sqlInput').onkeydown=e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();run()}};
 }
-function renderSqlResult(rows,errMsg){
+function renderSqlResult(r,errMsg){
   const panel=$('#sqlResultPanel');
   if(errMsg){panel.innerHTML=`<div class="banner">${esc(errMsg)}</div>`;return}
-  if(!rows.length){panel.innerHTML=`<div class="panel muted">No rows.</div>`;return}
   // fn_admin_execute_sql's own shape for a statement with no output rows
   // (DDL, or DML with no RETURNING) -- a count, not a real row set.
-  if(rows.length===1&&'rows_affected' in rows[0]){
-    panel.innerHTML=`<div class="panel">ok -- ${esc(rows[0].rows_affected)} row(s) affected.</div>`;return;
+  if('rows_affected' in r){
+    panel.innerHTML=`<div class="panel">ok -- ${esc(r.rows_affected)} row(s) affected.</div>`;return;
   }
-  const cols=Object.keys(rows[0]);
-  panel.innerHTML=`<div class="panel"><div class="muted" style="font-size:12px;margin-bottom:10px">${esc(rows.length)} row(s)</div><table class="table"><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td class="mono">${esc(fmtSqlCell(r[c]))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  const cols=r.cols||[],rows=r.rows||[];
+  if(!rows.length){panel.innerHTML=`<div class="panel muted">No rows.</div>`;return}
+  // cols/rows, not one keyed object per row: jsonb sorts object keys as
+  // part of its own storage, so a keyed shape came back alphabetized
+  // instead of in SELECT order (confirmed live) -- see
+  // fn_admin_execute_sql's own comment for why this positional shape is
+  // what actually survives being embedded in dashboard_rpc's own jsonb
+  // response.
+  panel.innerHTML=`<div class="panel"><div class="muted" style="font-size:12px;margin-bottom:10px">${esc(rows.length)} row(s)</div><table class="table"><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${rows.map(row=>`<tr>${row.map(v=>`<td class="mono">${esc(fmtSqlCell(v))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 function fmtSqlCell(v){
   if(v===null||v===undefined)return '—';

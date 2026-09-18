@@ -1368,11 +1368,12 @@ BEGIN
       -- allgres_public.fn_admin_execute_sql's own comment covers the
       -- design (scope, one-statement-per-call, error propagation); this
       -- is admin-gated the same way as every other platform-configuration
-      -- action, nothing looser.
+      -- action, nothing looser. That function itself already returns
+      -- either {"cols":[...],"rows":[[...]]} or {"ok":true,
+      -- "rows_affected":N} -- `||` just adds "ok":true to the former too,
+      -- so the dashboard's own generic ok-check works either way.
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
-      RETURN jsonb_build_object('ok', true, 'rows', COALESCE((
-        SELECT jsonb_agg(row_data) FROM allgres_public.fn_admin_execute_sql(p_request->>'sql')
-      ), '[]'::jsonb));
+      RETURN jsonb_build_object('ok', true) || allgres_public.fn_admin_execute_sql(p_request->>'sql');
 
     WHEN 'provider.update' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');

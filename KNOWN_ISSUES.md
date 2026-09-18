@@ -4931,3 +4931,100 @@ The corrected claim about `allgres.analyze_sql`'s role here is also now
 reflected in [Security model, "The SQL
 console"](docs/security.md#the-sql-console), replacing the false one
 item 61 originally shipped.
+
+## 63. SQL console: multi-column results came back alphabetized, not in SELECT order
+
+Reported immediately after item 62 landed: `SELECT 3 AS zebra, 1 AS
+apple, 2 AS mango` rendered as `apple | mango | zebra` in the results
+table -- alphabetical, not the `zebra, apple, mango` order actually
+written. Root cause, once isolated with a bare comparison —
+
+```sql
+SELECT to_jsonb(t) FROM (SELECT 3 AS zebra, 1 AS apple, 2 AS mango) t;
+-- {"apple": 1, "mango": 2, "zebra": 3}
+SELECT to_json(t)  FROM (SELECT 3 AS zebra, 1 AS apple, 2 AS mango) t;
+-- {"zebra":3,"apple":1,"mango":2}
+```
+
+— is a real, documented, by-design property of `jsonb` as a type, not a
+bug in `to_jsonb` or anything upstream of it: `jsonb`'s binary storage
+format sorts and deduplicates object keys as part of how it's stored,
+the exact thing that makes indexed `jsonb` lookups fast; `json` (text)
+has no such structure and preserves whatever order the input had. This
+is not a corner this function could route around by simply switching
+`to_jsonb` for `to_json` internally, either -- `dashboard_rpc` itself
+`RETURNS jsonb`, so no matter what type an intermediate value holds,
+everything is normalized to jsonb's own canonical key-sorted form by the
+time it reaches the actual HTTP response. A JSON *array*'s element
+order, unlike an object's key order, does survive jsonb storage (arrays
+are ordered sequences, not key-addressed) -- so the only way to actually
+preserve column order end to end is to never put it in object keys at
+all.
+
+Fixed by changing `fn_admin_execute_sql`'s return shape from one `jsonb`
+object per row (`SETOF jsonb`, keyed by column name) to a single `jsonb`
+value shaped `{"cols": [...], "rows": [[...], [...]]}` -- columns
+named once, each row a plain positional array matching that order. The
+extraction uses `json_each(to_json(t)) WITH ORDINALITY`: `to_json`
+(text, order-preserving) turns a row into a JSON object with real column
+order intact, `json_each` walks it back out as an ordered set of
+key/value pairs (an ordered *set*, not an ordered *object*, is exactly
+where order survives becoming jsonb again), and `WITH ORDINALITY` gives
+each pair a stable position to aggregate by. `cols` is read from one
+representative row (`LIMIT 1`); every row of a single query result
+always shares the same columns in the same order, so this is correct,
+not just convenient. The function's own return type changed
+(`RETURNS TABLE(row_data jsonb)` → `RETURNS jsonb`, a single value, not
+a set), which meant `dashboard_rpc`'s own `sql.execute` branch changed
+too, from aggregating a set (`jsonb_agg(row_data) FROM
+fn_admin_execute_sql(...)`) to a plain call merged with `||` (`jsonb_
+build_object('ok', true) || fn_admin_execute_sql(...)`, so both the
+row-shaped `{"cols":...,"rows":...}` result and the DDL/DML
+`{"rows_affected":...}` result end up with a matching top-level `"ok":
+true`). The dashboard's own `sqlConsolePage`/`renderSqlResult` were
+updated to read `cols`/`rows` and render each row positionally instead
+of via `Object.keys()` on a per-row object (which had been reading back
+whatever order *JavaScript's* own key enumeration happened to produce,
+compounding the same underlying problem client-side).
+
+Deploying this one was more involved than items 61/62's own fixes,
+worth recording since it will recur for any future signature change to
+this function: `CREATE OR REPLACE FUNCTION` cannot change an existing
+function's return type at all (`cannot change return type of existing
+function`) -- confirmed live, attempting the same `psql -f`
+re-application items 61/62 used for a body-only change failed outright
+this time. A signature change needs the function actually dropped and
+recreated, which (per item 62's own first bug) requires manually
+walking the extension-membership bookkeeping again since a plain `DROP
+FUNCTION`/re-`psql -f` cycle leaves the new object unregistered exactly
+like a brand-new function does:
+
+```sql
+ALTER EXTENSION allgres DROP FUNCTION allgres_public.fn_admin_execute_sql(text);
+DROP FUNCTION allgres_public.fn_admin_execute_sql(text);
+-- (re-run sql/operator_accounts_and_chat.sql, e.g. psql -f)
+ALTER EXTENSION allgres ADD FUNCTION allgres_public.fn_admin_execute_sql(text);
+ALTER FUNCTION allgres_public.fn_admin_execute_sql(text) OWNER TO allgres_owner;
+```
+
+`sql/grants_and_facade.sql` also needed re-applying in the same pass
+(its `dashboard_rpc` branch referenced the old `row_data` column name,
+confirmed live as `column "row_data" does not exist` when skipped) --
+`dashboard_rpc`'s own signature didn't change, so that file's own
+re-application needed no extension-membership dance, only
+`fn_admin_execute_sql`'s did.
+
+Verified: direct SQL calls confirmed correct column order for a
+multi-column single row, a multi-row result, a bare `SELECT now();`
+(trailing `;`, one column), DDL, and DML with `RETURNING` (now also
+`{"cols":...,"rows":...}`-shaped rather than a bare keyed object, for
+consistency); a genuine multi-statement attempt still cleanly rejected.
+Confirmed the full `dashboard_rpc` path end to end with a real admin
+session token. Fresh install (`DROP EXTENSION ... CASCADE` → `CREATE
+EXTENSION`) plus `fn_selftest()` across two separate connections both
+report `"failed": 0, "passed": 333`; `cargo test --lib
+--no-default-features --features pg16` still 30/30. Live Playwright
+re-check through the real dashboard UI as a genuine admin account:
+`SELECT 3 AS zebra, 1 AS apple, 2 AS mango` now renders columns
+`ZEBRA | APPLE | MANGO`, in that order. A throwaway admin account
+created for this verification was deactivated and deleted afterward.
