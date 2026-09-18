@@ -1,9 +1,15 @@
 # Buildable MVP image: PostgreSQL 17 + one Allgres extension.
 FROM postgres:17-bookworm AS builder
 
+# libssl-dev is also pulled in transitively here (postgresql-server-dev-17
+# depends on libpq-dev, which depends on libssl-dev, on Debian) -- listed
+# explicitly anyway, since cargo-pgrx's own openssl-sys dependency needs
+# it directly and that transitive chain is not something to rely on
+# silently (confirmed live: a source install on a machine without it hit
+# exactly this, see KNOWN_ISSUES.md item 52).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl build-essential clang libclang-dev pkg-config git \
-    postgresql-server-dev-17 && rm -rf /var/lib/apt/lists/*
+    ca-certificates curl build-essential clang libclang-dev pkg-config \
+    libssl-dev git postgresql-server-dev-17 && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH=/root/.cargo/bin:$PATH

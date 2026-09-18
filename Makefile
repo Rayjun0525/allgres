@@ -52,6 +52,22 @@ ifeq ($(shell command -v clang 2>/dev/null),)
 	  needs libclang specifically, not just a generic C compiler. Install \
 	  it first (Debian/Ubuntu: `apt install clang libclang-dev`))
 endif
+ifeq ($(shell command -v pkg-config 2>/dev/null),)
+	$(error pkg-config not found on PATH -- several of cargo-pgrx's own \
+	  dependencies (openssl-sys among them) need it to locate system \
+	  libraries. Install it first (Debian/Ubuntu: `apt install \
+	  pkg-config`))
+endif
+ifeq ($(shell pkg-config --exists openssl 2>/dev/null && echo yes),)
+	$(error OpenSSL development files not found via pkg-config -- \
+	  cargo-pgrx's own openssl-sys dependency needs them to build, \
+	  regardless of PostgreSQL's own OpenSSL support. Confirmed live: not \
+	  every base image that already has a C toolchain and clang also has \
+	  this. Install them first (Debian/Ubuntu: `apt install libssl-dev`; \
+	  Fedora/RHEL: `dnf install openssl-devel`), or set PKG_CONFIG_PATH \
+	  to wherever `openssl.pc` actually lives if it's already installed \
+	  somewhere pkg-config isn't searching)
+endif
 	@echo "Targeting PostgreSQL $(PG_MAJOR) via $(PG_CONFIG)"
 
 # rustup's own official install method -- the same one-liner Dockerfile

@@ -4085,3 +4085,85 @@ sections item 50 had already moved into `docs/deployment/source-install.md`
 end in this environment (which already had the full toolchain), and a
 fresh `fn_selftest()` after the rebuild still passes 333/0. No SQL or Rust
 changed.
+
+## 52. `make install` failed on `openssl-sys` — item 51's toolchain check still missed a machine without OpenSSL dev files
+
+The very next failure after item 51's fix, on a different machine
+(`$HOST = aarch64-unknown-linux-gnu`): a bare C toolchain and `clang` were
+both present, so `check` passed, but `build` still died compiling
+`cargo-pgrx` itself, this time inside `openssl-sys`'s build script:
+
+```
+Could not find openssl via pkg-config:
+  pkg-config exited with status code 1
+  Package openssl was not found in the pkg-config search path.
+The PKG_CONFIG_PATH environment variable is not set.
+Could not find directory of OpenSSL installation, and this `-sys` crate
+cannot proceed without this knowledge.
+make: *** [Makefile:62: build] Error 101
+```
+
+Root cause: the same class of gap item 51 closed for the compiler, one
+dependency further down. `cargo-pgrx` pulls in `openssl-sys` (for its own
+HTTPS-capable dependencies, unrelated to PostgreSQL's own OpenSSL
+linkage), and `openssl-sys`'s build script needs `pkg-config` on `PATH`
+*and* `pkg-config` able to resolve `openssl.pc` — i.e. the OpenSSL
+development package, not just the runtime library most systems already
+have. This sandbox's own environment already had `libssl-dev` installed,
+which is exactly why the previous fix's own `make install` re-run never
+caught this: the test environment wasn't representative of a machine
+missing it. Checked why the repo's own `Dockerfile`/`cnpg/Dockerfile`/CI
+never listed it and still built fine: `apt-cache show libpq-dev` shows
+`Depends: ..., libssl-dev`, and `postgresql-server-dev-NN` depends on
+`libpq-dev` — so on Debian/Ubuntu, installing the `-server-dev` package
+already prerequisite for `pg_config` transitively drags in `libssl-dev`
+via a hard `Depends`, even with `--no-install-recommends`. That chain
+doesn't hold on every distro or non-apt PostgreSQL install, which is
+exactly the gap the user's machine fell into.
+
+Fixed the same way as item 51:
+
+- **Fail fast with a clear message.** `Makefile`'s `check` target now also
+  verifies `pkg-config` is on `PATH` and that `pkg-config --exists
+  openssl` succeeds, each with its own `$(error ...)` naming the missing
+  piece, the Debian/Ubuntu and Fedora/RHEL package names, and the
+  `PKG_CONFIG_PATH` escape hatch for an OpenSSL installed somewhere
+  pkg-config isn't searching. Verified live with the same non-destructive
+  isolation technique as item 51 -- an isolated `PATH` directory
+  (`/tmp/fake-path2`, symlinking in only `pg_config`, `cc`, `clang`, and
+  the handful of coreutils the check script itself needs) with
+  `pkg-config` deliberately left out fired the pkg-config-missing error;
+  restoring `pkg-config` but pointing `PKG_CONFIG_LIBDIR=/tmp/empty-
+  pkgconfig PKG_CONFIG_PATH=` at an empty directory (so `openssl.pc`
+  can't be found without touching the real system OpenSSL install) fired
+  the openssl-not-found error; removing both overrides passed clean again
+  -- three runs, one per state, nothing uninstalled from the shared
+  sandbox.
+- **Document it.** README.md's Quick start "Source" path and
+  `docs/deployment/source-install.md` now list OpenSSL's development
+  files (`libssl-dev`/`openssl-devel`) as a third explicit prerequisite
+  alongside `-server-dev` and the C toolchain, with the aarch64 case
+  called out as a concrete "this isn't universal" example.
+- **Close the same gap in the images that already worked by accident.**
+  `Dockerfile` and `cnpg/Dockerfile` now install `libssl-dev` explicitly
+  instead of relying on the undocumented transitive `libpq-dev` chain
+  above, and all three `apt-get install` lines in
+  `.github/workflows/ci.yml` do the same -- so the docs' claim that "all
+  three package lists above are the exact ones the repo-root `Dockerfile`
+  and `cnpg/Dockerfile` already install" stays true instead of aspirational.
+  The Docker/CI changes are **not live-build-verified** -- no Docker
+  daemon is reachable in this sandbox (`docker ps` fails to connect to
+  `unix:///var/run/docker.sock` at all), the same limitation
+  `cnpg/Dockerfile`'s own pre-existing "UNVERIFIED" comment already
+  discloses for a different assumption in the same file; `libssl-dev` is
+  additive to an install line that already worked, and on Debian/Ubuntu
+  it's a package apt already pulls in transitively today, so the risk is
+  low, but it hasn't been run for real.
+
+Verified live in this sandbox (which already had `libssl-dev`): `make
+check`, `make install`, and a fresh `cargo pgrx install` all still pass
+clean after the `Makefile` change, and `fn_selftest()` still reports
+`"failed": 0, "passed": 333` across two genuinely separate `psql`
+connections (not two calls in one `SELECT` -- see this file's own
+variable-hygiene notes on why that distinction matters here too). No SQL
+or Rust changed.

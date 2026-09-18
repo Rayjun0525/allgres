@@ -7,7 +7,7 @@ of the first part of this page.
 No Docker: install straight onto an existing PostgreSQL 16, 17, or 18
 server. The guiding principle is the same as Docker's `./scripts/
 bootstrap.sh` — a working instance in a handful of commands, not a
-multi-page install guide to work through by hand. You need two things on
+multi-page install guide to work through by hand. You need three things on
 `PATH` before the first command below:
 
 - That PostgreSQL version's own `-dev`/`-server-dev` package
@@ -17,13 +17,25 @@ multi-page install guide to work through by hand. You need two things on
   `cargo-pgrx` itself (the tool, before it ever touches this extension's
   own source) needs one to build, via `bindgen`'s use of libclang for
   Postgres FFI generation. On Debian/Ubuntu: `apt install build-essential
-  clang libclang-dev pkg-config` — the exact same packages the repo-root
-  `Dockerfile` and `cnpg/Dockerfile` already install before their own
-  `cargo-pgrx` build. Missing this surfaces as `error: failed to compile
-  cargo-pgrx v0.19.2` with no further explanation from Cargo itself;
-  `make check` (run automatically by `make`/`make install`) now fails
-  fast with a clear message naming the missing tool instead, before ever
-  reaching that `cargo install` line.
+  clang libclang-dev pkg-config`.
+- OpenSSL's development files: `cargo-pgrx` also pulls in `openssl-sys`,
+  which needs `pkg-config` to find `openssl.pc` and the headers/library
+  it points at. On Debian/Ubuntu: `apt install libssl-dev`; on
+  Fedora/RHEL: `dnf install openssl-devel`. **Not every environment that
+  already has a C toolchain and `clang` also has this** — confirmed live
+  on an aarch64 machine that had everything else and still hit `error:
+  failed to compile cargo-pgrx` from a bare `openssl-sys` build-script
+  failure, distinct from (and only reachable after fixing) the missing-
+  compiler case below.
+
+All three package lists above are the exact ones the repo-root
+`Dockerfile` and `cnpg/Dockerfile` already install before their own
+`cargo-pgrx` build. Missing any of them surfaces as `error: failed to
+compile cargo-pgrx v0.19.2`, with the real reason only visible scrolled
+up in Cargo's own build output; `make check` (run automatically by
+`make`/`make install`) now fails fast with a clear message naming
+whichever piece is actually missing instead, before ever reaching that
+`cargo install` line.
 
 Rust and `cargo-pgrx` are handled for you if they aren't already there:
 

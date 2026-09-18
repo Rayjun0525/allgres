@@ -28,14 +28,20 @@ USER 0
 # build error here.
 #
 # UNVERIFIED (no Docker daemon in the environment this Dockerfile was
-# written in -- see README, "CNPG (CloudNativePG)"): this assumes the
+# written in -- see docs/deployment/cnpg.md): this assumes the
 # PGDG apt repo that gives this base image its own postgresql-${PG_MAJOR}
 # packages also has postgresql-server-dev-${PG_MAJOR} available from the
 # same source. If this RUN fails on "Unable to locate package", that
 # assumption is the first thing to check.
+#
+# libssl-dev: cargo-pgrx's own openssl-sys dependency needs it directly,
+# not just PostgreSQL's own SSL support -- postgresql-server-dev-${PG_MAJOR}
+# pulls it in transitively via libpq-dev on Debian, but that chain is not
+# something to rely on silently (confirmed live: a source install on a
+# machine without it hit exactly this, see KNOWN_ISSUES.md item 52).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl build-essential clang libclang-dev pkg-config git \
-    "postgresql-server-dev-${PG_MAJOR}" \
+    ca-certificates curl build-essential clang libclang-dev pkg-config \
+    libssl-dev git "postgresql-server-dev-${PG_MAJOR}" \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
