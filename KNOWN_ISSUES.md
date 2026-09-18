@@ -4533,3 +4533,77 @@ written directly from the user's own confirmation of how their instance
 starts, the same way item 55's `sudo`-placement fix was derived from a
 live transcript rather than a local repro. No `Makefile`, SQL, or Rust
 changed; purely an extension of item 56's own documentation-only fix.
+
+## 59. Dashboard's Korean toggle was half-translated -- nav labels only, everything else stayed English
+
+Reported live against a real install (the first time anyone had actually
+looked at the dashboard past login this session): a screenshot showing
+the Agents page with the sidebar and page `<h1>` in Korean ("에이전트")
+but the "New agent" button, every table header, and all body copy still
+in English -- an inconsistent, half-finished look, not a rendering bug.
+
+Root cause: `web/index.html`'s `I18N`/`t()` system only ever had entries
+for nav labels and a couple dozen short UI words (`save`, `edit`,
+`signIn`, section headers, ...); every other string on every page --
+button labels, table column headers, panel copy, empty-state text, toast
+messages -- was hardcoded English, never routed through `t()` at all.
+Selecting 한국어 in Settings therefore never produced a real Korean
+dashboard, only ever this English-with-a-translated-frame look. Reported
+alongside two smaller, related points: the *default* language actually
+was already `en` in code (`localStorage.getItem('allgres_lang')||'en'`)
+-- contrary to how it read from the screenshot, a real default-to-Korean
+bug was never present, just a stale `ko` value some earlier session
+(browser or this same testing) had left in that browser's own
+`localStorage` -- and the "design doesn't match the reference" point
+from the same message, which a live re-screenshot of the current
+(already design-swept, item 0bd7956) build did not reproduce -- current
+Overview/Agents/Settings pages screenshotted clean, properly spaced,
+consistent with the earlier design-sweep work; most likely the same
+explanation as the language confusion, an older cached build or an
+earlier point in this same troubleshooting session, not a live gap in
+the current code.
+
+Asked directly rather than guessing given the size of the alternative
+(fully translating a 5000+ line single-file dashboard's every string):
+remove the toggle and go English-only, keep English-by-default with the
+half-translated toggle still reachable, or commit to actually finishing
+a complete Korean translation. Chosen: remove it entirely -- matches
+this project's own "don't half-build a feature, and don't add generality
+beyond what's needed" stance, and a half-finished i18n surface is worse
+than none, actively confusing rather than merely incomplete.
+
+Fixed in `web/index.html`:
+
+- Collapsed `I18N` from `{en:{...}, ko:{...}}` to a single flat string
+  table, and `t(key)` from `` const d=I18N[lang()]||I18N.en; return
+  d[key]??I18N.en[key]??key `` down to `return I18N[key]??key` -- every
+  existing `t('someKey')` call site needed no change at all, since a
+  call for a key neither dictionary ever defined was already falling
+  through to `key` itself unchanged (which is why most body copy was
+  already effectively "translated" to itself); only the nav labels and
+  short UI words that *did* have real dictionary entries changed
+  behavior, and only by permanently resolving to their `en` value.
+- Deleted `lang()`/`setLang()` and the Settings page's language toggle
+  row (the `langBtn` buttons and their click handler) entirely, along
+  with the now-dead `language` dictionary key; the "Language / Theme"
+  panel is now just "Theme".
+- No migration needed for a browser with a stale `allgres_lang=ko`
+  already in `localStorage`: `t()` no longer reads that key at all, so
+  the page silently and permanently reverts to English on next load
+  regardless of what's still stored there -- confirmed live (see below).
+
+Verified: `cargo pgrx install --no-default-features --features pg16`
+rebuilt clean (`web/index.html` is compiled in via `include_str!` in
+`src/lib.rs`, so this was a real rebuild+reinstall+restart, not just an
+edit); `cargo test --lib --no-default-features --features pg16` still
+30/30, including `dashboard_html_carries_the_csp_nonce_placeholder`
+(confirms the compiled-in HTML still carries its CSP nonce placeholder
+intact); `fn_selftest()` still `"failed": 0, "passed": 333` across two
+separate `psql` connections. Live browser check (Playwright,
+`/opt/pw-browsers/chromium-1194`) against the rebuilt worker: logged in
+with `allgres_lang` deliberately pre-set to `'ko'` in `localStorage`
+first (simulating exactly the stale-toggle browser this bug was reported
+from) -- Agents and Settings pages both rendered fully in English, no
+mixed-language strings anywhere, Settings' language row gone and Theme
+row intact. A throwaway admin account created for this test
+(`admin_test`) was deactivated and deleted afterward. No SQL changed.
