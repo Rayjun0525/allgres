@@ -4025,3 +4025,63 @@ this project's own actual `Dockerfile`/`docker-compose.yml`/`src/*.rs`
 defaults (`ALLGRES_ALLOW_INSECURE_HTTP` must be exactly `"1"`,
 `ALLGRES_DATABASE` defaults to `postgres` same as the runtime worker's own
 `DEFAULT_DB`) rather than assumed.
+
+## 51. `make install` failed with a bare "failed to compile cargo-pgrx" on a machine with no C toolchain
+
+Raised directly, already correctly self-diagnosed: "make, gcc가
+안깔려있으면 동작을 안하니까 사전에 설치해야하는 패키지 리드미에 추가하고"
+(if make/gcc aren't installed it doesn't work -- add the prerequisite
+packages to the README). The actual failure:
+
+```
+warning: build failed, waiting for other jobs to finish...
+error: failed to compile `cargo-pgrx v0.19.2`, intermediate artifacts can
+be found at `/tmp/cargo-install4sAZof`.
+make: *** [Makefile:46: build] Error 101
+```
+
+Root cause: the `Makefile`'s `check` target only ever verified `pg_config`
+was on `PATH` -- it said nothing about a C toolchain. `build`'s `cargo
+install --locked cargo-pgrx` (before it ever reaches this extension's own
+source) needs one anyway: `cargo-pgrx` depends on `bindgen` for Postgres
+FFI generation, which needs `libclang` specifically, and several of its
+other dependencies need a plain C compiler for their own `build.rs`.
+Neither the `Makefile` nor `docs/deployment/source-install.md` (nor
+README.md's own Quick start, pre-item-50-split) ever named these as
+prerequisites -- only `pg_config`/the `-server-dev` package was mentioned,
+so a machine with PostgreSQL's dev headers but no general-purpose build
+tools hit this exact wall. The repo-root `Dockerfile` and `cnpg/Dockerfile`
+already knew the real list (`build-essential clang libclang-dev
+pkg-config`) -- they just never fed it back into the docs read by anyone
+installing straight onto their own machine.
+
+Fixed two ways:
+
+- **Fail fast with a clear message.** `Makefile`'s `check` target now also
+  verifies `cc`/`gcc` and `clang` are on `PATH`, each with its own
+  `$(error ...)` naming the missing tool and the exact `apt install`
+  line -- the same "catch the mistake here, with a real message, instead
+  of inside cargo-pgrx with a much less obvious one" pattern
+  `cnpg/Dockerfile`'s own `Cargo.toml` existence check already uses (see
+  item 45's own entry). Verified live: with `PATH` narrowed to a
+  directory holding nothing but `pg_config` (`/tmp/fake-path`, wired to
+  the real one via a wrapper script) and `PG_MAJOR` forced so the
+  `pg_config`-detection shell calls themselves (which need `tail`, not
+  reachable in that narrowed `PATH`) weren't what was under test, `make
+  check` correctly errored on the missing compiler, then on missing
+  `clang` once a bare `cc` was added back, then passed clean once both
+  were restored -- three separate runs, one per state.
+- **Document it.** README.md's Quick start "Source" path and
+  `docs/deployment/source-install.md` both now list the C toolchain
+  alongside the `-server-dev` package as a prerequisite, naming the exact
+  Debian/Ubuntu packages and pointing at `make check`'s own new fast-fail
+  as the thing that catches it if skipped.
+
+Also fixed in passing: three places in the `Makefile`'s own comments and
+`install`/`quickstart` target output still said "see README.md, 'X'" for
+sections item 50 had already moved into `docs/deployment/source-install.md`
+-- stale since that split, now pointing at the right file. Verified live:
+`make check`, `make install`, and `make quickstart` all run clean end to
+end in this environment (which already had the full toolchain), and a
+fresh `fn_selftest()` after the rebuild still passes 333/0. No SQL or Rust
+changed.

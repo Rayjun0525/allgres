@@ -55,8 +55,11 @@ detail](docs/deployment/docker.md).
 
 Install straight onto an existing PostgreSQL 16, 17, or 18 server. You need
 that PostgreSQL version's own `-dev`/`-server-dev` package installed first
-(`pg_config` on `PATH`); Rust and `cargo-pgrx` are handled for you if
-they aren't already there:
+(`pg_config` on `PATH`), plus a C toolchain (`build-essential clang
+libclang-dev pkg-config` on Debian/Ubuntu — `cargo-pgrx` itself needs one to
+build, via `bindgen`, not just this extension's own source; `make check`
+fails fast with this same message if it's missing). Rust and `cargo-pgrx`
+are handled for you if they aren't already there:
 
 ```bash
 git clone https://github.com/Rayjun0525/allgres.git

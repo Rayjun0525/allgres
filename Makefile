@@ -8,9 +8,10 @@
 #
 # `make quickstart` goes one step further and actually runs the thing --
 # against the `postgres` database, using the no-restart install path
-# (README, "Installing without a restart") rather than editing
-# postgresql.conf. Kept separate from `install` on purpose: `install` only
-# ever touches this machine's Postgres *installation* (files under
+# (docs/deployment/source-install.md, "Installing without a restart")
+# rather than editing postgresql.conf. Kept separate from `install` on
+# purpose: `install` only ever touches this machine's Postgres
+# *installation* (files under
 # pg_config's own lib/share dirs, same as any extension's own `make
 # install`); `quickstart` is the one target that touches a live database,
 # so it stays a deliberate, separate step rather than a side effect of
@@ -35,6 +36,21 @@ endif
 ifeq ($(filter $(PG_MAJOR),16 17 18),)
 	$(error PostgreSQL $(PG_MAJOR) (from $(PG_CONFIG)) is not supported -- \
 	  Allgres targets 16, 17, and 18)
+endif
+ifeq ($(shell command -v cc 2>/dev/null || command -v gcc 2>/dev/null),)
+	$(error no C compiler found on PATH -- cargo-pgrx itself needs one to \
+	  build (via bindgen, for Postgres FFI generation), before it ever \
+	  touches this extension's own source. Install a C toolchain first \
+	  (Debian/Ubuntu: `apt install build-essential clang libclang-dev \
+	  pkg-config` -- the same packages the repo-root Dockerfile and \
+	  cnpg/Dockerfile already install before their own cargo-pgrx build). \
+	  Without this, `cargo install cargo-pgrx` below fails with a bare \
+	  "error: failed to compile `cargo-pgrx`" and no further explanation)
+endif
+ifeq ($(shell command -v clang 2>/dev/null),)
+	$(error clang not found on PATH -- bindgen (a cargo-pgrx dependency) \
+	  needs libclang specifically, not just a generic C compiler. Install \
+	  it first (Debian/Ubuntu: `apt install clang libclang-dev`))
 endif
 	@echo "Targeting PostgreSQL $(PG_MAJOR) via $(PG_CONFIG)"
 
@@ -72,7 +88,7 @@ install: build
 	@echo "  2) shared_preload_libraries = 'allgres' in postgresql.conf, restart"
 	@echo "     Postgres, then CREATE EXTENSION allgres;"
 	@echo ""
-	@echo "See README.md, 'Extension installation', for the full picture."
+	@echo "See docs/deployment/source-install.md for the full picture."
 
 quickstart:
 	psql -v ON_ERROR_STOP=1 -d $(QUICKSTART_DB) -c "SET allgres.reloadable = 'on'; \
@@ -83,8 +99,8 @@ quickstart:
 	@echo "\"ok\": true above -- allgres just started with no restart; open http://127.0.0.1:8088"
 	@echo "\"ok\": false, already in shared_preload_libraries -- also fine, the static"
 	@echo "  (postmaster-managed) workers already cover it; open http://127.0.0.1:8088 the same way"
-	@echo "any other \"ok\": false -- dynamic start didn't happen; see README.md,"
-	@echo "  'Installing without a restart'"
+	@echo "any other \"ok\": false -- dynamic start didn't happen; see"
+	@echo "  docs/deployment/source-install.md, 'Installing without a restart'"
 
 clean:
 	cargo clean
