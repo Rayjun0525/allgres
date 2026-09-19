@@ -12,7 +12,7 @@ Allgres web BGWorker (Rust, no SPI, one thread per connection)
   v
 Allgres runtime BGWorker
   |  SPI thread ......... short transactions only (pump, dashboard RPC)
-  |  HTTP thread pool ... blocking LLM / tool calls, never touches Postgres
+  |  HTTP thread pool ... blocking LLM / function calls, never touches Postgres
   v
 PL/pgSQL control plane
   +--> agent state, policy, queue, retries, audit log

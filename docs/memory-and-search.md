@@ -68,7 +68,7 @@ prompt changes. `search_agents` embeds the query the same way and ranks
 every agent the caller actually holds an `agent` permission for by cosine
 similarity — the identical permission check `delegate` itself enforces, so
 a search can never surface a name the caller could not actually delegate
-to — returning the ranked list as a `tool_result` on the next step.
+to — returning the ranked list as a `function_result` on the next step.
 
 Embeddings are stored as a plain array (`agents.embedding`), never
 [pgvector](https://github.com/pgvector/pgvector)'s own `vector` type, so

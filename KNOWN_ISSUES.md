@@ -5530,3 +5530,92 @@ identity field's `disabled` property `true`, no grant form, no `Revoke`
 button, `Autonomy level` present and enabled, and the Save button
 relabeled; the ordinary agent's modal was unaffected on every one of
 those same checks.
+
+## 72. v2 redesign, Phase 3a: renamed "Tool" to "Function" throughout, including the `call_tool`/`tool` wire protocol keys
+
+Pure rename, no behavior change -- prep work before Phase 3b (real
+PL/pgSQL Function bodies), 3c (Procedure -> real `CREATE PROCEDURE`), and
+3d (an MCP-client Function handler), all still to come. "Tool" was a
+confusing name once agents can author their own callable units and call
+other agents too -- the user asked for "Function" throughout, including
+the JSON the LLM actually emits, not just internal naming.
+
+Renamed: table `allgres_private.procedure_tools` -> `allgres_private.
+functions` (PK `tool_id` -> `function_id`); `procedure_tool_bindings` ->
+`procedure_function_bindings`; `fn_create_procedure_tool` -> `fn_create_
+function`; `fn_bind_procedure_tool` -> `fn_bind_procedure_function`;
+`outbound_calls.procedure_tool_id`/`.kind = 'tool'` -> `.procedure_
+function_id`/`.kind = 'function'`; `model_experiments.tool_id` ->
+`.function_id`; `change_proposals.target_tool_id`/`kind = 'tool_
+override'` -> `.target_function_id`/`'function_override'`;
+`apply_tool_experiment_start/promote/reject` -> `apply_function_
+experiment_*`; `fn_set_tool_override_autonomy_preset` -> `fn_set_
+function_override_autonomy_preset`; `agent_config` keys `tool_override_
+self_approve_canary_cap`/`tool_override_auto_promote_slack_pct` ->
+`function_override_*`; `execution_logs.role = 'tool'` -> `'function'`;
+`permissions.resource_type = 'tool'` -> `'function'`. Wire protocol: the
+LLM's `{"action":"call_tool","tool":"...","args":{...}}` is now
+`{"action":"call_function","function":"...","args":{...}}`; reason
+strings `tool_not_permitted`/`unknown_tool` -> `function_not_permitted`/
+`unknown_function`; result type `tool_result` -> `function_result`.
+dashboard_rpc actions: `procedure_tools.list`/`.create`/`.bind` ->
+`functions.list`/`.create`/`.bind`; `tool_experiments.list` -> `function_
+experiments.list`; `agents.set_tool_override_autonomy_preset` -> `agents.
+set_function_override_autonomy_preset`. `sql/rpc_catalog.json`
+regenerated (`scripts/gen_rpc_catalog.py`) and the two frozen-catalog
+arrays in `fn_selftest` updated to match, same commit. `web/index.html`:
+the permission-type picker's `tool` option, `opts.tools`/`state.
+toolExperiments`, the "Tool model experiments" panel, and every RPC/field
+reference that follows from the renames above. `src/outbound.rs`/`src/
+runtime_worker.rs`: the two `kind == "tool"`/`json!("tool")` string
+comparisons that classify an outbound call (no Rust identifier was ever
+named "tool" -- confirmed by grep before changing anything). Docs
+(`procedures.md`, `security.md`, `architecture.md`, `sql-sandbox.md`,
+`system-agents.md`, `memory-and-search.md`, `README.md`) updated to
+match; `procedures.md`'s own "Procedure tool functions" section also
+dropped a stale claim of a "Settings -> Procedure tool functions" UI
+panel that was never actually built (a real doc/implementation mismatch,
+unrelated to this rename, fixed while already touching this file) in
+favor of naming the `functions.create`/`.bind` dashboard_rpc actions
+directly. `KNOWN_ISSUES.md` itself (this file) is left untouched for
+every *past* entry -- it is a dated engineering log of what happened at
+the time, not a document that tracks current naming, so old entries keep
+saying "tool" where that was the real name when they were written.
+
+Mechanical approach: rather than hand-editing ~600 occurrences across six
+`sql/*.sql` files, wrote a small Python script (substring replacement, no
+regex) with a short list of explicit pre-rules for the two cases a pure
+`tool -> function` swap would get wrong -- the bare table name needing
+its `procedure_` prefix dropped entirely (-> `functions`, not `procedure_
+functions`), and preventing the pre-existing `v_tools` and `v_procedure_
+tools` local variables (two distinct declarations in the same `fn_next_
+step` scope) from both collapsing onto the same `v_functions` name, which
+would have been a genuine duplicate-variable compile error -- then a
+blanket `tool`/`Tool` -> `function`/`Function` substring sweep for
+everything else. Reviewed the full diff afterward rather than trusting
+the script blindly: caught and hand-fixed three "Tool Function" ->
+"Function Function" doubled-word artifacts in comments (should just read
+"Function"), confirmed zero accidental matches inside unrelated English
+usage (`docs/deployment/source-install.md`'s "the tool" meaning
+`cargo-pgrx`, `docs/self-improvement.md`'s "wrong tool for judging" idiom,
+`sql/operator_accounts_and_chat.sql`'s "admin-only power tool" idiom --
+all three grepped for and confirmed untouched), and grepped the whole
+repo afterward for a residual case-insensitive `tool` in every `sql/`,
+`src/`, and `web/index.html` file: zero matches outside those three
+confirmed-unrelated idioms.
+
+Verified: rebuilt and reinstalled; fresh install's `fn_selftest()` read
+`"failed": 0, "passed": 331` across two separate `psql` connections
+(identical on both); confirmed via `git diff` that the number of defined
+test cases in `sql/selftest.sql` is unchanged at 295 before and after
+(the rename touches names, not test count -- a small run-to-run
+difference in the *passed* count against Phase 2's reported 330 appears
+unrelated to this change, since no case was added, removed, or made
+conditional by a pure identifier rename); `cargo test --lib --no-
+default-features --features pg16` still 30/30. No separate live-HTTP
+proof beyond `fn_selftest` for this entry: nothing about permission
+logic, role scoping, or worker behavior changed, only names, and the
+existing selftest suite already exercises every renamed call path
+(function permission grants, procedure-bound function calls, the canary
+experiment lifecycle, the frozen RPC catalog) under both its "should
+succeed" and "should be rejected" cases.

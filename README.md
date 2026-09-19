@@ -5,7 +5,7 @@
 Allgres is a PostgreSQL-native agent control plane. It packages the PL/pgSQL
 state machine, a Rust/pgrx native runtime worker, outbound HTTP/HTTPS, and an
 embedded browser control panel into one PostgreSQL extension. Point it at an
-LLM provider, create an agent, and it plans, calls tools, delegates to other
+LLM provider, create an agent, and it plans, calls functions, delegates to other
 agents, and reports back — all through ordinary SQL tables you can query
 yourself.
 
@@ -106,7 +106,7 @@ end to end, and `scripts/smoke.sh`).
   PostgreSQL's own parse tree and run under an unprivileged role. See
   [The SQL sandbox](docs/sql-sandbox.md).
 - **Outbound calls** — LLM provider calls and the `http_get`/`http_request`
-  tools, all behind an SSRF guard. See [Security model](docs/security.md).
+  functions, all behind an SSRF guard. See [Security model](docs/security.md).
 - **Human-in-the-loop** — `await_human`, operator approve/reject, and timed
   expiry via the watchdog.
 - **Self-modification, operator-governed** — an agent can propose a change
@@ -171,7 +171,7 @@ working instance running.
 | [Security model](docs/security.md) | Exposure, CORS, SSRF, secrets at rest, privileges, per-agent roles, self-modification |
 | [The SQL sandbox](docs/sql-sandbox.md) | How an agent's `execute_sql` is analyzed and gated |
 | [Memory and semantic search](docs/memory-and-search.md) | `remember`/`recall`, search history, semantic delegate search |
-| [Procedures](docs/procedures.md) | Operator-curated reusable instructions and tool functions |
+| [Procedures](docs/procedures.md) | Operator-curated reusable instructions and Functions |
 | [System agents](docs/system-agents.md) | `health_monitor`, `creator`, `fixer`, `self_improve`, and the rest |
 | [Operator audit log](docs/audit-log.md) | Who did what, `operator_name` vs. a real verified account |
 | [Model configuration and chat](docs/chat-and-models.md) | Providers, test connection, sessions, General/Messenger/Project chat modes |

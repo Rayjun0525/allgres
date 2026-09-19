@@ -67,7 +67,7 @@ UPDATE allgres_private.llm_providers SET response_format_json_object = false WHE
 INSERT INTO allgres_private.sql_sandbox_allowlist (resource_ref)
 VALUES ('allgres_public.v_sales'), ('allgres_public.v_my_tasks'),
        ('allgres_public.v_system_health'), ('allgres_public.v_permission_audit'),
-       ('allgres_public.v_agent_health'), ('allgres_public.v_tool_model_experiments')
+       ('allgres_public.v_agent_health'), ('allgres_public.v_function_model_experiments')
 ON CONFLICT DO NOTHING;
 
 DO $seed$
@@ -86,7 +86,7 @@ BEGIN
 Allowed:
 {"action":"final_answer","answer":"..."}
 {"action":"execute_sql","sql":"SELECT ..."}
-{"action":"call_tool","tool":"http_get","args":{"url":"https://..."}}
+{"action":"call_function","function":"http_get","args":{"url":"https://..."}}
 {"action":"await_human","reason":"..."}
 
 For numbers use execute_sql against allgres_public.v_sales (region, sku, amount, sold_on).
@@ -107,7 +107,7 @@ $prompt$,
   FROM (VALUES
     ('view', 'allgres_public.v_sales'),
     ('view', 'allgres_public.v_my_tasks'),
-    ('tool', 'http_get')
+    ('function', 'http_get')
   ) AS x(resource_type, resource_ref)
   ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
 
@@ -129,19 +129,19 @@ $seed$;
 -- tab: item 39's own follow-up to that tab always needing an agent picked
 -- from a dropdown first, reported live as friction an operator (or a
 -- regular user with exactly one thing they want to talk to) shouldn't have
--- to deal with just to say hello. Unlike 'analyst' it holds no view/tool
+-- to deal with just to say hello. Unlike 'analyst' it holds no view/function
 -- permissions and no demo data -- a plain conversational partner, not a
 -- data-query one -- so its own prompt never offers execute_sql. It does
--- offer call_tool, though (see the seoul-weather procedure grant below):
--- an earlier version of this prompt omitted call_tool entirely on the
+-- offer call_function, though (see the seoul-weather procedure grant below):
+-- an earlier version of this prompt omitted call_function entirely on the
 -- assumption this agent would never need it, which meant the model was
--- never actually told the protocol's required "tool" field name for that
--- action once seoul-weather granted it a real tool to call -- it guessed a
+-- never actually told the protocol's required "function" field name for that
+-- action once seoul-weather granted it a real function to call -- it guessed a
 -- plausible key ("name") instead, and every such call was then silently
--- rejected as unpermitted (fn_next_step reads content->>'tool', found
--- nothing, and fell through the same path a genuinely unauthorized tool
+-- rejected as unpermitted (fn_next_step reads content->>'function', found
+-- nothing, and fell through the same path a genuinely unauthorized function
 -- name would). Documenting the exact shape here, the same way 'analyst'
--- already does for its own call_tool grant, is the fix -- not a
+-- already does for its own call_function grant, is the fix -- not a
 -- permissions change, since the grant itself was already correct.
 DO $seed$
 DECLARE
@@ -157,10 +157,10 @@ BEGIN
 
 Allowed:
 {"action":"final_answer","answer":"..."}
-{"action":"call_tool","tool":"...","args":{}}
+{"action":"call_function","function":"...","args":{}}
 {"action":"await_human","reason":"..."}
 
-Have a normal, friendly conversation. If a procedure you were given names a specific tool (for example seoul_weather), use call_tool with that exact name in the "tool" field and an empty args object, then answer using its result in your own words. When you have a reply, emit final_answer with your answer as plain text.
+Have a normal, friendly conversation. If a procedure you were given names a specific function (for example seoul_weather), use call_function with that exact name in the "function" field and an empty args object, then answer using its result in your own words. When you have a reply, emit final_answer with your answer as plain text.
 $prompt$,
         -- Deliberately no llm_config here, same reason as 'analyst' above.
         updated_at = now()
@@ -169,21 +169,21 @@ $prompt$,
 END
 $seed$;
 
--- A first Procedure / Tool Function pair. The Procedure is reusable prompt
+-- A first Procedure / Function pair. The Procedure is reusable prompt
 -- policy; seoul_weather is a fixed, reviewed HTTP capability bound to it.
--- Granting this one procedure is sufficient for an agent to use the tool.
+-- Granting this one procedure is sufficient for an agent to use the function.
 INSERT INTO allgres_private.procedures (name, content)
-VALUES ('seoul-weather', $procedure$When asked about Seoul weather, call the `seoul_weather` tool with an empty args object. Read the returned JSON, report the current conditions and temperature in Korean, and say when the source does not contain a requested forecast detail.$procedure$)
+VALUES ('seoul-weather', $procedure$When asked about Seoul weather, call the `seoul_weather` function with an empty args object. Read the returned JSON, report the current conditions and temperature in Korean, and say when the source does not contain a requested forecast detail.$procedure$)
 ON CONFLICT (name) DO NOTHING;
 
-INSERT INTO allgres_private.procedure_tools (name, description, handler, args_template)
+INSERT INTO allgres_private.functions (name, description, handler, args_template)
 VALUES ('seoul_weather', 'Fetch current weather and forecast data for Seoul.', 'http_get',
   '{"url":"https://wttr.in/Seoul?format=j1"}'::jsonb)
 ON CONFLICT (name) DO NOTHING;
 
-INSERT INTO allgres_private.procedure_tool_bindings (procedure_id, tool_id)
-SELECT p.procedure_id, t.tool_id
-FROM allgres_private.procedures p, allgres_private.procedure_tools t
+INSERT INTO allgres_private.procedure_function_bindings (procedure_id, function_id)
+SELECT p.procedure_id, t.function_id
+FROM allgres_private.procedures p, allgres_private.functions t
 WHERE p.name = 'seoul-weather' AND t.name = 'seoul_weather'
 ON CONFLICT DO NOTHING;
 
@@ -222,7 +222,7 @@ Allowed:
 You can read exactly two views: allgres_public.v_system_health (worker
 counts, queue backlogs, pending approvals, recent failures) and
 allgres_public.v_permission_audit (every agent's permission grants). You
-cannot change anything -- no propose_change, no delegate, no tools. Your
+cannot change anything -- no propose_change, no delegate, no functions. Your
 job is to look, compare against what you remembered last time (it is
 already in your own context below, if you have run before), and report:
 what changed, anything that looks wrong (a queue backlog that never drains,
@@ -417,28 +417,28 @@ Never change what the target agent is supposed to accomplish -- only how
 cheaply it gets there. If you find nothing worth changing, use final_answer
 to say so.
 
-You also own a narrower, tool-scoped version of the same idea: any
-procedure_tool a turn was dispatched through can carry its own model
+You also own a narrower, function-scoped version of the same idea: any
+procedure_function a turn was dispatched through can carry its own model
 override, cheaper than whatever the calling agent's own llm_config uses for
-its turns in general (see allgres_public.v_tool_model_experiments -- read it
-with execute_sql). A tool with no override yet, or one you think could run
+its turns in general (see allgres_public.v_function_model_experiments -- read it
+with execute_sql). A function with no override yet, or one you think could run
 on something cheaper, is a candidate: propose
-{"action":"propose_change","target_tool_id":"...","op":"start_experiment","candidate_provider":"...","candidate_model":"...","canary_percent":N,"reason":"..."}
-to trial it on a small share (canary_percent) of that tool's real traffic
+{"action":"propose_change","target_function_id":"...","op":"start_experiment","candidate_provider":"...","candidate_model":"...","canary_percent":N,"reason":"..."}
+to trial it on a small share (canary_percent) of that function's real traffic
 without touching the rest. Once a running experiment has at least its
 min_sample_size, compare candidate_success_rate against baseline_success_rate
 on the same view and propose either
-{"action":"propose_change","target_tool_id":"...","op":"promote","experiment_id":"...","reason":"..."}
+{"action":"propose_change","target_function_id":"...","op":"promote","experiment_id":"...","reason":"..."}
 (candidate held up) or the same shape with "op":"reject" (it did not) --
 never promote on a smaller sample than min_sample_size, and never propose a
-second start_experiment for a tool that already has one running.
+second start_experiment for a function that already has one running.
 $prompt$,
           max_steps = 6,
           updated_at = now()
       WHERE agent_id = v_agent;
       INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
       VALUES (v_agent, 'view', 'allgres_public.v_agent_health'),
-             (v_agent, 'view', 'allgres_public.v_tool_model_experiments')
+             (v_agent, 'view', 'allgres_public.v_function_model_experiments')
       ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
     END;
   END IF;
@@ -454,10 +454,10 @@ $prompt$,
 
   -- Same "an existing install picks this up too, not just a fresh one"
   -- reasoning as health_monitor's grant just above, for self_improve's own
-  -- new tool-model-experiment view: the IF NOT EXISTS block only runs the
+  -- new function-model-experiment view: the IF NOT EXISTS block only runs the
   -- very first time this agent is created.
   INSERT INTO allgres_private.permissions (agent_id, resource_type, resource_ref)
-  SELECT agent_id, 'view', 'allgres_public.v_tool_model_experiments'
+  SELECT agent_id, 'view', 'allgres_public.v_function_model_experiments'
   FROM allgres_private.agents WHERE name = 'self_improve'
   ON CONFLICT (agent_id, resource_type, resource_ref) DO NOTHING;
 END
@@ -540,8 +540,8 @@ SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connections', ''
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.api_connection_secrets', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedures', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_history', '');
-SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_tools', '');
-SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_tool_bindings', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.functions', '');
+SELECT pg_catalog.pg_extension_config_dump('allgres_private.procedure_function_bindings', '');
 SELECT pg_catalog.pg_extension_config_dump('allgres_private.schedules', '');
 -- Real runtime state (which canary experiments ran, and what they decided),
 -- not regenerated by CREATE EXTENSION -- the same "a pg_dump of this

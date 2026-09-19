@@ -597,14 +597,14 @@ BEGIN
         (p_request->>'agent_id')::uuid, p_request->>'autonomy_level'
       );
 
-    -- Named starting points for self_improve's own two tool_override
+    -- Named starting points for self_improve's own two function_override
     -- autonomy dials (allgres_private.validate_agent_config's own
     -- comment) -- a value between or outside the three presets is still
     -- reachable directly with fn_set_agent_config, same as any other
     -- agent_config tunable; this is only the convenience wrapper.
-    WHEN 'agents.set_tool_override_autonomy_preset' THEN
+    WHEN 'agents.set_function_override_autonomy_preset' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
-      RETURN allgres_public.fn_set_tool_override_autonomy_preset(
+      RETURN allgres_public.fn_set_function_override_autonomy_preset(
         (p_request->>'agent_id')::uuid, p_request->>'preset'
       );
 
@@ -724,21 +724,21 @@ BEGIN
 
     -- Read-only visibility into self_improve's model-optimizer canary
     -- experiments. Admin-only, the same as a 'create_agent' proposal in the
-    -- inbox above (proposals.list's own comment) -- a tool's model choice
+    -- inbox above (proposals.list's own comment) -- a function's model choice
     -- is an infra-wide decision, not scoped to any one non-admin user's
     -- agents. Queries the private tables directly rather than going through
-    -- allgres_public.v_tool_model_experiments: that view's own
+    -- allgres_public.v_function_model_experiments: that view's own
     -- agent_may_read gate is for an *agent's* execute_sql (current_agent_id()
     -- is NULL here, dashboard_rpc has no agent context of its own), and
     -- dashboard_rpc's admin check just above already is this surface's
     -- access control -- the same reasoning proposals.list/fixes.list below
     -- query allgres_private.change_proposals/fix_proposals directly instead
     -- of through a view.
-    WHEN 'tool_experiments.list' THEN
+    WHEN 'function_experiments.list' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN jsonb_build_object('ok', true, 'experiments', COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
-          'experiment_id', x.experiment_id, 'tool_id', x.tool_id, 'tool_name', x.tool_name,
+          'experiment_id', x.experiment_id, 'function_id', x.function_id, 'function_name', x.function_name,
           'candidate_provider', x.candidate_provider, 'candidate_model', x.candidate_model,
           'canary_percent', x.canary_percent, 'status', x.status,
           'min_sample_size', x.min_sample_size, 'baseline_success_rate', x.baseline_success_rate,
@@ -748,7 +748,7 @@ BEGIN
         ) ORDER BY x.created_at DESC)
         FROM (
           SELECT
-            e.experiment_id, e.tool_id, pt.name AS tool_name,
+            e.experiment_id, e.function_id, pt.name AS function_name,
             e.candidate_provider, e.candidate_model, e.canary_percent, e.status,
             e.min_sample_size, e.baseline_success_rate,
             count(oc.call_id) AS sample_size,
@@ -758,7 +758,7 @@ BEGIN
             ) AS candidate_success_rate,
             e.reason, e.created_at, e.decided_at
           FROM allgres_private.model_experiments e
-          JOIN allgres_private.procedure_tools pt USING (tool_id)
+          JOIN allgres_private.functions pt USING (function_id)
           LEFT JOIN allgres_private.outbound_calls oc
             ON oc.experiment_id = e.experiment_id AND oc.outcome IS NOT NULL
           WHERE NOT (p_request ? 'status') OR e.status = p_request->>'status'
@@ -824,7 +824,7 @@ BEGIN
     -- Fills the four grant-target pickers a permissions editor needs in one
     -- call: agent-visible views (queried live from pg_catalog, not hardcoded,
     -- so a newly created view shows up with no code change), the one real
-    -- tool, other agents (delegate targets), and a note that http_host is
+    -- function, other agents (delegate targets), and a note that http_host is
     -- free text -- there is no fixed list of allowed hosts to offer.
     WHEN 'permissions.options' THEN
       RETURN jsonb_build_object(
@@ -833,7 +833,7 @@ BEGIN
           SELECT jsonb_agg(schemaname || '.' || viewname ORDER BY viewname)
           FROM pg_catalog.pg_views WHERE schemaname = 'allgres_public'
         ), '[]'::jsonb),
-        'tools', '["http_get", "http_request"]'::jsonb,
+        'functions', '["http_get", "http_request"]'::jsonb,
         'agents', COALESCE((
           SELECT jsonb_agg(name ORDER BY name) FROM allgres_private.agents WHERE is_active
         ), '[]'::jsonb),
@@ -1462,7 +1462,7 @@ BEGIN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_delete_model_price((p_request->>'provider_id')::uuid, p_request->>'model');
 
-    -- Roadmap item 2: named external HTTP endpoints the 'http_request' tool
+    -- Roadmap item 2: named external HTTP endpoints the 'http_request' function
     -- can call with a stored credential (see allgres_private.api_connections'
     -- own comment). Never returns api_key -- only has_secret, the same as
     -- settings.get for llm_providers.
@@ -1565,33 +1565,33 @@ BEGIN
         (p_request->>'procedure_id')::uuid, (p_request->>'generation')::int
       );
 
-    WHEN 'procedure_tools.list' THEN
-      RETURN jsonb_build_object('ok', true, 'tools', COALESCE((
+    WHEN 'functions.list' THEN
+      RETURN jsonb_build_object('ok', true, 'functions', COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
-          'tool_id', pt.tool_id, 'name', pt.name, 'description', pt.description,
+          'function_id', pt.function_id, 'name', pt.name, 'description', pt.description,
           'handler', pt.handler, 'args_template', pt.args_template,
           'is_active', pt.is_active,
           'procedures', COALESCE((
             SELECT jsonb_agg(pr.name ORDER BY pr.name)
-            FROM allgres_private.procedure_tool_bindings pb
+            FROM allgres_private.procedure_function_bindings pb
             JOIN allgres_private.procedures pr USING (procedure_id)
-            WHERE pb.tool_id = pt.tool_id
+            WHERE pb.function_id = pt.function_id
           ), '[]'::jsonb)
         ) ORDER BY pt.name)
-        FROM allgres_private.procedure_tools pt
+        FROM allgres_private.functions pt
       ), '[]'::jsonb));
 
-    WHEN 'procedure_tools.create' THEN
+    WHEN 'functions.create' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
-      RETURN allgres_public.fn_create_procedure_tool(
+      RETURN allgres_public.fn_create_function(
         p_request->>'name', p_request->>'description', p_request->>'handler',
         COALESCE(p_request->'args_template', '{}'::jsonb)
       );
 
-    WHEN 'procedure_tools.bind' THEN
+    WHEN 'functions.bind' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
-      RETURN allgres_public.fn_bind_procedure_tool(
-        (p_request->>'procedure_id')::uuid, (p_request->>'tool_id')::uuid
+      RETURN allgres_public.fn_bind_procedure_function(
+        (p_request->>'procedure_id')::uuid, (p_request->>'function_id')::uuid
       );
 
     -- Roadmap item 6: schedule/event-driven execution (see

@@ -596,7 +596,7 @@ $fn$;
 
 -- ---------------------------------------------------------------------------
 -- Roadmap item 2: generic authenticated HTTP connections, for the
--- 'http_request' tool (see fn_next_step's call_tool handling and
+-- 'http_request' function (see fn_next_step's call_function handling and
 -- fn_claim_outbound below). Same create/set/set_secret shape as
 -- fn_create_provider/fn_set_provider/fn_set_provider_secret, deliberately --
 -- this is the same credential-storage problem (a named endpoint plus an
@@ -754,7 +754,7 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION allgres_public.fn_create_procedure_tool(
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_function(
   p_name text, p_description text, p_handler text, p_args_template jsonb
 ) RETURNS jsonb
 LANGUAGE plpgsql
@@ -768,33 +768,33 @@ DECLARE
   v_id uuid;
 BEGIN
   IF v_name !~ '^[a-z][a-z0-9_]{0,62}$' THEN
-    RAISE EXCEPTION 'tool name must use lowercase letters, digits, and underscores' USING ERRCODE = 'P0001';
+    RAISE EXCEPTION 'function name must use lowercase letters, digits, and underscores' USING ERRCODE = 'P0001';
   END IF;
   IF NULLIF(trim(p_description), '') IS NULL THEN
-    RAISE EXCEPTION 'tool description is required' USING ERRCODE = 'P0001';
+    RAISE EXCEPTION 'function description is required' USING ERRCODE = 'P0001';
   END IF;
   IF p_handler <> 'http_get' THEN
-    RAISE EXCEPTION 'only the http_get tool handler is supported' USING ERRCODE = 'P0001';
+    RAISE EXCEPTION 'only the http_get function handler is supported' USING ERRCODE = 'P0001';
   END IF;
   IF p_args_template IS NULL
     OR jsonb_typeof(p_args_template) <> 'object'
     OR p_args_template ?| ARRAY(SELECT key FROM jsonb_object_keys(p_args_template) key WHERE key <> 'url') THEN
-    RAISE EXCEPTION 'http_get tool arguments must contain only url' USING ERRCODE = 'P0001';
+    RAISE EXCEPTION 'http_get function arguments must contain only url' USING ERRCODE = 'P0001';
   END IF;
   v_url := NULLIF(trim(p_args_template->>'url'), '');
   v_reason := allgres_private.check_outbound_url(v_url, false);
   IF v_reason IS NOT NULL THEN
-    RAISE EXCEPTION 'invalid tool URL: %', v_reason USING ERRCODE = 'P0001';
+    RAISE EXCEPTION 'invalid function URL: %', v_reason USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO allgres_private.procedure_tools (name, description, handler, args_template)
+  INSERT INTO allgres_private.functions (name, description, handler, args_template)
   VALUES (v_name, trim(p_description), p_handler, jsonb_build_object('url', v_url))
-  RETURNING tool_id INTO v_id;
-  PERFORM allgres_private.audit('procedure_tools.create', jsonb_build_object('tool_id', v_id, 'name', v_name));
-  RETURN jsonb_build_object('ok', true, 'tool_id', v_id);
+  RETURNING function_id INTO v_id;
+  PERFORM allgres_private.audit('functions.create', jsonb_build_object('function_id', v_id, 'name', v_name));
+  RETURN jsonb_build_object('ok', true, 'function_id', v_id);
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION allgres_public.fn_bind_procedure_tool(p_procedure_id uuid, p_tool_id uuid)
+CREATE OR REPLACE FUNCTION allgres_public.fn_bind_procedure_function(p_procedure_id uuid, p_function_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -804,12 +804,12 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM allgres_private.procedures WHERE procedure_id = p_procedure_id) THEN
     RAISE EXCEPTION 'procedure not found' USING ERRCODE = 'P0001';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM allgres_private.procedure_tools WHERE tool_id = p_tool_id) THEN
-    RAISE EXCEPTION 'tool not found' USING ERRCODE = 'P0001';
+  IF NOT EXISTS (SELECT 1 FROM allgres_private.functions WHERE function_id = p_function_id) THEN
+    RAISE EXCEPTION 'function not found' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO allgres_private.procedure_tool_bindings (procedure_id, tool_id)
-  VALUES (p_procedure_id, p_tool_id) ON CONFLICT DO NOTHING;
-  PERFORM allgres_private.audit('procedure_tools.bind', jsonb_build_object('procedure_id', p_procedure_id, 'tool_id', p_tool_id));
+  INSERT INTO allgres_private.procedure_function_bindings (procedure_id, function_id)
+  VALUES (p_procedure_id, p_function_id) ON CONFLICT DO NOTHING;
+  PERFORM allgres_private.audit('functions.bind', jsonb_build_object('procedure_id', p_procedure_id, 'function_id', p_function_id));
   RETURN jsonb_build_object('ok', true);
 END;
 $fn$;

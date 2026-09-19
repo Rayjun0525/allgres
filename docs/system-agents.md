@@ -17,7 +17,7 @@ all — zero rows without the grant, the full picture with it.
 
 A seeded example, `health_monitor`, ships with both views granted and
 nothing else — no `execute_sql` access to any business-data view, no
-`delegate`, no tools, and deliberately no `propose_change` in its prompt
+`delegate`, no functions, and deliberately no `propose_change` in its prompt
 either: this first slice is read-and-report only, more conservative than a
 maintenance agent strictly needs to be, on purpose. It compares against
 what it `remember`ed on its last run (already sitting in its own context,

@@ -69,7 +69,7 @@ source IPs; it is one layer, not a substitute for a real token.
 ## Outbound requests (SSRF)
 
 One guard covers every outbound path — the LLM endpoint, the `http_get` and
-`http_request` tools, and the OAuth token exchange:
+`http_request` functions, and the OAuth token exchange:
 
 - `https` only, unless the provider is explicitly marked
   `allow_private_network`;

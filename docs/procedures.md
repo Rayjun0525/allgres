@@ -20,8 +20,8 @@ turn, only once granted the matching permission — `resource_type =
 'procedure'`, `resource_ref = '<name>'` — through the exact same
 `agent_has_permission`/`agent_permission_refs` machinery (inheritance
 through a system agent's parent chain included) that already gates a view
-or a tool. A disabled procedure (`is_active = false`) never shows even to
-an agent holding the grant, the same way a disabled `llm_providers` row
+or a function. A disabled procedure (`is_active = false`) never shows even
+to an agent holding the grant, the same way a disabled `llm_providers` row
 stops being reachable without losing its history.
 
 Deliberately not in this slice: no agent-authored procedures yet — an
@@ -31,12 +31,13 @@ admin_approval/self_approve/auto autonomy-level flow `propose_change`
 already gives an agent for its own policy) is real future work, not done
 here.
 
-## Procedure tool functions
+## Functions
 
-A procedure may also bind one or more named **tool functions**. A tool
-function is the callable half of a procedure: its name and description are
-shown with the procedure in the agent's `tools` bounds, while its handler and
-arguments stay operator-curated in `allgres_private.procedure_tools`.
+A procedure may also bind one or more named **Functions**
+(`allgres_private.functions`, `procedure_function_bindings`). A Function is
+the callable half of a procedure: its name and description are shown with
+the procedure in the agent's `functions` bounds (the `call_function` action),
+while its handler and arguments stay operator-curated.
 
 The first handler is deliberately narrow: `http_get` with one fixed HTTPS
 URL. An agent calls the function name (for example, `seoul_weather`) with an
@@ -46,12 +47,14 @@ outbound URL validation. A procedure grant therefore authorizes precisely
 the reviewed operation without also granting arbitrary `http_get` access or
 an open-ended host permission.
 
-Create and bind functions from **Settings → Procedure tool functions**. The
-seeded `seoul-weather` procedure demonstrates the pattern: it binds
-`seoul_weather` to `https://wttr.in/Seoul?format=j1` and grants the procedure
-to the General agent. To make a new function usable, bind it to a procedure,
-then grant that procedure to the intended agent in the usual permission UI.
-This keeps the naming model clear: **Procedure** is the reusable capability;
-a **tool function** is one fixed operation inside it. More handlers,
-parameter schemas, versioning, and agent-authored proposals remain future
-work.
+Create and bind Functions via the `functions.create` / `functions.bind`
+dashboard_rpc actions — there is no dedicated Settings panel for authoring
+them yet, only the read-only Function model experiments panel. The seeded
+`seoul-weather` procedure demonstrates the pattern: it binds `seoul_weather`
+to `https://wttr.in/Seoul?format=j1` and grants the procedure to the General
+agent. To make a new Function usable, bind it to a procedure, then grant
+that procedure to the intended agent in the usual permission UI. This keeps
+the naming model clear: **Procedure** is the reusable capability; a
+**Function** is one fixed operation inside it. Real PL/pgSQL Function
+bodies, an MCP-client handler, and agent-authored proposals are planned
+next (see the v2 redesign notes in KNOWN_ISSUES.md).

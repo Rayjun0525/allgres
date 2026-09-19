@@ -323,9 +323,9 @@ fn perform_http(call_id: &str, call: &Value) -> (i32, String) {
         GuardedResolver { allow_private },
     );
 
-    let outcome = if kind == "tool" {
+    let outcome = if kind == "function" {
         // http_get always queued "GET" here (the column defaults to it); the
-        // 'http_request' tool is the first caller that ever queues anything
+        // 'http_request' function is the first caller that ever queues anything
         // else. GET/DELETE take no body (ureq's WithoutBody builder has no
         // send_json at all); POST/PUT/PATCH always send one, defaulting to
         // an empty JSON object when the SQL layer didn't attach a real body.

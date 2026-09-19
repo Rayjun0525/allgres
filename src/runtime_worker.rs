@@ -458,9 +458,9 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
         // in Settings) -- same shape as 3c, a different table with no
         // task_id (fn_claim_provider_probe, not fn_claim_outbound), sharing
         // the same HTTP threads and capacity budget. kind is forced to
-        // "tool" here (not left to perform_http's "llm" default) because
+        // "function" here (not left to perform_http's "llm" default) because
         // this is a plain GET with no body -- the default POST-JSON branch
-        // perform_http takes for "llm"/anything-not-"tool"/"oauth" would
+        // perform_http takes for "llm"/anything-not-"function"/"oauth" would
         // send this GET request a body it neither needs nor should have.
         if ready && in_flight < capacity {
             let claimed = claim_provider_probe_jobs((capacity - in_flight) as i32);
@@ -472,7 +472,7 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
                     }
                     let mut call = call.clone();
                     if let Some(obj) = call.as_object_mut() {
-                        obj.insert("kind".to_string(), json!("tool"));
+                        obj.insert("kind".to_string(), json!("function"));
                     }
                     let job = OutboundJob { call_id: id.to_string(), queue: OutboundQueue::ProviderProbe, call };
                     if jobs.send(job).is_err() {

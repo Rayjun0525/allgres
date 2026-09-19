@@ -27,7 +27,7 @@ and `pg_proc` regardless of who is asking. So it only validates and returns
 the normalized statement text; it queues that text in `allgres_private.sql_calls`
 and the runtime worker's SPI thread claims it and runs it as a **top-level**
 statement, issued directly by the worker with no enclosing `SECURITY DEFINER`
-frame — the same claim/complete shape already used for outbound LLM and tool
+frame — the same claim/complete shape already used for outbound LLM and function
 calls. `SET ROLE sandbox` is legal there.
 
 Layered, strongest first:
