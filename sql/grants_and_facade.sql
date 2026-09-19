@@ -1582,6 +1582,7 @@ BEGIN
           'function_id', pt.function_id, 'name', pt.name, 'description', pt.description,
           'handler', pt.handler, 'args_template', pt.args_template,
           'body', pt.body, 'param_schema', pt.param_schema,
+          'mcp_connection_id', pt.mcp_connection_id,
           'build_status', pt.build_status, 'build_error', pt.build_error,
           'is_active', pt.is_active,
           'procedures', COALESCE((
@@ -1599,7 +1600,8 @@ BEGIN
       RETURN allgres_public.fn_create_function(
         p_request->>'name', p_request->>'description', p_request->>'handler',
         COALESCE(p_request->'args_template', '{}'::jsonb),
-        p_request->>'body', p_request->'param_schema'
+        p_request->>'body', p_request->'param_schema',
+        NULL, NULLIF(p_request->>'mcp_connection_id', '')::uuid
       );
 
     WHEN 'functions.update' THEN

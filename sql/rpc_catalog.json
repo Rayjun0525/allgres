@@ -747,6 +747,7 @@
       "body",
       "description",
       "handler",
+      "mcp_connection_id",
       "name",
       "param_schema",
       "session_token"

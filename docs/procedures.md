@@ -80,6 +80,27 @@ Two handlers exist:
   `SECURITY DEFINER` or change role before it ever reaches `CREATE
   FUNCTION`, as defense in depth — the real boundary is still the role
   switch above, not this check.
+- **`mcp_call`** — calls one remote tool on a registered MCP server over
+  HTTP, via a JSON-RPC `tools/call` request. Reuses
+  `allgres_private.api_connections` for the server registration rather
+  than a second connection registry — an MCP server is just another named
+  HTTP endpoint with an optional credential, the same shape
+  `http_request`'s own connection already is. `args_template` holds only
+  `{"tool":"<remote tool name>"}`, fixed at creation like `http_get`'s own
+  single field; the agent's own `call_function` args become the JSON-RPC
+  request's `arguments` object, never fixed — closer to `http_request`'s
+  "operator fixes the destination, the agent supplies the request
+  content" split than to `http_get`'s fully-fixed shape. No build step:
+  unlike `plpgsql`, there is no dynamically-compiled Postgres object here,
+  just a JSON-RPC envelope built at call time. A JSON-RPC-level `error`
+  and the MCP-specific `result.isError` tool failure are both reported
+  back as a plain error, never mistaken for a successful `function_result`
+  — confirmed live against a real HTTP endpoint (see KNOWN_ISSUES.md's
+  Phase 3d entry). Deliberately narrow, the same way `http_get` was at
+  first: a direct `tools/call` request with no prior MCP session
+  handshake (`initialize`), so it works against a stateless MCP-over-HTTP
+  server but not one that requires establishing a session first — a real
+  interoperability gap for some servers, not yet addressed.
 
 Create or edit a Function via the `functions.create` / `functions.update` /
 `functions.bind` dashboard_rpc actions — there is no dedicated Settings
@@ -141,5 +162,10 @@ would (see KNOWN_ISSUES.md's Phase 3c entry).
 This keeps the naming model clear: **Procedure** is the reusable
 capability, now real code as well as a description; a **Function** is one
 operation inside it — fixed for `http_get`, a real role-scoped PL/pgSQL
-body for `plpgsql`. An MCP-client handler is planned next (see the v2
-redesign notes in KNOWN_ISSUES.md).
+body for `plpgsql`, one remote tool call for `mcp_call`. A Procedure body
+may only call something synchronous this way (another `plpgsql` Function,
+ordinary SQL) — an `http_get`/`http_request`/`mcp_call` Function needs a
+real outbound HTTP round trip, which a single blocking `CALL` cannot wait
+on; that, and a `call_llm()` helper for a Procedure's own mid-pipeline
+judgment calls, remain future work (see the v2 redesign notes in
+KNOWN_ISSUES.md).

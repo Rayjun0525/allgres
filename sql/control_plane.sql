@@ -2079,6 +2079,37 @@ CREATE TABLE IF NOT EXISTS allgres_private.api_connection_secrets (
   api_key        text
 );
 
+-- A third Function handler, mcp_call (Phase 3d): calls one remote tool on
+-- a registered MCP server via a JSON-RPC 'tools/call' request over HTTP
+-- (see fn_submit_result's call_function branch and fn_complete_outbound's
+-- own 'mcp' kind below). Reuses api_connections above rather than
+-- inventing a second connection registry -- an MCP server is just another
+-- named HTTP endpoint with an optional credential, the same shape
+-- http_request's own connection already is. args_template holds only
+-- {"tool":"<remote tool name>"}, the one thing an operator reviews and
+-- fixes (mirroring http_get's own single-fixed-field shape); the agent's
+-- own call_function args become the JSON-RPC request's "arguments"
+-- object, the same "operator fixes the destination, the agent supplies
+-- the request content" split http_request's connection already uses.
+-- Column added here, after api_connections, rather than inline in
+-- functions' own CREATE TABLE far above: functions is defined long before
+-- api_connections in this file, so an inline REFERENCES here would fail
+-- with "relation does not exist" (the same ordering pitfall
+-- function_calls/procedure_calls already had to work around against
+-- tasks in Phase 3b/3c).
+ALTER TABLE allgres_private.functions
+  ADD COLUMN IF NOT EXISTS mcp_connection_id uuid REFERENCES allgres_private.api_connections(connection_id);
+ALTER TABLE allgres_private.functions DROP CONSTRAINT IF EXISTS functions_handler_check;
+ALTER TABLE allgres_private.functions ADD CONSTRAINT functions_handler_check
+  CHECK (handler IN ('http_get', 'plpgsql', 'mcp_call'));
+ALTER TABLE allgres_private.functions DROP CONSTRAINT IF EXISTS functions_check;
+ALTER TABLE allgres_private.functions ADD CONSTRAINT functions_check
+  CHECK (
+    (handler = 'http_get' AND body IS NULL AND mcp_connection_id IS NULL)
+    OR (handler = 'plpgsql' AND body IS NOT NULL AND mcp_connection_id IS NULL)
+    OR (handler = 'mcp_call' AND body IS NULL AND mcp_connection_id IS NOT NULL)
+  );
+
 CREATE TABLE IF NOT EXISTS allgres_private.outbound_calls (
   call_id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id          uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
@@ -2150,9 +2181,16 @@ CREATE INDEX IF NOT EXISTS procedure_calls_queued_idx
 -- mid-turn, unlike an agent's own identity embedding (embedding_calls
 -- above, which has no task to belong to). See fn_complete_outbound's
 -- 'embedding' branch for what happens to the response.
+-- 'mcp': an mcp_call Function's JSON-RPC 'tools/call' request (see
+-- functions.mcp_connection_id's own comment). Same claim-time credential
+-- injection as 'function'/http_request (connection_id/auth_kind), same
+-- generic JSON-POST perform_http already sends for anything that isn't
+-- 'function'/'oauth' -- only fn_complete_outbound needs a kind-specific
+-- branch, to unwrap the JSON-RPC envelope's 'result'/'error' instead of
+-- passing the raw HTTP response through.
 ALTER TABLE allgres_private.outbound_calls DROP CONSTRAINT IF EXISTS outbound_calls_kind_check;
 ALTER TABLE allgres_private.outbound_calls ADD CONSTRAINT outbound_calls_kind_check
-  CHECK (kind IN ('llm', 'function', 'embedding', 'recall'));
+  CHECK (kind IN ('llm', 'function', 'embedding', 'recall', 'mcp'));
 
 -- Per-function model override/canary tracking. procedure_function_id is stamped on
 -- BOTH sides of the "function call, then the turn that processes its result"
@@ -4378,6 +4416,8 @@ DECLARE
   v_path text;
   v_req_headers jsonb;
   v_req_body jsonb;
+  v_orig_args jsonb;
+  v_call_kind text;
   v_procedure_function allgres_private.functions%ROWTYPE;
   v_procedure_bound boolean := false;
   v_bound_procedure_id uuid;
@@ -4580,6 +4620,14 @@ BEGIN
   IF v_action = 'call_function' THEN
     v_function := v_parsed->>'function';
     v_args := COALESCE(v_parsed->'args', '{}'::jsonb);
+    -- Preserved for mcp_call below: v_args itself gets overwritten with
+    -- the procedure-bound Function's fixed args_template further down
+    -- (http_get's own substitution), but an mcp_call Function needs the
+    -- agent's *original* args as the JSON-RPC call's "arguments" object,
+    -- the same way http_request's own agent-supplied body/headers are
+    -- never replaced by anything fixed.
+    v_orig_args := v_args;
+    v_call_kind := 'function';
     v_allowed := allgres_private.agent_has_permission(t.agent_id, 'function', v_function);
     IF NOT v_allowed THEN
       SELECT pt.* INTO v_procedure_function
@@ -4641,7 +4689,7 @@ BEGIN
       END IF;
     END IF;
 
-    IF v_function NOT IN ('http_get', 'http_request') THEN
+    IF v_function NOT IN ('http_get', 'http_request', 'mcp_call') THEN
       PERFORM allgres_private.append_log(
         p_task_id, t.step_count + 1, 'error',
         jsonb_build_object('reason', 'unknown_function', 'function', v_function)
@@ -4660,6 +4708,53 @@ BEGIN
       v_method := 'GET';
       v_url := v_args->>'url';
       v_req_headers := jsonb_build_object('accept', 'application/json, text/plain, */*');
+    ELSIF v_function = 'mcp_call' THEN
+      -- Only ever reachable through the procedure-bound resolution path
+      -- above (like plpgsql -- see its own comment); mcp_connection_id
+      -- being NULL here means an admin somehow granted a direct 'function'
+      -- permission literally named 'mcp_call', which was never a
+      -- meaningful grant to begin with (there is no connection or remote
+      -- tool to call without a real Function row).
+      IF NOT v_procedure_bound OR v_procedure_function.mcp_connection_id IS NULL THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'unknown_function', 'function', v_function)
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+      SELECT * INTO v_conn FROM allgres_private.api_connections
+      WHERE connection_id = v_procedure_function.mcp_connection_id AND is_enabled;
+      IF NOT FOUND THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'mcp_connection_unavailable', 'function', v_function)
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END IF;
+      v_call_kind := 'mcp';
+      v_method := 'POST';
+      v_url := v_conn.base_url;
+      v_conn_auth := NULLIF(v_conn.auth_kind, 'none');
+      -- v_args is already the Function's own fixed args_template
+      -- ({"tool":"..."}) by this point (the same overwrite http_get's
+      -- args_template substitution relies on); v_orig_args is what the
+      -- calling agent actually passed to call_function, which becomes the
+      -- JSON-RPC request's own "arguments" -- the "operator fixes the
+      -- destination and which remote tool, the agent supplies the
+      -- request content" split, same as http_request's own connection.
+      v_req_headers := jsonb_build_object('accept', 'application/json, text/event-stream', 'content-type', 'application/json');
+      v_req_body := jsonb_build_object(
+        'jsonrpc', '2.0', 'id', 1, 'method', 'tools/call',
+        'params', jsonb_build_object('name', v_args->>'tool', 'arguments', COALESCE(v_orig_args, '{}'::jsonb))
+      );
+      IF NOT (v_req_headers ? 'idempotency-key') THEN
+        v_req_headers := v_req_headers || jsonb_build_object(
+          'idempotency-key',
+          md5(p_task_id::text || '|' || v_method || '|' || v_url || '|' || v_req_body::text)
+        );
+      END IF;
     ELSE
       -- 'http_request': method/headers/body, and an optional named
       -- allgres_private.api_connections credential -- see that table's own
@@ -4782,7 +4877,7 @@ BEGIN
       allow_private, connection_id, auth_kind, idempotency_key,
       procedure_function_id, procedure_id
     ) VALUES (
-      p_task_id, 'function', v_function, v_url, v_method, v_req_headers, v_req_body, 'queued',
+      p_task_id, v_call_kind, v_function, v_url, v_method, v_req_headers, v_req_body, 'queued',
       COALESCE(v_conn.allow_private_network, false), v_conn.connection_id, v_conn_auth,
       v_req_headers->>'idempotency-key',
       CASE WHEN v_procedure_bound THEN v_procedure_function.function_id END,
@@ -6585,6 +6680,7 @@ DECLARE
   v_price allgres_private.llm_model_prices%ROWTYPE;
   v_cost_usd numeric;
   v_schedule_id uuid;
+  v_mcp_fname text;
 BEGIN
   PERFORM set_config('statement_timeout', '2000', true);
 
@@ -6635,6 +6731,57 @@ BEGIN
         'procedure_id', c.procedure_id
       )
     );
+  -- 'mcp' (Phase 3d, an mcp_call Function's JSON-RPC 'tools/call'
+  -- request): unlike 'function' above, an HTTP 200 alone does not mean
+  -- success -- JSON-RPC and MCP both signal failure *inside* a
+  -- successful HTTP response, never only via status code. Checked in
+  -- order: a non-2xx HTTP status (transport-level failure, same as any
+  -- other outbound call); an unparseable body; a JSON-RPC-level `error`
+  -- member (the remote server itself rejected the request, e.g. unknown
+  -- method or bad params); the MCP-specific `result.isError` flag (the
+  -- *tool* ran and reported its own failure, distinct from a JSON-RPC
+  -- error -- see the MCP spec's tool-execution-error convention). Only
+  -- past all four does `result.content` become a function_result, the
+  -- same shape a plpgsql Function's own result already has.
+  ELSIF c.kind = 'mcp' THEN
+    IF p_status IS NULL OR p_status < 200 OR p_status >= 300 THEN
+      v_payload := jsonb_build_object(
+        'type', 'error',
+        'message', 'mcp http ' || COALESCE(p_status::text, '0') || ': ' || left(COALESCE(p_body, ''), 2000)
+      );
+    ELSE
+      BEGIN
+        v_parsed := p_body::jsonb;
+      EXCEPTION WHEN others THEN
+        v_parsed := NULL;
+      END;
+      SELECT name INTO v_mcp_fname FROM allgres_private.functions WHERE function_id = c.procedure_function_id;
+      IF v_parsed IS NULL THEN
+        v_payload := jsonb_build_object(
+          'type', 'error',
+          'message', 'mcp function ' || COALESCE(v_mcp_fname, 'unknown') || ' returned invalid JSON: ' || left(COALESCE(p_body, ''), 500)
+        );
+      ELSIF v_parsed ? 'error' THEN
+        v_payload := jsonb_build_object(
+          'type', 'error',
+          'message', 'mcp function ' || COALESCE(v_mcp_fname, 'unknown') || ' failed: ' || COALESCE(v_parsed->'error'->>'message', 'unknown error')
+        );
+      ELSIF COALESCE((v_parsed->'result'->>'isError')::boolean, false) THEN
+        v_payload := jsonb_build_object(
+          'type', 'error',
+          'message', 'mcp function ' || COALESCE(v_mcp_fname, 'unknown') || ' reported a tool error: ' || left(COALESCE(v_parsed->'result'->'content'->0->>'text', ''), 500)
+        );
+      ELSE
+        v_payload := jsonb_build_object(
+          'type', 'function_result',
+          'content', jsonb_build_object(
+            'function', v_mcp_fname,
+            'result', COALESCE(v_parsed->'result'->'content', v_parsed->'result', 'null'::jsonb)
+          )
+        );
+      END IF;
+    END IF;
+
   -- fn_search_agents' own query embedding (item: semantic delegate
   -- discovery). Same {"data":[{"embedding":[...]}]} response shape as
   -- fn_complete_agent_embedding parses, but the result here is a ranked
@@ -6995,8 +7142,12 @@ BEGIN
       -- to confirm instead of letting the agent retry blindly, reusing
       -- the exact waiting_human/human_approvals shape fn_submit_result's
       -- own await_human branch already uses -- not a new mechanism, the
-      -- same one, triggered by the watchdog instead of the model.
-      IF r.kind = 'function' AND COALESCE(r.method, 'GET') <> 'GET' THEN
+      -- same one, triggered by the watchdog instead of the model. An
+      -- mcp_call is always a POST (a JSON-RPC 'tools/call' request), so
+      -- it gets the identical ambiguous-mutation treatment as a mutating
+      -- http_request -- a remote MCP tool is no less likely to have a
+      -- real side effect than an arbitrary POST.
+      IF r.kind IN ('function', 'mcp') AND COALESCE(r.method, 'GET') <> 'GET' THEN
         UPDATE allgres_private.tasks
         SET status = 'waiting_human', updated_at = now()
         WHERE task_id = r.task_id;

@@ -784,7 +784,7 @@ $fn$;
 CREATE OR REPLACE FUNCTION allgres_public.fn_create_function(
   p_name text, p_description text, p_handler text, p_args_template jsonb,
   p_body text DEFAULT NULL, p_param_schema jsonb DEFAULT NULL,
-  p_created_by_agent_id uuid DEFAULT NULL
+  p_created_by_agent_id uuid DEFAULT NULL, p_mcp_connection_id uuid DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -796,6 +796,7 @@ DECLARE
   v_reason text;
   v_id uuid;
   v_sql_ident text;
+  v_mcp_tool text;
 BEGIN
   IF v_name !~ '^[a-z][a-z0-9_]{0,62}$' THEN
     RAISE EXCEPTION 'function name must use lowercase letters, digits, and underscores' USING ERRCODE = 'P0001';
@@ -803,7 +804,7 @@ BEGIN
   IF NULLIF(trim(p_description), '') IS NULL THEN
     RAISE EXCEPTION 'function description is required' USING ERRCODE = 'P0001';
   END IF;
-  IF p_handler NOT IN ('http_get', 'plpgsql') THEN
+  IF p_handler NOT IN ('http_get', 'plpgsql', 'mcp_call') THEN
     RAISE EXCEPTION 'unknown function handler: %', p_handler USING ERRCODE = 'P0001';
   END IF;
 
@@ -820,6 +821,29 @@ BEGIN
     END IF;
     INSERT INTO allgres_private.functions (name, description, handler, args_template, created_by_agent_id)
     VALUES (v_name, trim(p_description), p_handler, jsonb_build_object('url', v_url), p_created_by_agent_id)
+    RETURNING function_id INTO v_id;
+  ELSIF p_handler = 'mcp_call' THEN
+    -- Fixed at creation, same as http_get: which MCP server (a real,
+    -- enabled api_connections row) and which one remote tool on it. The
+    -- agent's own call_function args become that tool's JSON-RPC
+    -- "arguments" object at call time (fn_submit_result), never
+    -- fixed here -- an MCP tool call is closer to http_request's "operator
+    -- fixes the destination, the agent supplies the request content"
+    -- split than to http_get's fully-fixed shape.
+    IF p_mcp_connection_id IS NULL OR NOT EXISTS (
+      SELECT 1 FROM allgres_private.api_connections WHERE connection_id = p_mcp_connection_id AND is_enabled
+    ) THEN
+      RAISE EXCEPTION 'mcp_call function needs an existing, enabled connection' USING ERRCODE = 'P0001';
+    END IF;
+    v_mcp_tool := NULLIF(trim(p_args_template->>'tool'), '');
+    IF p_args_template IS NULL
+      OR jsonb_typeof(p_args_template) <> 'object'
+      OR v_mcp_tool IS NULL
+      OR p_args_template ?| ARRAY(SELECT key FROM jsonb_object_keys(p_args_template) key WHERE key <> 'tool') THEN
+      RAISE EXCEPTION 'mcp_call function arguments must contain only a non-empty tool' USING ERRCODE = 'P0001';
+    END IF;
+    INSERT INTO allgres_private.functions (name, description, handler, args_template, mcp_connection_id, created_by_agent_id)
+    VALUES (v_name, trim(p_description), p_handler, jsonb_build_object('tool', v_mcp_tool), p_mcp_connection_id, p_created_by_agent_id)
     RETURNING function_id INTO v_id;
   ELSE
     PERFORM allgres_private.validate_function_body(p_body);

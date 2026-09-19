@@ -83,6 +83,11 @@ DECLARE
   v_func_test_proc uuid;
   v_created_procedure_id uuid;
   v_proc_name text;
+  v_mcp_conn_id uuid;
+  v_tid_saved uuid;
+  v_sid_saved uuid;
+  v_mcp_function_id uuid;
+  v_mcp_name text;
   v_i int;
   v_comp_sid uuid;
   v_comp_tid uuid;
@@ -802,6 +807,131 @@ BEGIN
   v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_function_uses_fixed_saved_url', 'ok', ok));
   DELETE FROM allgres_private.outbound_calls WHERE call_id = v_call2;
 
+  -- Saved here, restored just before 'disabled_procedure_hidden_even_
+  -- with_permission' below: every mcp_call/run_procedure test between
+  -- here and there creates its own fresh session/task and reassigns
+  -- v_tid/v_sid to it (a genuine fixture each of those tests needs), but
+  -- that pre-existing test still assumes v_tid is this exact "selftest
+  -- procedure recall" task -- caught live, without this it silently ran
+  -- fn_next_step against whatever task the last test above happened to
+  -- leave behind instead, and NOT LIKE against a NULL content (no
+  -- messages at all, a cancelled/completed task) evaluates to SQL NULL,
+  -- not false, so the case still reported as neither passing nor
+  -- actually failing.
+  v_tid_saved := v_tid;
+  v_sid_saved := v_sid;
+  v_sid := (allgres_public.fn_create_session(v_agent, 'selftest mcp_call')->>'session_id')::uuid;
+  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+
+  -- mcp_call (Phase 3d): fn_create_function's own validation.
+  BEGIN
+    PERFORM allgres_public.fn_create_function(
+      'selftest_mcp_no_conn', 'x', 'mcp_call', jsonb_build_object('tool', 'search'), NULL, NULL, NULL, NULL
+    );
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%needs an existing, enabled connection%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'create_mcp_call_function_needs_a_connection', 'ok', ok));
+
+  DELETE FROM allgres_private.functions WHERE name LIKE 'selftest_mcp_%';
+  DELETE FROM allgres_private.api_connections WHERE name = 'selftest_mcp_conn';
+  r := allgres_public.fn_create_connection('selftest_mcp_conn', 'https://mcp.selftest.invalid/mcp');
+  v_mcp_conn_id := (r->>'connection_id')::uuid;
+
+  BEGIN
+    PERFORM allgres_public.fn_create_function(
+      'selftest_mcp_bad_args', 'x', 'mcp_call', jsonb_build_object('tool', 'search', 'extra', 1), NULL, NULL, NULL, v_mcp_conn_id
+    );
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%only a non-empty tool%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'create_mcp_call_function_rejects_extra_args', 'ok', ok));
+
+  v_mcp_name := 'selftest_mcp_' || replace(extract(epoch from clock_timestamp())::text, '.', '_');
+  sub := allgres_public.fn_create_function(
+    v_mcp_name, 'calls a remote MCP tool', 'mcp_call', jsonb_build_object('tool', 'search'), NULL, NULL, NULL, v_mcp_conn_id
+  );
+  v_mcp_function_id := (sub->>'function_id')::uuid;
+  ok := (sub->>'ok')::boolean AND EXISTS (
+    SELECT 1 FROM allgres_private.functions
+    WHERE function_id = v_mcp_function_id AND mcp_connection_id = v_mcp_conn_id
+      AND args_template = jsonb_build_object('tool', 'search') AND build_status = 'built'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'create_mcp_call_function_stores_tool_and_connection', 'ok', ok));
+
+  -- Bind it to 'selftest_procedure' (v_call, still granted to v_agent at
+  -- this point) and drive a real call_function through it: the JSON-RPC
+  -- envelope carries the fixed tool name but the agent's own args, and
+  -- the row is queued with kind='mcp', not 'function' -- an outbound HTTP
+  -- call, unlike a plpgsql Function's call_function (a local SPI call,
+  -- no outbound_calls row at all).
+  PERFORM allgres_public.fn_bind_procedure_function(v_call, v_mcp_function_id);
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"call_function"}',
+    'parsed', jsonb_build_object('action', 'call_function', 'function', v_mcp_name, 'args', jsonb_build_object('query', 'weather'))
+  ));
+  v_call2 := (sub->>'call_id')::uuid;
+  SELECT to_jsonb(o) INTO r FROM allgres_private.outbound_calls o WHERE o.call_id = v_call2;
+  ok := sub->>'action' = 'call_function'
+    AND r->>'kind' = 'mcp' AND r->>'method' = 'POST' AND r->>'url' = 'https://mcp.selftest.invalid/mcp'
+    AND (r->'request_body'->'params'->>'name') = 'search'
+    AND (r->'request_body'->'params'->'arguments') = jsonb_build_object('query', 'weather');
+  v := v || jsonb_build_array(jsonb_build_object('name', 'mcp_call_function_queues_jsonrpc_tools_call', 'ok', ok));
+
+  -- fn_complete_outbound's own 'mcp' branch: a JSON-RPC-level error (still
+  -- HTTP 200, per spec) and an MCP tool-level error (result.isError) are
+  -- both reported as a plain 'error', never mistaken for a function_result;
+  -- a genuine success unwraps result.content. fn_complete_outbound only
+  -- ever completes a call that is 'in_flight' (fenced against a stale/
+  -- already-reclaimed result) -- fn_claim_outbound is what normally makes
+  -- that transition, so a direct call here has to do it by hand first,
+  -- the same way the pre-existing llm-override tests already do.
+  UPDATE allgres_private.outbound_calls SET status = 'in_flight' WHERE call_id = v_call2;
+  comp := allgres_public.fn_complete_outbound(v_call2, 200, '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}');
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'error' AND content->>'message' LIKE '%method not found%'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'mcp_jsonrpc_error_reported_as_error', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"call_function"}',
+    'parsed', jsonb_build_object('action', 'call_function', 'function', v_mcp_name, 'args', '{}'::jsonb)
+  ));
+  v_call2 := (sub->>'call_id')::uuid;
+  UPDATE allgres_private.outbound_calls SET status = 'in_flight' WHERE call_id = v_call2;
+  comp := allgres_public.fn_complete_outbound(v_call2, 200, '{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"tool blew up"}]}}');
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'error' AND content->>'message' LIKE '%tool blew up%'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'mcp_tool_level_error_reported_as_error', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"call_function"}',
+    'parsed', jsonb_build_object('action', 'call_function', 'function', v_mcp_name, 'args', '{}'::jsonb)
+  ));
+  v_call2 := (sub->>'call_id')::uuid;
+  UPDATE allgres_private.outbound_calls SET status = 'in_flight' WHERE call_id = v_call2;
+  comp := allgres_public.fn_complete_outbound(v_call2, 200, '{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"sunny"}],"isError":false}}');
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'function' AND content->'result'->0->>'text' = 'sunny'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'mcp_success_unwraps_result_content', 'ok', ok));
+
+  -- Every outbound_calls row above still references 'selftest_procedure'
+  -- (procedure_id) via its own FK -- cleaned up here, the same as
+  -- procedure_function_uses_fixed_saved_url's own DELETE just above,
+  -- rather than left to block selftest_cleanup's later DELETE FROM
+  -- procedures WHERE procedure_id = v_call (caught live: it does).
+  DELETE FROM allgres_private.outbound_calls WHERE procedure_function_id = v_mcp_function_id;
+
   -- run_procedure (Phase 3c): 'selftest_procedure' has content but no real
   -- body (the original seed, content-only) -- rejected up front as
   -- 'procedure_not_built', never silently queued against a nonexistent
@@ -900,6 +1030,13 @@ BEGIN
   PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', v_proc_name);
 
   PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
+
+  -- Restore the original "selftest procedure recall" task/session (saved
+  -- above, before the mcp_call/run_procedure tests started reassigning
+  -- v_tid/v_sid to their own fixtures) -- everything from here on is
+  -- pre-existing code that still assumes v_tid is that one task.
+  v_tid := v_tid_saved;
+  v_sid := v_sid_saved;
 
   -- Disabled (is_active = false) never shows even with a grant -- the same
   -- "operator can pull a bad one without deleting its history" property

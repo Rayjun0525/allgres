@@ -5941,3 +5941,152 @@ independently of Function-level role-scoping, not merely inherited by
 association. Confirmed via `pg_proc` that both built objects showed
 `prosecdef = false`, owned by `allgres_function_admin`, matching a
 Function's own build.
+
+## 75. v2 redesign, Phase 3d: `mcp_call` -- a Function handler that calls a remote MCP tool over JSON-RPC
+
+Adds a third Function handler, `mcp_call`, alongside `http_get` and
+`plpgsql`: a `call_function` against it sends a JSON-RPC 2.0 `tools/call`
+request to a registered MCP server. Deliberately narrow, the same way
+`http_get` was at first: a single, session-less `tools/call` POST, no
+prior MCP `initialize` handshake -- works against a stateless MCP-over-
+HTTP server, not one that requires establishing a session first. That
+gap, an `http_get`/`http_request`/`mcp_call` Function call from inside a
+Procedure body (needs a real async round trip a blocking `CALL` cannot
+wait on), and `call_llm()` all stay future work, unchanged from Phase
+3b/3c's own notes.
+
+**Design: reuse everything already built for `http_request`, add nothing
+new to the Rust side.** `api_connections` (name, base_url, auth_kind,
+credential) is reused rather than inventing a second connection
+registry -- an MCP server is just another named HTTP endpoint with an
+optional credential. `functions.args_template` holds only
+`{"tool":"<remote tool name>"}`, fixed at creation like `http_get`'s own
+single field (an operator reviews and fixes *which* MCP server and
+*which* tool); the agent's own `call_function` args become the JSON-RPC
+request's `arguments` object, never fixed -- closer to `http_request`'s
+"operator fixes the destination, the agent supplies the request content"
+split than to `http_get`'s fully-fixed shape. Checked before writing any
+Rust: `src/outbound.rs`'s `perform_http` already has a generic
+"anything that isn't `function`/`oauth`" branch that does a plain
+JSON-POST with whatever headers are supplied, and `fn_claim_outbound`'s
+credential injection is already keyed on `auth_kind`/`connection_id`
+being set, not on `kind` -- both already correct for `mcp` with zero
+Rust changes. `mcp_call` needs no build step at all (unlike `plpgsql`):
+there is no dynamically-compiled Postgres object, just a JSON-RPC
+envelope assembled at call time, so `build_status` stays `'built'` (the
+default) for it.
+
+**Schema (`sql/control_plane.sql`).** `functions.handler` widened to
+`('http_get', 'plpgsql', 'mcp_call')`; new `functions.mcp_connection_id`
+(FK to `api_connections`) and a widened multi-column `CHECK` tying each
+handler to exactly the columns it needs. Added *after*
+`api_connections`'s own `CREATE TABLE`, not inline in `functions`'s
+(defined far earlier in the file) -- the same "relation does not exist"
+ordering pitfall `function_calls`/`procedure_calls` already hit against
+`tasks` in Phase 3b/3c, checked for proactively this time before writing
+the `ALTER TABLE` rather than after a failed install. Confirmed the
+inline `CHECK` constraints' exact auto-generated names
+(`functions_handler_check`, `functions_check`) live against the running
+database before writing `DROP CONSTRAINT IF EXISTS` for them, rather
+than guessing -- a wrong guessed name would have silently left the old,
+narrower constraint in place alongside a new one that could never
+actually be satisfied by any row. `outbound_calls.kind` widened to add
+`'mcp'`; `fn_watchdog`'s ambiguous-mutation-on-timeout check (which
+pauses a task for human confirmation rather than blindly retrying a
+call that may already have taken effect) widened from `kind = 'function'`
+to `kind IN ('function', 'mcp')`, since an MCP tool call is exactly as
+ambiguous on timeout as a mutating `http_request`.
+
+**Authoring (`fn_create_function`, `operator_runtime_and_integrations.
+sql`).** Validates the connection exists and is enabled, and that
+`args_template` contains only a non-empty `tool`. `fn_update_function`
+left untouched -- like `http_get`, `mcp_call` is fixed at creation, not
+editable (a new connection or tool is a new Function, not an edit of
+this one).
+
+**Calling one (`fn_submit_result`'s `call_function` branch,
+`sql/control_plane.sql`).** Only ever reachable through the
+procedure-bound resolution path, same as `plpgsql` -- there is no
+meaningful direct `'function'` permission grant literally named
+`mcp_call` (no connection or remote tool to call without a real Function
+row), guarded explicitly rather than left to fail confusingly. Builds
+`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":<the
+fixed tool>,"arguments":<the agent's own original args>}}` and queues it
+into `outbound_calls` with `kind='mcp'`, reusing the exact same
+URL-validation/`http_host`-permission/idempotency-key logic
+`http_get`/`http_request` already run through (a new `v_call_kind`
+variable replaces a hardcoded `'function'` literal in the shared
+`INSERT`, the only change needed to that shared code path).
+
+**Completing one (`fn_complete_outbound`'s new `'mcp'` branch).** Unlike
+`'function'`, an HTTP 200 does not mean success -- JSON-RPC and MCP both
+signal failure *inside* a nominally successful response, never only via
+status code. Checked in order: a non-2xx HTTP status (transport failure);
+an unparseable body; a JSON-RPC-level `error` member (the server itself
+rejected the request); the MCP-specific `result.isError` flag (the tool
+ran and reported its own failure -- a second, distinct error convention
+from JSON-RPC's own, per the MCP spec). Only past all four does
+`result.content` become a `function_result`, the same shape a `plpgsql`
+Function's own result already has.
+
+**Three real bugs caught during verification, all in the new selftest
+coverage, none in the SQL/Rust that actually ships:**
+
+1. A fixed-name `api_connections` row (`selftest_mcp_conn`) created for
+   the test and never deleted -- a `UNIQUE` violation on the second,
+   separate-connection `fn_selftest()` run. Fixed with the same
+   delete-before-create idempotency pattern the pre-existing
+   `selftest_conn`/`selftest_schedule` tests already use, which should
+   have been reached for immediately rather than assumed unnecessary.
+2. Deleting that same connection on the next run then failed on a
+   *different* FK, from leftover `selftest_mcp_*` Function rows still
+   referencing it -- fixed by deleting those first.
+3. The most interesting one: the new `mcp_call` tests reused the shared
+   `v_tid`/`v_sid` task fixture directly (unlike the Phase 3c
+   `run_procedure` tests just below them, which correctly create their
+   own fresh session per test) to drive four `call_function`/
+   `fn_complete_outbound` round trips against it. Each one silently
+   consumed one more of that shared task's step budget, which a much
+   later, entirely unrelated, pre-existing test
+   (`disabled_procedure_hidden_even_with_permission`) still assumes is
+   nowhere near exhausted. That test's own check is a `NOT LIKE` against
+   `fn_next_step`'s response content -- once the task actually hit
+   `max_steps`, `fn_next_step` returns `{"action":"done","reason":
+   "max_steps"}` with no `messages` key at all, so the check's left side
+   became SQL `NULL` rather than a real string, and `NULL NOT LIKE
+   '...'` evaluates to `NULL`, not `false`. `fn_selftest`'s own scoring
+   (`WHERE NOT (ok)::boolean`) treats a `NULL` `ok` as neither a pass nor
+   a genuine failure (`NOT NULL` is `NULL`, and a `WHERE` clause keeps
+   only `TRUE` rows) -- so this surfaced only as a case quietly missing
+   from both counts, not a loud test failure, until checked for
+   explicitly with a query that treats "not `TRUE`" as "count it."
+   Fixed by saving `v_tid`/`v_sid` before the `mcp_call` tests begin,
+   pointing them at a dedicated fresh session for the duration of that
+   block (mirroring what the `run_procedure` tests already did
+   correctly), and restoring the saved originals immediately before
+   control returns to the pre-existing code that still depends on them.
+   Root-caused by adding a targeted `RAISE NOTICE` to dump `fn_next_
+   step`'s actual response at the failing line rather than continuing to
+   reason about it in the abstract, once two rounds of guessing hadn't
+   converged.
+
+Verified: rebuilt and reinstalled; fresh install's `fn_selftest()` read
+`"failed": 0, "passed": 352` across two separate `psql` connections,
+identical both times (`failing_cases` genuinely empty, not just an
+absence of `(ok)::boolean = false` rows -- checked with a query that
+also flags a `NULL` `ok`, precisely because of bug 3 above); `cargo test
+--lib --no-default-features --features pg16` still 30/30. Live, beyond
+`fn_selftest` (a new external-call kind, exactly what the verification
+loop calls out): ran a real local HTTP server as a minimal MCP endpoint,
+registered it as a connection with `allow_private_network` (needed for a
+`127.0.0.1` target, the same SSRF guard every other outbound call already
+goes through), created an `mcp_call` Function against it, bound and
+granted a procedure, and drove a real task through `call_function`.
+Confirmed the actual outbound HTTP request the runtime worker sent
+carried the correct JSON-RPC envelope (`"method":"tools/call"`,
+`"params":{"name":"search","arguments":{"query":"weather"}}`) and that
+the mock server's real JSON-RPC response came back unwrapped correctly
+in the execution log
+(`{"result":[{"text":"echo:weather","type":"text"}],"function":
+"live_mcp_search"}`) -- the full round trip through the real HTTP thread
+pool, not a synthetic body handed straight to `fn_complete_outbound`.
