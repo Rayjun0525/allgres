@@ -224,7 +224,6 @@ jobs:
         run: |
           sudo chown "$(id -un)" /usr/lib/postgresql/16/lib /usr/share/postgresql/16/extension
           cargo pgrx install --no-default-features --features pg16 --pg-config /usr/lib/postgresql/16/bin/pg_config
-          cp -f sql/allgres--*.sql /usr/share/postgresql/16/extension/
 
       - name: Configure and restart the cluster
         run: |

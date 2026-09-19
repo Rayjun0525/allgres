@@ -6472,3 +6472,61 @@ rendered as the same status badge every other "healthy" row uses) once
 given the corrected `BEGIN`/`END` shape, edited a `plpgsql` function's
 fields, and bound a Function to a Procedure -- confirmed in the database
 directly afterward, not just by re-reading the same page's own claim.
+
+## 78. GitHub Actions CI had been red on `main` since before the v2 redesign, undetected by this project's own local verification loop
+
+Every commit through item 77 reported `fn_selftest()` 359/0 (twice, in
+separate connections), `cargo test --lib` 32/32, and live browser/psql
+checks -- and every one of those claims was true for what it actually
+tested. None of it ran `tests/e2e_mock.sql`, the fixture CI itself runs
+after `smoke.sql`, so a real regression sat on `main` through the entire
+v2 redesign without ever showing up locally. Caught only when an external
+review of the live repo pointed at GitHub's own Actions tab; verified
+directly against `main`'s Actions history and job logs rather than taken
+on faith, since the specific technical claim (which commit, which job,
+which line) was checkable and checking it first is cheaper than either
+agreeing or dismissing on trust.
+
+Two independent, unrelated causes, both real:
+
+- **`tests/e2e_mock.sql` still asserted `WHERE e.role = 'tool'`** in the
+  `search_agents` embedding-search fixture (4 occurrences), a leftover
+  from the Phase 3a Tool-to-Function rename. `sql/selftest.sql` and the
+  Rust/SQL wire-protocol layer were updated at rename time; this file,
+  which only ever runs in CI (it needs the `allgres web` worker acting as
+  a mock HTTP endpoint, `ALLGRES_ENABLE_MOCK=1`), was not. Confirmed via
+  the actual job log: `psql:tests/e2e_mock.sql:263: ERROR:  Allgres E2E
+  search_agents did not complete (got 0 tool results)`, with the offending
+  `WHERE e.role = 'tool';` line printed right below it by Postgres's own
+  `CONTEXT`. This alone failed all three `native-matrix` legs (PG16/17/18)
+  and `docker-smoke`, which all run this file after `smoke.sql`.
+- **`fault-injection-drill`'s own `cargo pgrx install` step still ran `cp
+  -f sql/allgres--*.sql /usr/share/postgresql/16/extension/`** after an
+  earlier, unrelated commit ("Remove the extension-upgrade-path
+  machinery") deleted those checked-in `sql/allgres--*.sql` files
+  entirely -- pgrx has written the generated SQL script straight into the
+  extension directory on every `cargo pgrx install` since, making the
+  `cp` both redundant and, once its source glob matched nothing, fatal
+  (`cp: cannot stat 'sql/allgres--*.sql': No such file or directory`,
+  exit code 1). The `native-matrix` job's own install step never had this
+  line, which is why only this one job hit it. This predates the entire
+  v2 redesign -- confirmed via `mcp__github__actions_list`, the commit
+  that removed the upgrade-path files was already red on `main` before
+  any Phase 3a-3e work started, for this reason alone.
+
+Fixed by correcting `tests/e2e_mock.sql`'s four `role = 'tool'` lines to
+`role = 'function'`, and deleting the leftover `cp` line from
+`.github/workflows/ci.yml`'s `fault-injection-drill` job. Verified: fresh
+install, `fn_selftest()` 359/0 across two separate connections; `cargo
+test --lib` 32/32 (unaffected, no Rust or extension-SQL change); then,
+specifically because this item is about a gap in exactly that loop, ran
+the real regressing fixture directly -- `ALLGRES_ENABLE_MOCK=1`, cluster
+restarted, `tests/smoke.sql` then `tests/e2e_mock.sql` via `psql -f`
+against the real `allgres runtime`/`allgres web` workers -- which now
+prints `e2e ok` instead of the `search_agents did not complete` error.
+The local verification loop this project relies on (`CLAUDE.md`'s own
+checklist) still does not run `tests/e2e_mock.sql` or the fault-injection
+drill by default; that gap is not closed by this item and remains real --
+this item only fixes the two specific regressions it let through, and
+does so by running the exact fixture that exposed them, not by trusting
+`fn_selftest()` alone this time.

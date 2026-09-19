@@ -253,7 +253,7 @@ BEGIN
     SELECT count(*) INTO v_n
     FROM allgres_private.execution_logs e
     JOIN _allgres_search_agent s ON s.task_id = e.task_id
-    WHERE e.role = 'tool';
+    WHERE e.role = 'function';
     EXIT WHEN v_n = 1;
     PERFORM pg_sleep(0.1);
   END LOOP;
@@ -270,7 +270,7 @@ BEGIN
   SELECT (e.content->>'body')::jsonb INTO v_body
   FROM allgres_private.execution_logs e
   JOIN _allgres_search_agent s ON s.task_id = e.task_id
-  WHERE e.role = 'tool';
+  WHERE e.role = 'function';
 
   v_top := v_body->0->>'name';
   IF v_top <> 'e2e_alpha_agent' THEN
@@ -348,7 +348,7 @@ BEGIN
     SELECT count(*) INTO v_n
     FROM allgres_private.execution_logs e
     JOIN _allgres_recall_agent r ON r.task_id = e.task_id
-    WHERE e.role = 'tool';
+    WHERE e.role = 'function';
     EXIT WHEN v_n = 1;
     PERFORM pg_sleep(0.1);
   END LOOP;
@@ -365,7 +365,7 @@ BEGIN
   SELECT (e.content->>'body')::jsonb INTO v_body
   FROM allgres_private.execution_logs e
   JOIN _allgres_recall_agent r ON r.task_id = e.task_id
-  WHERE e.role = 'tool';
+  WHERE e.role = 'function';
 
   v_top := v_body->0->>'content';
   IF v_top NOT LIKE '%alpha%' THEN
