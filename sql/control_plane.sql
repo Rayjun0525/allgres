@@ -1368,6 +1368,36 @@ CREATE TABLE IF NOT EXISTS allgres_private.users (
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 
+-- The real PostgreSQL security identity behind a user account (v2 redesign,
+-- "권한 시스템" -- a real Postgres ROLE per user, NOLOGIN, is the actual
+-- enforcement mechanism now; the account row above stays the login/identity
+-- record). Set once by fn_provision_user_role (fn_create_user calls it for
+-- every new account). Mirrors agents.pg_role's own column exactly, for the
+-- same reason: NULL only ever means "not provisioned yet", never "no
+-- identity" -- a fresh install with no users yet has an empty table, not a
+-- NULL-role user.
+ALTER TABLE allgres_private.users
+  ADD COLUMN IF NOT EXISTS pg_role text UNIQUE;
+
+-- v2 redesign, "권한 시스템": which real user account owns a given agent, if
+-- any. NULL for every system agent and for 'general' (a shared front door,
+-- not any one user's possession) -- non-NULL only for a user-defined agent,
+-- created on that user's behalf (through 'general', see fn_create_agent's
+-- own comment). This is what an agent's own PostgreSQL role gets chained
+-- under: fn_create_agent GRANTs the owner's pg_role to the new agent's
+-- pg_role when this is set, so the agent inherits exactly what its owner
+-- was actually granted -- never more -- and nothing has to separately check
+-- "does this exceed the creator's own permission" at creation time, because
+-- PostgreSQL's own role-membership inheritance already makes exceeding it
+-- impossible. An agent is, in effect, an AI identity subordinate to the
+-- real human identity that made it -- the same shape a service account
+-- under a human owner has anywhere else. Declared here, after
+-- allgres_private.users exists, rather than alongside agents' other
+-- ALTER TABLEs above (this file's own load order creates agents long
+-- before users).
+ALTER TABLE allgres_private.agents
+  ADD COLUMN IF NOT EXISTS created_by_user_id uuid REFERENCES allgres_private.users(user_id);
+
 -- A bearer token distinct from the dashboard's own shared one: this one
 -- identifies a single logged-in user, carried by the browser the same way
 -- (sessionStorage, sent back on every chat/messenger/account call) but

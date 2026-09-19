@@ -69,7 +69,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers')
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;
@@ -79,7 +79,18 @@ BEGIN
     WHERE n.nspname = 'allgres_private' AND p.proname = 'fn_provision_agent_role'
       AND p.proowner <> 'allgres_role_admin'::regrole
   ) THEN
-    ALTER FUNCTION allgres_private.fn_provision_agent_role(uuid) OWNER TO allgres_role_admin;
+    ALTER FUNCTION allgres_private.fn_provision_agent_role(uuid, text) OWNER TO allgres_role_admin;
+  END IF;
+
+  -- fn_provision_user_role (v2 redesign, "권한 시스템"): same reasoning as
+  -- fn_provision_agent_role just above -- it runs a dynamic CREATE ROLE, so
+  -- it is owned by allgres_role_admin, never allgres_owner.
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'allgres_private' AND p.proname = 'fn_provision_user_role'
+      AND p.proowner <> 'allgres_role_admin'::regrole
+  ) THEN
+    ALTER FUNCTION allgres_private.fn_provision_user_role(uuid) OWNER TO allgres_role_admin;
   END IF;
 
   IF EXISTS (
@@ -164,7 +175,15 @@ GRANT EXECUTE ON FUNCTION allgres_private.fn_signal_cancel_worker() TO allgres_o
 -- same role never needed one, which is why this was missed on the first
 -- pass (confirmed live: fn_create_agent failed with "permission denied for
 -- function fn_provision_agent_role" the moment the two owners diverged).
-GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_agent_role(uuid) TO allgres_owner;
+GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_agent_role(uuid, text) TO allgres_owner;
+
+-- fn_create_user (owned by allgres_owner) calls fn_provision_user_role
+-- directly -- same cross-owner reasoning as fn_provision_agent_role above,
+-- and fn_create_agent (owned by allgres_owner) reads allgres_private.users
+-- .pg_role directly too (to resolve p_creator_user_id's own role before
+-- chaining a new agent under it) -- that read needs no extra grant since
+-- allgres_owner already owns the users table via the ownership-fixing pass.
+GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_user_role(uuid) TO allgres_owner;
 
 -- fn_provision_agent_role's own body reads and updates allgres_private.agents
 -- directly -- also implicit before the ownership split (same reasoning as
@@ -172,8 +191,11 @@ GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_agent_role(uuid) TO allgr
 -- schema allgres_private" on the very next call after the EXECUTE grant
 -- alone. USAGE on the schema plus exactly the two privileges the function
 -- body actually uses, not a blanket grant on every table in the schema.
+-- fn_provision_user_role needs the same two privileges on allgres_private
+-- .users, for the same reason.
 GRANT USAGE ON SCHEMA allgres_private TO allgres_role_admin;
 GRANT SELECT, UPDATE ON allgres_private.agents TO allgres_role_admin;
+GRANT SELECT, UPDATE ON allgres_private.users TO allgres_role_admin;
 
 REVOKE ALL ON SCHEMA allgres_private FROM PUBLIC;
 REVOKE ALL ON SCHEMA allgres_public FROM PUBLIC;
@@ -345,8 +367,14 @@ REVOKE EXECUTE ON FUNCTION allgres_private.encrypt_secret(text) FROM PUBLIC;
 -- needs this directly: fn_create_agent (allgres_public, same owner) calls it
 -- internally, which needs no grant at all between two objects owned by the
 -- same role.
-REVOKE ALL ON FUNCTION allgres_private.fn_provision_agent_role(uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_agent_role(uuid) TO operator;
+REVOKE ALL ON FUNCTION allgres_private.fn_provision_agent_role(uuid, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_agent_role(uuid, text) TO operator;
+
+-- Same reasoning as fn_provision_agent_role just above, for the user-role
+-- equivalent: manually re-provisioning a user's role is a legitimate
+-- operator maintenance action, but explicit beats ambient.
+REVOKE ALL ON FUNCTION allgres_private.fn_provision_user_role(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_user_role(uuid) TO operator;
 
 -- ---------------------------------------------------------------------------
 -- 13. allgres facade + dashboard RPC.
@@ -1816,7 +1844,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers')
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;

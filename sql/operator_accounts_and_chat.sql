@@ -336,6 +336,57 @@ $fn$;
 --     the lighter audit log item 28 already built.
 -- ---------------------------------------------------------------------------
 
+-- v2 redesign, "권한 시스템": gives a user account its own real PostgreSQL
+-- security identity, the same shape fn_provision_agent_role (sql/operator_
+-- agents_and_policies.sql) already gives an agent, and for the same
+-- underlying reason -- SET ROLE has to land on something real once a
+-- Function/Procedure call actually needs PostgreSQL's own GRANT/RLS to mean
+-- anything. NOLOGIN: nobody ever connects as this role directly: it exists
+-- purely to be GRANTed real privileges and to be GRANTed, in turn, to every
+-- agent this user creates (fn_provision_agent_role's own p_owner_pg_role
+-- parameter) -- role membership inheritance is what makes "a user-defined
+-- agent can never exceed its creator's own permissions" automatic instead
+-- of a separately-maintained check. Owned by allgres_role_admin (the one
+-- role scoped to CREATE ROLE, see "1. Roles" in sql/control_plane.sql),
+-- never allgres_owner, same reasoning as fn_provision_agent_role. No
+-- explicit self-grant needed after CREATE ROLE: a role with CREATEROLE
+-- that creates another role can already GRANT that role's membership to
+-- anyone else with no further setup -- confirmed live, and the opposite
+-- assumption (that an explicit `GRANT <new role> TO allgres_role_admin
+-- WITH ADMIN OPTION` was needed first) failed outright with "ADMIN option
+-- cannot be granted back to your own grantor", since creating the role
+-- already made allgres_role_admin its grantor.
+CREATE OR REPLACE FUNCTION allgres_private.fn_provision_user_role(p_user_id uuid)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_role text;
+BEGIN
+  SELECT pg_role INTO v_role FROM allgres_private.users WHERE user_id = p_user_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_provision_user_role: user not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF v_role IS NOT NULL THEN
+    RETURN v_role;
+  END IF;
+
+  v_role := 'allgres_user_' || replace(p_user_id::text, '-', '');
+
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+    EXECUTE format(
+      'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT',
+      v_role
+    );
+  END IF;
+
+  UPDATE allgres_private.users SET pg_role = v_role WHERE user_id = p_user_id;
+  RETURN v_role;
+END;
+$fn$;
+
 -- Every password operation here requires pgcrypto -- unlike provider secret
 -- encryption (allgres_private.encrypt_secret), which degrades to plaintext
 -- with a loud warning when pgcrypto is missing, a password hash has no safe
@@ -354,6 +405,7 @@ DECLARE
   v_ns text := allgres_private.pgcrypto_schema();
   v_hash text;
   v_id uuid;
+  v_pg_role text;
   v_username text := btrim(COALESCE(p_username, ''));
 BEGIN
   IF v_ns IS NULL THEN
@@ -377,10 +429,12 @@ BEGIN
   VALUES (v_username, v_hash, p_role)
   RETURNING user_id INTO v_id;
 
+  v_pg_role := allgres_private.fn_provision_user_role(v_id);
+
   -- Never log p_password/v_hash: audit_log.details is not a secrets store.
   PERFORM allgres_private.audit('users.create', jsonb_build_object('user_id', v_id, 'username', v_username, 'role', p_role));
 
-  RETURN jsonb_build_object('ok', true, 'user_id', v_id, 'username', v_username, 'role', p_role);
+  RETURN jsonb_build_object('ok', true, 'user_id', v_id, 'username', v_username, 'role', p_role, 'pg_role', v_pg_role);
 END;
 $fn$;
 

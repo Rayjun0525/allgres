@@ -29,7 +29,17 @@
 -- SECURITY DEFINER function in this file, is owned by that same installer;
 -- it does not need or request any privilege the installer did not already
 -- have.
-CREATE OR REPLACE FUNCTION allgres_private.fn_provision_agent_role(p_agent_id uuid)
+-- p_owner_pg_role (v2 redesign, "권한 시스템"): when given, GRANTs that role
+-- to the new agent's role so it inherits exactly what its owner was
+-- actually granted -- never more. Only applied on first provisioning (the
+-- early-return above skips it on replay), which is correct: an agent's
+-- owner is fixed at creation, never reassigned later. Requires
+-- allgres_role_admin to already hold ADMIN OPTION on p_owner_pg_role --
+-- true for any role fn_provision_user_role created, since that function
+-- (owned by the same allgres_role_admin) grants itself that option at
+-- creation time; passing any other role here would fail loudly with a
+-- permission error rather than silently skipping the chain.
+CREATE OR REPLACE FUNCTION allgres_private.fn_provision_agent_role(p_agent_id uuid, p_owner_pg_role text DEFAULT NULL)
 RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -56,6 +66,9 @@ BEGIN
     EXECUTE format('GRANT sandbox TO %I', v_role);
     EXECUTE format('GRANT %I TO worker', v_role);
     EXECUTE format('ALTER ROLE %I SET search_path = pg_temp', v_role);
+    IF p_owner_pg_role IS NOT NULL THEN
+      EXECUTE format('GRANT %I TO %I', p_owner_pg_role, v_role);
+    END IF;
   END IF;
 
   UPDATE allgres_private.agents SET pg_role = v_role WHERE agent_id = p_agent_id;
@@ -63,7 +76,14 @@ BEGIN
 END;
 $fn$;
 
-CREATE OR REPLACE FUNCTION allgres_public.fn_create_agent(p_name text, p_prompt text DEFAULT NULL)
+-- p_creator_user_id (v2 redesign, "권한 시스템"): NULL for an admin/system
+-- creation (unchanged behavior); set for a user-defined agent, created on
+-- that user's own behalf (through 'general' in chat -- see the Chat
+-- redesign). Chains the new agent's PostgreSQL role under the creator's own
+-- (fn_provision_agent_role's p_owner_pg_role), so the agent can never do
+-- anything its creator was not itself granted -- enforced by PostgreSQL's
+-- own role-membership inheritance, not by a check in this function.
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_agent(p_name text, p_prompt text DEFAULT NULL, p_creator_user_id uuid DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -72,21 +92,28 @@ AS $fn$
 DECLARE
   v_id uuid;
   v_role text;
+  v_owner_pg_role text;
 BEGIN
   IF btrim(COALESCE(p_name, '')) = '' THEN
     RAISE EXCEPTION 'agent name required' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO allgres_private.agents (name)
-  VALUES (btrim(p_name))
+  IF p_creator_user_id IS NOT NULL THEN
+    SELECT pg_role INTO v_owner_pg_role FROM allgres_private.users WHERE user_id = p_creator_user_id;
+    IF v_owner_pg_role IS NULL THEN
+      RAISE EXCEPTION 'fn_create_agent: creator user not found or not yet provisioned' USING ERRCODE = 'P0001';
+    END IF;
+  END IF;
+  INSERT INTO allgres_private.agents (name, created_by_user_id)
+  VALUES (btrim(p_name), p_creator_user_id)
   RETURNING agent_id INTO v_id;
   IF p_prompt IS NOT NULL AND btrim(p_prompt) <> '' THEN
     UPDATE allgres_private.policies
     SET system_prompt = p_prompt, updated_at = now()
     WHERE agent_id = v_id;
   END IF;
-  v_role := allgres_private.fn_provision_agent_role(v_id);
+  v_role := allgres_private.fn_provision_agent_role(v_id, v_owner_pg_role);
   PERFORM allgres_private.queue_agent_embedding(v_id);
-  PERFORM allgres_private.audit('agents.create', jsonb_build_object('agent_id', v_id, 'name', btrim(p_name)));
+  PERFORM allgres_private.audit('agents.create', jsonb_build_object('agent_id', v_id, 'name', btrim(p_name), 'created_by_user_id', p_creator_user_id));
   RETURN jsonb_build_object('ok', true, 'agent_id', v_id, 'pg_role', v_role);
 END;
 $fn$;

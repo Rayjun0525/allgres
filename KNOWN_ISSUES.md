@@ -5367,3 +5367,92 @@ sandbox-allowlist test's fixture list includes the literal string
 that is *not* on the allowlist (a plausible-looking name that happens to
 share the old project's name, not a reference to the removed rename
 machinery) -- left as-is.
+
+## 70. v2 redesign, Phase 1: a real PostgreSQL role per user, chained to every agent that user creates
+
+First slice of the "권한 시스템" redesign (`claude/allgres-v2-redesign` branch):
+real Postgres ROLE-based privilege, not just the procedural `permissions`
+table + `agent_has_permission()` checks every SECURITY DEFINER function
+runs today. The end goal is real `GRANT`/RLS enforcement once agents call
+real PL/pgSQL functions/procedures under their own identity; this phase is
+just the foundation those later phases build on -- creating the roles and
+chaining them correctly, nothing yet actually gated by them.
+
+Discovered before writing anything: agents already have their own real
+PostgreSQL role (`fn_provision_agent_role`, `allgres_agent_<uuid>`,
+`sql/operator_agents_and_policies.sql`) -- built for an unrelated reason
+(PostgreSQL refuses `SET ROLE` inside a `SECURITY DEFINER` function, so
+`execute_sql`'s sandbox validates in one DEFINER call and executes in a
+second, non-DEFINER one, issued top-level by the runtime worker, where
+`SET LOCAL ROLE` is legal -- item 1). The redesign's own working plan had
+assumed agents would carry no PostgreSQL identity at all, only users would
+-- reading the actual code first turned up a real, load-bearing mechanism
+already doing exactly what a from-scratch design would have had to
+reinvent. Kept it rather than ripping it out: an agent is, in effect, an
+AI identity subordinate to whichever real human made it -- the same shape
+a service account under a human owner has anywhere else -- so the existing
+per-agent role is the right unit to chain under a new per-user role, not
+something to replace.
+
+Added:
+
+- `allgres_private.users.pg_role` (mirrors `agents.pg_role` exactly) and
+  `allgres_private.fn_provision_user_role(uuid)`, owned by
+  `allgres_role_admin` (the one role scoped to `CREATEROLE`, never
+  `allgres_owner` -- same reasoning `fn_provision_agent_role` already
+  documents). Creates `allgres_user_<uuid>`, `NOLOGIN`. `fn_create_user`
+  calls it for every new account and returns `pg_role` alongside the
+  existing fields.
+- `allgres_private.agents.created_by_user_id` (nullable; NULL for every
+  system agent and for 'general', a shared front door rather than any one
+  user's possession -- non-NULL only for a user-defined agent). Added
+  *after* the `users` table in `sql/control_plane.sql`, not alongside
+  `agents`' other columns further up the same file -- this file creates
+  `agents` long before `users` exists, and the FK needs both.
+- `fn_provision_agent_role` gained an optional `p_owner_pg_role text`
+  parameter: when given, `GRANT`s that role to the new agent's role right
+  after creating it, applied only on first provisioning (an agent's owner
+  is fixed at creation, never reassigned). `fn_create_agent` gained a
+  matching optional `p_creator_user_id uuid`, resolves that user's own
+  `pg_role`, and passes it through.
+
+One real bug caught by the verification loop, not by review: the first
+version of `fn_provision_user_role` followed a false analogy to how
+`sandbox`/`worker` membership is granted in "12. Grants" (`GRANT sandbox
+TO allgres_role_admin WITH ADMIN OPTION`, needed there because those are
+*pre-existing* fixed roles `allgres_role_admin` never created) and tried
+`GRANT <new user role> TO allgres_role_admin WITH ADMIN OPTION` right
+after creating it. That failed outright on the very first `fn_create_user`
+call in a fresh install's own `fn_selftest`: `ERROR: ADMIN option cannot
+be granted back to your own grantor` -- creating a role already makes the
+creator its grantor, so re-granting it back to itself is a cycle
+PostgreSQL refuses. Confirmed live (a `SET ROLE allgres_role_admin`
+session, `CREATE ROLE` a probe role, `GRANT` it straight to a second probe
+role with no self-grant in between) that no such step is needed at all:
+`CREATEROLE` plus having created a role is already sufficient to grant
+that role to anyone else. Removed the erroneous self-grant entirely rather
+than working around the error.
+
+Verified: rebuilt and reinstalled (`cargo pgrx install --no-default-
+features --features pg16`); fresh install's `fn_selftest()` read `"failed":
+0, "passed": 332` across two separate `psql` connections; `cargo test
+--lib --no-default-features --features pg16` still 30/30. Then the actual
+mechanism, live, not just "it installs": created a real user
+(`fn_create_user`) and a real agent owned by it (`fn_create_agent` with
+`p_creator_user_id` set), confirmed via `pg_auth_members` that the agent's
+role is a member of both `sandbox` (unchanged baseline) and the new user
+role; `GRANT`ed `SELECT` on a throwaway probe table to the user role only,
+then confirmed under `SET ROLE <agent's role>` the `SELECT` succeeded
+(inherited from the owner, nothing granted to the agent directly) while
+`SET ROLE sandbox` on the same table correctly hit `insufficient_privilege`
+-- the grant reached exactly the intended chain and nowhere else. Probe
+table and roles dropped afterward.
+
+Not yet done, later phases: nothing actually runs under `SET ROLE
+<owner>` yet (this phase only makes the chain exist); the Function/
+Procedure layer itself (real `SECURITY INVOKER` PL/pgSQL, replacing the
+current `procedure_tools`/`call_tool` shape); the chat-driven "ask general
+to create an agent for me" flow regular users would actually reach
+`fn_create_agent`'s new parameter through; and the `permissions` table's
+own redefinition as a GRANT mirror rather than the enforcement source it
+still is today.
