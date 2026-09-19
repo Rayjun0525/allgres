@@ -300,7 +300,7 @@ ALTER TABLE allgres_private.agents
 -- policies, versioned with policy_history/generation) nor a general agent
 -- feature (autonomy_level, permissions) -- a specific system agent's own
 -- tunable behavior instead: session_compactor's compaction_threshold/
--- compaction_keep_recent, orchestrator's min_mentions_to_route (see
+-- compaction_keep_recent is the one still in this file (see
 -- fn_set_agent_config and each reader's own comment). Unversioned and
 -- unstructured on purpose -- unlike a policy edit, changing one of these
 -- is not a decision anyone needs an approval trail or a rollback for, and
@@ -749,38 +749,6 @@ BEGIN
     'previous_summary', v_prev_summary,
     'turns', v_old_logs
   ));
-END;
-$fn$;
-
--- item 40: fires a one-shot advisory task for orchestrator whenever a
--- Messenger post @mentions more than one agent -- see fn_messenger_post's
--- own comment for what "advisory" means today (it records an opinion,
--- delivery order is still text order). Kept as its own function, not
--- inlined into fn_messenger_post, the same reasoning as
--- maybe_trigger_compaction: a clearly-named, independently testable unit.
-CREATE OR REPLACE FUNCTION allgres_private.queue_orchestrator_opinion(
-  p_orchestrator uuid, p_message_id uuid, p_text text, p_agent_ids uuid[]
-) RETURNS void
-LANGUAGE plpgsql
-AS $fn$
-DECLARE
-  v_sid uuid;
-  v_tid uuid;
-  v_candidates jsonb;
-BEGIN
-  SELECT COALESCE(jsonb_agg(jsonb_build_object('name', a.name, 'system_prompt', p.system_prompt)), '[]'::jsonb)
-  INTO v_candidates
-  FROM allgres_private.agents a
-  JOIN allgres_private.policies p USING (agent_id)
-  WHERE a.agent_id = ANY(p_agent_ids);
-
-  v_sid := (allgres_public.fn_create_session(
-    p_orchestrator, 'messenger_route:' || p_message_id::text
-  )->>'session_id')::uuid;
-  SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
-
-  INSERT INTO allgres_private.execution_logs (task_id, step_number, role, content)
-  VALUES (v_tid, 1, 'user', jsonb_build_object('message', p_text, 'candidates', v_candidates));
 END;
 $fn$;
 
@@ -4845,8 +4813,8 @@ BEGIN
     -- Default (no "wait"): completely unchanged from before roadmap item 5
     -- -- delegate is a one-shot hand-off, the parent's job ends the moment
     -- the child is queued, and no caller of delegate written before this
-    -- (orchestrator's multi-mention routing, self_improve's cross-agent
-    -- proposals) is affected. "wait": true is the opt-in real dependency
+    -- (self_improve's cross-agent proposals) is affected. "wait": true is
+    -- the opt-in real dependency
     -- edge: the parent stays 'running' instead of completing, so its next
     -- turn can delegate again (fanning out to more children over further
     -- turns, exactly like this one) or call the new await_children action
@@ -5353,8 +5321,8 @@ BEGIN
 
   -- Roadmap item 5: a real multi-agent task dependency edge. delegate
   -- itself stays fire-and-forget (an agent may fan out to several
-  -- sub-agents across several turns, exactly as orchestrator already does
-  -- for parallel routing); await_children is the explicit synchronization
+  -- sub-agents across several turns); await_children is the explicit
+  -- synchronization
   -- point -- pause until every one of this task's own children (however
   -- many were delegated, across however many turns) reaches a terminal
   -- state, then resume with what each one actually did. Rejected outright

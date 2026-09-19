@@ -6,9 +6,9 @@ Part of the [documentation index](../README.md).
 
 Roadmap item 5: `delegate` on its own is a one-shot, fire-and-forget hand-off
 — the moment a child task is queued, the parent task completes. That is
-still the default, unchanged, and is exactly what orchestrator's own
-multi-mention routing and self_improve's cross-agent proposals already rely
-on. `delegate` also now accepts `"wait": true`: instead of completing, the
+still the default, unchanged, and is exactly what self_improve's
+cross-agent proposals already rely on. `delegate` also now accepts
+`"wait": true`: instead of completing, the
 parent stays `running`, so its very next turn can delegate again (fanning
 out to more agents) or call the new `await_children` action — which pauses
 the task (`waiting_children`) until *every* task it has delegated, however

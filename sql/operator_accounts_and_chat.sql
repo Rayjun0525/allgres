@@ -627,16 +627,16 @@ BEGIN
 END;
 $fn$;
 
--- The guard on every agent-config action that can reach a system agent
--- (agents.update, policy.rollback, permissions.grant/revoke): a regular
--- agent needs no session_token at all today (the shared dashboard bearer
--- token alone has always been enough, see the module comment on
--- allgres_private.users), so this only starts requiring a logged-in admin
--- once the *target* is a system agent -- an ordinary agent's config is
--- unaffected, exactly the "borrow the idea, don't touch what already
--- works" shape the rest of this file follows. NULL p_agent_id (a request
--- with no/invalid agent_id) is left to the caller's own validation to
--- reject -- this function only ever tightens an is_system=true target.
+-- The guard on the one system-agent action that stays dashboard-editable
+-- (agents.set_autonomy): a regular agent needs no session_token at all
+-- today (the shared dashboard bearer token alone has always been enough,
+-- see the module comment on allgres_private.users), so this only starts
+-- requiring a logged-in admin once the *target* is a system agent -- an
+-- ordinary agent's config is unaffected, exactly the "borrow the idea,
+-- don't touch what already works" shape the rest of this file follows.
+-- NULL p_agent_id (a request with no/invalid agent_id) is left to the
+-- caller's own validation to reject -- this function only ever tightens
+-- an is_system=true target.
 CREATE OR REPLACE FUNCTION allgres_private.require_admin_for_system_agent(p_token text, p_agent_id uuid)
 RETURNS void
 LANGUAGE plpgsql
@@ -646,6 +646,30 @@ BEGIN
     SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_system
   ) THEN
     PERFORM allgres_private.require_admin(p_token);
+  END IF;
+END;
+$fn$;
+
+-- v2 redesign, "에이전트 모델": a system agent's identity (prompt/config,
+-- permission grants, policy rollback) is no longer editable from the
+-- dashboard at all, admin session or not -- changing one now requires a
+-- direct DB connection and a real UPDATE/SQL statement, on purpose (see
+-- KNOWN_ISSUES.md). Deliberately a hard RAISE EXCEPTION rather than a
+-- require_admin-style "escalate the check": there is no session, admin or
+-- otherwise, this should ever let through. autonomy_level is the one
+-- exception -- it stays behind require_admin_for_system_agent above, not
+-- this function, since it is an ordinary operator dial, not an identity
+-- edit (confirmed: this is the one thing admins actually tune from the
+-- Agents page day to day).
+CREATE OR REPLACE FUNCTION allgres_private.forbid_system_agent_edit(p_agent_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  IF p_agent_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM allgres_private.agents WHERE agent_id = p_agent_id AND is_system
+  ) THEN
+    RAISE EXCEPTION 'system agents cannot be edited from the dashboard -- connect directly to the database' USING ERRCODE = 'P0001';
   END IF;
 END;
 $fn$;
@@ -1007,8 +1031,6 @@ DECLARE
   v_sid uuid;
   v_sids uuid[] := ARRAY[]::uuid[];
   v_mid uuid;
-  v_orchestrator uuid;
-  v_orchestrator_config jsonb;
 BEGIN
   u := allgres_private.session_user(p_session_token);
   IF u.user_id IS NULL THEN
@@ -1019,8 +1041,7 @@ BEGIN
   END IF;
 
   -- Every distinct @mention, in the order it first appears in the text --
-  -- that order is what actually decides delivery order today (see
-  -- orchestrator's comment below for what it decides instead).
+  -- that order is what actually decides delivery order.
   SELECT array_agg(name ORDER BY first_pos) INTO v_names FROM (
     SELECT (m)[1] AS name, min(ord) AS first_pos
     FROM regexp_matches(v_text, '@([A-Za-z0-9_-]+)', 'g') WITH ORDINALITY AS t(m, ord)
@@ -1047,23 +1068,6 @@ BEGIN
     (author_user_id, content, mentioned_agent_id, session_id, mentioned_agent_ids)
   VALUES (u.user_id, v_text, v_agent_id, v_sid, NULLIF(v_agent_ids, ARRAY[]::uuid[]))
   RETURNING message_id INTO v_mid;
-
-  -- orchestrator (item 40): advisory only in this pass -- it reads the same
-  -- multi-mention message and the mentioned agents' own prompts and records
-  -- its opinion on response order via its own final_answer, but delivery
-  -- above already happened in text order regardless. A real reordering-
-  -- before-delivery pass is future work; this at least exercises the seeded
-  -- agent against a real message rather than leaving it permanently idle.
-  -- How many mentions actually engage it (default 2, i.e. "more than
-  -- one") is admin-tunable via orchestrator's own agent_config
-  -- (min_mentions_to_route, set through agents.update) -- the same
-  -- pattern session_compactor's thresholds use.
-  SELECT agent_id, agent_config INTO v_orchestrator, v_orchestrator_config
-  FROM allgres_private.agents WHERE name = 'orchestrator' AND is_active;
-  IF v_orchestrator IS NOT NULL
-     AND array_length(v_agent_ids, 1) >= COALESCE((v_orchestrator_config->>'min_mentions_to_route')::int, 2) THEN
-    PERFORM allgres_private.queue_orchestrator_opinion(v_orchestrator, v_mid, v_text, v_agent_ids);
-  END IF;
 
   RETURN jsonb_build_object(
     'ok', true, 'message_id', v_mid, 'mentioned_agent_id', v_agent_id, 'session_id', v_sid,

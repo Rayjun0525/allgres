@@ -618,11 +618,11 @@ BEGIN
 
     WHEN 'agents.update' THEN
       v_id := (p_request->>'agent_id')::uuid;
-      -- Two gates, deliberately not one: require_admin_for_system_agent is
-      -- unconditional the moment the target is a system agent (it always
-      -- has been); require_admin_if_accounts_exist is what now also covers
-      -- an *ordinary* agent, but only once accounts are actually in use.
-      PERFORM allgres_private.require_admin_for_system_agent(p_request->>'session_token', v_id);
+      -- v2 redesign: a system agent's identity is no longer dashboard-
+      -- editable at all (forbid_system_agent_edit -- a hard RAISE, not an
+      -- admin escalation); require_admin_if_accounts_exist still covers an
+      -- *ordinary* agent, once accounts are actually in use.
+      PERFORM allgres_private.forbid_system_agent_edit(v_id);
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       IF p_request ? 'is_active' THEN
         PERFORM allgres_public.fn_set_agent_active(v_id, (p_request->>'is_active')::boolean);
@@ -667,9 +667,7 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'policy.rollback' THEN
-      PERFORM allgres_private.require_admin_for_system_agent(
-        p_request->>'session_token', (p_request->>'agent_id')::uuid
-      );
+      PERFORM allgres_private.forbid_system_agent_edit((p_request->>'agent_id')::uuid);
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_rollback_policy(
         (p_request->>'agent_id')::uuid, (p_request->>'generation')::int
@@ -810,18 +808,14 @@ BEGIN
       ), '[]'::jsonb));
 
     WHEN 'permissions.grant' THEN
-      PERFORM allgres_private.require_admin_for_system_agent(
-        p_request->>'session_token', (p_request->>'agent_id')::uuid
-      );
+      PERFORM allgres_private.forbid_system_agent_edit((p_request->>'agent_id')::uuid);
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_grant_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'
       );
 
     WHEN 'permissions.revoke' THEN
-      PERFORM allgres_private.require_admin_for_system_agent(
-        p_request->>'session_token', (p_request->>'agent_id')::uuid
-      );
+      PERFORM allgres_private.forbid_system_agent_edit((p_request->>'agent_id')::uuid);
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_revoke_permission(
         (p_request->>'agent_id')::uuid, p_request->>'type', p_request->>'ref'

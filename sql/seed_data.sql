@@ -321,32 +321,6 @@ $prompt$,
     END;
   END IF;
 
-  -- orchestrator: Messenger's routing brain for a message that @mentions
-  -- more than one agent at once -- decides the order they respond in (and,
-  -- through delegate, whether one should hand off to another) instead of
-  -- firing every mentioned agent independently and interleaving their
-  -- replies at random. See fn_messenger_post's multi-mention branch, the
-  -- real call site.
-  IF NOT EXISTS (SELECT 1 FROM allgres_private.agents WHERE name = 'orchestrator') THEN
-    DECLARE v_agent uuid;
-    BEGIN
-      INSERT INTO allgres_private.agents (name, is_system, parent_agent_id, autonomy_level)
-      VALUES ('orchestrator', true, v_root, 'auto') RETURNING agent_id INTO v_agent;
-      UPDATE allgres_private.policies
-      SET system_prompt = $prompt$Your job is multi-agent routing in a shared Messenger channel. You are given
-one message that @mentions more than one agent, and the name/system_prompt
-summary of each. Reply with one JSON object only:
-{"action":"final_answer","answer":"<json array of agent names, in the order they should respond>"}
-Order by who most directly owns the request first; an agent whose answer
-would depend on another's should come after it. You do not answer the
-message yourself.
-$prompt$,
-          max_steps = 4,
-          updated_at = now()
-      WHERE agent_id = v_agent;
-    END;
-  END IF;
-
   -- creator: the only agent that may call create_agent (see fn_submit_result's
   -- create_agent branch) -- proposing a brand-new agent (name + prompt) for
   -- a human or its own admin_approval/self_approve setting to let through.

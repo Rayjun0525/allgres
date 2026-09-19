@@ -165,15 +165,15 @@ $fn$;
 
 -- agent_config stays a fully open jsonb bag for any key a future tunable
 -- needs -- see its own column comment, "a new tunable never needs a new
--- migration" -- but every key a *current* reader actually casts (the three
+-- migration" -- but every key a *current* reader actually casts (the ones
 -- below, all via (value->>'key')::int) is checked here at set time instead
--- of only failing later, mid-turn, the moment maybe_trigger_compaction or
--- fn_messenger_post finally reads a bad one back. An unknown key -- the
--- whole reason this column is a jsonb bag and not one column per tunable --
--- is left alone entirely; only names this file's own readers already
--- depend on get a fail-fast check, and it never blocks the key from being
--- set to jsonb null (the documented "clear it back to default" signal,
--- checked before this loop ever sees it as a would-be integer).
+-- of only failing later, mid-turn, the moment maybe_trigger_compaction
+-- finally reads a bad one back. An unknown key -- the whole reason this
+-- column is a jsonb bag and not one column per tunable -- is left alone
+-- entirely; only names this file's own readers already depend on get a
+-- fail-fast check, and it never blocks the key from being set to jsonb
+-- null (the documented "clear it back to default" signal, checked before
+-- this loop ever sees it as a would-be integer).
 CREATE OR REPLACE FUNCTION allgres_private.validate_agent_config(p_config jsonb)
 RETURNS void
 LANGUAGE plpgsql
@@ -187,7 +187,6 @@ BEGIN
     SELECT * FROM (VALUES
       ('compaction_threshold', 1, 1000000),
       ('compaction_keep_recent', 0, 1000000),
-      ('min_mentions_to_route', 1, 1000),
       -- self_improve's own tool_override autonomy dials (fn_submit_result's
       -- own comment on the tiers): tool_override_self_approve_canary_cap is
       -- the canary_percent ceiling self_approve auto-starts under (higher =

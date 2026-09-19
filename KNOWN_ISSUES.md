@@ -5456,3 +5456,77 @@ to create an agent for me" flow regular users would actually reach
 `fn_create_agent`'s new parameter through; and the `permissions` table's
 own redefinition as a GRANT mirror rather than the enforcement source it
 still is today.
+
+## 71. v2 redesign, Phase 2: retired the `orchestrator` agent; system agents are no longer dashboard-editable at all
+
+Two independent pieces of the "에이전트 모델" redesign.
+
+**`orchestrator` removed.** Investigated before touching anything, since
+the working plan had assumed it needed replacing with a new "system
+function" once one existed (Phase 3): reading `fn_messenger_post`'s actual
+code showed it never did real multi-agent routing at all -- delivery to
+every `@mentioned` agent already happens unconditionally, in text order;
+`orchestrator` only ever got a one-shot advisory task queued alongside
+that, whose own `final_answer` nothing downstream ever reads or acts on
+(the function's own comment: "delivery above already happened in text
+order regardless... a real reordering-before-delivery pass is future
+work"). Two of this file's own earlier comments (task-orchestration.md,
+and two spots in `sql/control_plane.sql`) claimed `orchestrator` used
+`delegate` for this -- checked against its actual seeded prompt and it
+never did; corrected rather than left stale. Confirmed nothing else
+depended on it before deleting: removed the seed block (`sql/seed_data.
+sql`), `allgres_private.queue_orchestrator_opinion` (`sql/control_plane.
+sql`), the `fn_messenger_post` branch that called it, the `web/index.html`
+UI for its one `agent_config` field (`min_mentions_to_route`, also
+dropped from `validate_agent_config`'s known-key list), and the three
+selftest cases that only ever exercised this dead path -- one selftest
+case (`agent_config_rejects_out_of_range_known_key`) that happened to use
+`min_mentions_to_route` purely as a convenient known-integer-range example
+was repointed to `compaction_keep_recent` instead, unrelated to
+orchestrator itself. Four system agents remain (`session_compactor`,
+`creator`, `fixer`, `self_improve`, under the shared `system_root`), down
+from five.
+
+**System agents are now fully locked out of dashboard editing**, not just
+admin-gated. Before this, `agents.update`/`policy.rollback`/
+`permissions.grant`/`permissions.revoke` on a system-agent target required
+`require_admin_for_system_agent` (an admin session) -- an admin *could*
+edit a system agent's prompt, config, or grants straight from the
+dashboard. On explicit direction, this is now a hard `RAISE EXCEPTION`
+(`allgres_private.forbid_system_agent_edit`, new), admin session or not:
+changing a system agent's identity now requires a direct database
+connection. One deliberate carve-out, confirmed with the user before
+building it: `agents.set_autonomy` stays exactly as it was
+(`require_admin_for_system_agent`, admin-gated but not blocked) --
+`autonomy_level` is an ordinary operator dial (this is the one thing
+admins actually tune on `creator`/`fixer`/`self_improve` day to day from
+the Agents page), not an identity edit, and locking it too would remove
+the only reason that field has a dashboard control at all.
+`web/index.html`'s Agents edit modal reflects this directly rather than
+just relying on the backend rejection: a system-agent target now renders
+every identity field (`name`, prompt, provider/model, step/retry/
+concurrency limits, active toggle, `agent_config`) `disabled`, shows a
+banner explaining why, hides the permission grant form and every
+`Revoke` button, and `historyModal` hides its `Rollback to this version`
+button for a system agent -- only the `Autonomy level` field stays live,
+and Save is relabeled "Save autonomy level" for that one case.
+
+Verified: rebuilt and reinstalled; fresh install's `fn_selftest()` read
+`"failed": 0, "passed": 330` across two separate `psql` connections (down
+from 332 -- three orchestrator-only cases removed, two new
+system-agent-lockout cases added, net one existing case repointed rather
+than removed); `cargo test --lib --no-default-features --features pg16`
+still 30/30. Live, not just selftest: confirmed `orchestrator` seeds zero
+rows on a fresh install and exactly four `is_system` agents besides
+`system_root` exist; called `agents.update` against `creator` (a real
+system agent) with a real admin session and confirmed `{"ok":false,
+"error":"system agents cannot be edited from the dashboard..."}`, with
+the prompt actually unchanged afterward, while `agents.set_autonomy`
+against the same agent with the same session still succeeded. UI: served
+the built `web/index.html` (nonce substituted, real CSP header) under
+Playwright with `/api/v1/agents` mocked to one system and one ordinary
+agent -- opening the system agent's edit modal showed the banner, every
+identity field's `disabled` property `true`, no grant form, no `Revoke`
+button, `Autonomy level` present and enabled, and the Save button
+relabeled; the ordinary agent's modal was unaffected on every one of
+those same checks.

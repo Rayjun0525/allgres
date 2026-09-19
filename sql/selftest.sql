@@ -81,8 +81,6 @@ DECLARE
   v_comp_sid uuid;
   v_comp_tid uuid;
   v_comp_base timestamptz;
-  v_orchestrator_id uuid;
-  v_msg_id uuid;
   v_mentioned_ids uuid[];
   v_mention_target uuid;
   v_admin_tok text;
@@ -2686,9 +2684,12 @@ BEGIN
       AND allgres_private.agent_effective_prompt(v_acct_agent) NOT LIKE '%system agent family%';
     v := v || jsonb_build_array(jsonb_build_object('name', 'system_agent_prompt_inherits_root_framing', 'ok', ok));
 
-    -- is_system agents may only be edited from an admin session; an
-    -- ordinary agent (v_acct_agent) is unaffected and needs no token at
-    -- all, exactly as before item 32.
+    -- require_admin_for_system_agent itself (v2 redesign: now used only for
+    -- agents.set_autonomy, the one system-agent field still dashboard-
+    -- editable -- everything else goes through forbid_system_agent_edit's
+    -- hard block instead, tested separately below): a system-agent target
+    -- needs a real admin session; an ordinary agent (v_acct_agent) is
+    -- unaffected and needs no token at all.
     BEGIN
       PERFORM allgres_private.require_admin_for_system_agent(NULL, v_creator_id);
       ok := false;
@@ -3836,23 +3837,34 @@ BEGIN
     ok := COALESCE((sub->>'ok')::boolean, false);
     v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_ordinary_agent_succeeds_with_admin_session', 'ok', ok));
 
-    -- dashboard_rpc never raises to its caller (its own outer EXCEPTION
-    -- WHEN OTHERS turns everything into {ok:false,...}), so a rejection
-    -- here shows up as ok is-distinct-from-true, not a thrown error.
+    comp := allgres.dashboard_rpc(jsonb_build_object(
+      'action', 'agents.update', 'agent_id', v_sys_target::text, 'session_token', v_admin_tok,
+      'agent_config', jsonb_build_object('probe', 2)
+    ));
+    ok := COALESCE((comp->>'ok')::boolean, false)
+      AND (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_sys_target) = jsonb_build_object('probe', 2);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_persists_merged_not_replaced', 'ok', ok));
+
+    -- v2 redesign: a system agent's own agent_config is no longer
+    -- dashboard-editable at all -- forbid_system_agent_edit rejects
+    -- agents.update outright the moment the target is_system, admin
+    -- session or not (dashboard_rpc never raises to its caller, its own
+    -- outer EXCEPTION WHEN OTHERS turns everything into {ok:false,...}, so
+    -- a rejection here shows up as ok is-distinct-from-true either way).
     sub := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'agents.update', 'agent_id', v_creator_id::text,
       'agent_config', jsonb_build_object('probe', 1)
     ));
     ok := (sub->>'ok')::boolean IS DISTINCT FROM true;
-    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_system_agent_needs_admin', 'ok', ok));
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_system_agent_blocked_without_session', 'ok', ok));
 
     comp := allgres.dashboard_rpc(jsonb_build_object(
       'action', 'agents.update', 'agent_id', v_creator_id::text, 'session_token', v_admin_tok,
       'agent_config', jsonb_build_object('probe', 2)
     ));
-    ok := COALESCE((comp->>'ok')::boolean, false)
-      AND (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = jsonb_build_object('probe', 2);
-    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_persists_merged_not_replaced', 'ok', ok));
+    ok := (comp->>'ok')::boolean IS DISTINCT FROM true
+      AND NOT (SELECT agent_config FROM allgres_private.agents WHERE agent_id = v_creator_id) = jsonb_build_object('probe', 2);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'agent_config_on_system_agent_blocked_even_with_admin_session', 'ok', ok));
 
     -- item 36's own fix, spot-checked on a representative few of the
     -- platform-configuration actions that used to have no session check at
@@ -4150,7 +4162,7 @@ BEGIN
 
     BEGIN
       PERFORM allgres_public.fn_set_agent_config(
-        v_creator_id, jsonb_build_object('min_mentions_to_route', 0)
+        v_creator_id, jsonb_build_object('compaction_keep_recent', -1)
       );
       ok := false;
     EXCEPTION WHEN others THEN
@@ -4230,14 +4242,16 @@ BEGIN
       jsonb_build_object('compaction_threshold', NULL, 'compaction_keep_recent', NULL)
     );
 
-    -- 34. orchestrator multi-mention (item 40): a message mentioning more
-    -- than one agent is delivered to all of them, in text order, and
-    -- queues a real (if advisory-only in this pass) opinion task for
-    -- orchestrator. Never v_acct_agent, which fn_chat_send would leave a
-    -- session referencing -- the same FK this whole section is careful to
-    -- avoid for v_acct_agent everywhere else, so it stays deletable at the
-    -- very end; v_sys_target and a second disposable target are used
-    -- instead, both fine to accumulate sessions on forever.
+    -- 34. Multi-mention delivery (item 40): a message mentioning more than
+    -- one agent is delivered to all of them, in text order. (The
+    -- orchestrator agent that used to also get an advisory-only "opinion"
+    -- task queued here was removed in the v2 redesign -- it never actually
+    -- reordered or gated delivery, see KNOWN_ISSUES.md.) Never v_acct_agent,
+    -- which fn_chat_send would leave a session referencing -- the same FK
+    -- this whole section is careful to avoid for v_acct_agent everywhere
+    -- else, so it stays deletable at the very end; v_sys_target and a
+    -- second disposable target are used instead, both fine to accumulate
+    -- sessions on forever.
     SELECT agent_id INTO v_mention_target FROM allgres_private.agents WHERE name = 'selftest_mention_target';
     IF v_mention_target IS NULL THEN
       v_mention_target := (allgres_public.fn_create_agent('selftest_mention_target')->>'agent_id')::uuid;
@@ -4252,65 +4266,6 @@ BEGIN
       AND v_mentioned_ids[1] = v_sys_target
       AND v_mentioned_ids[2] = v_mention_target;
     v := v || jsonb_build_array(jsonb_build_object('name', 'messenger_multi_mention_delivers_to_all_in_text_order', 'ok', ok));
-
-    v_msg_id := (r->>'message_id')::uuid;
-    SELECT agent_id INTO v_orchestrator_id FROM allgres_private.agents WHERE name = 'orchestrator';
-    ok := EXISTS (
-      SELECT 1 FROM allgres_private.sessions
-      WHERE agent_id = v_orchestrator_id AND goal = 'messenger_route:' || v_msg_id::text
-    );
-    v := v || jsonb_build_array(jsonb_build_object('name', 'multi_mention_queues_orchestrator_opinion', 'ok', ok));
-
-    -- 34b. orchestrator's min_mentions_to_route (agent metadata config,
-    -- same as session_compactor's thresholds): raising it must actually
-    -- suppress routing for a mention count that used to qualify, and
-    -- clearing it back must restore the default (>= 2) behavior --
-    -- confirms this reads live from agent_config on every post, not once
-    -- at startup. Each re-mention below reuses the same two chat sessions
-    -- the multi-mention test above just opened, and fn_continue_session
-    -- refuses a second message while the last root task is still queued --
-    -- so the loop clears whatever the previous post left in flight first.
-    FOR v_tid IN
-      SELECT t.task_id FROM allgres_private.tasks t
-      JOIN allgres_private.user_agent_chat_sessions cs ON cs.session_id = t.session_id
-      WHERE cs.user_id = (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user')
-        AND cs.agent_id IN (v_sys_target, v_mention_target)
-        AND t.status IN ('queued', 'running', 'waiting_human')
-    LOOP
-      PERFORM allgres_public.fn_next_step(v_tid);
-      PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
-        'type', 'llm_response', 'content', '{"action":"final_answer","answer":"ok"}',
-        'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'ok')
-      ));
-    END LOOP;
-    PERFORM allgres_public.fn_set_agent_config(v_orchestrator_id, jsonb_build_object('min_mentions_to_route', 3));
-    r := allgres_public.fn_messenger_post(v_user_tok, '@selftest_fix_target @selftest_mention_target selftest raised min-mentions');
-    ok := NOT EXISTS (
-      SELECT 1 FROM allgres_private.sessions
-      WHERE agent_id = v_orchestrator_id AND goal = 'messenger_route:' || (r->>'message_id')
-    );
-    v := v || jsonb_build_array(jsonb_build_object('name', 'raised_min_mentions_suppresses_routing', 'ok', ok));
-
-    FOR v_tid IN
-      SELECT t.task_id FROM allgres_private.tasks t
-      JOIN allgres_private.user_agent_chat_sessions cs ON cs.session_id = t.session_id
-      WHERE cs.user_id = (SELECT user_id FROM allgres_private.users WHERE username = 'selftest_user')
-        AND cs.agent_id IN (v_sys_target, v_mention_target)
-        AND t.status IN ('queued', 'running', 'waiting_human')
-    LOOP
-      PERFORM allgres_public.fn_next_step(v_tid);
-      PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
-        'type', 'llm_response', 'content', '{"action":"final_answer","answer":"ok"}',
-        'parsed', jsonb_build_object('action', 'final_answer', 'answer', 'ok')
-      ));
-    END LOOP;
-    PERFORM allgres_public.fn_set_agent_config(v_orchestrator_id, jsonb_build_object('min_mentions_to_route', NULL));
-    r := allgres_public.fn_messenger_post(v_user_tok, '@selftest_fix_target @selftest_mention_target selftest reset min-mentions');
-    ok := EXISTS (
-      SELECT 1 FROM allgres_private.sessions
-      WHERE agent_id = v_orchestrator_id AND goal = 'messenger_route:' || (r->>'message_id')
-    );
-    v := v || jsonb_build_array(jsonb_build_object('name', 'clearing_min_mentions_restores_default_routing', 'ok', ok));
 
     -- 35. Project chat mode (item 42): a project bound to an agent, with a
     -- preset_prompt appended after that agent's own effective prompt.

@@ -40,20 +40,17 @@ read surface already in place.
 
 ## System agents
 
-Beyond the two demo/maintenance agents above, five built-in agents operate
+Beyond the two demo/maintenance agents above, four built-in agents operate
 the platform itself, seeded under one shared parent (`system_root`) so a
-grant or a framing sentence added to the root reaches all five without
+grant or a framing sentence added to the root reaches all four without
 being restated per agent: `session_compactor` (summarizes a session's
 older turns once its log passes a threshold — `allgres_private.
-maybe_trigger_compaction`, called on every `fn_next_step`), `orchestrator`
-(records an advisory opinion on response order whenever a Messenger post
-`@mentions` more than one agent — delivery itself is still text order; see
-KNOWN_ISSUES item 31 for what "advisory" means here), `creator`, `fixer`,
-and `self_improve`. `agent_id`/`name`/`system_prompt` inheritance is real —
-`allgres_private.agent_has_permission`/`agent_effective_prompt` walk
-`parent_agent_id` so a child sees its own grants plus everything the root
-was granted, and its own prompt appended after the root's shared framing.
-Every one of the five is `is_system = true`: editing its policy or
+maybe_trigger_compaction`, called on every `fn_next_step`), `creator`,
+`fixer`, and `self_improve`. `agent_id`/`name`/`system_prompt` inheritance
+is real — `allgres_private.agent_has_permission`/`agent_effective_prompt`
+walk `parent_agent_id` so a child sees its own grants plus everything the
+root was granted, and its own prompt appended after the root's shared
+framing. Every one of the four is `is_system = true`: editing its policy or
 permissions from the Agents page always requires an admin session
 (`require_admin_for_system_agent`), unconditionally. An ordinary,
 non-system agent used to be unaffected by this specific check — but see
@@ -62,10 +59,15 @@ created, the platform-configuration surface as a whole (agent creation
 and edits, providers, the allowlist, OAuth connect) requires an admin
 session too, system agent or not.
 
+(A fifth system agent, `orchestrator`, used to record an advisory-only
+opinion on response order whenever a Messenger post `@mentions` more than
+one agent — delivery itself was always text order regardless, so this
+never actually reordered or gated anything. Removed in the v2 redesign;
+see KNOWN_ISSUES.md.)
+
 Any behavior constant a specific agent kind needs — `session_compactor`'s
-trigger threshold and how many recent logs it leaves uncompacted,
-`orchestrator`'s minimum `@mention` count before it bothers routing —
-lives in a generic `agent_config jsonb` column on every agent rather than
+trigger threshold and how many recent logs it leaves uncompacted — lives
+in a generic `agent_config jsonb` column on every agent rather than
 being compiled in, so a future parameter never needs a schema migration.
 `fn_set_agent_config` merges into it (a key sent as `null` clears back to
 the coded default), through the same admin gate as every other
