@@ -313,6 +313,7 @@ pub extern "C-unwind" fn _PG_init() {
 }
 
 mod config;
+mod function_exec;
 mod http_protocol;
 mod outbound;
 mod rpc;

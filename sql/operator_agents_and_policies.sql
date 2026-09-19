@@ -668,6 +668,34 @@ BEGIN
     RETURN jsonb_build_object('ok', true, 'status', 'approved', 'created_agent', v_created);
   END IF;
 
+  -- 'create_function'/'update_function' (any agent's own Function
+  -- proposal): same "no generation to go stale against" reasoning as
+  -- 'create_agent'. 'update_function' targets r.target_function_id;
+  -- 'create_function' needs no target, same as 'create_agent'.
+  IF r.kind = 'create_function' THEN
+    v_created := allgres_public.fn_create_function(
+      r.proposed_changes->>'name', r.proposed_changes->>'description', 'plpgsql', '{}'::jsonb,
+      r.proposed_changes->>'body', COALESCE(r.proposed_changes->'param_schema', '{}'::jsonb), r.agent_id
+    );
+    UPDATE allgres_private.change_proposals
+    SET status = 'approved', decided_at = now(), decided_reply = p_reply
+    WHERE proposal_id = p_proposal_id;
+    PERFORM allgres_private.audit('proposals.decide', jsonb_build_object('proposal_id', p_proposal_id, 'status', 'approved', 'kind', 'create_function'));
+    RETURN jsonb_build_object('ok', true, 'status', 'approved', 'created_function', v_created);
+  END IF;
+
+  IF r.kind = 'update_function' THEN
+    v_created := allgres_public.fn_update_function(
+      r.target_function_id, r.proposed_changes->>'description',
+      r.proposed_changes->>'body', r.proposed_changes->'param_schema'
+    );
+    UPDATE allgres_private.change_proposals
+    SET status = 'approved', decided_at = now(), decided_reply = p_reply
+    WHERE proposal_id = p_proposal_id;
+    PERFORM allgres_private.audit('proposals.decide', jsonb_build_object('proposal_id', p_proposal_id, 'status', 'approved', 'kind', 'update_function', 'target_function_id', r.target_function_id));
+    RETURN jsonb_build_object('ok', true, 'status', 'approved', 'updated_function', v_created);
+  END IF;
+
   -- 'function_override' (self_improve's model-optimizer role, see
   -- functions.llm_override's own comment): also no generation to go
   -- stale against, same reasoning as 'create_agent' -- a procedure_function has

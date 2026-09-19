@@ -77,6 +77,10 @@ DECLARE
   v_self_id uuid;
   v_sys_target uuid;
   v_fix_id uuid;
+  v_created_function_id uuid;
+  v_func_proposal_id uuid;
+  v_func_name text;
+  v_func_test_proc uuid;
   v_i int;
   v_comp_sid uuid;
   v_comp_tid uuid;
@@ -2778,6 +2782,129 @@ BEGIN
     v := v || jsonb_build_array(jsonb_build_object('name', 'autonomy_auto_creates_agent_immediately', 'ok', ok));
     PERFORM allgres_public.fn_set_agent_autonomy(v_creator_id, 'admin_approval');
 
+    -- create_function/update_function: unlike create_agent, ANY agent may
+    -- author or edit a plpgsql Function -- gated only by that agent's own
+    -- autonomy_level, same 'admin_approval' queues / 'auto' applies split.
+    -- fn_selftest cannot exercise the real build (that happens on the
+    -- runtime worker's own top-level SPI thread, a separate OS process --
+    -- see src/function_exec.rs) or a genuinely role-scoped call; those are
+    -- proved live instead (KNOWN_ISSUES.md). What is exercised here is the
+    -- whole SQL-side contract: proposal queuing/approval, the body
+    -- guardrails, and that a Function still 'pending' (or 'failed') a
+    -- build is never silently queued for a call.
+    v_func_name := 'selftest_fn_' || replace(extract(epoch from clock_timestamp())::text, '.', '_');
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest create_function')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"create_function"}',
+      'parsed', jsonb_build_object(
+        'action', 'create_function', 'name', v_func_name,
+        'description', 'selftest-created function, safe to ignore.',
+        'body', 'BEGIN RETURN p_args; END;', 'reason', 'selftest'
+      )
+    ));
+    v_func_proposal_id := (sub->>'proposal_id')::uuid;
+    ok := v_func_proposal_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM allgres_private.change_proposals
+      WHERE proposal_id = v_func_proposal_id AND kind = 'create_function' AND status = 'pending'
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'create_function_queues_a_proposal', 'ok', ok));
+
+    comp := allgres_public.fn_decide_proposal(v_func_proposal_id, true);
+    v_created_function_id := (comp->'created_function'->>'function_id')::uuid;
+    ok := comp->>'status' = 'approved' AND EXISTS (
+      SELECT 1 FROM allgres_private.functions
+      WHERE function_id = v_created_function_id AND handler = 'plpgsql'
+        AND build_status = 'pending' AND sql_ident IS NOT NULL AND created_by_agent_id = v_agent
+    );
+    v := v || jsonb_build_array(jsonb_build_object('name', 'decide_proposal_creates_the_function', 'ok', ok));
+
+    -- A body trying to escape its own SECURITY INVOKER is rejected before
+    -- it ever reaches CREATE FUNCTION -- defense in depth, not the real
+    -- boundary (that's SET ROLE + a real GRANT at call time, proved live
+    -- against llm_secrets, not here -- see KNOWN_ISSUES.md).
+    BEGIN
+      PERFORM allgres_public.fn_create_function(
+        'selftest_bad_fn_' || replace(extract(epoch from clock_timestamp())::text, '.', '_'), 'x', 'plpgsql', '{}'::jsonb,
+        'BEGIN SET ROLE allgres_owner; RETURN ''{}''::jsonb; END;', '{}'::jsonb
+      );
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%may not change role%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'create_function_rejects_set_role_body', 'ok', ok));
+
+    -- update_function edits body/description and re-queues the build
+    -- (build_status back to 'pending'); it never touches name or handler.
+    sub := allgres_public.fn_update_function(
+      v_created_function_id, 'updated description',
+      'BEGIN RETURN jsonb_build_object(''ok'', true); END;', NULL
+    );
+    ok := COALESCE((sub->>'ok')::boolean, false)
+      AND (SELECT description FROM allgres_private.functions WHERE function_id = v_created_function_id) = 'updated description'
+      AND (SELECT build_status FROM allgres_private.functions WHERE function_id = v_created_function_id) = 'pending';
+    v := v || jsonb_build_array(jsonb_build_object('name', 'update_function_edits_and_requeues_build', 'ok', ok));
+
+    BEGIN
+      PERFORM allgres_public.fn_update_function(
+        v_created_function_id, NULL, 'BEGIN SET ROLE allgres_owner; RETURN ''{}''::jsonb; END;', NULL
+      );
+      ok := false;
+    EXCEPTION WHEN others THEN
+      ok := SQLERRM LIKE '%may not change role%';
+    END;
+    v := v || jsonb_build_array(jsonb_build_object('name', 'update_function_rejects_set_role_body', 'ok', ok));
+
+    -- call_function against a Function whose build has not finished
+    -- (build_status is still 'pending' right after the edit above) is
+    -- rejected up front with a clear reason, never silently queued
+    -- against a stale or nonexistent allgres_functions object.
+    INSERT INTO allgres_private.procedures (name, content) VALUES ('selftest-fn-not-built-proc', 'x')
+      ON CONFLICT (name) DO NOTHING;
+    SELECT procedure_id INTO v_func_test_proc FROM allgres_private.procedures WHERE name = 'selftest-fn-not-built-proc';
+    PERFORM allgres_public.fn_bind_procedure_function(v_func_test_proc, v_created_function_id);
+    PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', 'selftest-fn-not-built-proc');
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest call_function not built')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    PERFORM allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"call_function"}',
+      'parsed', jsonb_build_object('action', 'call_function', 'function', v_func_name, 'args', '{}'::jsonb)
+    ));
+    ok := EXISTS (
+      SELECT 1 FROM allgres_private.execution_logs
+      WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'function_not_built'
+    ) AND NOT EXISTS (SELECT 1 FROM allgres_private.function_calls WHERE function_id = v_created_function_id);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'call_function_rejects_a_function_not_yet_built', 'ok', ok));
+
+    -- Revoke immediately: v_agent (the shared 'analyst' fixture) must go
+    -- back to holding zero procedure grants, exactly as every earlier
+    -- procedure-visibility test in this file assumes it starts -- a
+    -- leftover grant here silently broke procedure_hidden_from_prompt_
+    -- without_permission/disabled_procedure_hidden_even_with_permission
+    -- on a second run within the same database (caught live, this
+    -- actually happened once).
+    PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest-fn-not-built-proc');
+
+    -- autonomy_level='auto' skips the proposal queue entirely, same as
+    -- create_agent's own identical dial.
+    PERFORM allgres_public.fn_set_agent_autonomy(v_agent, 'auto');
+    v_sid := (allgres_public.fn_create_session(v_agent, 'selftest auto create_function')->>'session_id')::uuid;
+    SELECT task_id INTO v_tid FROM allgres_private.tasks WHERE session_id = v_sid LIMIT 1;
+    PERFORM allgres_public.fn_next_step(v_tid);
+    sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+      'type', 'llm_response', 'content', '{"action":"create_function"}',
+      'parsed', jsonb_build_object(
+        'action', 'create_function', 'name', 'selftest_auto_fn_' || replace(extract(epoch from clock_timestamp())::text, '.', '_'),
+        'description', 'selftest-created function, safe to ignore.', 'body', 'BEGIN RETURN p_args; END;'
+      )
+    ));
+    ok := COALESCE((sub->>'applied')::boolean, false)
+      AND EXISTS (SELECT 1 FROM allgres_private.functions WHERE function_id = (sub->'created_function'->>'function_id')::uuid);
+    v := v || jsonb_build_array(jsonb_build_object('name', 'autonomy_auto_creates_function_immediately', 'ok', ok));
+    PERFORM allgres_public.fn_set_agent_autonomy(v_agent, 'admin_approval');
+
     -- propose_fix (fixer only): admin_approval queues a fix that
     -- fn_decide_fix applies; only ever against a disposable scratch target,
     -- never a real seeded agent.
@@ -4729,7 +4856,7 @@ BEGIN
     'audit.list', 'settings.get', 'provider.update', 'provider.create', 'connections.list',
     'connections.create', 'connections.update', 'connections.delete', 'procedures.list', 'procedures.get',
     'procedures.create', 'procedures.update', 'procedures.rollback', 'functions.list',
-    'functions.create', 'functions.bind', 'schedules.list', 'schedules.create',
+    'functions.create', 'functions.update', 'functions.bind', 'schedules.list', 'schedules.create',
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
     'providers.oauth_device_status', 'providers.oauth_callback', 'providers.probe_start', 'providers.probe_status',
     'events', 'approvals.list',
@@ -4752,7 +4879,7 @@ BEGIN
     'audit.list', 'settings.get', 'provider.update', 'provider.create', 'connections.list',
     'connections.create', 'connections.update', 'connections.delete', 'procedures.list', 'procedures.get',
     'procedures.create', 'procedures.update', 'procedures.rollback', 'functions.list',
-    'functions.create', 'functions.bind', 'schedules.list', 'schedules.create',
+    'functions.create', 'functions.update', 'functions.bind', 'schedules.list', 'schedules.create',
     'schedules.update', 'schedules.delete', 'schedules.run_now', 'providers.oauth_start', 'providers.oauth_device_start',
     'providers.oauth_device_status', 'providers.oauth_callback', 'providers.probe_start', 'providers.probe_status',
     'events', 'approvals.list',

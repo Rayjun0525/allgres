@@ -290,6 +290,10 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_outbound(int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_outbound(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_sql(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_sql(uuid, boolean, jsonb, int, boolean, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_function_builds(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_function_build(uuid, boolean, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_function_calls(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_function_call(uuid, boolean, jsonb, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_oauth(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_agent_embedding(int) TO worker;
@@ -1570,6 +1574,8 @@ BEGIN
         SELECT jsonb_agg(jsonb_build_object(
           'function_id', pt.function_id, 'name', pt.name, 'description', pt.description,
           'handler', pt.handler, 'args_template', pt.args_template,
+          'body', pt.body, 'param_schema', pt.param_schema,
+          'build_status', pt.build_status, 'build_error', pt.build_error,
           'is_active', pt.is_active,
           'procedures', COALESCE((
             SELECT jsonb_agg(pr.name ORDER BY pr.name)
@@ -1585,7 +1591,15 @@ BEGIN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_create_function(
         p_request->>'name', p_request->>'description', p_request->>'handler',
-        COALESCE(p_request->'args_template', '{}'::jsonb)
+        COALESCE(p_request->'args_template', '{}'::jsonb),
+        p_request->>'body', p_request->'param_schema'
+      );
+
+    WHEN 'functions.update' THEN
+      PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
+      RETURN allgres_public.fn_update_function(
+        (p_request->>'function_id')::uuid, p_request->>'description',
+        p_request->>'body', p_request->'param_schema'
       );
 
     WHEN 'functions.bind' THEN

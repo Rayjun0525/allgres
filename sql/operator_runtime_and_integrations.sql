@@ -754,8 +754,37 @@ BEGIN
 END;
 $fn$;
 
+-- A plpgsql-handler body's only real security boundary is what it runs
+-- this file spent Phase 3b building: SECURITY INVOKER plus the calling
+-- agent's own Postgres GRANTs, checked by the engine on every statement
+-- inside it, not a checklist here. This block is defense-in-depth only --
+-- catching an author's mistake or a confused-deputy attempt early, with a
+-- clear error, rather than relying solely on it ever mattering at
+-- execution time.
+CREATE OR REPLACE FUNCTION allgres_private.validate_function_body(p_body text)
+RETURNS void
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  IF p_body IS NULL OR length(p_body) = 0 THEN
+    RAISE EXCEPTION 'function body is required' USING ERRCODE = 'P0001';
+  END IF;
+  IF length(p_body) > 20000 THEN
+    RAISE EXCEPTION 'function body is too long (max 20000 characters)' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_body ~* '\ySECURITY\s+DEFINER\y' THEN
+    RAISE EXCEPTION 'function body may not declare SECURITY DEFINER' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_body ~* '\ySET\s+(SESSION\s+)?ROLE\y' OR p_body ~* '\yRESET\s+ROLE\y' THEN
+    RAISE EXCEPTION 'function body may not change role' USING ERRCODE = 'P0001';
+  END IF;
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_create_function(
-  p_name text, p_description text, p_handler text, p_args_template jsonb
+  p_name text, p_description text, p_handler text, p_args_template jsonb,
+  p_body text DEFAULT NULL, p_param_schema jsonb DEFAULT NULL,
+  p_created_by_agent_id uuid DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -766,6 +795,7 @@ DECLARE
   v_url text;
   v_reason text;
   v_id uuid;
+  v_sql_ident text;
 BEGIN
   IF v_name !~ '^[a-z][a-z0-9_]{0,62}$' THEN
     RAISE EXCEPTION 'function name must use lowercase letters, digits, and underscores' USING ERRCODE = 'P0001';
@@ -773,24 +803,84 @@ BEGIN
   IF NULLIF(trim(p_description), '') IS NULL THEN
     RAISE EXCEPTION 'function description is required' USING ERRCODE = 'P0001';
   END IF;
-  IF p_handler <> 'http_get' THEN
-    RAISE EXCEPTION 'only the http_get function handler is supported' USING ERRCODE = 'P0001';
+  IF p_handler NOT IN ('http_get', 'plpgsql') THEN
+    RAISE EXCEPTION 'unknown function handler: %', p_handler USING ERRCODE = 'P0001';
   END IF;
-  IF p_args_template IS NULL
-    OR jsonb_typeof(p_args_template) <> 'object'
-    OR p_args_template ?| ARRAY(SELECT key FROM jsonb_object_keys(p_args_template) key WHERE key <> 'url') THEN
-    RAISE EXCEPTION 'http_get function arguments must contain only url' USING ERRCODE = 'P0001';
+
+  IF p_handler = 'http_get' THEN
+    IF p_args_template IS NULL
+      OR jsonb_typeof(p_args_template) <> 'object'
+      OR p_args_template ?| ARRAY(SELECT key FROM jsonb_object_keys(p_args_template) key WHERE key <> 'url') THEN
+      RAISE EXCEPTION 'http_get function arguments must contain only url' USING ERRCODE = 'P0001';
+    END IF;
+    v_url := NULLIF(trim(p_args_template->>'url'), '');
+    v_reason := allgres_private.check_outbound_url(v_url, false);
+    IF v_reason IS NOT NULL THEN
+      RAISE EXCEPTION 'invalid function URL: %', v_reason USING ERRCODE = 'P0001';
+    END IF;
+    INSERT INTO allgres_private.functions (name, description, handler, args_template, created_by_agent_id)
+    VALUES (v_name, trim(p_description), p_handler, jsonb_build_object('url', v_url), p_created_by_agent_id)
+    RETURNING function_id INTO v_id;
+  ELSE
+    PERFORM allgres_private.validate_function_body(p_body);
+    -- sql_ident is derived from the new row's own function_id, never from
+    -- the author-chosen name, so renaming a Function later never touches
+    -- the real Postgres object or its grants (see the table's own
+    -- comment).
+    INSERT INTO allgres_private.functions
+      (name, description, handler, param_schema, body, build_status, created_by_agent_id)
+    VALUES
+      (v_name, trim(p_description), p_handler, COALESCE(p_param_schema, '{}'::jsonb), p_body, 'pending', p_created_by_agent_id)
+    RETURNING function_id INTO v_id;
+    v_sql_ident := 'fn_' || replace(v_id::text, '-', '');
+    UPDATE allgres_private.functions SET sql_ident = v_sql_ident WHERE function_id = v_id;
   END IF;
-  v_url := NULLIF(trim(p_args_template->>'url'), '');
-  v_reason := allgres_private.check_outbound_url(v_url, false);
-  IF v_reason IS NOT NULL THEN
-    RAISE EXCEPTION 'invalid function URL: %', v_reason USING ERRCODE = 'P0001';
-  END IF;
-  INSERT INTO allgres_private.functions (name, description, handler, args_template)
-  VALUES (v_name, trim(p_description), p_handler, jsonb_build_object('url', v_url))
-  RETURNING function_id INTO v_id;
-  PERFORM allgres_private.audit('functions.create', jsonb_build_object('function_id', v_id, 'name', v_name));
+
+  PERFORM allgres_private.audit('functions.create', jsonb_build_object('function_id', v_id, 'name', v_name, 'handler', p_handler));
   RETURN jsonb_build_object('ok', true, 'function_id', v_id);
+END;
+$fn$;
+
+-- Edits an existing plpgsql-handler Function's body/description/
+-- param_schema (never its name or handler -- renaming or retyping a
+-- Function is a new one, not an edit of this one) and re-queues its
+-- build. The previous build stays live and callable until the new one
+-- actually finishes (build_status only flips to 'pending' here, the old
+-- allgres_functions.<sql_ident> object is untouched until the worker's
+-- CREATE OR REPLACE actually runs), so an in-flight call never sees a
+-- function that briefly doesn't exist.
+CREATE OR REPLACE FUNCTION allgres_public.fn_update_function(
+  p_function_id uuid, p_description text DEFAULT NULL,
+  p_body text DEFAULT NULL, p_param_schema jsonb DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  f allgres_private.functions%ROWTYPE;
+BEGIN
+  SELECT * INTO f FROM allgres_private.functions WHERE function_id = p_function_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'function not found' USING ERRCODE = 'P0001';
+  END IF;
+  IF f.handler <> 'plpgsql' THEN
+    RAISE EXCEPTION 'only a plpgsql function can be edited -- http_get is fixed at creation' USING ERRCODE = 'P0001';
+  END IF;
+  IF p_body IS NOT NULL THEN
+    PERFORM allgres_private.validate_function_body(p_body);
+  END IF;
+
+  UPDATE allgres_private.functions
+  SET description = COALESCE(NULLIF(trim(p_description), ''), description),
+      body = COALESCE(p_body, body),
+      param_schema = COALESCE(p_param_schema, param_schema),
+      build_status = CASE WHEN p_body IS NOT NULL THEN 'pending' ELSE build_status END,
+      updated_at = now()
+  WHERE function_id = p_function_id;
+
+  PERFORM allgres_private.audit('functions.update', jsonb_build_object('function_id', p_function_id));
+  RETURN jsonb_build_object('ok', true, 'function_id', p_function_id);
 END;
 $fn$;
 

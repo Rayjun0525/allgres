@@ -300,6 +300,41 @@ exactly this reason.
 
 `execution_logs` is append-only, enforced by trigger and by `REVOKE`.
 
+### Real PL/pgSQL Functions
+
+A `plpgsql`-handler Function (see [Procedures](procedures.md)) is a real
+Postgres object, dynamically built and later called under exactly the same
+per-agent-role model as `execute_sql` above -- reusing it rather than
+inventing a second one. Building it (`CREATE OR REPLACE FUNCTION
+allgres_functions.<generated ident>(p_args jsonb) RETURNS jsonb LANGUAGE
+plpgsql SECURITY INVOKER AS $$<body>$$`) runs as `allgres_function_admin`,
+a role that owns nothing but `CREATE` on the `allgres_functions` schema --
+scoped this narrowly for the same reason `allgres_role_admin` is a separate
+role from `allgres_owner` (see `sql/control_plane.sql`'s own comment on
+that pattern): a bug in the one worker-invoked build step never becomes a
+bug in every other `SECURITY DEFINER` function `allgres_owner` also owns.
+Calling it later runs `SET LOCAL ROLE <the calling agent's own Postgres
+role>` first, the identical fallback-to-`sandbox` shape `fn_run_sandboxed_
+sql` already uses for an agent that predates per-agent roles. Both steps
+are top-level SPI statements the runtime worker issues directly
+(`src/function_exec.rs`, mirroring `src/sandbox.rs`), for the same reason
+`execute_sql` needs the split: PostgreSQL forbids `SET ROLE` inside a
+`SECURITY DEFINER` function, so neither the build nor the call can happen
+from inside `dashboard_rpc`/`fn_submit_result` itself.
+
+This makes the enforcement real, not procedural: a body's own SQL runs
+under whatever the calling agent's role can already do, checked by the
+engine on every statement, the same as an ordinary client connected as
+that role. Confirmed live -- a Function whose body read
+`allgres_private.llm_secrets` (a table no ordinary agent role has any grant
+on) failed with a genuine `permission denied for schema allgres_private`
+when actually called as the agent's own role, while an equivalent body
+doing pure computation succeeded and returned its result normally.
+`validate_function_body` additionally rejects a body that tries to declare
+`SECURITY DEFINER` or change role, before it ever reaches `CREATE
+FUNCTION` -- defense in depth against a confused-deputy attempt, not the
+real boundary (which is the role switch above, and holds regardless).
+
 ### The SQL console
 
 `allgres_public.fn_admin_execute_sql` (`dashboard_rpc` action

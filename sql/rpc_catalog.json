@@ -742,9 +742,24 @@
     ],
     "params": [
       "args_template",
+      "body",
       "description",
       "handler",
       "name",
+      "param_schema",
+      "session_token"
+    ]
+  },
+  {
+    "action": "functions.update",
+    "guards": [
+      "require_admin_if_accounts_exist"
+    ],
+    "params": [
+      "body",
+      "description",
+      "function_id",
+      "param_schema",
       "session_token"
     ]
   },

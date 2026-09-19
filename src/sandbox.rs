@@ -41,13 +41,15 @@ pub(crate) fn claim_sql_jobs(limit: i32) -> Value {
 /// database value and a string built with `format!` -- belt and suspenders
 /// alongside the fact that the column this comes from is only ever written
 /// by that one function, never by anything agent- or operator-controlled.
-fn valid_pg_role(s: &str) -> bool {
+pub(crate) fn valid_pg_role(s: &str) -> bool {
     s.strip_prefix("allgres_agent_")
         .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Runs `f` inside its own subtransaction so a Postgres ERROR raised while
-/// it runs is caught and the enclosing transaction kept alive afterward,
+/// it runs is caught and the enclosing transaction kept alive afterward
+/// (also reused by src/function_exec.rs, for the exact same reason, to
+/// build and call a plpgsql-handler Function),
 /// instead of the error propagating out of the pump loop and terminating
 /// the whole worker process. Needed specifically for query cancellation
 /// (`pg_cancel_backend`, the real-time "stop" button's own mechanism for a
@@ -82,7 +84,7 @@ fn valid_pg_role(s: &str) -> bool {
 /// query was observed live to keep running well past both a
 /// `pg_cancel_backend` call against this exact pid and its own
 /// `statement_timeout`, with no cancellation error ever logged.
-fn run_in_subtransaction<F>(f: F) -> Result<Value, String>
+pub(crate) fn run_in_subtransaction<F>(f: F) -> Result<Value, String>
 where
     F: FnOnce() -> Result<Value, String> + std::panic::UnwindSafe,
 {
@@ -140,7 +142,7 @@ where
 /// every timeout reason added since has been appended after them, never
 /// inserted before, which is what makes hardcoding 3 here safe across
 /// pg16/17/18 rather than something that needs a per-version binding.
-const PG_STATEMENT_TIMEOUT_ID: std::ffi::c_int = 3;
+pub(crate) const PG_STATEMENT_TIMEOUT_ID: std::ffi::c_int = 3;
 
 unsafe extern "C" {
     fn enable_timeout_after(id: std::ffi::c_int, delay_ms: std::ffi::c_int);

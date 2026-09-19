@@ -5619,3 +5619,191 @@ existing selftest suite already exercises every renamed call path
 (function permission grants, procedure-bound function calls, the canary
 experiment lifecycle, the frozen RPC catalog) under both its "should
 succeed" and "should be rejected" cases.
+
+## 73. v2 redesign, Phase 3b: real PL/pgSQL Functions -- SECURITY INVOKER, built and called under the calling agent's own role
+
+Added a second Function handler, `plpgsql`, alongside the existing
+`http_get`. Confirmed with the user before building: it must be authorable
+and editable from the dashboard, an agent must also be able to author one
+for itself, and it must run under the calling agent's *own* Postgres
+role so a real `GRANT` -- not a procedural check re-derived on every call
+-- is what actually bounds it.
+
+**Why this needed the same split `execute_sql`'s sandbox already has.**
+PostgreSQL forbids `SET ROLE` inside a `SECURITY DEFINER` function, and
+`dashboard_rpc`/`fn_submit_result` are `SECURITY DEFINER` (they run as
+`allgres_owner`). So neither *building* a Function's real Postgres object
+(which has to happen as a role that can `CREATE` in a dedicated schema,
+not `allgres_owner`) nor *calling* it (which has to happen as the calling
+agent's own role, not `allgres_owner`) can happen from inside those
+functions. Both are instead queued and picked up by the runtime worker,
+which issues them as genuinely top-level SPI statements -- exactly
+`fn_run_sandboxed_sql`'s own pattern, applied twice: once for DDL, once
+for the call.
+
+**Schema (`sql/control_plane.sql`).** `allgres_private.functions` gained
+`handler` widened to `('http_get', 'plpgsql')`, plus `body`,
+`param_schema`, `sql_ident` (`fn_<function_id, dashes stripped>` --
+derived from the row's own id, never the author-chosen `name`, so
+renaming a Function never touches the real object or its grants),
+`build_status` (`pending` / `building` / `built` / `failed`),
+`build_error`, and `created_by_agent_id`, with a `CHECK` tying `handler`
+to whether `body` is set. A new table, `allgres_private.function_calls`,
+queues one *call* against an already-built Function -- deliberately not
+folded into `outbound_calls` (which is HTTP-shaped: a mandatory `url`,
+`method`, `headers` every row must carry, and picked up by the HTTP
+thread pool), since a plpgsql call is a local `SET LOCAL ROLE` + `SELECT`
+on the SPI thread, not an outbound request at all. Both new
+tables/queues get the same claim/complete/`'lost'`-on-timeout shape
+`outbound_calls`/`sql_calls` already use (`fn_claim_function_builds`,
+`fn_complete_function_build`, `fn_claim_function_calls`,
+`fn_complete_function_call`, plus two new `fn_watchdog` reclaim loops --
+a stuck `'building'` row resets to `'pending'` rather than staying stuck
+forever, since there is no task to notify for a build).
+
+A new role, `allgres_function_admin` (`NOLOGIN`, owns nothing but `CREATE`
+on a new schema, `allgres_functions`), owns every dynamically-built
+Function object -- scoped this narrowly rather than handed to
+`allgres_owner`, the same reasoning `allgres_role_admin`'s own comment in
+"1. Roles" already gives for `fn_provision_agent_role`: a bug in the one
+function that does this dynamic `CREATE` should never also be a bug in
+every other `SECURITY DEFINER` function `allgres_owner` owns. `worker` is
+granted membership in `allgres_function_admin` (so it can `SET LOCAL
+ROLE` to it, the same way it already can to `sandbox`), and `sandbox`
+gets `USAGE` on `allgres_functions` (every agent role is already a member
+of `sandbox`, which is what a call actually runs as when an agent
+predates per-agent roles -- identical fallback to `fn_run_sandboxed_sql`).
+
+**Authoring (`sql/operator_runtime_and_integrations.sql`).**
+`fn_create_function`/`fn_update_function` widened to accept
+`body`/`param_schema` for the `plpgsql` handler, validated by a new
+`allgres_private.validate_function_body`: non-empty, under 20000
+characters, and -- defense in depth, not the real boundary -- rejects a
+body that tries to declare `SECURITY DEFINER` or change role. The real
+boundary is the role switch at build/call time, which holds regardless of
+what the body says about itself.
+
+**Agent-authored Functions (`sql/control_plane.sql`'s `fn_submit_result`,
+`sql/operator_agents_and_policies.sql`'s `fn_decide_proposal`).** New
+actions `create_function`/`update_function`, deliberately *not*
+restricted to one named system agent the way `create_agent` is restricted
+to `creator` -- since a Function's real security boundary holds no matter
+who authored the body, there is no equivalent reason to gate authorship
+itself. Gated only by the calling agent's own `autonomy_level`, the exact
+same `admin_approval` (queues a `change_proposals` row,
+`kind='create_function'`/`'update_function'`) vs. `self_approve`/`auto`
+(applies immediately) split `create_agent` already uses.
+`fn_next_step`'s bounds gained a `create_function`/`update_function`
+authoring guide (the required `p_args jsonb -> jsonb` signature, that
+`SECURITY INVOKER` runs it under the caller's own role, what
+`param_schema` means) so an agent can actually write a valid body, not
+just be told the action exists.
+
+**Calling one (`fn_submit_result`'s `call_function` branch).** When a
+procedure-bound Function resolves to `handler = 'plpgsql'`, the call is
+queued into `function_calls` with the agent's own `args` (unlike
+`http_get`, never replaced by a fixed template -- the security property
+here is the role switch, not fixing the arguments) and returns
+immediately; a Function whose build is not yet `'built'` (`'pending'`,
+`'building'`, or `'failed'`) is rejected up front with reason
+`function_not_built`, never silently queued against a stale or
+nonexistent `allgres_functions` object.
+
+**Rust (`src/function_exec.rs`, new -- mirrors `src/sandbox.rs` closely).**
+`pump_function_builds`: claims pending builds, dollar-quotes the body with
+a tag verified absent from it (so arbitrary body content, including a
+literal `$$`, is embedded verbatim with no further escaping needed or
+possible), and runs `SET LOCAL ROLE allgres_function_admin; CREATE OR
+REPLACE FUNCTION allgres_functions.<sql_ident>(p_args jsonb) RETURNS
+jsonb LANGUAGE plpgsql SECURITY INVOKER AS <dollar-quoted body>;` as a
+top-level SPI statement inside `run_in_subtransaction` (reused from
+`sandbox.rs`, made `pub(crate)` for this). `pump_function_calls`: claims
+queued calls, `SET LOCAL ROLE <the agent's own pg_role, or 'sandbox' as
+fallback>`, then `SELECT allgres_functions.<sql_ident>($1::jsonb)` --
+unlike `fn_run_sandboxed_sql`, no intermediate wrapper function is
+needed, since the built Function *is* the sandboxed artifact, there is no
+separately-validated SQL text to reshape. Both wired into
+`runtime_worker.rs`'s existing pump loop, same tier as `pump_sql` (SPI
+thread, one claim per tick, `SQL_STATEMENT_TIMEOUT_MS`-bounded).
+
+**Wiring (`sql/grants_and_facade.sql`).** No new ownership-exclusion
+entries needed -- the ownership-fixing passes scan only
+`allgres_private`/`allgres_public`/`allgres`, never `allgres_functions`,
+so a dynamically-built Function is never touched by them (confirmed by
+reading the exact `WHERE n.nspname IN (...)` clause before assuming this,
+rather than guessing). The four new claim/complete functions got explicit
+`GRANT EXECUTE ... TO worker` (mirroring `fn_claim_sql`/`fn_complete_sql`
+exactly); `fn_create_function`/`fn_update_function` needed no new grant at
+all -- they're called only from functions `allgres_owner` already owns,
+and the file's existing blanket `REVOKE EXECUTE ON ALL FUNCTIONS IN
+SCHEMA allgres_public FROM PUBLIC` / `GRANT EXECUTE ON ALL FUNCTIONS IN
+SCHEMA allgres_public TO operator` already cover anything newly defined
+in an earlier-loaded file by the time this one runs last (confirmed by
+reading those two statements' exact scope before assuming a per-function
+grant was needed). `functions.list`/`functions.create` extended with
+`body`/`param_schema`/`build_status`/`build_error`; new
+`functions.update` action; `rpc_catalog.json` regenerated and both frozen
+arrays in `fn_selftest` updated to match.
+
+**Caught a real table-ordering bug before the first build attempt** (the
+same class of mistake CLAUDE.md's own written-down history already warns
+about): first placed `function_calls` right next to `functions`/
+`procedure_function_bindings`, early in "2. Schemas, tables" -- but its
+`REFERENCES allgres_private.tasks(task_id)` failed with "relation
+allgres_private.tasks does not exist", since `tasks` is not defined until
+much later in the file. Fixed by moving the whole table (plus its index)
+to right after `outbound_calls`'s own definition, which already needs
+`tasks` and is therefore already correctly ordered after it.
+
+**Caught a real selftest idempotency bug on the second, separate-
+connection run** (again, exactly the class of bug CLAUDE.md's own history
+warns this project has hit before): a new `call_function_rejects_a_
+function_not_yet_built` test case granted the shared `analyst` fixture
+(`v_agent`) a `procedure` permission and never revoked it. On a second
+`fn_selftest()` call within the same database, that leftover grant made
+`v_agent` already hold *a* procedure permission, which broke two
+unrelated, textually-earlier tests that assume `v_agent` starts with
+zero (`procedure_hidden_from_prompt_without_permission`,
+`disabled_procedure_hidden_even_with_permission` -- both failed only on
+the second run, passed on the first). Fixed by calling
+`fn_revoke_permission` immediately after the test that needed the grant,
+restoring `v_agent` to the state every other test assumes.
+
+Verified: rebuilt and reinstalled; fresh install's `fn_selftest()` read
+`"failed": 0, "passed": 338` across two separate `psql` connections,
+identical both times (confirming the idempotency fix above actually
+worked, not just that it compiled); `cargo test --lib --no-default-
+features --features pg16` still 30/30. Live, beyond `fn_selftest` (this
+phase genuinely needed it -- new external-call-shaped worker behavior and
+new role-scoping, exactly what the verification loop calls out): created
+a `plpgsql` Function whose body ran `SELECT count(*) FROM allgres_private.
+llm_secrets` and confirmed it actually appeared in `pg_proc` owned by
+`allgres_function_admin` with `security_definer = false`; drove a real
+task through `fn_submit_result`'s `call_function` path as the seeded
+`general` agent (falling back to the shared `sandbox` role, since a fresh
+install's seeded agents have no per-agent `pg_role` yet) and confirmed the
+execution log recorded `"function secret_probe failed: permission denied
+for schema allgres_private"` -- a genuine Postgres permission error, not
+a procedural rejection. Ran the identical pipeline with a second,
+benign Function (`RETURN jsonb_build_object('answer', (p_args->>'x')::int
++ 1)`) and confirmed it returned `{"result": {"answer": 42}, "function":
+"add_one"}` in the execution log, proving the positive path works and the
+first result was a real permission boundary, not something broken more
+generally. Also confirmed live that `DROP EXTENSION ... CASCADE` cleanly
+drops every dynamically-built object in `allgres_functions` too (it
+cascades through the schema, which the extension owns, regardless of who
+owns the individual functions inside it) -- no orphaned objects survive
+an uninstall. One environment-specific thing learned along the way, not a
+bug: the "allgres runtime" worker connects to whichever single database
+`ALLGRES_DATABASE` (or its default) names, set at `shared_preload_
+libraries` load time -- a fresh `CREATE DATABASE` for verification has no
+worker of its own unless dynamically started (`fn_start_dynamic_workers`,
+which itself refuses to run when already statically preloaded), so live
+Function-pipeline testing has to happen against the database the real
+worker is actually attached to, not an arbitrary scratch database.
+
+Deliberately not in this slice: no Settings UI for authoring a `plpgsql`
+Function (same gap `http_get` already had, per Phase 3a's own note); an
+MCP-client handler (Phase 3d); Procedure becoming a real `CREATE
+PROCEDURE` that calls Functions in code (Phase 3c); `call_llm()` for a
+future Procedure body's own mid-pipeline judgment calls (Phase 3e).

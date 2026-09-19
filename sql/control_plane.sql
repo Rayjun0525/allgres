@@ -106,6 +106,21 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_settings_reader') THEN
     CREATE ROLE allgres_settings_reader NOLOGIN NOINHERIT;
   END IF;
+  -- Same reasoning again, for real PL/pgSQL Functions (see "2. Schemas,
+  -- tables" below, allgres_private.functions): CREATE on the
+  -- allgres_functions schema is the only privilege this needs, and it is
+  -- exercised exactly once, by the runtime worker's own top-level SPI call
+  -- that dynamically CREATE OR REPLACEs one agent- or operator-authored
+  -- Function body (never by any SECURITY DEFINER function in this file,
+  -- which cannot SET ROLE at all -- see sql-sandbox.md for why that
+  -- restriction exists and how the split already works for execute_sql).
+  -- Owning the schema this narrowly, rather than granting allgres_owner
+  -- CREATE on it, keeps a bug in the one function that builds these
+  -- (fn_run_function_build, Rust-invoked) from also being a bug in every
+  -- other SECURITY DEFINER function allgres_owner owns.
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_function_admin') THEN
+    CREATE ROLE allgres_function_admin NOLOGIN NOINHERIT;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator') THEN
     CREATE ROLE operator LOGIN;
   END IF;
@@ -138,6 +153,28 @@ ALTER ROLE operator SET search_path = allgres_private, allgres_public, pg_temp;
 -- `sandbox` to run agent SQL (fn_run_sandboxed_sql); that second hop needs
 -- role membership.
 GRANT sandbox TO worker;
+
+-- allgres_functions: the schema every dynamically-built, agent- or
+-- operator-authored real PL/pgSQL Function body actually lives in (see
+-- allgres_private.functions.sql_ident below). Owned by
+-- allgres_function_admin, never allgres_owner, so that CREATE privilege on
+-- it stays confined to the one worker-invoked build step that needs it.
+-- `worker` needs membership in allgres_function_admin for that same
+-- reason `worker` needs membership in `sandbox` above: the runtime
+-- worker's own top-level SPI call is the only place `SET LOCAL ROLE` is
+-- legal (PostgreSQL forbids it inside a SECURITY DEFINER function), so
+-- building a Function has to happen there, not in any PL/pgSQL function
+-- in this file.
+CREATE SCHEMA IF NOT EXISTS allgres_functions AUTHORIZATION allgres_function_admin;
+GRANT allgres_function_admin TO worker;
+-- USAGE goes to `sandbox`, not `worker`: every agent role is already a
+-- member of `sandbox` (fn_provision_agent_role), which is what the worker
+-- actually SET LOCAL ROLEs to before calling a built Function (the
+-- agent's own specific role if it has one, `sandbox` itself as the
+-- fallback for one that predates per-agent roles -- same fallback
+-- run_sandboxed_sql already uses). `worker` itself never needs to touch
+-- this schema directly; it only ever reaches it after switching away.
+GRANT USAGE ON SCHEMA allgres_functions TO sandbox;
 
 -- ---------------------------------------------------------------------------
 -- Drop objects whose signature or return type changed since 0.1.0.
@@ -461,20 +498,53 @@ CREATE TABLE IF NOT EXISTS allgres_private.procedure_history (
 CREATE INDEX IF NOT EXISTS procedure_history_procedure_idx
   ON allgres_private.procedure_history (procedure_id, generation DESC);
 
--- A Function is a named, reusable execution contract.  Version one is
--- deliberately narrow: it can only invoke the existing asynchronous
--- http_get runtime with a fixed operator-reviewed URL.  This makes a
--- procedure grant meaningful without giving an agent arbitrary SQL/function
--- execution or an unrestricted network capability.
+-- A Function is a named, reusable execution contract. Two handlers exist:
+-- `http_get` (the original, narrowest form -- a fixed, operator-reviewed
+-- URL and nothing else, args_template holding only {"url":...}) and
+-- `plpgsql` (a real PL/pgSQL function body, dynamically CREATE OR
+-- REPLACEd into allgres_functions and run SECURITY INVOKER under
+-- whichever agent's own Postgres role actually calls it -- see
+-- build_status/sql_ident/body below and src/function_exec.rs). This is
+-- the whole point of the `plpgsql` handler: a real Postgres GRANT is what
+-- bounds what its body can touch, not a procedural check re-derived on
+-- every call the way http_get's URL/args_template fixing is. A procedure
+-- grant is therefore still meaningful without giving an agent unreviewed
+-- network or SQL capability -- for http_get because the URL is fixed at
+-- creation time, for plpgsql because the body runs as the calling agent
+-- and can never see more than that agent's own role already grants it.
 CREATE TABLE IF NOT EXISTS allgres_private.functions (
   function_id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name          text NOT NULL UNIQUE CHECK (name ~ '^[a-z][a-z0-9_]{0,62}$'),
   description   text NOT NULL,
-  handler       text NOT NULL CHECK (handler IN ('http_get')),
+  handler       text NOT NULL CHECK (handler IN ('http_get', 'plpgsql')),
   args_template jsonb NOT NULL DEFAULT '{}'::jsonb,
+  -- plpgsql-only. body is the function's own statements (never a full
+  -- CREATE FUNCTION -- the build step supplies the signature, language,
+  -- and SECURITY INVOKER itself, so an author can never smuggle in
+  -- SECURITY DEFINER or a different argument list). param_schema
+  -- documents the expected shape of the single `p_args jsonb` argument,
+  -- shown back to an authoring agent in fn_next_step's bounds (see
+  -- "Function authoring" there) -- advisory only, never enforced by this
+  -- table, the same way args_template's shape for http_get is enforced
+  -- procedurally rather than by a schema validator.
+  body          text,
+  param_schema  jsonb NOT NULL DEFAULT '{}'::jsonb,
+  -- sql_ident is the function's real, permanent name inside
+  -- allgres_functions once built (fn_<function_id, dashes stripped> --
+  -- never derived from the author-chosen `name`, so renaming a Function
+  -- never requires renaming or re-granting the underlying Postgres
+  -- object). NULL until the first successful build.
+  sql_ident     text UNIQUE,
+  build_status  text NOT NULL DEFAULT 'built' CHECK (build_status IN ('pending', 'building', 'built', 'failed')),
+  build_error   text,
+  created_by_agent_id uuid REFERENCES allgres_private.agents(agent_id),
   is_active     boolean NOT NULL DEFAULT true,
   created_at    timestamptz NOT NULL DEFAULT now(),
-  updated_at    timestamptz NOT NULL DEFAULT now()
+  updated_at    timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+    (handler = 'http_get' AND body IS NULL)
+    OR (handler = 'plpgsql' AND body IS NOT NULL)
+  )
 );
 
 CREATE TABLE IF NOT EXISTS allgres_private.procedure_function_bindings (
@@ -1109,9 +1179,16 @@ ALTER TABLE allgres_private.change_proposals
 -- self_improve may ever create one (enforced in fn_submit_result, not
 -- here, the same as target_agent_id above) -- widening the CHECK, not
 -- re-adding the column, since an existing install already has it.
+--
+-- 'create_function'/'update_function': any agent's own Function proposal,
+-- gated the same way 'create_agent' is -- see fn_submit_result's own
+-- create_function/update_function branches. 'update_function' is the one
+-- kind besides 'function_override' that uses target_function_id (which
+-- Function it edits); 'create_function' needs neither target column,
+-- same as 'create_agent'.
 ALTER TABLE allgres_private.change_proposals DROP CONSTRAINT IF EXISTS change_proposals_kind_check;
 ALTER TABLE allgres_private.change_proposals ADD CONSTRAINT change_proposals_kind_check
-  CHECK (kind IN ('policy_change', 'create_agent', 'function_override'));
+  CHECK (kind IN ('policy_change', 'create_agent', 'function_override', 'create_function', 'update_function'));
 ALTER TABLE allgres_private.change_proposals
   ADD COLUMN IF NOT EXISTS target_function_id uuid REFERENCES allgres_private.functions(function_id) ON DELETE CASCADE;
 
@@ -1997,6 +2074,32 @@ CREATE TABLE IF NOT EXISTS allgres_private.outbound_calls (
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now()
 );
+
+-- A queue for calling one *built* plpgsql-handler Function, distinct from
+-- outbound_calls above: outbound_calls is HTTP-shaped (a mandatory url,
+-- method, headers) and every row it queues is picked up by the worker's
+-- HTTP thread pool; a plpgsql Function call is not an HTTP request at
+-- all -- it is a local `SET LOCAL ROLE <the calling agent's own role>;
+-- SELECT allgres_functions.<sql_ident>($1)`, issued by the worker's own
+-- top-level SPI thread for the exact same "SET ROLE is illegal inside a
+-- SECURITY DEFINER function" reason fn_run_sandboxed_sql already has to
+-- work around (see src/function_exec.rs, which mirrors src/sandbox.rs's
+-- run_sandboxed_sql almost exactly). Same claim/complete/'lost'-reclaim
+-- shape as outbound_calls otherwise, minus every HTTP-only column.
+CREATE TABLE IF NOT EXISTS allgres_private.function_calls (
+  call_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id      uuid NOT NULL REFERENCES allgres_private.tasks(task_id) ON DELETE CASCADE,
+  function_id  uuid NOT NULL REFERENCES allgres_private.functions(function_id) ON DELETE CASCADE,
+  agent_id     uuid NOT NULL REFERENCES allgres_private.agents(agent_id),
+  args         jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status       text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'in_flight', 'harvested', 'lost')),
+  result       jsonb,
+  error        text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS function_calls_queued_idx
+  ON allgres_private.function_calls (created_at) WHERE status = 'queued';
 
 -- 'embedding': fn_search_agents' own query text, queued and claimed exactly
 -- like 'llm' (same provider/auth_kind resolution in fn_claim_outbound, same
@@ -3914,15 +4017,21 @@ BEGIN
   -- A procedure grant also exposes its reviewed Functions.  Keep these
   -- structured rather than merely appending their names: the model receives
   -- the exact fixed arguments and cannot substitute a host or URL.
+  -- 'args' is args_template for http_get (the fixed, reviewed operation --
+  -- see that column's own comment) and param_schema for plpgsql (a
+  -- documented *shape* for the agent's own args, never fixed values --
+  -- the plpgsql handler's real security boundary is SECURITY INVOKER plus
+  -- the calling agent's own Postgres role, not a fixed argument set).
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
     'name', pt.name, 'description', pt.description, 'handler', pt.handler,
-    'args', pt.args_template, 'procedure', pr.name
+    'args', CASE WHEN pt.handler = 'plpgsql' THEN pt.param_schema ELSE pt.args_template END,
+    'procedure', pr.name
   ) ORDER BY pt.name), '[]'::jsonb)
   INTO v_procedure_functions
   FROM allgres_private.functions pt
   JOIN allgres_private.procedure_function_bindings pb USING (function_id)
   JOIN allgres_private.procedures pr USING (procedure_id)
-  WHERE pt.is_active AND pr.is_active
+  WHERE pt.is_active AND pr.is_active AND pt.build_status IS DISTINCT FROM 'failed'
     AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'));
   v_functions := v_functions || v_procedure_functions;
 
@@ -3947,8 +4056,22 @@ BEGIN
       || v_views::text
       || E'\nfunctions: '
       || v_functions::text
-      || E'\nPick action from final_answer | execute_sql | call_function | delegate | await_children | await_human | propose_change | remember.'
+      || E'\nPick action from final_answer | execute_sql | call_function | create_function | update_function | delegate | await_children | await_human | propose_change | remember.'
       || E'\nFor numeric questions, execute_sql first. Do not invent keys.'
+      || E'\ncreate_function: {"action":"create_function","name":"...","description":"...","body":"...","param_schema":{...},"reason":"..."}'
+      || E' -- authors a new real PL/pgSQL Function. body is only the statements inside the function, never a full'
+      || E' CREATE FUNCTION: it becomes the body of `CREATE FUNCTION allgres_functions.<generated>(p_args jsonb) RETURNS jsonb'
+      || E' LANGUAGE plpgsql SECURITY INVOKER AS $$<body>$$`, so it must read its argument as the variable p_args (jsonb)'
+      || E' and always RETURN a jsonb value. It runs later as whichever agent actually calls it, under that agent''s own'
+      || E' Postgres role -- it can only ever see what that role''s own grants allow, the same as your own execute_sql'
+      || E' action, so write it exactly as carefully. param_schema is a plain jsonb description of the args shape you'
+      || E' expect callers to pass (shown back to them, never enforced) -- e.g. {"limit":"integer, optional, default 20"}.'
+      || E' It cannot declare SECURITY DEFINER or change role. Whether this applies immediately or waits for an operator'
+      || E' to approve it depends on your own autonomy_level; either way you get the new function_id back, or an error'
+      || E' if the body was rejected. Bind it to a procedure (an operator action) before any agent can actually call it.'
+      || E'\nupdate_function: {"action":"update_function","function_id":"...","description":"...","body":"...","param_schema":{...},"reason":"..."}'
+      || E' -- edits an existing plpgsql Function''s body/description/param_schema (never its name) and re-queues its'
+      || E' build; the previous version stays callable until the new build actually finishes. Same rules as create_function.'
       || E'\nawait_children: {"action":"await_children"} -- pauses this task until every task you have delegated'
       || E' (however many, across however many turns) has finished; your next turn then sees what each one did.'
       || E' Rejected if you have nothing pending to wait on.'
@@ -4309,7 +4432,7 @@ BEGIN
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
     'final_answer', 'execute_sql', 'call_function', 'delegate', 'search_agents', 'recall', 'await_human', 'propose_change',
-    'remember', 'create_agent', 'propose_fix', 'await_children'
+    'remember', 'create_agent', 'propose_fix', 'await_children', 'create_function', 'update_function'
   ) THEN
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count + 1, 'error',
@@ -4412,6 +4535,28 @@ BEGIN
           AND pr.is_active
           AND pr.name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'))
         LIMIT 1;
+        -- A plpgsql-handler Function is queued and returned here, entirely
+        -- separately from the http_get/http_request logic below: it is
+        -- not an outbound HTTP call at all (see allgres_private.
+        -- function_calls's own comment), and args are the agent's own --
+        -- unlike http_get's args_template substitution, a plpgsql body's
+        -- real security boundary is SECURITY INVOKER plus the calling
+        -- agent's own Postgres role, not a fixed argument set.
+        IF v_procedure_function.handler = 'plpgsql' THEN
+          IF v_procedure_function.build_status <> 'built' THEN
+            PERFORM allgres_private.append_log(
+              p_task_id, t.step_count + 1, 'error',
+              jsonb_build_object('reason', 'function_not_built', 'function', v_function, 'build_status', v_procedure_function.build_status)
+            );
+            UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+            RETURN jsonb_build_object('action', 'continue');
+          END IF;
+          INSERT INTO allgres_private.function_calls (task_id, function_id, agent_id, args)
+          VALUES (p_task_id, v_procedure_function.function_id, t.agent_id, v_args)
+          RETURNING call_id INTO v_call;
+          UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+          RETURN jsonb_build_object('action', 'call_function', 'function', v_function, 'call_id', v_call);
+        END IF;
         v_function := v_procedure_function.handler;
         v_args := v_procedure_function.args_template;
         v_allowed := true;
@@ -5203,6 +5348,122 @@ BEGIN
     RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
   END IF;
 
+  -- create_function/update_function: any agent may author or edit a
+  -- reusable plpgsql Function, gated by that agent's own autonomy_level
+  -- exactly the way create_agent is gated by creator's -- 'auto'/
+  -- 'self_approve' apply immediately (queuing the real build, see
+  -- fn_create_function/fn_update_function), 'admin_approval' (every
+  -- agent's default) queues a change_proposals row instead. Deliberately
+  -- not restricted to one named system agent the way create_agent is
+  -- restricted to 'creator': a Function is a shared capability any agent
+  -- might usefully contribute, not a sensitive identity operation, and
+  -- fn_create_function's plpgsql handler already applies the real
+  -- security boundary (SECURITY INVOKER, the calling agent's own
+  -- Postgres role) regardless of who authored the body.
+  IF v_action = 'create_function' THEN
+    IF NULLIF(btrim(COALESCE(v_parsed->>'name', '')), '') IS NULL
+       OR NULLIF(btrim(COALESCE(v_parsed->>'description', '')), '') IS NULL
+       OR NULLIF(btrim(COALESCE(v_parsed->>'body', '')), '') IS NULL THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'create_function_incomplete', 'parsed', v_parsed)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    IF a.autonomy_level <> 'admin_approval' THEN
+      BEGIN
+        v_created := allgres_public.fn_create_function(
+          v_parsed->>'name', v_parsed->>'description', 'plpgsql', '{}'::jsonb,
+          v_parsed->>'body', COALESCE(v_parsed->'param_schema', '{}'::jsonb), t.agent_id
+        );
+      EXCEPTION WHEN others THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'create_function_rejected', 'message', SQLERRM)
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END;
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'assistant',
+        jsonb_build_object('created_function', v_created, 'autonomy_level', a.autonomy_level)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue', 'applied', true, 'created_function', v_created);
+    END IF;
+
+    INSERT INTO allgres_private.change_proposals (agent_id, task_id, kind, proposed_changes, reason, base_generation)
+    VALUES (
+      t.agent_id, p_task_id, 'create_function',
+      jsonb_build_object(
+        'name', v_parsed->>'name', 'description', v_parsed->>'description',
+        'body', v_parsed->>'body', 'param_schema', COALESCE(v_parsed->'param_schema', '{}'::jsonb)
+      ),
+      NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), ''), 0
+    )
+    RETURNING proposal_id INTO v_proposal;
+
+    PERFORM allgres_private.append_log(
+      p_task_id, t.step_count + 1, 'assistant',
+      jsonb_build_object('proposed_function', v_parsed, 'proposal_id', v_proposal)
+    );
+    UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
+  END IF;
+
+  IF v_action = 'update_function' THEN
+    v_function_target := NULLIF(v_parsed->>'function_id', '')::uuid;
+    IF v_function_target IS NULL OR NOT EXISTS (
+      SELECT 1 FROM allgres_private.functions WHERE function_id = v_function_target AND handler = 'plpgsql'
+    ) THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'update_function_target_not_found', 'function_id', v_function_target)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    IF a.autonomy_level <> 'admin_approval' THEN
+      BEGIN
+        v_created := allgres_public.fn_update_function(
+          v_function_target, v_parsed->>'description', v_parsed->>'body', v_parsed->'param_schema'
+        );
+      EXCEPTION WHEN others THEN
+        PERFORM allgres_private.append_log(
+          p_task_id, t.step_count + 1, 'error',
+          jsonb_build_object('reason', 'update_function_rejected', 'message', SQLERRM)
+        );
+        UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+        RETURN jsonb_build_object('action', 'continue');
+      END;
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'assistant',
+        jsonb_build_object('updated_function', v_created, 'autonomy_level', a.autonomy_level)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue', 'applied', true, 'updated_function', v_created);
+    END IF;
+
+    INSERT INTO allgres_private.change_proposals
+      (agent_id, task_id, kind, proposed_changes, reason, base_generation, target_function_id)
+    VALUES (
+      t.agent_id, p_task_id, 'update_function',
+      jsonb_build_object('description', v_parsed->>'description', 'body', v_parsed->>'body', 'param_schema', v_parsed->'param_schema'),
+      NULLIF(btrim(COALESCE(v_parsed->>'reason', '')), ''), 0, v_function_target
+    )
+    RETURNING proposal_id INTO v_proposal;
+
+    PERFORM allgres_private.append_log(
+      p_task_id, t.step_count + 1, 'assistant',
+      jsonb_build_object('proposed_function_update', v_parsed, 'proposal_id', v_proposal, 'target_function_id', v_function_target)
+    );
+    UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'continue', 'proposal_id', v_proposal);
+  END IF;
+
   IF v_action = 'propose_fix' THEN
     IF a.name <> 'fixer' THEN
       PERFORM allgres_private.append_log(
@@ -5752,6 +6013,192 @@ BEGIN
     v_n := v_n + 1;
   END LOOP;
   RETURN jsonb_build_object('count', v_n, 'calls', v_out);
+END;
+$fn$;
+
+-- Claims Functions still waiting on their first (or a re-queued) build.
+-- The worker itself issues the actual `CREATE OR REPLACE FUNCTION
+-- allgres_functions.<sql_ident> ... SECURITY INVOKER AS $$<body>$$` as a
+-- top-level SPI statement under `SET LOCAL ROLE allgres_function_admin`
+-- (src/function_exec.rs) -- the same "cannot SET ROLE inside a SECURITY
+-- DEFINER function" reason fn_claim_sql/fn_run_sandboxed_sql already work
+-- around, applied to DDL instead of an agent's own SELECT. Marking
+-- 'building' here (rather than leaving 'pending') is what stops a second
+-- claim from racing the first if more than one worker cycle ever runs
+-- concurrently.
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_function_builds(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT function_id, sql_ident, body
+    FROM allgres_private.functions
+    WHERE build_status = 'pending' AND handler = 'plpgsql'
+    ORDER BY updated_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE allgres_private.functions
+    SET build_status = 'building', updated_at = now()
+    WHERE function_id = r.function_id;
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'function_id', r.function_id,
+      'sql_ident', r.sql_ident,
+      'body', r.body
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'builds', v_out);
+END;
+$fn$;
+
+-- Records the outcome of one CREATE OR REPLACE FUNCTION the worker just
+-- ran. Fenced on 'building' the same way fn_complete_sql fences on
+-- 'in_flight': a function this stale result no longer describes (e.g. a
+-- second fn_update_function re-queued it while the first build was still
+-- running) is simply ignored rather than overwriting the newer attempt's
+-- own eventual result.
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_function_build(
+  p_function_id uuid, p_ok boolean, p_error text
+) RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+BEGIN
+  UPDATE allgres_private.functions
+  SET build_status = CASE WHEN COALESCE(p_ok, false) THEN 'built' ELSE 'failed' END,
+      build_error = CASE WHEN COALESCE(p_ok, false) THEN NULL ELSE p_error END,
+      updated_at = now()
+  WHERE function_id = p_function_id AND build_status = 'building';
+  IF FOUND THEN
+    PERFORM allgres_private.audit('functions.build_complete', jsonb_build_object(
+      'function_id', p_function_id, 'ok', COALESCE(p_ok, false), 'error', p_error
+    ));
+  END IF;
+END;
+$fn$;
+
+-- Same claim shape as fn_claim_outbound/fn_claim_sql, for
+-- allgres_private.function_calls instead: a queued call against one
+-- already-built plpgsql Function. The worker runs it directly --
+-- `SET LOCAL ROLE <pg_role>; SELECT allgres_functions.<sql_ident>($1)` --
+-- with no intermediate wrapper function, unlike fn_run_sandboxed_sql: the
+-- built Function body *is* the sandboxed artifact here, there is no
+-- separately-validated SQL text to re-shape.
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_function_calls(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT fc.call_id, fc.task_id, fc.args, f.sql_ident, a.pg_role
+    FROM allgres_private.function_calls fc
+    JOIN allgres_private.tasks t ON t.task_id = fc.task_id
+    JOIN allgres_private.functions f ON f.function_id = fc.function_id
+    JOIN allgres_private.agents a ON a.agent_id = fc.agent_id
+    WHERE fc.status = 'queued' AND t.status = 'running' AND f.build_status = 'built'
+    ORDER BY fc.created_at
+    FOR UPDATE OF fc SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE allgres_private.function_calls
+    SET status = 'in_flight', updated_at = now()
+    WHERE call_id = r.call_id;
+    -- pg_role is NULL for an agent that predates per-agent roles; the
+    -- worker falls back to the shared `sandbox` role, same as
+    -- fn_claim_sql's own identical fallback.
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'call_id', r.call_id,
+      'task_id', r.task_id,
+      'sql_ident', r.sql_ident,
+      'args', r.args,
+      'pg_role', r.pg_role
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'calls', v_out);
+END;
+$fn$;
+
+-- Records one function_calls result and re-enters the agent loop, same
+-- fencing/never-abort-the-harvest shape as fn_complete_sql above.
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_function_call(
+  p_call_id uuid, p_ok boolean, p_result jsonb, p_error text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  c allgres_private.function_calls%ROWTYPE;
+  v_fname text;
+  v_payload jsonb;
+  v_result jsonb;
+  v_running boolean;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+
+  SELECT * INTO c FROM allgres_private.function_calls WHERE call_id = p_call_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_complete_function_call: not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF c.status <> 'in_flight' THEN
+    RETURN jsonb_build_object(
+      'submit', jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status),
+      'call_id', p_call_id
+    );
+  END IF;
+
+  UPDATE allgres_private.function_calls
+  SET status = 'harvested', updated_at = now()
+  WHERE call_id = p_call_id;
+
+  SELECT name INTO v_fname FROM allgres_private.functions WHERE function_id = c.function_id;
+
+  IF COALESCE(p_ok, false) THEN
+    v_payload := jsonb_build_object(
+      'type', 'function_result',
+      'content', jsonb_build_object('function', v_fname, 'result', COALESCE(p_result, 'null'::jsonb))
+    );
+  ELSE
+    v_payload := jsonb_build_object(
+      'type', 'error',
+      'message', 'function ' || COALESCE(v_fname, c.function_id::text) || ' failed: ' || COALESCE(p_error, 'execution failed')
+    );
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1 FROM allgres_private.tasks WHERE task_id = c.task_id AND status = 'running'
+  ) INTO v_running;
+
+  IF v_running THEN
+    BEGIN
+      v_result := allgres_public.fn_submit_result(c.task_id, v_payload);
+    EXCEPTION WHEN others THEN
+      v_result := jsonb_build_object('action', 'error', 'message', SQLERRM);
+    END;
+  ELSE
+    v_result := jsonb_build_object('action', 'skipped', 'reason', 'task_not_running');
+  END IF;
+
+  RETURN jsonb_build_object('submit', v_result, 'call_id', p_call_id);
 END;
 $fn$;
 
@@ -6316,6 +6763,50 @@ BEGIN
         RAISE WARNING 'fn_watchdog: fn_submit_result failed for task % after sql timeout: %', r.task_id, SQLERRM;
       END;
     END IF;
+    n := n + 1;
+  END LOOP;
+
+  -- Same reclaim, for a plpgsql Function call the worker never came back
+  -- from (a crash between fn_claim_function_calls and
+  -- fn_complete_function_call).
+  FOR r IN
+    SELECT call_id, task_id
+    FROM allgres_private.function_calls
+    WHERE status = 'in_flight'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE allgres_private.function_calls
+    SET status = 'lost', updated_at = now()
+    WHERE call_id = r.call_id;
+    IF EXISTS (SELECT 1 FROM allgres_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
+      BEGIN
+        PERFORM allgres_public.fn_submit_result(
+          r.task_id,
+          jsonb_build_object('type', 'error', 'message', 'function execution timeout')
+        );
+      EXCEPTION WHEN others THEN
+        RAISE WARNING 'fn_watchdog: fn_submit_result failed for task % after function timeout: %', r.task_id, SQLERRM;
+      END;
+    END IF;
+    n := n + 1;
+  END LOOP;
+
+  -- Same reclaim, for a Function build the worker never came back from (a
+  -- crash between fn_claim_function_builds and fn_complete_function_build).
+  -- No task to notify -- a build is not tied to any one task -- so this
+  -- just resets it to 'pending' for the next build cycle to pick up again,
+  -- rather than leaving it stuck 'building' forever.
+  FOR r IN
+    SELECT function_id
+    FROM allgres_private.functions
+    WHERE build_status = 'building'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE allgres_private.functions
+    SET build_status = 'pending', updated_at = now()
+    WHERE function_id = r.function_id;
     n := n + 1;
   END LOOP;
 
