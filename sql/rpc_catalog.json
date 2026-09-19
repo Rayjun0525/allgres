@@ -702,6 +702,7 @@
       "require_admin_if_accounts_exist"
     ],
     "params": [
+      "body",
       "content",
       "name",
       "session_token"
@@ -713,6 +714,7 @@
       "require_admin_if_accounts_exist"
     ],
     "params": [
+      "body",
       "content",
       "is_active",
       "procedure_id",

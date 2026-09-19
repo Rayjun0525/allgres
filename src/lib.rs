@@ -316,6 +316,7 @@ mod config;
 mod function_exec;
 mod http_protocol;
 mod outbound;
+mod procedure_exec;
 mod rpc;
 mod runtime_worker;
 mod sandbox;

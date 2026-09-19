@@ -5807,3 +5807,137 @@ Function (same gap `http_get` already had, per Phase 3a's own note); an
 MCP-client handler (Phase 3d); Procedure becoming a real `CREATE
 PROCEDURE` that calls Functions in code (Phase 3c); `call_llm()` for a
 future Procedure body's own mid-pipeline judgment calls (Phase 3e).
+
+## 74. v2 redesign, Phase 3c: Procedure becomes a real `CREATE PROCEDURE` that calls Functions in code
+
+`allgres_private.procedures` gains the exact same `body`/`sql_ident`/
+`build_status`/`build_error` shape Phase 3b already gave
+`allgres_private.functions`, plus a `run_procedure` action, so a
+procedure is no longer only free-text guidance (`content`, unchanged) an
+agent reads and acts on call by call -- it can now be real PL/pgSQL code
+that runs to completion in one step. `content` and `body` are
+independent; a procedure with no `body` behaves exactly as before.
+
+**Design decision, confirmed with the user before building it, and
+worth writing down because it simplified the whole phase**: a
+Procedure's own body calling a bound Function does *not* need a second
+queue/`SET ROLE` round trip. Phase 3b's queue exists purely to get a
+Function call *into* a role-scoped SPI session in the first place
+(`dashboard_rpc`/`fn_submit_result` are `SECURITY DEFINER` and cannot
+`SET ROLE` themselves). Once a Procedure's own `CALL` has already put the
+worker into that session under the calling agent's role, a Function it
+calls from inside its own body is just an ordinary nested SQL statement
+in the same session -- no new plumbing needed for that at all. This is
+also why the scope is bounded the way it is: an `http_get`/`http_request`
+Function needs a real outbound HTTP round trip, which a single blocking
+`CALL` cannot wait on without tying up the SPI thread, so a Procedure
+body may only call something synchronous (another `plpgsql` Function,
+ordinary SQL) -- calling an HTTP-shaped Function, and `call_llm()` for a
+Procedure's own mid-pipeline judgment calls, both need a fundamentally
+different (resumable) execution model and stay future work, unchanged
+from Phase 3b's own note. Procedures also stay operator-authored only in
+this slice, unlike Functions -- widening that is not asked for here and
+kept out to bound scope.
+
+**Schema/SQL, closely mirroring Phase 3b's own shape throughout**
+(`sql/control_plane.sql`): `procedures.body`/`sql_ident`
+(`proc_<procedure_id, dashes stripped>`)/`build_status`/`build_error`;
+`procedure_history.body` alongside its existing `content`; a new
+`allgres_private.procedure_calls` table, deliberately separate from
+`function_calls` (a distinct queue per real object type, not because the
+shape differs) and from `outbound_calls` (still HTTP-shaped, still not
+what this is). `fn_claim_procedure_builds`/`fn_complete_procedure_build`/
+`fn_claim_procedure_calls`/`fn_complete_procedure_call` mirror their
+Function equivalents exactly, including two new `fn_watchdog` reclaim
+loops. `execution_logs.role` gained `'procedure'` (distinct from
+`'function'`, both still remapped to `'user'` for the LLM's own view) so
+the audit trail says accurately which kind of call actually happened.
+`fn_create_procedure`/`fn_set_procedure`/`fn_rollback_procedure`
+(`sql/operator_agents_and_policies.sql`) widened for `body`, reusing
+`allgres_private.validate_function_body` directly rather than adding a
+same-behavior wrapper function with its own name (`allgres_private.
+validate_procedure_body` would have been the third body-shape guardrail
+with the same first two rules -- SECURITY DEFINER, SET ROLE -- with
+nothing to justify a separate identity yet).
+
+**`run_procedure` (`fn_submit_result`, new action, alongside
+`call_function`)**: checks the same `'procedure'` permission a
+procedure grant already requires to show its `content` at all, resolves
+the named procedure, rejects `'procedure_not_permitted'` /
+`'unknown_procedure'` / `'procedure_not_built'` (body `NULL` or
+`build_status <> 'built'`) up front, then queues into `procedure_calls`
+with the agent's own `args`. Result comes back once as a
+`procedure_result`, handled in its own branch parallel to
+`function_result` -- deliberately *not* wired into the existing per-
+function/per-procedure model-override and canary-experiment machinery
+(functions/procedures' own `llm_override`, `model_experiments`): that
+system exists to pick a cheaper model for the *next* LLM turn's reasoning
+about one function call's result, which has no equivalent for a batch
+result a procedure's own code already finished acting on.
+`fn_next_step`'s bounds gained a `run_procedure` guide alongside
+`create_function`/`update_function`'s own.
+
+**Rust (`src/procedure_exec.rs`, new -- mirrors `src/function_exec.rs`
+almost exactly)**: `pump_procedure_builds`/`pump_procedure_calls`, wired
+into `runtime_worker.rs`'s pump loop at the same tier as the Function
+pair. `CREATE OR REPLACE PROCEDURE ... INOUT p_result jsonb ...
+SECURITY INVOKER AS <dollar-quoted body>` for the build; `CALL
+allgres_functions.<sql_ident>($1::jsonb, '{}'::jsonb)` for the call --
+Postgres returns a procedure's `OUT`/`INOUT` parameters as a one-row
+result exactly like a function's return value (documented behavior since
+procedures were introduced in PG11), which is what let the identical
+`Spi::get_one_with_args::<JsonB>` read work for both a `SELECT` and a
+`CALL` with no new SPI-handling code. `dollar_quote`/`valid_sql_ident`
+(the latter now taking a `prefix` argument, `"fn_"` or `"proc_"`) made
+`pub(crate)` in `function_exec.rs` and reused rather than duplicated.
+
+**Two real bugs caught during verification, both before this shipped:**
+
+1. The new `run_procedure` authoring-guide text in `fn_next_step`'s
+   prompt literally contained the substring `"# procedures"` inside an
+   example (`"<name from # procedures below>"`) -- which is also the
+   exact heading text the *conditional* procedures section uses,
+   present in the prompt only when an agent actually holds a procedure
+   grant. This made two long-standing, unrelated tests
+   (`procedure_hidden_from_prompt_without_permission`,
+   `disabled_procedure_hidden_even_with_permission`) fail on the very
+   first `fn_selftest()` run, not a second-run idempotency issue like
+   item 73's bug -- caught immediately rather than requiring a second
+   connection to surface. Fixed by rewording the example to avoid the
+   literal heading text.
+2. A new `run_procedure_rejects_an_unknown_procedure` test assumed
+   `run_procedure` would reach its "does this procedure exist" check
+   before its permission check -- but permission is checked first (the
+   same order `call_function` already uses), so a name the agent was
+   never granted hit `'procedure_not_permitted'`, not
+   `'unknown_procedure'`, and the test's assertion was simply checking
+   the wrong reason string. Fixed by splitting it into two cases: one
+   proving the ordinary "not granted" rejection
+   (`run_procedure_rejects_an_ungranted_procedure`), and one that first
+   grants a name matching no real procedure row (permissions have no FK
+   to `procedures.name`) to actually reach `'unknown_procedure'`.
+
+Verified: rebuilt and reinstalled; fresh install's `fn_selftest()` read
+`"failed": 0, "passed": 345` across two separate `psql` connections,
+identical both times; `cargo test --lib --no-default-features --features
+pg16` still 30/30. Live, beyond `fn_selftest` (a new external-call-
+shaped worker path and new role-scoping again, same reasoning as item
+73): created a plpgsql Function (`proc_helper_double`, doubles its `n`
+argument) and a Procedure (`double_and_check`) whose body called that
+Function *directly in its own code* -- `v_r :=
+allgres_functions.fn_<ident>(p_args);` -- then branched on the result
+with a plain `IF`; granted it to the seeded `general` agent, drove a real
+task through `run_procedure`, and confirmed the execution log recorded
+`{"result": {"note": "small", "value": 14}, "procedure":
+"double_and_check"}` for `n=7` -- the correct doubled value, correctly
+branched, with no second queue round trip for the nested Function call
+(confirmed by there being no corresponding `function_calls` row at all
+for that call, only the one `procedure_calls` row). Separately created a
+second Procedure whose body read `allgres_private.llm_secrets` directly
+(no nested Function involved) and confirmed it failed with the identical
+genuine `permission denied for schema allgres_private` a Function body
+gets, proving the Procedure's own `SECURITY INVOKER` role-scoping
+independently of Function-level role-scoping, not merely inherited by
+association. Confirmed via `pg_proc` that both built objects showed
+`prosecdef = false`, owned by `allgres_function_admin`, matching a
+Function's own build.

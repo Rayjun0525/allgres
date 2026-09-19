@@ -916,7 +916,9 @@ $fn$;
 -- endpoint or an agent's own policy).
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION allgres_public.fn_create_procedure(p_name text, p_content text)
+CREATE OR REPLACE FUNCTION allgres_public.fn_create_procedure(
+  p_name text, p_content text, p_body text DEFAULT NULL
+)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -924,6 +926,7 @@ SET search_path = allgres_private, pg_temp
 AS $fn$
 DECLARE
   v_id uuid;
+  v_sql_ident text;
 BEGIN
   IF NULLIF(trim(p_name), '') IS NULL THEN
     RAISE EXCEPTION 'procedure name is required' USING ERRCODE = 'P0001';
@@ -931,9 +934,18 @@ BEGIN
   IF NULLIF(trim(p_content), '') IS NULL THEN
     RAISE EXCEPTION 'procedure content is required' USING ERRCODE = 'P0001';
   END IF;
-  INSERT INTO allgres_private.procedures (name, content)
-  VALUES (trim(p_name), p_content)
+  -- Same body-shape guardrail a plpgsql Function's body gets (defense in
+  -- depth, not the real boundary -- see that function's own comment).
+  IF p_body IS NOT NULL THEN
+    PERFORM allgres_private.validate_function_body(p_body);
+  END IF;
+  INSERT INTO allgres_private.procedures (name, content, body, build_status)
+  VALUES (trim(p_name), p_content, p_body, CASE WHEN p_body IS NOT NULL THEN 'pending' ELSE 'built' END)
   RETURNING procedure_id INTO v_id;
+  IF p_body IS NOT NULL THEN
+    v_sql_ident := 'proc_' || replace(v_id::text, '-', '');
+    UPDATE allgres_private.procedures SET sql_ident = v_sql_ident WHERE procedure_id = v_id;
+  END IF;
   PERFORM allgres_private.audit('procedures.create', jsonb_build_object('procedure_id', v_id, 'name', trim(p_name)));
   RETURN jsonb_build_object('ok', true, 'procedure_id', v_id);
 END;
@@ -942,7 +954,8 @@ $fn$;
 CREATE OR REPLACE FUNCTION allgres_public.fn_set_procedure(
   p_procedure_id uuid,
   p_content text DEFAULT NULL,
-  p_enabled boolean DEFAULT NULL
+  p_enabled boolean DEFAULT NULL,
+  p_body text DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -951,23 +964,37 @@ AS $fn$
 DECLARE
   p_row allgres_private.procedures%ROWTYPE;
   v_content text;
+  v_body text;
   v_changed boolean;
+  v_body_changed boolean;
 BEGIN
   SELECT * INTO p_row FROM allgres_private.procedures WHERE procedure_id = p_procedure_id FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'procedure not found' USING ERRCODE = 'P0001';
   END IF;
 
+  IF p_body IS NOT NULL THEN
+    PERFORM allgres_private.validate_function_body(p_body);
+  END IF;
+
   v_content := COALESCE(NULLIF(p_content, ''), p_row.content);
-  v_changed := v_content IS DISTINCT FROM p_row.content;
+  v_body := COALESCE(p_body, p_row.body);
+  v_changed := v_content IS DISTINCT FROM p_row.content OR v_body IS DISTINCT FROM p_row.body;
+  v_body_changed := v_body IS DISTINCT FROM p_row.body;
 
   IF v_changed THEN
-    INSERT INTO allgres_private.procedure_history (procedure_id, generation, content)
-    VALUES (p_row.procedure_id, p_row.generation, p_row.content);
+    INSERT INTO allgres_private.procedure_history (procedure_id, generation, content, body)
+    VALUES (p_row.procedure_id, p_row.generation, p_row.content, p_row.body);
   END IF;
 
   UPDATE allgres_private.procedures
   SET content = v_content,
+      body = v_body,
+      -- sql_ident is assigned once, the first time this procedure ever
+      -- gets a body -- never re-derived, so a later edit re-uses the same
+      -- real Postgres object rather than orphaning the old one.
+      sql_ident = COALESCE(sql_ident, CASE WHEN v_body IS NOT NULL THEN 'proc_' || replace(procedure_id::text, '-', '') END),
+      build_status = CASE WHEN v_body_changed AND v_body IS NOT NULL THEN 'pending' ELSE build_status END,
       is_active = COALESCE(p_enabled, is_active),
       generation = generation + (CASE WHEN v_changed THEN 1 ELSE 0 END),
       updated_at = now()
@@ -987,7 +1014,8 @@ $fn$;
 
 -- Same shape as fn_rollback_policy: never a mutation of procedure_history,
 -- only ever a new version (via fn_set_procedure) that happens to match an
--- old one.
+-- old one. Restoring an old body re-queues a build the same way any other
+-- body edit does (fn_set_procedure's own v_body_changed check).
 CREATE OR REPLACE FUNCTION allgres_public.fn_rollback_procedure(p_procedure_id uuid, p_generation int)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1004,7 +1032,7 @@ BEGIN
       USING ERRCODE = 'P0001';
   END IF;
   PERFORM allgres_private.audit('procedures.rollback', jsonb_build_object('procedure_id', p_procedure_id, 'restored_generation', p_generation));
-  RETURN allgres_public.fn_set_procedure(p_procedure_id, h.content, NULL);
+  RETURN allgres_public.fn_set_procedure(p_procedure_id, h.content, NULL, h.body);
 END;
 $fn$;
 

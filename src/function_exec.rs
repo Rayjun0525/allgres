@@ -22,15 +22,16 @@ unsafe extern "C" {
     fn disable_timeout(id: std::ffi::c_int, keep_indicator: bool);
 }
 
-/// A sql_ident fn_create_function could actually have produced: `fn_`
-/// plus a uuid with its dashes stripped. Same belt-and-suspenders
-/// reasoning as sandbox.rs's `valid_pg_role` -- this is interpolated
-/// directly into a schema-qualified object name (`format!`, no
-/// parameterized form exists for that), and the column it comes from is
-/// only ever written by fn_create_function, never by anything agent- or
-/// operator-controlled.
-fn valid_sql_ident(s: &str) -> bool {
-    s.strip_prefix("fn_")
+/// A sql_ident fn_create_function/fn_create_procedure could actually have
+/// produced: `prefix` (`fn_` or `proc_`) plus a uuid with its dashes
+/// stripped. Same belt-and-suspenders reasoning as sandbox.rs's
+/// `valid_pg_role` -- this is interpolated directly into a
+/// schema-qualified object name (`format!`, no parameterized form exists
+/// for that), and the column it comes from is only ever written by those
+/// two functions, never by anything agent- or operator-controlled. Also
+/// used by src/procedure_exec.rs, for its own `proc_` idents.
+pub(crate) fn valid_sql_ident(s: &str, prefix: &str) -> bool {
+    s.strip_prefix(prefix)
         .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
@@ -53,7 +54,7 @@ pub(crate) fn claim_function_build_jobs(limit: i32) -> Value {
 /// there is no further escaping needed or possible for a PL/pgSQL
 /// function body. The tag only has to be unique against this one body,
 /// not globally or cryptographically random.
-fn dollar_quote(body: &str) -> (String, String) {
+pub(crate) fn dollar_quote(body: &str) -> (String, String) {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let mut tag = format!("body_{nanos:x}");
     while body.contains(&format!("${tag}$")) {
@@ -70,7 +71,7 @@ fn dollar_quote(body: &str) -> (String, String) {
 /// tries to declare `SECURITY DEFINER` for the same reason, defense in
 /// depth against the same confused-deputy attempt.
 fn run_function_build(sql_ident: &str, body: &str) -> Result<(), String> {
-    if !valid_sql_ident(sql_ident) {
+    if !valid_sql_ident(sql_ident, "fn_") {
         return Err("invalid sql_ident".to_string());
     }
     let (_tag, quoted_body) = dollar_quote(body);
@@ -163,7 +164,7 @@ pub(crate) fn claim_function_call_jobs(limit: i32) -> Value {
 /// validated SQL text to shape here: the built Function *is* the
 /// sandboxed artifact, so this just calls it with the agent's own args.
 fn run_function_call(sql_ident: &str, args: &Value, pg_role: Option<&str>) -> Result<Value, String> {
-    if !valid_sql_ident(sql_ident) {
+    if !valid_sql_ident(sql_ident, "fn_") {
         return Err("invalid sql_ident".to_string());
     }
     let role = pg_role.filter(|r| valid_pg_role(r)).unwrap_or("sandbox");

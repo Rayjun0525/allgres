@@ -294,6 +294,10 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_function_builds(int) TO worker
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_function_build(uuid, boolean, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_function_calls(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_function_call(uuid, boolean, jsonb, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_procedure_builds(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_procedure_build(uuid, boolean, text) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_procedure_calls(int) TO worker;
+GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_procedure_call(uuid, boolean, jsonb, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_oauth(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_oauth(uuid, int, text) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_claim_agent_embedding(int) TO worker;
@@ -1526,6 +1530,7 @@ BEGIN
       RETURN jsonb_build_object('ok', true, 'procedures', COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
           'procedure_id', p.procedure_id, 'name', p.name, 'content', p.content,
+          'body', p.body, 'build_status', p.build_status, 'build_error', p.build_error,
           'generation', p.generation, 'is_active', p.is_active,
           'created_at', p.created_at, 'updated_at', p.updated_at
         ) ORDER BY p.name)
@@ -1539,13 +1544,14 @@ BEGIN
         'procedure', (
           SELECT jsonb_build_object(
             'procedure_id', p.procedure_id, 'name', p.name, 'content', p.content,
+            'body', p.body, 'build_status', p.build_status, 'build_error', p.build_error,
             'generation', p.generation, 'is_active', p.is_active
           )
           FROM allgres_private.procedures p WHERE p.procedure_id = v_id
         ),
         'history', COALESCE((
           SELECT jsonb_agg(jsonb_build_object(
-            'generation', h.generation, 'content', h.content, 'changed_at', h.changed_at
+            'generation', h.generation, 'content', h.content, 'body', h.body, 'changed_at', h.changed_at
           ) ORDER BY h.generation DESC)
           FROM allgres_private.procedure_history h WHERE h.procedure_id = v_id
         ), '[]'::jsonb)
@@ -1553,14 +1559,15 @@ BEGIN
 
     WHEN 'procedures.create' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
-      RETURN allgres_public.fn_create_procedure(p_request->>'name', p_request->>'content');
+      RETURN allgres_public.fn_create_procedure(p_request->>'name', p_request->>'content', p_request->>'body');
 
     WHEN 'procedures.update' THEN
       PERFORM allgres_private.require_admin_if_accounts_exist(p_request->>'session_token');
       RETURN allgres_public.fn_set_procedure(
         (p_request->>'procedure_id')::uuid,
         NULLIF(p_request->>'content', ''),
-        CASE WHEN p_request ? 'is_active' THEN (p_request->>'is_active')::boolean ELSE NULL END
+        CASE WHEN p_request ? 'is_active' THEN (p_request->>'is_active')::boolean ELSE NULL END,
+        p_request->>'body'
       );
 
     WHEN 'procedures.rollback' THEN

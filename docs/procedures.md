@@ -4,32 +4,41 @@ Part of the [documentation index](../README.md).
 
 Roadmap item 4: a **procedure** (`allgres_private.procedures`) is a named,
 versioned, reusable "how to do X" an operator curates once from the
-**Settings → Procedures** panel — free text: a checklist, a SQL template, a
-delegation plan, whatever shape is useful. It is distinct from a memory in
-every way that matters here: shared rather than private to one agent,
-explicitly granted rather than automatically written, and versioned —
-`fn_set_procedure` snapshots the previous content into `procedure_history`
-only on an actual change (the same "only a real change bumps generation"
-rule `fn_set_policy` already applies to an agent's own policy), and
-`fn_rollback_procedure` restores a past version by creating a *new* one
-that happens to match it, the same non-destructive shape `fn_rollback_policy`
-uses — nothing is ever overwritten in place.
+**Settings → Procedures** panel. It has two independent halves: `content`,
+free text an agent reads in its own prompt (a checklist, background, when
+to use this — whatever shape is useful), and `body`, real PL/pgSQL code
+the agent can actually *run* (see "Running a procedure" below). A
+procedure with only `content` and no `body` works exactly as it always
+did — read-only guidance the agent acts on turn by turn. It is distinct
+from a memory in every way that matters here: shared rather than private
+to one agent, explicitly granted rather than automatically written, and
+versioned — `fn_set_procedure` snapshots the previous `content`/`body`
+into `procedure_history` only on an actual change (the same "only a real
+change bumps generation" rule `fn_set_policy` already applies to an
+agent's own policy), and `fn_rollback_procedure` restores a past version
+(both halves) by creating a *new* one that happens to match it, the same
+non-destructive shape `fn_rollback_policy` uses — nothing is ever
+overwritten in place, and restoring an old `body` re-queues its build the
+same way any other edit does.
 
-An agent sees a procedure's current content in its own prompt, on every
+An agent sees a procedure's current `content` in its own prompt, on every
 turn, only once granted the matching permission — `resource_type =
 'procedure'`, `resource_ref = '<name>'` — through the exact same
 `agent_has_permission`/`agent_permission_refs` machinery (inheritance
 through a system agent's parent chain included) that already gates a view
 or a function. A disabled procedure (`is_active = false`) never shows even
 to an agent holding the grant, the same way a disabled `llm_providers` row
-stops being reachable without losing its history.
+stops being reachable without losing its history. Running a `body` with
+`run_procedure` requires that exact same grant — there is no separate
+permission to run one versus merely read its description.
 
 Deliberately not in this slice: no agent-authored procedures yet — an
-operator is the only one who can create, edit, or roll one back today.
-Letting an agent *propose* a new or improved procedure (through the same
-admin_approval/self_approve/auto autonomy-level flow `propose_change`
-already gives an agent for its own policy) is real future work, not done
-here.
+operator is the only one who can create, edit, or roll one back today
+(unlike a plpgsql Function, which any agent may also author itself — see
+[Functions](#functions) below). Letting an agent *propose* a new or
+improved procedure (through the same admin_approval/self_approve/auto
+autonomy-level flow `propose_change` already gives an agent for its own
+policy) is real future work, not done here.
 
 ## Functions
 
@@ -85,9 +94,52 @@ agent's own role) holds regardless of who authored the body.
 
 The seeded `seoul-weather` procedure demonstrates the `http_get` pattern: it
 binds `seoul_weather` to `https://wttr.in/Seoul?format=j1` and grants the
-procedure to the General agent. To make a new Function usable, bind it to a
-procedure, then grant that procedure to the intended agent in the usual
-permission UI. This keeps the naming model clear: **Procedure** is the
-reusable capability; a **Function** is one operation inside it — fixed for
-`http_get`, a real role-scoped PL/pgSQL body for `plpgsql`. An MCP-client
-handler is planned next (see the v2 redesign notes in KNOWN_ISSUES.md).
+procedure to the General agent. To make a new Function usable via
+`call_function`, bind it to a procedure, then grant that procedure to the
+intended agent in the usual permission UI — binding is advisory for this
+purpose only (which Functions to show alongside a procedure's `content`),
+never an enforcement gate: a procedure's own `body` (below) may call any
+Function it likes, bound or not, since the real enforcement is the
+Postgres role the call actually runs under, not this table.
+
+## Running a procedure
+
+A procedure's `body` is real PL/pgSQL, built the identical way a plpgsql
+Function's `body` is (queued, then `CREATE OR REPLACE PROCEDURE
+allgres_functions.<generated ident>(p_args jsonb, INOUT p_result jsonb)
+LANGUAGE plpgsql SECURITY INVOKER AS $$<body>$$` issued by the runtime
+worker as a top-level SPI statement under `SET LOCAL ROLE
+allgres_function_admin`) — a procedure has no `RETURNS` clause of its
+own, so the body is expected to assign `p_result` before it ends, the way
+a Function's body ends in `RETURN`.
+
+An agent runs one with `run_procedure` (`{"action":"run_procedure",
+"procedure":"<name>","args":{...}}`), queued into
+`allgres_private.procedure_calls` and executed the same way a
+`call_function` is: `SET LOCAL ROLE <the calling agent's own Postgres
+role>` before the `CALL`. The crucial difference from `call_function` is
+what happens *inside* that one role-scoped session: the procedure's own
+body calls whichever Functions it needs directly, as ordinary nested
+statements, in order, with real `IF`/`LOOP` branching — not one LLM turn
+per Function call the way an agent following a procedure's `content` by
+hand would. There is no second queue round trip for a Function called
+this way: the queue and `SET ROLE` only exist to get *into* the
+role-scoped session in the first place, not for every statement run once
+inside it. This also means the body can only call something synchronous
+— another plpgsql Function, ordinary SQL — never an `http_get`/
+`http_request` Function, which requires an outbound HTTP round trip a
+single blocking procedure call cannot wait on; that capability (and a
+`call_llm()` helper for a procedure's own mid-pipeline judgment calls) is
+future work. The result comes back once, as a `procedure_result` (its own
+`execution_logs` role, distinct from a Function's `function_result`) —
+confirmed live: a procedure whose body called a Function and branched on
+its result returned the correctly-branched value, and a procedure whose
+body tried to read a table its calling agent's role has no grant on
+failed with the identical genuine `permission denied` a plpgsql Function
+would (see KNOWN_ISSUES.md's Phase 3c entry).
+
+This keeps the naming model clear: **Procedure** is the reusable
+capability, now real code as well as a description; a **Function** is one
+operation inside it — fixed for `http_get`, a real role-scoped PL/pgSQL
+body for `plpgsql`. An MCP-client handler is planned next (see the v2
+redesign notes in KNOWN_ISSUES.md).

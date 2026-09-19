@@ -477,10 +477,30 @@ ALTER TABLE allgres_private.permissions ADD CONSTRAINT permissions_resource_type
 -- agent's own policy (see fn_set_policy's own comment on why: "only ever a
 -- new version that happens to match an old one," never a rewrite of what
 -- was already recorded).
+-- content is the human/agent-facing description shown in an agent's own
+-- prompt (unchanged) -- a checklist, background, when to use this, in
+-- whatever prose an operator finds useful. body (Phase 3b's plpgsql
+-- Function pattern, applied here) is the real executable half: PL/pgSQL
+-- statements dynamically built into a real Postgres PROCEDURE (see
+-- sql_ident/build_status below), run SECURITY INVOKER under the calling
+-- agent's own role via `run_procedure`, exactly like a plpgsql Function
+-- is run via `call_function` -- except a procedure body can call a bound
+-- Function directly as an ordinary nested statement in the same
+-- already-role-switched session, with no separate queue round trip: the
+-- queue/SET ROLE dance only exists to get *into* that session in the
+-- first place, not for every call made once inside it. content and body
+-- are independent -- an operator may describe a procedure without yet
+-- giving it real code, the same way a Function's args_template/body used
+-- to be the only thing that mattered before this table grew a
+-- description column too.
 CREATE TABLE IF NOT EXISTS allgres_private.procedures (
   procedure_id  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name          text NOT NULL UNIQUE,
   content       text NOT NULL,
+  body          text,
+  sql_ident     text UNIQUE,
+  build_status  text NOT NULL DEFAULT 'built' CHECK (build_status IN ('pending', 'building', 'built', 'failed')),
+  build_error   text,
   generation    int NOT NULL DEFAULT 1,
   is_active     boolean NOT NULL DEFAULT true,
   created_at    timestamptz NOT NULL DEFAULT now(),
@@ -492,6 +512,7 @@ CREATE TABLE IF NOT EXISTS allgres_private.procedure_history (
   procedure_id  uuid NOT NULL REFERENCES allgres_private.procedures(procedure_id) ON DELETE CASCADE,
   generation    int NOT NULL,
   content       text NOT NULL,
+  body          text,
   changed_at    timestamptz NOT NULL DEFAULT now(),
   UNIQUE (procedure_id, generation)
 );
@@ -1221,7 +1242,7 @@ CREATE TABLE IF NOT EXISTS allgres_private.execution_logs (
   task_id     uuid NOT NULL REFERENCES allgres_private.tasks(task_id),
   step_number int NOT NULL,
   role        text NOT NULL CHECK (role IN
-                ('system', 'user', 'assistant', 'function', 'error', 'operator')),
+                ('system', 'user', 'assistant', 'function', 'procedure', 'error', 'operator')),
   content     jsonb NOT NULL,
   created_at  timestamptz NOT NULL DEFAULT now()
 );
@@ -2100,6 +2121,28 @@ CREATE TABLE IF NOT EXISTS allgres_private.function_calls (
 );
 CREATE INDEX IF NOT EXISTS function_calls_queued_idx
   ON allgres_private.function_calls (created_at) WHERE status = 'queued';
+
+-- Same shape again, for `run_procedure` against a *built* procedure body
+-- (allgres_private.procedures.body). Also not an HTTP call, same reasons
+-- as function_calls above -- a real `CALL allgres_functions.<sql_ident>
+-- ($1, '{}'::jsonb)` under the calling agent's own role. A procedure's
+-- own body calling a bound Function does *not* create a second row here
+-- or in function_calls: it is an ordinary nested statement in the same
+-- already-role-switched session the CALL above is already running in.
+CREATE TABLE IF NOT EXISTS allgres_private.procedure_calls (
+  call_id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id      uuid NOT NULL REFERENCES allgres_private.tasks(task_id) ON DELETE CASCADE,
+  procedure_id uuid NOT NULL REFERENCES allgres_private.procedures(procedure_id) ON DELETE CASCADE,
+  agent_id     uuid NOT NULL REFERENCES allgres_private.agents(agent_id),
+  args         jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status       text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'in_flight', 'harvested', 'lost')),
+  result       jsonb,
+  error        text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS procedure_calls_queued_idx
+  ON allgres_private.procedure_calls (created_at) WHERE status = 'queued';
 
 -- 'embedding': fn_search_agents' own query text, queued and claimed exactly
 -- like 'llm' (same provider/auth_kind resolution in fn_claim_outbound, same
@@ -4056,7 +4099,7 @@ BEGIN
       || v_views::text
       || E'\nfunctions: '
       || v_functions::text
-      || E'\nPick action from final_answer | execute_sql | call_function | create_function | update_function | delegate | await_children | await_human | propose_change | remember.'
+      || E'\nPick action from final_answer | execute_sql | call_function | run_procedure | create_function | update_function | delegate | await_children | await_human | propose_change | remember.'
       || E'\nFor numeric questions, execute_sql first. Do not invent keys.'
       || E'\ncreate_function: {"action":"create_function","name":"...","description":"...","body":"...","param_schema":{...},"reason":"..."}'
       || E' -- authors a new real PL/pgSQL Function. body is only the statements inside the function, never a full'
@@ -4069,6 +4112,11 @@ BEGIN
       || E' It cannot declare SECURITY DEFINER or change role. Whether this applies immediately or waits for an operator'
       || E' to approve it depends on your own autonomy_level; either way you get the new function_id back, or an error'
       || E' if the body was rejected. Bind it to a procedure (an operator action) before any agent can actually call it.'
+      || E'\nrun_procedure: {"action":"run_procedure","procedure":"<a name you were granted, shown in your procedures below>","args":{...}}'
+      || E' -- runs that procedure''s real code to completion in one step (it calls whichever Functions it needs itself,'
+      || E' in order, with real branching -- you do not drive it call by call the way you would with call_function) and'
+      || E' reports back once, as a procedure_result on your next turn. Requires the same procedure permission that'
+      || E' already shows you its description below; only an operator can author or edit a procedure''s real code.'
       || E'\nupdate_function: {"action":"update_function","function_id":"...","description":"...","body":"...","param_schema":{...},"reason":"..."}'
       || E' -- edits an existing plpgsql Function''s body/description/param_schema (never its name) and re-queues its'
       || E' build; the previous version stays callable until the new build actually finishes. Same rules as create_function.'
@@ -4140,10 +4188,10 @@ BEGIN
     -- fn_decide_approval); it has to reach the model as a 'user' turn just
     -- like a function result does, or the human's answer is visible on the
     -- dashboard but the agent it was meant for never sees it.
-    IF v_log.role IN ('system', 'user', 'assistant', 'function', 'operator') THEN
+    IF v_log.role IN ('system', 'user', 'assistant', 'function', 'procedure', 'operator') THEN
       v_messages := v_messages || jsonb_build_array(
         jsonb_build_object(
-          'role', CASE WHEN v_log.role IN ('function', 'operator') THEN 'user' ELSE v_log.role END,
+          'role', CASE WHEN v_log.role IN ('function', 'procedure', 'operator') THEN 'user' ELSE v_log.role END,
           'content', allgres_private.log_content_text(v_log.content)
         )
       );
@@ -4333,6 +4381,8 @@ DECLARE
   v_procedure_function allgres_private.functions%ROWTYPE;
   v_procedure_bound boolean := false;
   v_bound_procedure_id uuid;
+  v_procedure_name text;
+  v_procedure_row allgres_private.procedures%ROWTYPE;
   v_function_target uuid;
   v_op text;
   v_canary_percent int;
@@ -4375,7 +4425,7 @@ BEGIN
   END IF;
 
   v_type := p_payload->>'type';
-  IF v_type IS NULL OR v_type NOT IN ('llm_response', 'function_result', 'error') THEN
+  IF v_type IS NULL OR v_type NOT IN ('llm_response', 'function_result', 'procedure_result', 'error') THEN
     PERFORM allgres_private.append_log(
       p_task_id, t.step_count, 'error',
       jsonb_build_object('reason', 'payload_rejected', 'payload', p_payload)
@@ -4418,6 +4468,25 @@ BEGIN
     RETURN jsonb_build_object('action', 'continue');
   END IF;
 
+  -- A procedure runs to completion server-side in one shot (its own body
+  -- calls whichever bound Functions it needs, directly, in code -- see
+  -- run_procedure below) and reports back exactly once, distinct from
+  -- 'function' -- unlike a procedure-*bound* function call, there is no
+  -- per-call model-override/canary resolution for this: that mechanism
+  -- exists to pick a model for the *next* turn's reasoning about a single
+  -- function's result, which does not apply to a batch result a
+  -- procedure's own code already finished acting on.
+  IF v_type = 'procedure_result' THEN
+    PERFORM allgres_private.append_log(
+      p_task_id, t.step_count + 1, 'procedure',
+      COALESCE(p_payload->'content', '{}'::jsonb)
+    );
+    UPDATE allgres_private.tasks
+    SET step_count = step_count + 1, updated_at = now()
+    WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'continue');
+  END IF;
+
   -- llm_response
   PERFORM allgres_private.append_log(
     p_task_id, t.step_count + 1, 'assistant',
@@ -4431,7 +4500,7 @@ BEGIN
 
   v_action := v_parsed->>'action';
   IF v_action IS NULL OR v_action NOT IN (
-    'final_answer', 'execute_sql', 'call_function', 'delegate', 'search_agents', 'recall', 'await_human', 'propose_change',
+    'final_answer', 'execute_sql', 'call_function', 'run_procedure', 'delegate', 'search_agents', 'recall', 'await_human', 'propose_change',
     'remember', 'create_agent', 'propose_fix', 'await_children', 'create_function', 'update_function'
   ) THEN
     PERFORM allgres_private.append_log(
@@ -4724,6 +4793,54 @@ BEGIN
     SET step_count = step_count + 1, updated_at = now()
     WHERE task_id = p_task_id;
     RETURN jsonb_build_object('action', 'call_function', 'function', v_function, 'args', v_args, 'call_id', v_call);
+  END IF;
+
+  -- run_procedure: unlike call_function, this runs an entire procedure's
+  -- real PL/pgSQL body to completion server-side in one shot -- the body
+  -- itself calls whichever bound Functions it needs, directly, in code,
+  -- with real branching/loops, all under this one `SET LOCAL ROLE <the
+  -- calling agent's own role>` (see allgres_private.procedure_calls's own
+  -- comment) rather than one LLM turn per Function call. Gated by the
+  -- exact same 'procedure' permission a procedure grant already requires
+  -- for its content to show up in the prompt at all -- no separate grant
+  -- to run one versus merely read its description.
+  IF v_action = 'run_procedure' THEN
+    v_procedure_name := NULLIF(trim(v_parsed->>'procedure'), '');
+    IF v_procedure_name IS NULL
+       OR NOT (v_procedure_name = ANY(allgres_private.agent_permission_refs(t.agent_id, 'procedure'))) THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'procedure_not_permitted', 'procedure', v_procedure_name)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    SELECT * INTO v_procedure_row
+    FROM allgres_private.procedures
+    WHERE name = v_procedure_name AND is_active;
+    IF NOT FOUND THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'unknown_procedure', 'procedure', v_procedure_name)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+    IF v_procedure_row.body IS NULL OR v_procedure_row.build_status <> 'built' THEN
+      PERFORM allgres_private.append_log(
+        p_task_id, t.step_count + 1, 'error',
+        jsonb_build_object('reason', 'procedure_not_built', 'procedure', v_procedure_name, 'build_status', v_procedure_row.build_status)
+      );
+      UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+      RETURN jsonb_build_object('action', 'continue');
+    END IF;
+
+    INSERT INTO allgres_private.procedure_calls (task_id, procedure_id, agent_id, args)
+    VALUES (p_task_id, v_procedure_row.procedure_id, t.agent_id, COALESCE(v_parsed->'args', '{}'::jsonb))
+    RETURNING call_id INTO v_call;
+    UPDATE allgres_private.tasks SET step_count = step_count + 1, updated_at = now() WHERE task_id = p_task_id;
+    RETURN jsonb_build_object('action', 'run_procedure', 'procedure', v_procedure_name, 'call_id', v_call);
   END IF;
 
   -- Semantic delegate-target discovery ("function/skill search" -- an agent IS
@@ -6202,6 +6319,176 @@ BEGIN
 END;
 $fn$;
 
+-- Same shape as fn_claim_function_builds, for allgres_private.procedures
+-- instead: the worker itself issues `CREATE OR REPLACE PROCEDURE
+-- allgres_functions.<sql_ident>(p_args jsonb, INOUT p_result jsonb)
+-- SECURITY INVOKER AS $$<body>$$` as a top-level SPI statement under
+-- `SET LOCAL ROLE allgres_function_admin` (src/function_exec.rs).
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_procedure_builds(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT procedure_id, sql_ident, body
+    FROM allgres_private.procedures
+    WHERE build_status = 'pending' AND body IS NOT NULL
+    ORDER BY updated_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE allgres_private.procedures
+    SET build_status = 'building', updated_at = now()
+    WHERE procedure_id = r.procedure_id;
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'procedure_id', r.procedure_id,
+      'sql_ident', r.sql_ident,
+      'body', r.body
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'builds', v_out);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_procedure_build(
+  p_procedure_id uuid, p_ok boolean, p_error text
+) RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+BEGIN
+  UPDATE allgres_private.procedures
+  SET build_status = CASE WHEN COALESCE(p_ok, false) THEN 'built' ELSE 'failed' END,
+      build_error = CASE WHEN COALESCE(p_ok, false) THEN NULL ELSE p_error END,
+      updated_at = now()
+  WHERE procedure_id = p_procedure_id AND build_status = 'building';
+  IF FOUND THEN
+    PERFORM allgres_private.audit('procedures.build_complete', jsonb_build_object(
+      'procedure_id', p_procedure_id, 'ok', COALESCE(p_ok, false), 'error', p_error
+    ));
+  END IF;
+END;
+$fn$;
+
+-- Same shape as fn_claim_function_calls, for allgres_private.
+-- procedure_calls instead: a queued `run_procedure` call against an
+-- already-built procedure body. The worker runs it as a real `CALL`,
+-- not a `SELECT` (see src/function_exec.rs) -- Postgres returns a
+-- procedure's INOUT/OUT parameters as a one-row result exactly like a
+-- function's return value, which is what lets the same claim/complete
+-- shape work for both.
+CREATE OR REPLACE FUNCTION allgres_public.fn_claim_procedure_calls(p_limit int DEFAULT 4)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  r record;
+  v_out jsonb := '[]'::jsonb;
+  v_n int := 0;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+  FOR r IN
+    SELECT pc.call_id, pc.task_id, pc.args, p.sql_ident, a.pg_role
+    FROM allgres_private.procedure_calls pc
+    JOIN allgres_private.tasks t ON t.task_id = pc.task_id
+    JOIN allgres_private.procedures p ON p.procedure_id = pc.procedure_id
+    JOIN allgres_private.agents a ON a.agent_id = pc.agent_id
+    WHERE pc.status = 'queued' AND t.status = 'running' AND p.build_status = 'built'
+    ORDER BY pc.created_at
+    FOR UPDATE OF pc SKIP LOCKED
+    LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 4), 16))
+  LOOP
+    UPDATE allgres_private.procedure_calls
+    SET status = 'in_flight', updated_at = now()
+    WHERE call_id = r.call_id;
+    v_out := v_out || jsonb_build_array(jsonb_build_object(
+      'call_id', r.call_id,
+      'task_id', r.task_id,
+      'sql_ident', r.sql_ident,
+      'args', r.args,
+      'pg_role', r.pg_role
+    ));
+    v_n := v_n + 1;
+  END LOOP;
+  RETURN jsonb_build_object('count', v_n, 'calls', v_out);
+END;
+$fn$;
+
+CREATE OR REPLACE FUNCTION allgres_public.fn_complete_procedure_call(
+  p_call_id uuid, p_ok boolean, p_result jsonb, p_error text
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, allgres_public, pg_temp
+AS $fn$
+DECLARE
+  c allgres_private.procedure_calls%ROWTYPE;
+  v_pname text;
+  v_payload jsonb;
+  v_result jsonb;
+  v_running boolean;
+BEGIN
+  PERFORM set_config('statement_timeout', '2000', true);
+
+  SELECT * INTO c FROM allgres_private.procedure_calls WHERE call_id = p_call_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'fn_complete_procedure_call: not found' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF c.status <> 'in_flight' THEN
+    RETURN jsonb_build_object(
+      'submit', jsonb_build_object('action', 'stale', 'reason', 'call_not_in_flight', 'status', c.status),
+      'call_id', p_call_id
+    );
+  END IF;
+
+  UPDATE allgres_private.procedure_calls
+  SET status = 'harvested', updated_at = now()
+  WHERE call_id = p_call_id;
+
+  SELECT name INTO v_pname FROM allgres_private.procedures WHERE procedure_id = c.procedure_id;
+
+  IF COALESCE(p_ok, false) THEN
+    v_payload := jsonb_build_object(
+      'type', 'procedure_result',
+      'content', jsonb_build_object('procedure', v_pname, 'result', COALESCE(p_result, 'null'::jsonb))
+    );
+  ELSE
+    v_payload := jsonb_build_object(
+      'type', 'error',
+      'message', 'procedure ' || COALESCE(v_pname, c.procedure_id::text) || ' failed: ' || COALESCE(p_error, 'execution failed')
+    );
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1 FROM allgres_private.tasks WHERE task_id = c.task_id AND status = 'running'
+  ) INTO v_running;
+
+  IF v_running THEN
+    BEGIN
+      v_result := allgres_public.fn_submit_result(c.task_id, v_payload);
+    EXCEPTION WHEN others THEN
+      v_result := jsonb_build_object('action', 'error', 'message', SQLERRM);
+    END;
+  ELSE
+    v_result := jsonb_build_object('action', 'skipped', 'reason', 'task_not_running');
+  END IF;
+
+  RETURN jsonb_build_object('submit', v_result, 'call_id', p_call_id);
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_private.llm_text_from_http(p_body text)
 RETURNS text
 LANGUAGE plpgsql
@@ -6807,6 +7094,44 @@ BEGIN
     UPDATE allgres_private.functions
     SET build_status = 'pending', updated_at = now()
     WHERE function_id = r.function_id;
+    n := n + 1;
+  END LOOP;
+
+  -- Same two reclaims again, for a Procedure's call/build instead of a
+  -- Function's -- identical reasoning throughout (src/procedure_exec.rs).
+  FOR r IN
+    SELECT call_id, task_id
+    FROM allgres_private.procedure_calls
+    WHERE status = 'in_flight'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE allgres_private.procedure_calls
+    SET status = 'lost', updated_at = now()
+    WHERE call_id = r.call_id;
+    IF EXISTS (SELECT 1 FROM allgres_private.tasks WHERE task_id = r.task_id AND status = 'running') THEN
+      BEGIN
+        PERFORM allgres_public.fn_submit_result(
+          r.task_id,
+          jsonb_build_object('type', 'error', 'message', 'procedure execution timeout')
+        );
+      EXCEPTION WHEN others THEN
+        RAISE WARNING 'fn_watchdog: fn_submit_result failed for task % after procedure timeout: %', r.task_id, SQLERRM;
+      END;
+    END IF;
+    n := n + 1;
+  END LOOP;
+
+  FOR r IN
+    SELECT procedure_id
+    FROM allgres_private.procedures
+    WHERE build_status = 'building'
+      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    UPDATE allgres_private.procedures
+    SET build_status = 'pending', updated_at = now()
+    WHERE procedure_id = r.procedure_id;
     n := n + 1;
   END LOOP;
 

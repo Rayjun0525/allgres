@@ -81,6 +81,8 @@ DECLARE
   v_func_proposal_id uuid;
   v_func_name text;
   v_func_test_proc uuid;
+  v_created_procedure_id uuid;
+  v_proc_name text;
   v_i int;
   v_comp_sid uuid;
   v_comp_tid uuid;
@@ -799,6 +801,103 @@ BEGIN
     AND r->>'url' = 'https://example.com/allgres-selftest';
   v := v || jsonb_build_array(jsonb_build_object('name', 'procedure_function_uses_fixed_saved_url', 'ok', ok));
   DELETE FROM allgres_private.outbound_calls WHERE call_id = v_call2;
+
+  -- run_procedure (Phase 3c): 'selftest_procedure' has content but no real
+  -- body (the original seed, content-only) -- rejected up front as
+  -- 'procedure_not_built', never silently queued against a nonexistent
+  -- allgres_functions object. fn_selftest cannot exercise a real build or
+  -- call (the worker's own top-level SPI thread, a separate OS process --
+  -- see src/procedure_exec.rs); those are proved live instead
+  -- (KNOWN_ISSUES.md). What is exercised here is the SQL-side contract:
+  -- validation, build-status gating, and permission checks.
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"run_procedure"}',
+    'parsed', jsonb_build_object('action', 'run_procedure', 'procedure', 'selftest_procedure', 'args', '{}'::jsonb)
+  ));
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'procedure_not_built'
+  ) AND NOT EXISTS (SELECT 1 FROM allgres_private.procedure_calls WHERE procedure_id = v_call);
+  v := v || jsonb_build_array(jsonb_build_object('name', 'run_procedure_rejects_a_procedure_with_no_body', 'ok', ok));
+
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"run_procedure"}',
+    'parsed', jsonb_build_object('action', 'run_procedure', 'procedure', 'selftest_no_such_procedure', 'args', '{}'::jsonb)
+  ));
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'procedure_not_permitted'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'run_procedure_rejects_an_ungranted_procedure', 'ok', ok));
+
+  -- A permission row has no FK to procedures.name -- an operator can grant
+  -- a name that matches no real procedure, and run_procedure must still
+  -- reject it cleanly (as 'unknown_procedure'), never treat a dangling
+  -- grant as an unbounded pass.
+  PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', 'selftest_no_such_procedure');
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"run_procedure"}',
+    'parsed', jsonb_build_object('action', 'run_procedure', 'procedure', 'selftest_no_such_procedure', 'args', '{}'::jsonb)
+  ));
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'unknown_procedure'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'run_procedure_rejects_an_unknown_procedure', 'ok', ok));
+  PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_no_such_procedure');
+
+  -- A real body: create it, confirm it queues a build exactly like a
+  -- plpgsql Function does, then confirm run_procedure against it (still
+  -- 'pending' -- no real worker in this test) is rejected the same way,
+  -- and that the same SECURITY DEFINER/SET ROLE guardrail applies.
+  v_proc_name := 'selftest_proc_' || replace(extract(epoch from clock_timestamp())::text, '.', '_');
+  sub := allgres_public.fn_create_procedure(
+    v_proc_name, 'selftest-created procedure, safe to ignore.',
+    'BEGIN p_result := p_args; END;'
+  );
+  v_created_procedure_id := (sub->>'procedure_id')::uuid;
+  ok := (sub->>'ok')::boolean AND EXISTS (
+    SELECT 1 FROM allgres_private.procedures
+    WHERE procedure_id = v_created_procedure_id AND build_status = 'pending' AND sql_ident IS NOT NULL
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'create_procedure_with_body_queues_a_build', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_public.fn_create_procedure(
+      'selftest_bad_proc_' || replace(extract(epoch from clock_timestamp())::text, '.', '_'), 'x',
+      'BEGIN SET ROLE allgres_owner; p_result := ''{}''::jsonb; END;'
+    );
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%may not change role%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'create_procedure_rejects_set_role_body', 'ok', ok));
+
+  -- Editing the body re-queues a build (fn_set_procedure's own
+  -- v_body_changed check) -- simulate a prior successful build first, so
+  -- the edit's effect (flipping back to 'pending') is actually visible.
+  UPDATE allgres_private.procedures SET build_status = 'built' WHERE procedure_id = v_created_procedure_id;
+  sub := allgres_public.fn_set_procedure(
+    v_created_procedure_id, NULL, NULL, 'BEGIN p_result := jsonb_build_object(''ok'', true); END;'
+  );
+  ok := COALESCE((sub->>'ok')::boolean, false)
+    AND (SELECT build_status FROM allgres_private.procedures WHERE procedure_id = v_created_procedure_id) = 'pending';
+  v := v || jsonb_build_array(jsonb_build_object('name', 'update_procedure_body_requeues_build', 'ok', ok));
+
+  PERFORM allgres_public.fn_grant_permission(v_agent, 'procedure', v_proc_name);
+  UPDATE allgres_private.tasks SET status = 'running' WHERE task_id = v_tid;
+  sub := allgres_public.fn_submit_result(v_tid, jsonb_build_object(
+    'type', 'llm_response', 'content', '{"action":"run_procedure"}',
+    'parsed', jsonb_build_object('action', 'run_procedure', 'procedure', v_proc_name, 'args', '{}'::jsonb)
+  ));
+  ok := EXISTS (
+    SELECT 1 FROM allgres_private.execution_logs
+    WHERE task_id = v_tid AND role = 'error' AND content->>'reason' = 'procedure_not_built'
+  );
+  v := v || jsonb_build_array(jsonb_build_object('name', 'run_procedure_rejects_a_pending_build', 'ok', ok));
+  PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', v_proc_name);
 
   PERFORM allgres_public.fn_revoke_permission(v_agent, 'procedure', 'selftest_procedure');
 

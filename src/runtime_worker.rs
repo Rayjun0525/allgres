@@ -10,6 +10,7 @@ use crate::config::{bind_rpc_socket, configured_database, rpc_socket_path, socke
 use crate::outbound::{spawn_http_pool, OutboundJob, OutboundQueue, OUTBOUND_CANCEL_FLAGS};
 use crate::rpc::{handle_rpc_stream, valid_uuid};
 use crate::function_exec::{pump_function_builds, pump_function_calls};
+use crate::procedure_exec::{pump_procedure_builds, pump_procedure_calls};
 use crate::sandbox::pump_sql;
 use crate::truncate_utf8;
 use crate::{HTTP_THREADS, HTTP_TIMEOUT, MAX_RESPONSE_BYTES, PUMP_BUSY, PUMP_IDLE_MAX, PUMP_IDLE_MIN};
@@ -498,7 +499,11 @@ pub extern "C-unwind" fn allgres_runtime_main(_arg: pg_sys::Datum) {
         // rather than on the HTTP pool.
         let functions_ran = if ready { pump_function_builds() + pump_function_calls() } else { 0 };
 
-        if queued > 0 || sql_ran > 0 || functions_ran > 0 {
+        // 6. Real PL/pgSQL Procedures (src/procedure_exec.rs) -- same tier,
+        // same reasoning, just CALL instead of SELECT.
+        let procedures_ran = if ready { pump_procedure_builds() + pump_procedure_calls() } else { 0 };
+
+        if queued > 0 || sql_ran > 0 || functions_ran > 0 || procedures_ran > 0 {
             idle_delay = PUMP_IDLE_MIN;
             next_pump = Instant::now() + PUMP_BUSY;
         } else {

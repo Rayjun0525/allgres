@@ -335,6 +335,20 @@ doing pure computation succeeded and returned its result normally.
 FUNCTION` -- defense in depth against a confused-deputy attempt, not the
 real boundary (which is the role switch above, and holds regardless).
 
+A `plpgsql`-handler Procedure's `body` reuses this exact model --
+`CREATE OR REPLACE PROCEDURE ... INOUT p_result jsonb ... SECURITY
+INVOKER`, built as `allgres_function_admin`, run via `run_procedure`
+under `SET LOCAL ROLE <the calling agent's own role>` -- with one
+difference worth calling out: a Function called *from inside* a
+Procedure body is not a second role-switched round trip. It is an
+ordinary nested statement in the same already-role-switched session,
+since the queue-and-`SET ROLE` dance only exists to get into that
+session in the first place. Confirmed live the same way: a Procedure
+whose body read `llm_secrets` directly failed with the identical genuine
+`permission denied`, while a Procedure whose body called a bound
+Function and branched on its result did so correctly under that same
+one role for the whole call.
+
 ### The SQL console
 
 `allgres_public.fn_admin_execute_sql` (`dashboard_rpc` action
