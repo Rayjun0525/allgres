@@ -69,7 +69,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers', 'fn_llm_complete')
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers', 'fn_llm_complete', 'fn_worker_status')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;
@@ -120,6 +120,21 @@ BEGIN
       AND p.proowner <> 'allgres_llm_admin'::regrole
   ) THEN
     ALTER FUNCTION allgres_private.fn_llm_complete(jsonb, jsonb) OWNER TO allgres_llm_admin;
+  END IF;
+
+  -- fn_worker_status (KNOWN_ISSUES.md item 5): same role as fn_start_
+  -- dynamic_workers just above, for the same underlying privilege
+  -- (pg_read_all_stats) and the same reason -- it is the one place in
+  -- this file that reads another role's own pg_stat_activity row, and
+  -- both dashboard_rpc (allgres_owner) and v_system_health (whichever
+  -- agent role queries it) need that read without themselves gaining
+  -- cluster-wide visibility into every other backend's activity.
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'allgres_private' AND p.proname = 'fn_worker_status'
+      AND p.proowner <> 'allgres_settings_reader'::regrole
+  ) THEN
+    ALTER FUNCTION allgres_private.fn_worker_status() OWNER TO allgres_settings_reader;
   END IF;
 
   IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres_private') <> 'allgres_owner'::regrole THEN
@@ -233,6 +248,14 @@ GRANT EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) TO allgres_llm_a
 GRANT EXECUTE ON FUNCTION allgres_private.llm_text_from_http(text) TO allgres_llm_admin;
 GRANT EXECUTE ON FUNCTION allgres_private.extract_first_json(text) TO allgres_llm_admin;
 GRANT USAGE ON SCHEMA allgres_private TO sandbox;
+
+-- fn_worker_status (KNOWN_ISSUES.md item 5, owned by allgres_settings_
+-- reader): dashboard_rpc (allgres_owner) calls it directly for the
+-- Overview page's own Workers panel; v_system_health -- queried as
+-- whichever agent role holds the 'view' grant on it -- calls it too, for
+-- workers_online. Both are cross-owner calls needing their own explicit
+-- grant, same reasoning as every other cross-owner call in this file.
+GRANT EXECUTE ON FUNCTION allgres_private.fn_worker_status() TO allgres_owner, sandbox;
 
 REVOKE ALL ON SCHEMA allgres_private FROM PUBLIC;
 REVOKE ALL ON SCHEMA allgres_public FROM PUBLIC;
@@ -592,11 +615,14 @@ BEGIN
           WHERE datname = current_database()
         ),
         'host', allgres.native_host_stats(),
-        'workers', COALESCE((
-          SELECT jsonb_agg(jsonb_build_object('name', backend_type, 'pid', pid) ORDER BY backend_type)
-          FROM pg_stat_activity
-          WHERE backend_type IN ('allgres runtime','allgres web')
-        ), '[]'::jsonb),
+        -- Same pg_read_all_stats gap v_system_health's own workers_online
+        -- column had (KNOWN_ISSUES.md item 5): this ran as allgres_owner
+        -- (dashboard_rpc's own SECURITY DEFINER effective role), which is
+        -- not a member of pg_read_all_stats, so it saw zero rows for
+        -- another role's own backend regardless of how many workers were
+        -- actually running -- confirmed live. Routed through the same
+        -- allgres_settings_reader-owned helper for the same reason.
+        'workers', allgres_private.fn_worker_status(),
         'recent_tasks', COALESCE((
           SELECT jsonb_agg(to_jsonb(q) ORDER BY q.updated_at DESC)
           FROM (
@@ -1926,7 +1952,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers', 'fn_llm_complete')
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers', 'fn_llm_complete', 'fn_worker_status')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;

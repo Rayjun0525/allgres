@@ -248,7 +248,14 @@ BEGIN
     -- an ordinary pg_catalog, non-volatile, non-secdef function that is
     -- simply not on the allowlist -- proves default-deny holds for
     -- anything unseeded, not just the specific names already known to leak
-    'SELECT pg_get_userbyid(10) AS whoever'
+    'SELECT pg_get_userbyid(10) AS whoever',
+    -- KNOWN_ISSUES.md item 2: rejected by the relation-count cap before
+    -- ever reaching EXPLAIN, regardless of whether every one of these
+    -- relations would otherwise pass the allowlist -- 11 references, one
+    -- over the cap.
+    'SELECT 1 FROM allgres_public.v_sales a1, allgres_public.v_sales a2, allgres_public.v_sales a3, ' ||
+    'allgres_public.v_sales a4, allgres_public.v_sales a5, allgres_public.v_sales a6, allgres_public.v_sales a7, ' ||
+    'allgres_public.v_sales a8, allgres_public.v_sales a9, allgres_public.v_sales a10, allgres_public.v_sales a11'
   ] LOOP
     BEGIN
       PERFORM allgres_private.fn_validate_sql(v_agent, detail);
@@ -276,7 +283,12 @@ BEGIN
     'SELECT extract(year FROM sold_on) AS y FROM allgres_public.v_sales',
     -- a schema name inside a string literal is data, not a reference
     'SELECT ''allgres_private.sessions'' AS note FROM allgres_public.v_sales',
-    'SELECT region FROM allgres_public.v_sales WHERE sku = ''ARB-1'' /* join allgres_private.x */'
+    'SELECT region FROM allgres_public.v_sales WHERE sku = ''ARB-1'' /* join allgres_private.x */',
+    -- Exactly at the item 2 cap (10 relations), not one over it -- proves
+    -- the boundary is > 10, not >= 10.
+    'SELECT 1 FROM allgres_public.v_sales a1, allgres_public.v_sales a2, allgres_public.v_sales a3, ' ||
+    'allgres_public.v_sales a4, allgres_public.v_sales a5, allgres_public.v_sales a6, allgres_public.v_sales a7, ' ||
+    'allgres_public.v_sales a8, allgres_public.v_sales a9, allgres_public.v_sales a10'
   ] LOOP
     BEGIN
       ok := allgres_private.fn_validate_sql(v_agent, detail) IS NOT NULL;
@@ -2504,6 +2516,23 @@ BEGIN
   ok := ok AND n_logs = 0;
   PERFORM set_config('allgres.agent_id', '', true);
   v := v || jsonb_build_array(jsonb_build_object('name', 'maintenance_views_enforce_permission', 'ok', ok));
+
+  -- KNOWN_ISSUES.md item 5: fn_worker_status() must actually be callable
+  -- (no "permission denied for function", the exact live failure this
+  -- item's own fix closes) by both of its real callers -- allgres_owner
+  -- (dashboard_rpc, and this call itself, since fn_selftest runs as
+  -- allgres_owner) and any agent role via sandbox (v_system_health).
+  -- Cannot assert an exact worker count here: this database may or may
+  -- not have a real "allgres runtime" of its own (fn_start_dynamic_
+  -- workers' own comment on a statically-preloaded install already
+  -- covers why) -- only that the call succeeds and shapes a real jsonb
+  -- array either way.
+  BEGIN
+    ok := jsonb_typeof(allgres_private.fn_worker_status()) = 'array';
+  EXCEPTION WHEN others THEN
+    ok := false;
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'fn_worker_status_callable_and_shaped', 'ok', ok));
 
   -- Roadmap item 7 (evaluation-gated self-improvement): v_agent_health is
   -- the same permission-gated shape v_system_health/v_permission_audit

@@ -218,7 +218,21 @@ function clusterCard(){
   const db=state.overview?.db_sessions||{};
   return `<div class="panel"><h3>Cluster</h3><div class="row wrap" style="gap:20px"><div><div class="label">PostgreSQL</div><div>${esc(state.overview?.pg_version||'—')}</div></div><div><div class="label">CPUs / load (1m·5m·15m)</div><div>${esc(h.cpu_count??'—')} · ${esc(load)}</div></div><div><div class="label">Memory used / total</div><div>${esc(mem)}</div></div><div><div class="label">DB sessions (active/idle/total)</div><div>${esc(db.active??0)} / ${esc(db.idle??0)} / ${esc(db.total??0)}</div></div></div></div>`;
 }
-async function overview(){const d=await api('/api/v1/status');state.overview=d;$('#view').innerHTML=`${secretBanner(d.secret_storage)}<div class="hero"><h2>One database. One extension.</h2><p>Agents, state, policy, queue, audit, native I/O and dashboard inside PostgreSQL.</p></div>${clusterCard()}<div class="cards">${[['Agents',d.agents],['Active',d.active_agents],['Running',d.running_tasks],['Outbound',d.queued_outbound],['SQL',d.queued_sql],['Approvals',d.pending_approvals],['Failed',d.failed_tasks]].map(x=>`<div class="card"><div class="metric">${x[1]}</div><div class="label">${x[0]}</div></div>`).join('')}</div><div class="grid2"><div class="panel"><h3>Workers</h3>${(d.workers||[]).map(w=>`<div class="row"><span class="dot"></span><span>${esc(w.name)}</span><span class="spacer"></span><span class="mono muted">PID ${esc(w.pid)}</span></div>`).join('')||'<div class="muted">No workers reported</div>'}</div><div class="panel"><h3>Recent tasks</h3>${taskRows(d.recent_tasks||[],true)}</div></div>`}
+// KNOWN_ISSUES.md item 5: `allgres web` deliberately never connects to the
+// database (see runtime_worker.rs's own module doc), so it can never appear
+// in pg_stat_activity -- d.workers (built from that view, sql/grants_and_
+// facade.sql) can therefore only ever list `allgres runtime`, which used to
+// read as though the web worker were down while it was the one serving this
+// very page. Fixed client-side, not by teaching SQL to see a connection that
+// genuinely does not exist: this successful fetch is itself live proof
+// `allgres web` is up right now, so synthesize its row from that instead of
+// from a query that structurally cannot see it.
+function workersWithWeb(reported){
+  const workers=[...(reported||[])];
+  if(!workers.some(w=>w.name==='allgres web'))workers.push({name:'allgres web',self:true});
+  return workers;
+}
+async function overview(){const d=await api('/api/v1/status');state.overview=d;$('#view').innerHTML=`${secretBanner(d.secret_storage)}<div class="hero"><h2>One database. One extension.</h2><p>Agents, state, policy, queue, audit, native I/O and dashboard inside PostgreSQL.</p></div>${clusterCard()}<div class="cards">${[['Agents',d.agents],['Active',d.active_agents],['Running',d.running_tasks],['Outbound',d.queued_outbound],['SQL',d.queued_sql],['Approvals',d.pending_approvals],['Failed',d.failed_tasks]].map(x=>`<div class="card"><div class="metric">${x[1]}</div><div class="label">${x[0]}</div></div>`).join('')}</div><div class="grid2"><div class="panel"><h3>Workers</h3>${workersWithWeb(d.workers).map(w=>`<div class="row"><span class="dot"></span><span>${esc(w.name)}</span><span class="spacer"></span><span class="mono muted">${w.self?'serving this page':'PID '+esc(w.pid)}</span></div>`).join('')||'<div class="muted">No workers reported</div>'}</div><div class="panel"><h3>Recent tasks</h3>${taskRows(d.recent_tasks||[],true)}</div></div>`}
 function secretBanner(mode){if(!mode||mode==='encrypted')return '';const why=mode==='plaintext_no_pgcrypto'?'pgcrypto is not installed':'allgres.secret_key is not set';return `<div class="banner">Provider API keys are stored in plaintext because ${esc(why)}. See README, "Secrets at rest".</div>`}
 function taskRows(a,compact=false){if(!a.length)return '<div class="muted">No tasks yet.</div>';return `<table class="table"><thead><tr><th>Agent</th><th>Status</th><th>Goal</th>${compact?'':'<th>Steps</th><th>Updated</th>'}</tr></thead><tbody>${a.map(t=>`<tr><td>${esc(t.agent)}</td><td>${status(t.status)}</td><td>${esc(t.goal||'')}</td>${compact?'':`<td>${esc(t.step_count)}</td><td class="mono muted">${esc(t.updated_at||'')}</td>`}</tr>`).join('')}</tbody></table>`}
 

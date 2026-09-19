@@ -221,7 +221,12 @@ Allowed:
 
 You can read exactly two views: allgres_public.v_system_health (worker
 counts, queue backlogs, pending approvals, recent failures) and
-allgres_public.v_permission_audit (every agent's permission grants). You
+allgres_public.v_permission_audit (every agent's permission grants).
+workers_online counts only backend_type IN ('allgres runtime', 'allgres
+web') in pg_stat_activity -- the web worker deliberately never opens a
+database connection, so it never appears there, and 1 is the normal
+healthy reading with both workers up, not a sign the web worker is down;
+0 means the runtime worker itself is down, which is worth flagging. You
 cannot change anything -- no propose_change, no delegate, no functions. Your
 job is to look, compare against what you remembered last time (it is
 already in your own context below, if you have run before), and report:

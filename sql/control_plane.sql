@@ -2927,6 +2927,36 @@ AS
   WHERE agent_id IS NOT DISTINCT FROM allgres_private.current_agent_id()
     AND allgres_private.agent_may_read('allgres_public.v_sales', allgres_private.current_agent_id());
 
+-- KNOWN_ISSUES.md item 5: `pg_stat_activity` hides another role's own rows
+-- (all columns, not just the sensitive ones like query text) from any
+-- role that is not a superuser and not a member of `pg_read_all_stats` --
+-- not an error, a silent zero rows, the exact same trap
+-- `fn_start_dynamic_workers`'s own comment on `allgres_settings_reader`
+-- already documents for a different query. `allgres runtime`/`allgres
+-- web` both connect as (or, for the web worker, would connect as if it
+-- connected at all) `worker`, never `allgres_owner` -- so a query against
+-- `pg_stat_activity` written directly into `dashboard_rpc` (owned by
+-- `allgres_owner`) or into this view (run as whichever role queries it)
+-- saw zero workers, always, confirmed live: `SET ROLE allgres_owner;
+-- SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'allgres
+-- runtime'` returned 0 with the real worker running the whole time. Fixed
+-- by routing both readers through this one function instead, owned by
+-- `allgres_settings_reader` (already holds `pg_read_all_stats`, granted
+-- for exactly this kind of read -- see "1. Roles"), rather than handing
+-- `allgres_owner` itself that same broad, cluster-wide read and therefore
+-- every other `SECURITY DEFINER` function it owns too.
+CREATE OR REPLACE FUNCTION allgres_private.fn_worker_status()
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+  SELECT COALESCE(jsonb_agg(jsonb_build_object('name', backend_type, 'pid', pid) ORDER BY backend_type), '[]'::jsonb)
+  FROM pg_stat_activity
+  WHERE backend_type IN ('allgres runtime', 'allgres web')
+$fn$;
+
 -- Read-only diagnostic views for a maintenance/auditor agent (README,
 -- "Maintenance agents"). Same permission-gated shape as v_sales/
 -- v_my_tasks, but with no agent_id ownership column to filter rows by --
@@ -2940,12 +2970,13 @@ CREATE OR REPLACE VIEW allgres_public.v_system_health
   WITH (security_barrier = true)
 AS
   SELECT
-    -- Same caveat as the dashboard's own Workers panel (KNOWN_ISSUES.md,
-    -- item 5): `allgres web` deliberately has no database connection, so a
-    -- background worker without one never appears in pg_stat_activity at
-    -- all -- this reads as "1 worker online" even when both are healthy,
-    -- not a sign the web worker is down.
-    (SELECT count(*) FROM pg_stat_activity WHERE backend_type IN ('allgres runtime', 'allgres web')) AS workers_online,
+    -- `allgres web` deliberately has no database connection at all, so it
+    -- can never be one of the rows fn_worker_status() finds regardless of
+    -- role -- 1 is the normal healthy reading with both workers up, not a
+    -- sign the web worker is down (see health_monitor's own seeded system
+    -- prompt, sql/seed_data.sql, for the same caveat given to the one
+    -- reader that has to act on this raw number).
+    jsonb_array_length(allgres_private.fn_worker_status()) AS workers_online,
     (SELECT count(*) FROM allgres_private.outbound_calls WHERE status = 'queued') AS outbound_queued,
     (SELECT count(*) FROM allgres_private.outbound_calls WHERE status = 'in_flight') AS outbound_in_flight,
     (SELECT count(*) FROM allgres_private.sql_calls WHERE status = 'queued') AS sql_queued,
@@ -3699,6 +3730,35 @@ BEGIN
   -- SelectStmt and both of which write.
   IF COALESCE((v_tree->>'writes')::boolean, false) THEN
     RAISE EXCEPTION 'fn_validate_sql: statement writes; only reads are allowed'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  -- KNOWN_ISSUES.md item 2: `SET LOCAL statement_timeout` a few lines below
+  -- (before the `EXPLAIN` this function runs to cost-check the statement)
+  -- does not actually bound anything -- confirmed live, the same gap
+  -- run_sandboxed_sql's own comment documents in detail: `SET LOCAL`
+  -- inside an already-executing SECURITY DEFINER call never re-arms the
+  -- timer for the statement currently running, and the runtime worker's
+  -- own `BackgroundWorker::transaction` calls never go through the normal
+  -- client dispatch path that would arm one automatically either. A
+  -- pathologically join-heavy statement could therefore make the `EXPLAIN`
+  -- below take a genuinely long time with nothing to stop it. Rather than
+  -- reach for the same `enable_timeout_after` C-shim run_sandboxed_sql
+  -- uses (it would have to wrap the *entire* fn_complete_outbound call
+  -- from Rust, not just this one nested step, risking a false cancel on
+  -- unrelated, legitimately-slower work sharing that same call --
+  -- rank_memories_by_embedding's own non-pgvector fallback among them),
+  -- this bounds the actual risk deterministically instead: 10 is
+  -- comfortably under PostgreSQL's own `geqo_threshold` default (12) --
+  -- at or below it, the planner does exhaustive join-order search, which
+  -- is exactly where a many-way self-join could make `EXPLAIN` itself
+  -- slow; above it, PostgreSQL's own GEQO heuristic already bounds the
+  -- search, which is why 12 itself is not the cutoff. `relations` already
+  -- counts every RangeVar reference in the statement, including a table
+  -- joined to itself several times, not just distinct table names -- the
+  -- read that actually matters for join-order search cost.
+  IF jsonb_array_length(COALESCE(v_tree->'relations', '[]'::jsonb)) > 10 THEN
+    RAISE EXCEPTION 'fn_validate_sql: statement references too many tables (max 10)'
       USING ERRCODE = 'P0001';
   END IF;
 

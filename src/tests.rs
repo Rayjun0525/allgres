@@ -237,6 +237,17 @@ fn unqualified_relation_reports_a_null_schema() {
 }
 
 #[test]
+fn non_ascii_relation_name_is_read_correctly_end_to_end() {
+    // KNOWN_ISSUES.md item 9, at the level fn_validate_sql actually
+    // depends on: a relation name survives the full dump -> analyze_dump
+    // round trip intact, not mangled into something no allowlist entry
+    // or pg_class row could ever match.
+    let d = analyze_dump(&select_dump(&rangevar("allgres_public", "매출")));
+    assert_eq!(d["relations"][0]["schema"], "allgres_public");
+    assert_eq!(d["relations"][0]["name"], "매출");
+}
+
+#[test]
 fn collects_cte_names() {
     let dump = select_dump(&format!(
         "{{COMMONTABLEEXPR :ctename x :aliascolnames <> :ctequery <> :location 5}} {}",
@@ -275,6 +286,19 @@ fn token_reader_handles_escapes_null_and_empty() {
     assert_eq!(read_token("odd\\ name rest").0, Some("odd name".into()));
     assert_eq!(read_token("\\2fast rest").0, Some("2fast".into()));
     assert_eq!(read_token("last}").0, Some("last".into()));
+}
+
+#[test]
+fn token_reader_decodes_multibyte_utf8_instead_of_mangling_it() {
+    // KNOWN_ISSUES.md item 9: this used to read byte-by-byte and cast each
+    // raw byte straight to a char, turning one 3-byte Korean character into
+    // three garbled ones. "가나다" is a real, valid relation-name-shaped
+    // identifier a Postgres RangeVar's :relname could actually carry.
+    assert_eq!(read_token("가나다 :x").0, Some("가나다".into()));
+    // Mixed ASCII/non-ASCII, and a non-ASCII byte immediately followed by an
+    // escaped delimiter -- both byte-index bookkeeping paths exercised in
+    // the same token.
+    assert_eq!(read_token("café\\}bar}").0, Some("café}bar".into()));
 }
 
 #[test]

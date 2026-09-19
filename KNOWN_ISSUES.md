@@ -57,15 +57,48 @@ One consequence: `execute_sql` now costs two step-count ticks (queue, then
 result) instead of one, matching how `call_tool` already worked — relevant
 only to `policies.max_steps` budgeting.
 
-## 2. `statement_timeout` is now real, but only bounds sandboxed execution
+## 2. ~~`statement_timeout` is now real, but only bounds sandboxed execution~~ — closed, deterministically
 
 Fixed by 1 for the part that matters: `fn_run_sandboxed_sql` runs as a
 top-level statement, so `SET LOCAL statement_timeout` set by the runtime
 worker right before calling it actually arms. `fn_validate_sql`'s own
-`statement_timeout` (bounding parsing and the `EXPLAIN` cost check) is still
-set from inside a `SECURITY DEFINER` function and so is still nominal in the
-same nested-statement sense as before; the planner cost ceiling is what
-actually bounds that half.
+`statement_timeout` (bounding parsing and the `EXPLAIN` cost check) was
+still set from inside a `SECURITY DEFINER` function and so was still
+nominal in the same nested-statement sense as before -- confirmed live,
+long after this was first written: `SET statement_timeout = '1ms'`
+before calling `fn_validate_sql` directly (whose own body immediately
+raises it back to 5000ms) still failed with "canceling statement due to
+statement timeout" almost instantly, proving the inner `SET LOCAL` had
+zero effect on the timer already armed for that top-level call.
+
+Not fixed with the same `enable_timeout_after` C-shim `run_sandboxed_sql`
+itself uses (see that function's own comment in `src/sandbox.rs` for why
+plain `SET LOCAL` doesn't arm anything for a background-worker-issued
+statement -- confirmed live there too, a 30-second `pg_sleep` ran to
+completion untouched without it): that shim wraps one whole Rust-issued
+`Spi` call, and `fn_validate_sql` is
+reached from `fn_submit_result`, reached from `fn_complete_outbound`
+(`src/runtime_worker.rs`'s `submit_http_result`) -- the same one call
+`fn_complete_outbound` also uses for its own, unrelated,
+non-pgvector-fallback embedding-ranking work
+(`rank_memories_by_embedding`), which can legitimately take longer on a
+large memory corpus. Wrapping that whole call in a tight timeout risked
+turning a theoretical planning-time gap into a real regression on
+already-working, unrelated code.
+
+Closed instead with a deterministic, parse-tree-based cap, no timing
+involved: `fn_validate_sql` now rejects a statement referencing more
+than 10 relations (`jsonb_array_length(v_tree->'relations')`, which
+`analyze_sql` already builds by counting every `RangeVar` node --
+including a table joined to itself several times, not just distinct
+names) before ever calling `EXPLAIN`. 10 sits comfortably under
+PostgreSQL's own `geqo_threshold` default (12): at or below it, the
+planner runs exhaustive join-order search, exactly where a many-way
+self-join could make `EXPLAIN` itself slow; above it, PostgreSQL's own
+GEQO heuristic already bounds the search space, which is why 12 itself
+isn't the line drawn. Verified: a query with exactly 10 relations still
+validates; one with 11 is rejected with "too many tables" before
+`EXPLAIN` ever runs, both now covered in `fn_selftest`.
 
 ## 3. ~~Docker image path is unverified in this environment~~ — fixed, now green in CI
 
@@ -91,14 +124,88 @@ across every subsystem, upgraded, and confirmed byte-for-byte identical
 afterward, plus `fn_selftest`/`tests/smoke.sql`/`tests/e2e_mock.sql` all
 green post-upgrade.
 
-## 5. `allgres web` does not appear in `pg_stat_activity`
+## 5. ~~`allgres web` does not appear in `pg_stat_activity`~~ — fixed, plus a second, more serious bug this one led to finding
 
 The web worker deliberately has no database connection, and background workers
 without one are not listed in `pg_stat_activity`. The dashboard's Workers panel
-therefore only ever shows `allgres runtime`, which reads as though the web
-worker is down while it is serving the page you are looking at.
+therefore only ever showed `allgres runtime`, which read as though the web
+worker were down while it was serving the page you were looking at, and
+`allgres_public.v_system_health.workers_online` (already honestly commented
+in `sql/control_plane.sql` at the time this item was written, but not
+actually fixed anywhere) had the same structural blind spot for
+`health_monitor`, the one agent that actually reads it: since the count
+reads "1" identically whether the web worker is healthy or genuinely down,
+it could never actually distinguish the two, not just misreport one of
+them.
 
-## 6. Untested control-plane paths
+Investigating this live turned up a second, unrelated, and considerably
+worse bug in the exact same query: `allgres_owner` (`dashboard_rpc`'s own
+`SECURITY DEFINER` effective role, and whatever role queries
+`v_system_health` -- an agent's own restricted per-agent role) is not a
+superuser and not a member of `pg_read_all_stats`, and `pg_stat_activity`
+silently returns *zero rows* for a backend connected as a **different**
+role -- not null fields on a visible row, the row itself is simply absent
+-- for anyone lacking that membership. `allgres runtime`/`allgres web`
+both connect (or would connect) as `worker`, never `allgres_owner`. So
+this was never "shows 1 instead of 2" -- confirmed live, `SET ROLE
+allgres_owner; SELECT count(*) FROM pg_stat_activity WHERE backend_type =
+'allgres runtime'` returned **0** with that exact worker running the
+whole time. The dashboard's Workers panel and `workers_online` read empty
+in every real install, allgres web's own absence was never the part
+anyone would have noticed first. This is the identical trap
+`fn_start_dynamic_workers`'s own `allgres_settings_reader` role was
+already created to avoid for a different query (see "1. Roles") -- just
+never applied to this one.
+
+Three fixes, one shared root cause:
+
+- **The actual privilege gap**: a new `allgres_private.fn_worker_status()`,
+  `SECURITY DEFINER`, owned by `allgres_settings_reader` (already holds
+  `pg_read_all_stats`, so no new role was needed) rather than by
+  `allgres_owner` -- the same reasoning as every other narrow-role split
+  in this file: handing `allgres_owner` itself a broad, cluster-wide read
+  would have handed it to every other `SECURITY DEFINER` function it
+  owns too. Both real readers now call it instead of querying
+  `pg_stat_activity` directly: `dashboard_rpc`'s own `'workers'` field
+  (`sql/grants_and_facade.sql`) and `v_system_health.workers_online`
+  (`jsonb_array_length` of the same result, `sql/control_plane.sql`).
+  `EXECUTE` granted to both `allgres_owner` (dashboard_rpc's own call)
+  and `sandbox` (every per-agent role, for `v_system_health`'s own
+  readers) -- a bare worker name/pid list is low-sensitivity enough to
+  grant broadly, unlike the query text/client info `pg_read_all_stats`
+  also exposes, which neither caller ever reads.
+- **The dashboard** (`web/index.html`'s `overview()`) additionally
+  synthesizes an `allgres web` row from the one signal SQL structurally
+  cannot have even with the privilege fixed: the fact that
+  `/api/v1/status` just answered at all is itself live proof the web
+  worker serving it is up right now. `workersWithWeb()` adds that row
+  client-side only if the (now-correct) `pg_stat_activity` read still
+  didn't report one, labeled "serving this page" instead of a PID it was
+  never going to have.
+- **`health_monitor`**'s own seeded system prompt (`sql/seed_data.sql`)
+  now explains what `workers_online` actually means before the agent
+  ever has to guess: 1 is the normal healthy reading with both workers
+  up, 0 means the runtime worker itself is down and is worth flagging --
+  the same asymmetry the SQL comment already documented for a human
+  reader, now also given to the one reader that has to act on the raw
+  number without being able to read source comments. A fresh install
+  picks this up immediately; an existing `health_monitor` row (seeded
+  once, on first install, never re-seeded) keeps its old prompt until an
+  operator edits it or deletes the row to reseed -- the same
+  one-time-seed shape every other seeded agent prompt in this file
+  already has.
+
+Verified: `fn_worker_status()` confirmed callable (no permission error)
+by both `allgres_owner` and, live, `SET ROLE` to a real per-agent role;
+`SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'allgres
+runtime'` as `allgres_owner` went from the confirmed-live 0 above to
+correctly finding the row once called through the new function instead
+of directly. `fn_selftest`'s own new `fn_worker_status_callable_and_shaped`
+case covers the callability half (an exact worker count isn't
+assertable in `fn_selftest`, which may or may not run in a database with
+a real "allgres runtime" of its own).
+
+## 6. ~~Untested control-plane paths~~ — closed, every path this item listed is now covered
 
 No test covers these; they are wired up but unexercised:
 
@@ -134,12 +241,35 @@ separate, tighter cap specifically on failed-auth (401) responses so a
 token-guessing script locks out faster than an ordinary slow client ever
 could trip the general cap.
 
-## 9. Non-ASCII identifiers in the parse-tree reader
+## 9. ~~Non-ASCII identifiers in the parse-tree reader~~ — fixed
 
 `analyze_dump` reads the node dump byte-wise, so a relation or function name
-containing multi-byte UTF-8 is mangled. The failure is closed — a mangled name
-matches no allowlist entry and no `pg_proc` row, so the statement is rejected —
-but the error message will be confusing.
+containing multi-byte UTF-8 was mangled. The failure was closed — a mangled
+name matched no allowlist entry and no `pg_proc` row, so the statement was
+rejected — but the error message was confusing, and (worse than originally
+written down here) a legitimate non-ASCII relation or view name could never
+actually be granted to an agent at all: `fn_validate_sql` would reject the
+correctly-named object every single time, not just report a bad error for
+one.
+
+Root cause, found in `src/sql_parser.rs`'s `read_token`/`quoted_strings`:
+both read an already-valid UTF-8 Rust `&str` (decoded from Postgres's own
+`nodeToString` C string by the caller) one raw *byte* at a time, and for
+anything not a recognized ASCII delimiter, cast that byte straight to a
+`char` (`bytes[i] as char`) -- a byte-to-codepoint reinterpretation, not a
+UTF-8 decode. A 3-byte Korean character became three separate garbled
+Latin-1-range characters instead of the one real character. Fixed by
+decoding a full scalar value (`s[i..].chars().next()`, advancing by
+`ch.len_utf8()`) whenever a byte is `>= 0x80`; byte-wise scanning for the
+delimiters themselves (`\`, `{`, `}`, `(`, `)`, whitespace, and the quote
+character in `quoted_strings`) stays exactly as it was and needed no
+change, since every one of those is a single ASCII byte and a UTF-8
+continuation/lead byte (always `>= 0x80`) can never be mistaken for one.
+Covered by new unit tests (`token_reader_decodes_multibyte_utf8_instead_
+of_mangling_it`, `non_ascii_relation_name_is_read_correctly_end_to_end`,
+`src/tests.rs`) proving a Korean identifier now round-trips through the
+full `raw_parse_dump` -> `analyze_dump` path intact; `cargo test --lib`
+32/32.
 
 ## 10. Projects and a real `await_human` reply loop
 
@@ -303,6 +433,22 @@ identity attached to a cancel, grant, or approval decision, for the same
 reason item 10 gives (no accounts system yet); no confirmation dialog
 before `sessions.cancel` beyond the browser's own — an operator fat-fingering
 Cancel loses a running task with no undo.
+
+~~No operator identity attached~~ — stale the moment it was written down
+here, caught only later: `fn_cancel_session`, `fn_grant_permission`/
+`fn_revoke_permission`, and `fn_decide_approval` all already called
+`allgres_private.audit(...)` even at the time this item was first
+written (`sessions.cancel`/`permissions.grant`/`permissions.revoke`/
+`approvals.decide`, each with the details worth recording) — this note
+described a real gap in the audit log's own contents at the time (no
+accounts yet meant nothing to attribute), not a gap in whether these
+three actions were audited at all. Items 28 (the audit log) and 30 (real
+accounts) closed the actual gap: `allgres_private.audit_log` now
+captures the real `user_id`/`username` resolved server-side from
+`session_token`, not merely a self-reported `operator_name`, on every
+one of these calls. Fixed here by updating this note rather than
+leaving it read as still-open indefinitely — KNOWN_ISSUES.md's own
+worst repeat offender, per `CLAUDE.md`.
 
 ## 12. Six correctness/security regressions from items 10 and 11, found by external review
 

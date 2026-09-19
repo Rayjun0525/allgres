@@ -45,6 +45,19 @@ pub(crate) fn raw_parse_dump(sql: &str) -> String {
 
 /// Read one `outToken`-encoded value: `<>` is NULL, `""` is empty, and any
 /// other token ends at the first unescaped delimiter.
+///
+/// `s` is already a valid Rust `&str` (decoded from Postgres's C string by
+/// the caller), so a non-ASCII identifier such as a Korean relation name
+/// arrives here correctly encoded as UTF-8 -- multiple bytes making up one
+/// character. KNOWN_ISSUES.md item 9: this used to re-emit each of those
+/// bytes as its own standalone `char` (`bytes[i] as char`, a byte-to-
+/// codepoint cast, not a UTF-8 decode), turning one real character into
+/// several garbled ones. Safe to keep scanning by byte for delimiters
+/// themselves (the `\`, `{`, `}`, `(`, `)`, and whitespace bytes `outToken`
+/// treats specially are all ASCII, and a UTF-8 continuation/lead byte is
+/// always `>= 0x80`, so it can never be mistaken for one of them) -- only
+/// the ordinary, non-delimiter byte path needs to decode a full scalar
+/// value instead of one raw byte.
 pub(crate) fn read_token(s: &str) -> (Option<String>, usize) {
     let bytes = s.as_bytes();
     if bytes.starts_with(b"<>") {
@@ -59,7 +72,9 @@ pub(crate) fn read_token(s: &str) -> (Option<String>, usize) {
         let b = bytes[i];
         if b == b'\\' {
             // outToken escapes the delimiters, and prefixes a leading '<', '"'
-            // or digit so it cannot be confused with NULL or a number.
+            // or digit so it cannot be confused with NULL or a number -- the
+            // escaped byte is always one of those single ASCII delimiters,
+            // never the start of a multi-byte sequence.
             if i + 1 < bytes.len() {
                 out.push(bytes[i + 1] as char);
                 i += 2;
@@ -71,8 +86,14 @@ pub(crate) fn read_token(s: &str) -> (Option<String>, usize) {
         if b.is_ascii_whitespace() || b == b'}' || b == b')' || b == b'{' || b == b'(' {
             break;
         }
-        out.push(b as char);
-        i += 1;
+        if b < 0x80 {
+            out.push(b as char);
+            i += 1;
+        } else {
+            let ch = s[i..].chars().next().expect("s is valid UTF-8, i is a char boundary here");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
     }
     (Some(out), i)
 }
@@ -122,7 +143,11 @@ pub(crate) fn paren_body(s: &str) -> &str {
 }
 
 /// String nodes inside a List serialise as `"name"`, not as `{STRING ...}`,
-/// so a funcname list looks like `("pg_catalog" "generate_series")`.
+/// so a funcname list looks like `("pg_catalog" "generate_series")`. Same
+/// UTF-8 fix as `read_token` above, and the same reasoning: the quote and
+/// backslash bytes this scans for are ASCII, so byte-wise delimiter
+/// detection is safe, but an ordinary non-ASCII byte must decode a full
+/// scalar value, not become its own standalone (garbled) `char`.
 pub(crate) fn quoted_strings(body: &str) -> Vec<String> {
     let bytes = body.as_bytes();
     let mut out = Vec::new();
@@ -138,9 +163,13 @@ pub(crate) fn quoted_strings(body: &str) -> Vec<String> {
             if bytes[i] == b'\\' && i + 1 < bytes.len() {
                 s.push(bytes[i + 1] as char);
                 i += 2;
-            } else {
+            } else if bytes[i] < 0x80 {
                 s.push(bytes[i] as char);
                 i += 1;
+            } else {
+                let ch = body[i..].chars().next().expect("body is valid UTF-8, i is a char boundary here");
+                s.push(ch);
+                i += ch.len_utf8();
             }
         }
         i += 1;
