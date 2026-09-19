@@ -6389,3 +6389,86 @@ attributed to any schedule's `spent_cost_usd` budget the way the main
 turn loop's own LLM calls already are -- acceptable for this first slice
 the same way `mcp_call`'s missing session handshake was, revisit if this
 path sees real use.
+
+## 77. Dashboard UI never caught up to Function/Procedure authoring -- `functions.create`/`.update`/`.bind` and a Procedure's own `body` were RPC-only
+
+Phases 3b-3d (items 73-75) shipped real PL/pgSQL Functions, a real
+Procedure `body`, and an `mcp_call` handler entirely on the backend --
+`docs/procedures.md` already said as much for Functions ("there is no
+dedicated Settings panel for authoring them yet"), but checking live
+turned up the Procedures panel had the identical gap for its own `body`:
+`procedures.create`/`.update` calls from `web/index.html` sent only
+`name`/`content`, never `body`, and `build_status`/`build_error` were
+never shown anywhere -- an operator using the dashboard could not
+actually give a Procedure real, runnable code, only edit its `content`
+guidance, the exact thing this whole Phase 3c/3d slice was supposed to
+make possible from the dashboard too, not just over raw `dashboard_rpc`.
+
+Closed both at once, since they share the same "Settings panel, modal,
+save handler" shape every other section here already uses:
+
+- **A new Functions panel** (`web/index.html`, `functionModal`/
+  `newFunctionModal`/`functionHandlerFields`): lists every Function with
+  its handler, build status (`plpgsql` only), bound procedures, and
+  enabled state; a "New function" modal switches its own fields by
+  handler (`http_get`: URL; `mcp_call`: connection picker + remote tool
+  name; `plpgsql`: body + param_schema). The edit modal enforces the
+  same restriction `fn_update_function` itself already does server-side
+  (`IF f.handler <> 'plpgsql' THEN RAISE EXCEPTION 'only a plpgsql
+  function can be edited -- http_get is fixed at creation'`): only a
+  `plpgsql` function's description/body/param_schema show editable
+  fields and a Save button; `http_get`/`mcp_call` show their fixed
+  config read-only, since calling `functions.update` on either would
+  just fail -- the UI reflects a real backend constraint here, not one
+  it invented. A "Bind to procedure" control (populated from procedures
+  not already bound, since there is no `functions.unbind` action to
+  build against) calls `functions.bind` directly.
+- **The Procedures panel's own `body`**: both modals gained a Body
+  textarea (optional -- blank sends `null`, which `fn_set_procedure`/
+  `fn_create_procedure` already treat as "no body" or "no change," never
+  as "clear the existing one," since neither function supports clearing
+  a body once set -- the UI does not invent a capability the backend
+  lacks) and a build-status line once a body exists.
+
+**A real bug this surfaced, not a UI-only one**: both new Body textareas'
+placeholder text (and this entry's own first manual test) used a bare
+statement -- `p_result := jsonb_build_object('ok', true);` -- with no
+`BEGIN`/`END` wrapper. `run_function_build`/`run_procedure_build`
+(`src/function_exec.rs`/`src/procedure_exec.rs`) splice a body's text
+verbatim into `... LANGUAGE plpgsql ... AS $$<body>$$`, exactly like a
+real `CREATE FUNCTION`/`CREATE PROCEDURE` statement always has -- a bare
+statement with no `BEGIN`/`END` block is not valid PL/pgSQL there,
+confirmed live: the exact procedure this placeholder text described
+built with `build_status = 'failed'`, `build_error = 'syntax error at or
+near "p_result"'`. `sql/selftest.sql`'s own existing fixtures already
+used the correct shape (`'BEGIN p_result := ...; END;'`,
+`'BEGIN RETURN ...; END;'`) -- the placeholder text just never matched
+it. Fixed by correcting all three placeholders to the same `BEGIN ...
+END;` shape; a real operator typing exactly what the field suggested
+would otherwise have hit the identical confusing syntax error on their
+first attempt.
+
+**A second, much smaller bug from the same live pass**: four new inline
+`style="..."` values this change introduced (`min-height:100px/120px/
+160px`, `max-width:320px;white-space:pre-wrap`) were missing from
+`web/index.html`'s own CSP-nonce-workaround override list (item 60's own
+fix -- see that style block's comment on why every literal `style="..."`
+value needs its own matching `[style="..."]` rule or the browser
+silently drops it). Confirmed live via a real headless-Chromium session
+(Playwright, pre-installed in this environment): the console showed
+"Refused to apply inline style" for exactly these four values until
+added.
+
+Verified: rebuilt and reinstalled; fresh install's `fn_selftest()` read
+`"failed": 0, "passed": 359` across two separate `psql` connections
+(unchanged from before this item -- pure frontend, no new SQL surface);
+`cargo test --lib --no-default-features --features pg16` still 32/32.
+Live, in a real headless browser (not just `node --check` on the
+extracted script, though that ran clean too) against the real dashboard
+over real HTTP, signed in as a real admin account: created an `http_get`
+Function and a Procedure with a real `body`, confirmed the Procedure's
+body actually built (`build_status: 'running'` -- i.e. `'built'`,
+rendered as the same status badge every other "healthy" row uses) once
+given the corrected `BEGIN`/`END` shape, edited a `plpgsql` function's
+fields, and bound a Function to a Procedure -- confirmed in the database
+directly afterward, not just by re-reading the same page's own claim.

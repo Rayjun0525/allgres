@@ -103,9 +103,11 @@ Two handlers exist:
   interoperability gap for some servers, not yet addressed.
 
 Create or edit a Function via the `functions.create` / `functions.update` /
-`functions.bind` dashboard_rpc actions — there is no dedicated Settings
-panel for authoring them yet, only the read-only Function model experiments
-panel. **Any agent** may also author or edit one itself, through
+`functions.bind` dashboard_rpc actions, or Settings' own Functions panel
+(name, description, handler-specific fields, and — for `plpgsql` only,
+the one handler `functions.update` can edit after creation — body and
+param_schema, alongside its build status). **Any agent** may also author
+or edit one itself, through
 `create_function` / `update_function` actions gated by that agent's own
 `autonomy_level` (`admin_approval` queues a `change_proposals` row for an
 operator to decide; `self_approve`/`auto` apply immediately) — unlike
