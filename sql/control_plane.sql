@@ -121,6 +121,21 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_function_admin') THEN
     CREATE ROLE allgres_function_admin NOLOGIN NOINHERIT;
   END IF;
+  -- Same reasoning again, for allgres_private.fn_llm_complete (Phase 3e, a
+  -- `call_llm`-style helper a Procedure body can call for its own
+  -- mid-pipeline judgment): it needs allgres_private.provider_secret,
+  -- which decrypts a real LLM provider credential -- EXECUTE on that is
+  -- revoked from operator/worker precisely so nothing but the fully async,
+  -- worker-owned outbound_calls path can ever reach a real secret (see
+  -- provider_secret's own comment). Every per-agent role reaches
+  -- fn_llm_complete (via `sandbox`, below), so its own privilege -- unlike
+  -- everything else `sandbox` can reach -- must live in a role that owns
+  -- nothing but this one function, never allgres_owner: a bug in any other
+  -- allgres_owner-owned SECURITY DEFINER function must never carry the
+  -- power to decrypt and send a real LLM credential too.
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'allgres_llm_admin') THEN
+    CREATE ROLE allgres_llm_admin NOLOGIN NOINHERIT;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'operator') THEN
     CREATE ROLE operator LOGIN;
   END IF;
@@ -5977,6 +5992,109 @@ BEGIN
 END;
 $fn$;
 
+-- Phase 3e: a `call_llm`-style helper a Procedure's own body can call for
+-- its own mid-pipeline judgment -- named fn_llm_complete, not call_llm,
+-- specifically so it never collides with fn_next_step's own
+-- `"action":"call_llm"` (an unrelated value in a completely different
+-- namespace: the main per-task turn loop's own next-step verb, resolved by
+-- fn_dispatch_tasks into a queued, worker-owned, thread-pool-dispatched
+-- outbound_calls row -- nothing at all like this function). Reuses
+-- build_llm_http/sanitize_llm_config for request shaping (identical
+-- provider/model resolution and fail-closed behavior the main turn loop
+-- gets -- no separate, drift-prone copy of that logic), provider_secret
+-- for the credential, and llm_text_from_http/extract_first_json for
+-- response parsing -- the same four helpers fn_dispatch_tasks/
+-- fn_claim_outbound/fn_complete_outbound already use for the async path,
+-- just called directly instead of round-tripped through a queue, because
+-- this call is meant to return synchronously, inside the one blocking
+-- `CALL` a Procedure's body already is (see docs/procedures.md's "Running
+-- a procedure").
+--
+-- SECURITY DEFINER, owned by allgres_llm_admin (see "1. Roles" above) --
+-- not allgres_owner, since this is the one function anywhere in this file
+-- that both decrypts a real LLM provider secret (via provider_secret,
+-- otherwise reachable only from the fully worker-owned async path) and
+-- sends it over the network, and it is reachable by every per-agent role
+-- (granted to `sandbox`, sql/grants_and_facade.sql) -- unlike everything
+-- else that role can already reach.
+--
+-- Deliberately narrower than the main turn loop in two ways, both
+-- intentional for this first slice: p_llm_config is required, not
+-- defaulted from the calling agent's own policy (a Procedure body has no
+-- readily available "which agent is this" once `SET LOCAL ROLE` has
+-- already erased that from the role system -- see run_procedure_call's own
+-- comment -- so the procedure author names a provider/model explicitly,
+-- the same way http_get's URL or mcp_call's tool name is fixed at
+-- authoring time rather than resolved from context); and this call is not
+-- logged into execution_logs or outbound_calls the way a turn's own LLM
+-- call is -- it is a Procedure's own internal utility call, not a step in
+-- the visible agent/LLM conversation, and (see KNOWN_ISSUES.md's Phase 3e
+-- entry) its cost is not yet attributed to any schedule's spent_cost_usd
+-- budget, a known gap for a later slice if this path sees real use.
+--
+-- A network-level failure (bad status, timeout, unparsable body) comes
+-- back as {"ok": false, "error": ...} rather than an exception, so a
+-- Procedure's own body can branch on it with a plain IF -- a
+-- misconfigured p_llm_config (no such provider, provider disabled, no
+-- model) still raises, exactly like build_llm_http's own fail-closed
+-- behavior, since that is an authoring bug to fix, not a runtime
+-- condition to branch on.
+CREATE OR REPLACE FUNCTION allgres_private.fn_llm_complete(p_messages jsonb, p_llm_config jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = allgres_private, pg_temp
+AS $fn$
+DECLARE
+  v_http jsonb;
+  v_headers jsonb;
+  v_key text;
+  v_send jsonb;
+  v_status int;
+  v_body text;
+  v_text text;
+BEGIN
+  IF jsonb_typeof(p_messages) IS DISTINCT FROM 'array' OR jsonb_array_length(p_messages) = 0 THEN
+    RAISE EXCEPTION 'fn_llm_complete: p_messages must be a non-empty array' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_http := allgres_private.build_llm_http(jsonb_build_object(
+    'llm_config', allgres_private.sanitize_llm_config(p_llm_config),
+    'messages', p_messages
+  ));
+
+  -- Same credential injection as fn_claim_outbound's own 'llm' branch,
+  -- just done here instead of at claim time -- there is no outbound_calls
+  -- row for this call to keep the credential out of (see this function's
+  -- own header comment on why), so there is nothing extra to protect by
+  -- doing it any differently.
+  v_headers := v_http->'headers';
+  IF v_http->>'auth_kind' IS NOT NULL THEN
+    v_key := COALESCE(allgres_private.provider_secret((v_http->>'provider_id')::uuid), '');
+    v_headers := v_headers || jsonb_build_object(
+      v_http->>'auth_kind',
+      CASE WHEN v_http->>'auth_kind' = 'x-api-key' THEN v_key ELSE 'Bearer ' || v_key END
+    );
+  END IF;
+
+  v_send := allgres.native_llm_http_send(
+    v_http->>'url', v_headers, v_http->'body', COALESCE((v_http->>'allow_private')::boolean, false)
+  );
+  v_status := (v_send->>'status')::int;
+  v_body := v_send->>'body';
+
+  IF v_status IS NULL OR v_status < 200 OR v_status >= 300 THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'error', 'llm http ' || COALESCE(v_status::text, '0') || ': ' || left(COALESCE(v_body, ''), 2000)
+    );
+  END IF;
+
+  v_text := allgres_private.llm_text_from_http(v_body);
+  RETURN jsonb_build_object('ok', true, 'content', v_text, 'parsed', allgres_private.extract_first_json(v_text));
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION allgres_public.fn_dispatch_tasks()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -6012,6 +6130,29 @@ BEGIN
         SELECT 1 FROM allgres_private.sql_calls sc
         WHERE sc.task_id = tasks.task_id
           AND sc.status IN ('queued', 'in_flight')
+      )
+      -- Same guard, for call_function against a plpgsql Function and
+      -- run_procedure -- identical reasoning, and a real gap until Phase
+      -- 3e caught it live: both queue into their own table with the task
+      -- left 'running', so without this a slow function_calls/
+      -- procedure_calls row (previously always sub-second SQL, now
+      -- possibly a Procedure body's own fn_llm_complete call, up to
+      -- HTTP_TIMEOUT) gets raced by this same dispatch loop trying to
+      -- advance the task's next turn before the pending call resolves --
+      -- confirmed live: an agent with no llm_config configured at all
+      -- (irrelevant to the procedure call itself) still failed the task
+      -- with "no llm_config.provider configured", from fn_next_step being
+      -- called a second time on a task that was never meant to need one
+      -- yet (KNOWN_ISSUES.md's Phase 3e entry).
+      AND NOT EXISTS (
+        SELECT 1 FROM allgres_private.function_calls fc
+        WHERE fc.task_id = tasks.task_id
+          AND fc.status IN ('queued', 'in_flight')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM allgres_private.procedure_calls pc
+        WHERE pc.task_id = tasks.task_id
+          AND pc.status IN ('queued', 'in_flight')
       )
     ORDER BY created_at
     FOR UPDATE SKIP LOCKED
@@ -7250,11 +7391,21 @@ BEGIN
 
   -- Same two reclaims again, for a Procedure's call/build instead of a
   -- Function's -- identical reasoning throughout (src/procedure_exec.rs).
+  -- The floor is 150s here, not 15s: a Procedure call is bounded by
+  -- PROCEDURE_CALL_TIMEOUT_MS (60s, src/lib.rs), not the much shorter
+  -- SQL_STATEMENT_TIMEOUT_MS a plain Function call uses, since its body
+  -- may call fn_llm_complete (Phase 3e) -- a real synchronous HTTP round
+  -- trip on the same worker thread. Reclaiming at 15-90s (the shared
+  -- default) would race a legitimately still-running call, marking it
+  -- 'lost' -- and the task failed -- while the worker's own statement
+  -- timeout had not even fired yet. 150s keeps comfortable margin above
+  -- 60s the same way the shared 90s default already does above HTTP_TIMEOUT
+  -- (45s, see that constant's own comment).
   FOR r IN
     SELECT call_id, task_id
     FROM allgres_private.procedure_calls
     WHERE status = 'in_flight'
-      AND updated_at < now() - make_interval(secs => GREATEST(15, COALESCE(p_timeout_seconds, 90)))
+      AND updated_at < now() - make_interval(secs => GREATEST(150, COALESCE(p_timeout_seconds, 90)))
     FOR UPDATE SKIP LOCKED
   LOOP
     UPDATE allgres_private.procedure_calls

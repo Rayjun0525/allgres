@@ -69,7 +69,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers')
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers', 'fn_llm_complete')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;
@@ -107,6 +107,19 @@ BEGIN
       AND p.proowner <> 'allgres_signal_admin'::regrole
   ) THEN
     ALTER FUNCTION allgres_private.fn_signal_cancel_worker() OWNER TO allgres_signal_admin;
+  END IF;
+
+  -- fn_llm_complete (Phase 3e): same reasoning as fn_signal_cancel_worker
+  -- just above -- it is the one function in this file that decrypts a real
+  -- LLM provider secret (via provider_secret) and sends it over the
+  -- network, reachable by every per-agent role, so it is owned by
+  -- allgres_llm_admin, never allgres_owner.
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'allgres_private' AND p.proname = 'fn_llm_complete'
+      AND p.proowner <> 'allgres_llm_admin'::regrole
+  ) THEN
+    ALTER FUNCTION allgres_private.fn_llm_complete(jsonb, jsonb) OWNER TO allgres_llm_admin;
   END IF;
 
   IF (SELECT nspowner FROM pg_namespace WHERE nspname = 'allgres_private') <> 'allgres_owner'::regrole THEN
@@ -196,6 +209,30 @@ GRANT EXECUTE ON FUNCTION allgres_private.fn_provision_user_role(uuid) TO allgre
 GRANT USAGE ON SCHEMA allgres_private TO allgres_role_admin;
 GRANT SELECT, UPDATE ON allgres_private.agents TO allgres_role_admin;
 GRANT SELECT, UPDATE ON allgres_private.users TO allgres_role_admin;
+
+-- fn_llm_complete (owned by allgres_llm_admin, Phase 3e) calls four
+-- allgres_owner-owned helpers directly -- build_llm_http/sanitize_llm_
+-- config for request shaping, provider_secret for the credential,
+-- llm_text_from_http/extract_first_json for response parsing -- each its
+-- own explicit cross-owner EXECUTE grant, same reasoning as every other
+-- cross-owner call in this file. USAGE on allgres_private is needed twice
+-- over, for two different roles: allgres_llm_admin needs it to resolve its
+-- own schema-qualified calls to those four helpers (ownership of
+-- fn_llm_complete itself does not imply schema USAGE -- same reason
+-- allgres_role_admin has its own explicit grant two lines up, confirmed by
+-- that exact precedent); every per-agent role needs it, separately, to
+-- *reach* fn_llm_complete in the first place (granted to `sandbox`, which
+-- every per-agent role is already a member of -- see
+-- fn_provision_agent_role). Schema USAGE alone grants nothing beyond
+-- that, every table and function in the schema still gates access on its
+-- own separate grant, same as it already does for `operator` below.
+GRANT USAGE ON SCHEMA allgres_private TO allgres_llm_admin;
+GRANT EXECUTE ON FUNCTION allgres_private.build_llm_http(jsonb) TO allgres_llm_admin;
+GRANT EXECUTE ON FUNCTION allgres_private.sanitize_llm_config(jsonb) TO allgres_llm_admin;
+GRANT EXECUTE ON FUNCTION allgres_private.provider_secret(uuid) TO allgres_llm_admin;
+GRANT EXECUTE ON FUNCTION allgres_private.llm_text_from_http(text) TO allgres_llm_admin;
+GRANT EXECUTE ON FUNCTION allgres_private.extract_first_json(text) TO allgres_llm_admin;
+GRANT USAGE ON SCHEMA allgres_private TO sandbox;
 
 REVOKE ALL ON SCHEMA allgres_private FROM PUBLIC;
 REVOKE ALL ON SCHEMA allgres_public FROM PUBLIC;
@@ -307,6 +344,21 @@ GRANT EXECUTE ON FUNCTION allgres_public.fn_complete_provider_probe(uuid, int, t
 GRANT EXECUTE ON FUNCTION allgres_public.fn_watchdog(int) TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_schedules() TO worker;
 GRANT EXECUTE ON FUNCTION allgres_public.fn_run_sandboxed_sql(text) TO sandbox;
+
+-- fn_llm_complete (Phase 3e): the one function a Procedure body itself may
+-- call directly, as an ordinary nested statement in its own already-role-
+-- switched session -- not something the runtime worker calls on the
+-- agent's behalf, unlike everything else granted to `sandbox` above. See
+-- its own definition (sql/control_plane.sql) and allgres_llm_admin's own
+-- role comment for why it needs a narrow owner rather than allgres_owner.
+GRANT EXECUTE ON FUNCTION allgres_private.fn_llm_complete(jsonb, jsonb) TO sandbox;
+-- fn_selftest itself runs as allgres_owner and exercises fn_llm_complete's
+-- own fail-closed validation directly (a real network round trip is
+-- proved live instead, same distinction run_procedure's own build/call
+-- draws just below) -- same "fn_selftest needs its own grant" reasoning
+-- as any other allgres_owner-owned function calling out to one it does
+-- not own.
+GRANT EXECUTE ON FUNCTION allgres_private.fn_llm_complete(jsonb, jsonb) TO allgres_owner;
 
 -- current_agent_id() is deliberately SECURITY INVOKER, not DEFINER (see its
 -- own comment above, "1. Roles" is the wrong section to relitigate why),
@@ -438,7 +490,7 @@ SELECT project_id, name, description, is_active, created_at, updated_at
 FROM allgres_private.projects;
 
 REVOKE ALL ON SCHEMA allgres FROM PUBLIC;
-GRANT USAGE ON SCHEMA allgres TO operator, worker, allgres_settings_reader;
+GRANT USAGE ON SCHEMA allgres TO operator, worker, allgres_settings_reader, allgres_llm_admin;
 GRANT SELECT ON allgres.agents, allgres.tasks, allgres.projects TO operator;
 
 -- Same PUBLIC-EXECUTE-by-default gap the blanket revoke earlier in this
@@ -1812,6 +1864,19 @@ GRANT EXECUTE ON FUNCTION allgres.native_start_dynamic_workers() TO allgres_sett
 -- it doesn't own.
 GRANT EXECUTE ON FUNCTION allgres_public.fn_start_dynamic_workers() TO allgres_owner;
 
+-- native_llm_http_send (Phase 3e): same PUBLIC-revoked-by-schema, owned-by-
+-- allgres_owner, SECURITY INVOKER shape as native_start_dynamic_workers
+-- just above -- it decrypts nothing and resolves no credential itself, it
+-- only sends exactly the url/headers/body it is given, so its own
+-- ownership has no bearing on what it can read. Unlike
+-- native_start_dynamic_workers, EXECUTE here is granted only to
+-- allgres_llm_admin, never to `operator`/`sandbox`/anyone else -- calling
+-- it directly with attacker-chosen headers/body would make it a generic
+-- SSRF-guarded "POST anywhere" primitive, so the only path to it is
+-- through fn_llm_complete (allgres_private, owned by allgres_llm_admin),
+-- which is what actually builds the credentialed request.
+GRANT EXECUTE ON FUNCTION allgres.native_llm_http_send(text, jsonb, jsonb, boolean) TO allgres_llm_admin;
+
 -- ---------------------------------------------------------------------------
 -- 14. Final ownership pass.
 -- ---------------------------------------------------------------------------
@@ -1861,7 +1926,7 @@ BEGIN
     JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'allgres'
     WHERE n.nspname IN ('allgres_private', 'allgres_public', 'allgres')
       AND p.proowner <> 'allgres_owner'::regrole
-      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers')
+      AND p.proname NOT IN ('fn_provision_agent_role', 'fn_provision_user_role', 'fn_signal_cancel_worker', 'fn_start_dynamic_workers', 'fn_llm_complete')
   LOOP
     EXECUTE format('ALTER FUNCTION %s OWNER TO allgres_owner', r.sig);
   END LOOP;

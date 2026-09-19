@@ -932,6 +932,51 @@ BEGIN
   -- procedures WHERE procedure_id = v_call (caught live: it does).
   DELETE FROM allgres_private.outbound_calls WHERE procedure_function_id = v_mcp_function_id;
 
+  -- fn_llm_complete (Phase 3e): a Procedure body's own `call_llm`-style
+  -- helper (name deliberately distinct from fn_next_step's own
+  -- "action":"call_llm" -- see its own header comment). fn_selftest
+  -- exercises only its fail-closed input validation here (its own grant
+  -- to allgres_owner, sql/grants_and_facade.sql) -- a real network round
+  -- trip needs a live endpoint, proved live instead (KNOWN_ISSUES.md's
+  -- Phase 3e entry), the same split run_procedure's own build/call draws
+  -- just below.
+  BEGIN
+    PERFORM allgres_private.fn_llm_complete('[]'::jsonb, jsonb_build_object('provider', 'x', 'model', 'y'));
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%non-empty array%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'llm_complete_rejects_empty_messages', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_private.fn_llm_complete('{"role":"user"}'::jsonb, jsonb_build_object('provider', 'x', 'model', 'y'));
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%non-empty array%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'llm_complete_rejects_non_array_messages', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_private.fn_llm_complete(
+      jsonb_build_array(jsonb_build_object('role', 'user', 'content', 'hi')), '{}'::jsonb
+    );
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%no llm_config.provider configured%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'llm_complete_fails_closed_with_no_provider', 'ok', ok));
+
+  BEGIN
+    PERFORM allgres_private.fn_llm_complete(
+      jsonb_build_array(jsonb_build_object('role', 'user', 'content', 'hi')),
+      jsonb_build_object('provider', 'selftest_no_such_provider', 'model', 'x')
+    );
+    ok := false;
+  EXCEPTION WHEN others THEN
+    ok := SQLERRM LIKE '%is not configured or not enabled%';
+  END;
+  v := v || jsonb_build_array(jsonb_build_object('name', 'llm_complete_fails_closed_on_unknown_provider', 'ok', ok));
+
   -- run_procedure (Phase 3c): 'selftest_procedure' has content but no real
   -- body (the original seed, content-only) -- rejected up front as
   -- 'procedure_not_built', never silently queued against a nonexistent

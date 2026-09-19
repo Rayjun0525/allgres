@@ -147,25 +147,54 @@ hand would. There is no second queue round trip for a Function called
 this way: the queue and `SET ROLE` only exist to get *into* the
 role-scoped session in the first place, not for every statement run once
 inside it. This also means the body can only call something synchronous
-— another plpgsql Function, ordinary SQL — never an `http_get`/
-`http_request` Function, which requires an outbound HTTP round trip a
-single blocking procedure call cannot wait on; that capability (and a
-`call_llm()` helper for a procedure's own mid-pipeline judgment calls) is
-future work. The result comes back once, as a `procedure_result` (its own
-`execution_logs` role, distinct from a Function's `function_result`) —
-confirmed live: a procedure whose body called a Function and branched on
-its result returned the correctly-branched value, and a procedure whose
-body tried to read a table its calling agent's role has no grant on
-failed with the identical genuine `permission denied` a plpgsql Function
-would (see KNOWN_ISSUES.md's Phase 3c entry).
+directly as a nested statement — another plpgsql Function, ordinary SQL,
+or `allgres_private.fn_llm_complete` (below) — never an `http_get`/
+`http_request`/`mcp_call` Function, which requires an outbound HTTP round
+trip a single blocking procedure call cannot wait on; that capability
+remains future work. The result comes back once, as a `procedure_result`
+(its own `execution_logs` role, distinct from a Function's
+`function_result`) — confirmed live: a procedure whose body called a
+Function and branched on its result returned the correctly-branched
+value, and a procedure whose body tried to read a table its calling
+agent's role has no grant on failed with the identical genuine
+`permission denied` a plpgsql Function would (see KNOWN_ISSUES.md's Phase
+3c entry).
+
+### A Procedure body's own `call_llm`-style helper: `fn_llm_complete`
+
+A Procedure body can ask an LLM something mid-pipeline, synchronously,
+with `p_result := allgres_private.fn_llm_complete(p_messages, p_llm_config)`
+— `p_messages` the same `[{"role":"user","content":"..."}]` shape
+`fn_next_step`'s own turn loop builds, `p_llm_config` a required
+`{"provider":"...","model":"..."}` naming a real, enabled provider (no
+default from the calling agent's own policy: a Procedure body has no
+readily available "which agent is this" once `SET LOCAL ROLE` has
+already erased that from the role system for this session, so the
+provider/model is fixed at authoring time, the same way `http_get`'s URL
+or `mcp_call`'s tool name is). Named `fn_llm_complete`, not `call_llm` —
+that string is already `fn_next_step`'s own `"action"` value for a
+completely different thing (the main turn loop's own next-step verb),
+and reusing it here would make every future mention ambiguous. Returns
+`{"ok": true, "content": "...", "parsed": <jsonb-or-null>}` on success or
+`{"ok": false, "error": "..."}` on a network-level failure (bad status,
+timeout, unparsable body) — a plain value the body branches on with an
+`IF`, not an exception; a misconfigured `p_llm_config` (no such provider,
+disabled, no model) still raises, since that is an authoring bug to fix,
+not a runtime condition. Unlike a Function or Procedure call, this is not
+logged into `execution_logs` or `outbound_calls` — it is the Procedure's
+own internal utility call, not a step in the visible agent/LLM
+conversation, and (a known gap) its cost is not yet attributed to any
+schedule's `spent_cost_usd` budget. Confirmed live: a real Procedure body
+called `fn_llm_complete` against a real local HTTP endpoint and returned
+its actual response, unwrapped, in the `procedure_result` log (see
+KNOWN_ISSUES.md's Phase 3e entry).
 
 This keeps the naming model clear: **Procedure** is the reusable
 capability, now real code as well as a description; a **Function** is one
 operation inside it — fixed for `http_get`, a real role-scoped PL/pgSQL
 body for `plpgsql`, one remote tool call for `mcp_call`. A Procedure body
 may only call something synchronous this way (another `plpgsql` Function,
-ordinary SQL) — an `http_get`/`http_request`/`mcp_call` Function needs a
-real outbound HTTP round trip, which a single blocking `CALL` cannot wait
-on; that, and a `call_llm()` helper for a Procedure's own mid-pipeline
-judgment calls, remain future work (see the v2 redesign notes in
-KNOWN_ISSUES.md).
+ordinary SQL, or `fn_llm_complete`) — an `http_get`/`http_request`/
+`mcp_call` Function needs a real outbound HTTP round trip, which a single
+blocking `CALL` cannot wait on; that remains future work (see the v2
+redesign notes in KNOWN_ISSUES.md).

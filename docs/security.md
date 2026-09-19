@@ -69,7 +69,8 @@ source IPs; it is one layer, not a substitute for a real token.
 ## Outbound requests (SSRF)
 
 One guard covers every outbound path — the LLM endpoint, the `http_get`,
-`http_request`, and `mcp_call` functions, and the OAuth token exchange:
+`http_request`, and `mcp_call` functions, the OAuth token exchange, and a
+Procedure body's own synchronous `fn_llm_complete` call (below):
 
 - `https` only, unless the provider is explicitly marked
   `allow_private_network`;
@@ -348,6 +349,29 @@ whose body read `llm_secrets` directly failed with the identical genuine
 `permission denied`, while a Procedure whose body called a bound
 Function and branched on its result did so correctly under that same
 one role for the whole call.
+
+`allgres_private.fn_llm_complete` -- the one thing a Procedure body may
+call to reach the network directly, for a synchronous `call_llm`-style
+judgment call (see [Procedures](procedures.md)) -- deliberately does
+*not* reuse this per-agent-role model: it is a plain, fixed-role
+`SECURITY DEFINER` function, the same shape `fn_provision_agent_role` or
+`fn_signal_cancel_worker` already use for a broad, single-purpose
+privilege. That is the right shape here specifically because the
+privilege it needs (decrypting a real LLM provider secret, via
+`provider_secret`) is fixed and narrow, not "whatever this specific
+agent's own role can already do" -- no `SET ROLE` dance is needed or
+possible for it, since there is no third, dynamically-chosen role
+involved, only "run as the one role that may read this one class of
+secret." Following this project's own rule for a new broad privilege
+(`CLAUDE.md`): it is owned by a new `allgres_llm_admin` role that owns
+nothing else, never `allgres_owner`, since every per-agent role can reach
+it (granted to `sandbox`). The actual outbound POST is a separate native
+function, `allgres.native_llm_http_send`, `EXECUTE`-granted only to
+`allgres_llm_admin` -- never directly to `sandbox` -- since it is a dumb
+"send exactly this url/headers/body" primitive with no credential
+awareness of its own: reachable directly by an ordinary agent role, it
+would be a generic SSRF-guarded "POST anywhere with attacker-chosen
+headers" capability, even without ever touching a real secret.
 
 ### The SQL console
 

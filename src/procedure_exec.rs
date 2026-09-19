@@ -17,7 +17,7 @@ use crate::function_exec::{dollar_quote, valid_sql_ident};
 use crate::rpc::valid_uuid;
 use crate::runtime_worker::drop_privileges;
 use crate::sandbox::{run_in_subtransaction, valid_pg_role, PG_STATEMENT_TIMEOUT_ID};
-use crate::{SQL_CLAIM_LIMIT, SQL_STATEMENT_TIMEOUT_MS};
+use crate::{PROCEDURE_CALL_TIMEOUT_MS, SQL_CLAIM_LIMIT};
 use pgrx::bgworkers::BackgroundWorker;
 use pgrx::prelude::*;
 use pgrx::JsonB;
@@ -139,6 +139,10 @@ pub(crate) fn claim_procedure_call_jobs(limit: i32) -> Value {
 /// call also works here, just against a `CALL` statement instead of a
 /// `SELECT`. The second argument is the INOUT parameter's initial value,
 /// required syntactically even though the body always overwrites it.
+/// Bounded by `PROCEDURE_CALL_TIMEOUT_MS`, not the shorter
+/// `SQL_STATEMENT_TIMEOUT_MS` a plain Function call uses: unlike a
+/// Function, a Procedure's body may call `allgres_private.fn_llm_complete`
+/// (Phase 3e), a real synchronous HTTP round trip on this same thread.
 fn run_procedure_call(sql_ident: &str, args: &Value, pg_role: Option<&str>) -> Result<Value, String> {
     if !valid_sql_ident(sql_ident, "proc_") {
         return Err("invalid sql_ident".to_string());
@@ -151,12 +155,12 @@ fn run_procedure_call(sql_ident: &str, args: &Value, pg_role: Option<&str>) -> R
             let dropped = drop_privileges()
                 && Spi::run(&format!("SET LOCAL ROLE {role}")).is_ok()
                 && Spi::run("SET LOCAL search_path = pg_temp").is_ok()
-                && Spi::run(&format!("SET LOCAL statement_timeout = '{SQL_STATEMENT_TIMEOUT_MS}ms'")).is_ok();
+                && Spi::run(&format!("SET LOCAL statement_timeout = '{PROCEDURE_CALL_TIMEOUT_MS}ms'")).is_ok();
             if !dropped {
                 return Err("procedure role unavailable".to_string());
             }
             unsafe {
-                enable_timeout_after(PG_STATEMENT_TIMEOUT_ID, SQL_STATEMENT_TIMEOUT_MS);
+                enable_timeout_after(PG_STATEMENT_TIMEOUT_ID, PROCEDURE_CALL_TIMEOUT_MS);
             }
             let r = match Spi::get_one_with_args::<JsonB>(&sql, &[JsonB(args).into()]) {
                 Ok(Some(JsonB(v))) => Ok(v),

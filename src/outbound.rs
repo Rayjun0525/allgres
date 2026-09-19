@@ -286,6 +286,53 @@ impl ureq::unversioned::transport::Transport for CancellableTransport {
     }
 }
 
+/// Same SSRF-guarded POST as `perform_http`'s own generic (llm/mcp/
+/// embedding/recall) branch below, minus the cancellation wiring: this is
+/// called synchronously, in-process, by `allgres.native_llm_http_send`
+/// (src/lib.rs) -- a Procedure body's own `call_llm`-style helper
+/// (`allgres_private.fn_llm_complete`, Phase 3e) -- rather than dispatched
+/// onto the HTTP thread pool, so there is no `call_id` for `CancelGuard`
+/// to register against. Reuses the exact same `GuardedResolver` either
+/// way; the DNS-rebinding guard this whole module exists for does not
+/// depend on whether the connector also supports mid-flight cancellation.
+pub(crate) fn guarded_post_json(
+    url: &str,
+    headers: Option<&serde_json::Map<String, Value>>,
+    body: &Value,
+    allow_private: bool,
+) -> (i32, String) {
+    let lowered = url.to_ascii_lowercase();
+    if !(lowered.starts_with("http://") || lowered.starts_with("https://")) {
+        return (0, "outbound URL scheme not allowed".into());
+    }
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build();
+    let agent = ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        GuardedResolver { allow_private },
+    );
+    let mut req = agent.post(url);
+    if let Some(h) = headers {
+        for (k, v) in h {
+            if let Some(s) = v.as_str() {
+                req = req.header(k, s);
+            }
+        }
+    }
+    match req.send_json(body) {
+        Ok(mut r) => {
+            let status = r.status().as_u16() as i32;
+            let text = r.body_mut().read_to_string().unwrap_or_default();
+            (status, truncate_utf8(&text, MAX_RESPONSE_BYTES).to_string())
+        }
+        Err(e) => (0, e.to_string()),
+    }
+}
+
 fn perform_http(call_id: &str, call: &Value) -> (i32, String) {
     let cancel_guard = CancelGuard::register(call_id);
     let cancel_flag = cancel_guard.flag.clone();

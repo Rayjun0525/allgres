@@ -6090,3 +6090,156 @@ in the execution log
 (`{"result":[{"text":"echo:weather","type":"text"}],"function":
 "live_mcp_search"}`) -- the full round trip through the real HTTP thread
 pool, not a synthetic body handed straight to `fn_complete_outbound`.
+
+## 76. v2 redesign, Phase 3e: `fn_llm_complete` -- a `call_llm`-style helper a Procedure body can call for its own mid-pipeline judgment
+
+Closes the last item the v2 redesign's Phase 3 breakdown named: a
+Procedure body (item 74) could already call any bound Function directly,
+in code, with real branching -- but only a *synchronous* one (`plpgsql`),
+since its whole body runs inside one blocking `CALL` a single Postgres
+statement, with no way to pause and resume for a real network round
+trip. `http_get`/`http_request`/`mcp_call` all need exactly that kind of
+round trip, so none of them were ever callable from inside a Procedure.
+This closes the gap for one specific case -- asking an LLM something,
+mid-procedure -- via a new SQL function, `allgres_private.fn_llm_complete
+(p_messages jsonb, p_llm_config jsonb) RETURNS jsonb`. Named
+`fn_llm_complete`, deliberately not `call_llm`: that string is already a
+value of `fn_next_step`'s own `"action"` key, in a completely different
+namespace (the main per-task turn loop's own next-step verb, resolved by
+`fn_dispatch_tasks` into a queued, worker-owned, thread-pool-dispatched
+`outbound_calls` row) -- reusing it as a SQL identifier too would have
+made every future grep and every future reader stop and check which one
+a given mention meant.
+
+**Design.** Reuses `build_llm_http`/`sanitize_llm_config` for request
+shaping (the identical provider/model resolution and fail-closed
+behavior the main turn loop gets -- no second, drift-prone copy of that
+logic), `provider_secret` for the credential, and
+`llm_text_from_http`/`extract_first_json` for response parsing -- the
+same four helpers `fn_dispatch_tasks`/`fn_claim_outbound`/
+`fn_complete_outbound` already use for the async path, just called
+directly instead of round-tripped through a queue, because this call is
+meant to come back synchronously, inside the one blocking `CALL` a
+Procedure body already is. Deliberately narrower than the main turn loop
+in two ways: `p_llm_config` is required, never defaulted from the calling
+agent's own policy (a Procedure body has no readily available "which
+agent is this" once `SET LOCAL ROLE` has already erased that from the
+role system for this session, so the procedure author names a
+provider/model explicitly, the same way `http_get`'s URL or `mcp_call`'s
+tool name is fixed at authoring time rather than resolved from context);
+and the call is not logged into `execution_logs` or `outbound_calls` the
+way a turn's own LLM call is -- it is a Procedure's own internal utility
+call, not a step in the visible agent/LLM conversation, and (a known gap,
+below) its cost is not yet attributed to any schedule's `spent_cost_usd`
+budget. A network-level failure (bad status, timeout, unparsable body)
+comes back as `{"ok": false, "error": ...}` rather than an exception, so
+a Procedure body can branch on it with a plain `IF`; a misconfigured
+`p_llm_config` (no such provider, provider disabled, no model) still
+raises, exactly like `build_llm_http`'s own fail-closed behavior, since
+that is an authoring bug to fix, not a runtime condition to branch on.
+
+**The actual network call needed a new native function, and a new narrow
+role.** PL/pgSQL cannot itself perform HTTP I/O, and every existing
+outbound call in this extension is deliberately dispatched onto a
+dedicated HTTP thread pool (`src/outbound.rs`) precisely so it never
+blocks the worker's own SPI thread -- exactly the opposite of what a
+call from inside a Procedure's single blocking `CALL` needs: it must
+block *that* thread, on purpose, the same way the rest of the Procedure's
+own execution already does. `allgres.native_llm_http_send` (a new
+`#[pg_extern]`, `src/lib.rs`) is a thin, dumb "send exactly this
+url/headers/body, SSRF-guarded" primitive -- the guard logic itself
+(`GuardedResolver`, the DNS-rebinding-safe resolver every other outbound
+call already uses) is reused unchanged via a new `pub(crate)
+guarded_post_json` helper factored out of `perform_http`'s own generic
+branch in `src/outbound.rs`, not duplicated. It decrypts nothing and
+resolves no credential itself; `fn_llm_complete` is what builds the real,
+credentialed request before calling it. Following this project's own
+documented rule for a new broad privilege (`CLAUDE.md`, "Adding a new
+SECURITY DEFINER function that needs a broad privilege"): `fn_llm_complete`
+is the one function anywhere in this file that both decrypts a real LLM
+provider secret (via `provider_secret`, otherwise reachable only from the
+fully worker-owned async path) and sends it over the network, and it is
+reachable by every per-agent role (granted to `sandbox`) -- so it is
+owned by a new `allgres_llm_admin` role (`NOLOGIN NOINHERIT`, owns
+nothing else), never `allgres_owner`, with `native_llm_http_send`'s own
+`EXECUTE` granted only to that one role, never to `sandbox` directly (a
+directly-callable "POST anywhere with attacker-chosen headers" primitive
+would itself be a real capability leak, even though it touches no
+secret). Added to both of `sql/grants_and_facade.sql`'s ownership-
+exclusion lists, per `CLAUDE.md`'s own explicit warning about the second,
+late-splice pass.
+
+**Timeouts had to widen too, deliberately, for Procedures only.** A
+plain Function/Procedure call was bounded by the same
+`SQL_STATEMENT_TIMEOUT_MS` (5s) sandboxed SQL uses -- generous for pure
+PL/pgSQL, far too short for even one LLM round trip (`HTTP_TIMEOUT`,
+45s). A new `PROCEDURE_CALL_TIMEOUT_MS` (60s, `src/lib.rs`) replaces it
+in `run_procedure_call` only (`src/procedure_exec.rs`) -- plain Function
+calls are untouched, since only a Procedure body can reach
+`fn_llm_complete`. `fn_watchdog`'s own `procedure_calls` `'in_flight'`
+reclaim floor widened from 15s to 150s for the same reason (comfortable
+margin above the new 60s ceiling, matching the same roughly-2x-worst-case
+proportionality the existing 90s default already keeps above
+`HTTP_TIMEOUT`) -- left at 15s everywhere else, since nothing else grew a
+longer per-call ceiling.
+
+**A real, previously-latent bug, caught live, not by `fn_selftest`.**
+`fn_dispatch_tasks`'s own dispatch loop already guarded against
+re-advancing a task that just emitted `execute_sql` (a `NOT EXISTS`
+check against `sql_calls`) -- explicitly, per that guard's own comment,
+because a task left `'running'` with no `outbound_calls` row would
+otherwise get raced by the next pump, calling `fn_next_step` again before
+the pending result existed. The identical guard was never added for
+`call_function` (against a `plpgsql` Function) or `run_procedure` when
+Phase 3b/3c introduced them -- both queue into their own table
+(`function_calls`/`procedure_calls`) and leave the task `'running'` with
+no `sql_calls`/`outbound_calls` row either, the exact same shape the
+guard exists to protect. This never surfaced before because a plain SQL
+Function call was always sub-second, completing well within one worker
+tick, long before `fn_dispatch_tasks`'s own next pass could catch the
+task still `'running'` with nothing pending. A Procedure body calling
+`fn_llm_complete` is not sub-second -- a real network round trip, up to
+`HTTP_TIMEOUT` -- which is exactly what turned this from a latent gap
+into a live, reproducible failure during Phase 3e's own verification: a
+freshly created live-test agent (deliberately given no `llm_config` of
+its own for an unrelated reason, see below) had its task fail with
+`"agent has no llm_config.provider configured"` moments after a
+`run_procedure` action was submitted and clearly still in flight -- an
+error that made no sense until checking `fn_dispatch_tasks` directly
+confirmed it had simply called `fn_next_step` a second time on the same
+task while the procedure call was still queued/in-flight, exactly the
+`execute_sql` race with a different callee. Fixed by adding the same two
+`NOT EXISTS` guards (`function_calls`, `procedure_calls`) already used
+for `sql_calls`, in `sql/control_plane.sql`'s `fn_dispatch_tasks`.
+
+Verified: rebuilt and reinstalled; fresh install's `fn_selftest()` read
+`"failed": 0, "passed": 356` across two separate `psql` connections,
+identical both times, `failing_cases` genuinely empty (checked with the
+same `(c->>'ok')::boolean IS NOT TRUE` diagnostic Phase 3d's own bug 3
+required, not just the headline count); `cargo test --lib
+--no-default-features --features pg16` still 30/30. Live, beyond
+`fn_selftest` (a new synchronous call path, a new native function, a new
+narrow role -- exactly what the verification loop calls out): ran a real
+local HTTP server standing in for an OpenAI-compatible chat completions
+endpoint, registered it as a real, enabled `llm_providers` row with
+`allow_private_network` (needed for a `127.0.0.1` target, the same SSRF
+guard every other outbound call already goes through), created a real
+agent and a real Procedure whose body calls `fn_llm_complete`, granted
+it, and drove a real task through the actual background worker end to
+end -- the mock server's first response told the main turn loop to
+`run_procedure`; its second request, received and logged by the mock
+server itself as a genuinely separate HTTP call, was the Procedure
+body's own `fn_llm_complete` call, carrying exactly the one message the
+body constructed (`"what is the answer"`), nothing from the outer
+conversation; the real HTTP response it returned came back correctly as
+`{"ok": true, "content": "the answer is 42 (echo: what is the answer)",
+"parsed": null}` in the `procedure_result` execution log, with zero
+`error`-role log entries anywhere near that step (confirming the
+`fn_dispatch_tasks` race fix actually holds under the live timing that
+exposed it) and zero new `outbound_calls` rows for that second call
+(confirming the call bypasses that ledger, as designed). Known gap, not
+yet closed: that same bypass means this call's cost is not yet
+attributed to any schedule's `spent_cost_usd` budget the way the main
+turn loop's own LLM calls already are -- acceptable for this first slice
+the same way `mcp_call`'s missing session handshake was, revisit if this
+path sees real use.

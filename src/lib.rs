@@ -64,6 +64,18 @@ pub(crate) const SQL_CLAIM_LIMIT: i32 = 1;
 /// the two can never drift apart.
 pub(crate) const SQL_STATEMENT_TIMEOUT_MS: i32 = 5000;
 
+/// A Procedure call gets a much longer ceiling than a plain Function call
+/// or sandboxed SQL: its body may call `allgres_private.fn_llm_complete`
+/// (Phase 3e, a synchronous `call_llm`-style helper) one or more times,
+/// each bounded by `HTTP_TIMEOUT` (45s) on its own, run serially on this
+/// same SPI thread -- there is no separate thread pool for it the way the
+/// main per-task turn loop's own LLM calls get, since the whole point of a
+/// Procedure body is one blocking `CALL`, not a second async round trip.
+/// Kept comfortably under `fn_watchdog`'s own widened `procedure_calls`
+/// reclaim floor (150s, sql/control_plane.sql) so a legitimately still-
+/// running call can never be reclaimed as 'lost' out from under itself.
+pub(crate) const PROCEDURE_CALL_TIMEOUT_MS: i32 = 60000;
+
 pub(crate) const MAX_WEB_THREADS: usize = 64;
 pub(crate) const MAX_REQUEST_BYTES: usize = 1 << 20;
 pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
@@ -271,6 +283,32 @@ mod allgres {
         }
 
         JsonB(json!({"ok": true, "already_running": false, "results": results}))
+    }
+
+    /// Performs one SSRF-guarded HTTP(S) POST, synchronously, on the calling
+    /// backend's own thread -- unlike every other outbound call in this
+    /// extension, which is dispatched onto a dedicated HTTP thread pool
+    /// (src/outbound.rs) precisely so it never blocks the worker's own SPI
+    /// thread. This one is meant to block it: it is the only thing
+    /// `allgres_private.fn_llm_complete` (Phase 3e's `call_llm`-style
+    /// helper for a Procedure body) calls, itself only ever reachable from
+    /// inside a Procedure's own single blocking `CALL`
+    /// (src/procedure_exec.rs's `run_procedure_call`) -- that design
+    /// already accepts a Procedure body tying up this one worker thread
+    /// for its own duration, so paying that same cost for one more HTTP
+    /// round trip inside it is the existing trade-off applied once more,
+    /// not a new one. SECURITY INVOKER (the default): it decrypts nothing
+    /// and resolves no credential itself, only sends exactly the
+    /// url/headers/body it is given -- fn_llm_complete (SECURITY DEFINER,
+    /// owned by the narrow allgres_llm_admin role) is what injects the
+    /// real credential before calling this, and EXECUTE here is granted
+    /// only to that role, never to `sandbox` -- see
+    /// sql/grants_and_facade.sql.
+    #[pg_extern]
+    fn native_llm_http_send(url: &str, headers: JsonB, body: JsonB, allow_private: bool) -> JsonB {
+        let (status, resp_body) =
+            crate::outbound::guarded_post_json(url, headers.0.as_object(), &body.0, allow_private);
+        JsonB(json!({"status": status, "body": resp_body}))
     }
 }
 
